@@ -6,7 +6,7 @@
     <arg name="gb_conf_path" default="$(find stack_master)/config/$(arg racecar_version)/global_planner_params.yaml" />
     <arg name="reverse" default="False" doc="Set True if you want reverse direction of raceline" />
     <arg name="create_map" default="True" doc="Set false if you use only global optimization" />
-    <arg name="create_global_path" default="Ture" doc="Set false if you want to save map only" />
+    <arg name="create_global_path" default="True" doc="Set false if you want to save map only" />
     <arg name="show_plots" default="False" doc="Set true if you want see the result with images" />
     <arg name="use_vesc_imu" default="False" doc="whether use built-in vesc imu or microstrain" />
 
