@@ -20,3 +20,5 @@ if [ -z "$ROS_HOSTNAME" ]; then
     export ROS_HOSTNAME=localhost
 fi
 export ROS_MASTER_URI="http://${ROS_HOSTNAME}:11311"
+
+export CAR_NAME="FIESTA1"
