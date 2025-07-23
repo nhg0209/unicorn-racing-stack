@@ -26,6 +26,6 @@ setuptools>=61,<65 # to avoid reinstallation
 clothoids
 
 # graph-based overtaking reqs
-python-igraph
+# python-igraph
 flake8==3.7.9
 pyzmq==18.1.1
