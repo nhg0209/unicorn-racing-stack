@@ -80,7 +80,7 @@ docker compose build nuc
 
 Then Open the workspace from VS Code:
 ```bash
-code ~/unicorn_ws
+code ~/unicorn_ws/UNICORN
 ```
 
 In the VS Code window, press `Ctrl + Shift + P` to open the command palette. From the banner that appears, select `Dev Containers: Rebuild and Reopen in Container`. This will allow VS Code to automatically connect to the container.
