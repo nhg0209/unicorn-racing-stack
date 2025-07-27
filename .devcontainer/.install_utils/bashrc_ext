@@ -6,7 +6,7 @@ alias sauce='source /opt/ros/noetic/setup.bash && source /home/${USER}/catkin_ws
 alias scripz='cd /home/${USER}/catkin_ws/src/race_stack/stack_master/scripts'
 alias switch_map='/home/${USER}/catkin_ws/src/race_stack/stack_master/scripts/switch_map.sh $1'
 alias record='/home/${USER}/catkin_ws/src/race_stack/stack_master/scripts/bag.sh'
-# alias unicorn='docker exec -it -e DISPLAY="$DISPLAY" icra_UNICORN bash'
+alias sb='source ~/.bashrc'
 
 echo "ROS_ROOT   $ROS_ROOT"
 echo "ROS_DISTRO $ROS_DISTRO"
