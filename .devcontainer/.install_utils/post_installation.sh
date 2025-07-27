@@ -25,7 +25,17 @@ catkin build
 cd /home/${USER}/catkin_ws
 catkin build f1tenth_simulator
 
-# last source
+# particle_filter build
+cd /home/${USER}/catkin_ws
+catkin build particle_filter
+cd /home/${USER}/catkin_ws/src/race_stack/state_estimation/particle_filter_python3/range_libc/pywrapper
+chmod +x compile.sh 
+./compile.sh
+
+# source
 source /opt/ros/noetic/setup.bash && source /home/${USER}/catkin_ws/devel/setup.bash
+
+# python privileges
+find /home/${USER}/catkin_ws -type f -name "*.py" -exec chmod +x {} \;
 
 
