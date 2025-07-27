@@ -1,0 +1,12 @@
+
+# motion model dispersion constant, this could be improved. Large values will spread out
+# the particle distribution more. Too much and it is overly computational to represent the
+# true prob. dist, too little and the particle filter can diverge at high speeds where the
+# ackermann motion model is inaccurate
+
+
+motion_dispersion_x : 0.05
+
+motion_dispersion_y : 0.025
+
+motion_dispersion_theta : 0.25
