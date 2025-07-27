@@ -11,14 +11,15 @@ alias sb='source ~/.bashrc'
 echo "ROS_ROOT   $ROS_ROOT"
 echo "ROS_DISTRO $ROS_DISTRO"
 
-# automatically get zerotier IP. Be careful! it does not work if do not have an ip assigned with the correct prefix, "192.168.192" in this case, and it might not work if you have multiple ips with the same prefix
-# export ROS_HOSTNAME=$( ifconfig | awk '/inet 192.168.192/ {print $2}' )
-
 # check if ros hostname is empty
 if [ -z "$ROS_HOSTNAME" ]; then
     echo "ROS_HOSTNAME is empty, setting it to default"
     export ROS_HOSTNAME=localhost
 fi
+
+# automatically get zerotier IP. Be careful! it does not work if do not have an ip assigned with the correct prefix, "192.168.192" in this case, and it might not work if you have multiple ips with the same prefix
+# export ROS_HOSTNAME=$( ifconfig | awk '/inet 192.168./ {print $2}' )
+
 export ROS_MASTER_URI="http://${ROS_HOSTNAME}:11311"
 
 export CAR_NAME="FIESTA1"
