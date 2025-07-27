@@ -4,3 +4,6 @@
 [submodule "f110_utils/libs/ccma"]
 	path = f110_utils/libs/ccma
 	url = https://github.com/ForzaETH/ccma.git
+[submodule "state_estimation/particle_filter_python3"]
+	path = state_estimation/particle_filter_python3
+	url = https://github.com/jsryu118/particle_filter_python3.git
