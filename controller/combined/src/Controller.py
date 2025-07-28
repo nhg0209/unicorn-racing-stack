@@ -99,7 +99,7 @@ class Controller:
         self.heading_error_thres = heading_error_thres
         self.steer_gain_for_speed = steer_gain_for_speed
 
-        self.future_constant = future_constant
+        self._constant = _constant
 
         self.trailing_gap = trailing_gap
         self.trailing_vel_gain = trailing_vel_gain
@@ -142,8 +142,8 @@ class Controller:
         self.wheelbase = wheelbase
         
         self.start_mode = False 
-        self.future_lat_err = 0.0
-        self.future_lat_e_norm = 0.0
+        self._lat_err = 0.0
+        self._lat_e_norm = 0.0
         self.lat_acc = 0.0
         self.boost_mode = False
 
@@ -152,9 +152,9 @@ class Controller:
         self.state = state
         self.position_in_map = position_in_map
 
-        #-------------------------------Future Position-----------------------------
-        self.future_position = np.zeros((1,3))
-        #-------------------------------Future Position-----------------------------
+        #------------------------------- Position-----------------------------
+        self._position = np.zeros((1,3))
+        #------------------------------- Position-----------------------------
 
 
         self.waypoint_array_in_map = waypoint_array_in_map
@@ -170,11 +170,11 @@ class Controller:
 
         v = [np.cos(yaw)*self.speed_now, np.sin(yaw)*self.speed_now] 
         
-        #-------------------------------Future Position-----------------------------
+        #------------------------------- Position-----------------------------
 
-        self.future_position = self.calc_future_position(self.future_constant)
+        self._position = self.calc__position(self._constant)
         
-        #-------------------------------Future Position-----------------------------
+        #------------------------------- Position-----------------------------
 
         self.idx_nearest_waypoint = self.nearest_waypoint(self.position_in_map[0, :2], self.waypoint_array_in_map[:, :2])
         
@@ -186,15 +186,15 @@ class Controller:
             # calculate curvature of global optimizer waypoints
             self.curvature_waypoints = np.mean(abs(self.waypoint_array_in_map[self.idx_nearest_waypoint+10:self.idx_nearest_waypoint+20,5]))
                     
-        # calculate future lateral error and future lateral error norm
+        # calculate  lateral error and  lateral error norm
 
-        self.future_lat_e_norm, self.future_lat_err = self.calc_future_lateral_error_norm()
+        self._lat_e_norm, self._lat_err = self.calc__lateral_error_norm()
 
         ### LONGITUDINAL CONTROL ###
         
-        #-----------------------------------------Future-------------------------------------------
-        self.speed_command = self.calc_speed_command(v, self.future_lat_e_norm)
-        #-----------------------------------------Future-------------------------------------------
+        #------------------------------------------------------------------------------------
+        self.speed_command = self.calc_speed_command(v, self._lat_e_norm)
+        #------------------------------------------------------------------------------------
 
         self.speed_command = self.speed_adjust_heading(self.speed_command)
 
@@ -214,7 +214,7 @@ class Controller:
         ### LATERAL CONTROL ###
 
         steering_angle = None
-        self.future_idx_nearest_waypoint = self.nearest_waypoint(self.future_position[0, :2], self.waypoint_array_in_map[:, :2])
+        self._idx_nearest_waypoint = self.nearest_waypoint(self._position[0, :2], self.waypoint_array_in_map[:, :2])
 
         #-----------------------------------------Future-------------------------------------------
         L1_point, L1_distance = self.calc_future_L1_point(self.future_lat_err)
@@ -518,7 +518,7 @@ class Controller:
         """
         future_position = self.future_position[0, :2]
         idx_future_local_wpnts = self.nearest_waypoint(future_position, self.waypoint_array_in_map[:, :2])
-        future_local_wpnts_d = abs(self.waypoint_array_in_map[idx_future_local_wpnts,3])
+        future_local_wpnts_d = abs(self.waypoint_array_in_map[idx_future_local_wpnts,8])
         future_potision_s, future_position_d = self.converter.get_frenet([self.future_position[0,0]],[self.future_position[0,1]])
         future_position_d = abs(future_position_d[0])
         future_lat_err = future_position_d - future_local_wpnts_d 
