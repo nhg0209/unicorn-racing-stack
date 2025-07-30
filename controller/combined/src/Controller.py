@@ -70,7 +70,7 @@ class Controller:
                 logger_info = logging.info,
                 logger_warn = logging.warn,
             ):
- 
+
         # Parameters from manager
         self.t_clip_min = t_clip_min
         self.t_clip_max = t_clip_max
