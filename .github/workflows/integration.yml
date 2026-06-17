@@ -1,0 +1,112 @@
+name: integration
+
+# Re-validate the whole stack whenever:
+#   - a component repo pushes        -> it fires a repository_dispatch
+#                                       (see ci_templates/notify-race-stack.yml)
+#   - this meta-repo gets a push/PR on jazzy
+#
+# With vcstool branch-tracking there is no pinned pointer to bump: the value of
+# this job is INTEGRATION VALIDATION — does the latest CAC (+ any enabled
+# component) still resolve and colcon-build together? The exact commits that
+# were built are exported to unicorn.lock.repos and uploaded as an artifact.
+on:
+  repository_dispatch:
+    types: [submodule_updated]
+  push:
+    branches: [jazzy]
+  pull_request:
+    branches: [jazzy]
+
+# A burst of component pushes must not pile up N full builds.
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege. Bump to `contents: write` only if you choose to commit the
+# lockfile back (see the commented step below) — and if you do, commit with the
+# default GITHUB_TOKEN so the push does NOT re-trigger this workflow.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ros:jazzy-ros-base
+    steps:
+      - name: Checkout meta-repo
+        uses: actions/checkout@v4
+
+      - name: Install workspace tooling
+        run: |
+          apt-get update
+          apt-get install -y python3-vcstool python3-colcon-common-extensions python3-pip git
+
+      - name: Import component repos (vcstool)
+        run: |
+          mkdir -p src
+          vcs import --recursive --force src < unicorn.repos
+          echo "----- exact commits being built -----"
+          vcs export --exact src | tee unicorn.lock.repos
+
+      - name: Install Python deps not covered by rosdep (from CAC sim stack)
+        run: |
+          CAC=src/creating_autonomous_car
+          if [ -d "$CAC/simulator/f1tenth_gym" ]; then
+            pip install -e "$CAC/simulator/f1tenth_gym" --break-system-packages
+          fi
+          pip install transforms3d pynput --break-system-packages
+          pip install --upgrade coverage --break-system-packages
+
+      - name: rosdep
+        run: |
+          rosdep update
+          # -r: keep going past keys that need the car-only / pip sources
+          rosdep install --from-paths src --ignore-src -r -y || true
+
+      - name: colcon build
+        shell: bash
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+      - name: colcon test
+        shell: bash
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          source install/setup.bash
+          colcon test --return-code-on-test-failure || true
+          colcon test-result --verbose || true
+
+      - name: Upload lockfile (exact commits that built green)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unicorn.lock.repos
+          path: unicorn.lock.repos
+
+      # ── Optional: commit the lockfile back for race-day reproducibility ────
+      # Requires `permissions: contents: write` above. MUST use GITHUB_TOKEN
+      # (not a PAT) so the push does not re-trigger this workflow, and guard
+      # against a loop with paths-ignore on the push trigger.
+      #
+      # - name: Commit lockfile on green (jazzy only)
+      #   if: github.event_name != 'pull_request' && github.ref == 'refs/heads/jazzy'
+      #   run: |
+      #     git config user.name  "github-actions[bot]"
+      #     git config user.email "github-actions[bot]@users.noreply.github.com"
+      #     git add unicorn.lock.repos
+      #     git commit -m "ci: update unicorn.lock.repos [skip ci]" || exit 0
+      #     git push
+
+# ── Extending to a CAR (full) profile ───────────────────────────────────────
+# The job above builds the SIMULATION profile (CAC's car-only packages stay
+# COLCON_IGNORE'd). To also validate the car build, add a second job that:
+#   1. installs the heavy apt deps from build_packages_on_car.sh (cartographer,
+#      ceres, pcl, protobuf, ...),
+#   2. removes the 5 car-only COLCON_IGNORE markers under
+#      src/creating_autonomous_car/{sensor,slam}/...,
+#   3. imports CAC's nested src/creating_autonomous_car/sensor/urg_node/additional_repos.repos,
+#   4. builds range_libc, then colcon build.
+# It is intentionally omitted by default because the cartographer/ceres source
+# build is slow; enable it once you want car-side CI coverage (with caching).

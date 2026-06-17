@@ -1,0 +1,40 @@
+# unicorn.repos — vcstool manifest for the unicorn-racing-stack ROS 2 Jazzy meta-repo.
+#
+#   Populate the workspace ./src :   vcs import src < unicorn.repos
+#   Update to the latest tracked tips:   vcs pull   src
+#   Snapshot the exact built commits:    vcs export --exact src > unicorn.lock.repos
+#
+# ── ACTIVE (builds today) ───────────────────────────────────────────────────
+# creating_autonomous_car is the proven ROS 2 Jazzy base layer. It already
+# provides f110_msgs, controller, perception, planner, simulator, slam
+# (cartographer + particle_filter), sensor/vesc and stack_master. Tracked at
+# its `jazzy` branch so the meta-repo always integrates the latest base.
+repositories:
+  creating_autonomous_car:
+    type: git
+    url: https://github.com/HMCL-UNIST/creating_autonomous_car.git
+    version: jazzy
+
+# ── PENDING MIGRATION — do NOT import yet (these are still ROS 1) ────────────
+# The repos below are the UNICORN-specific components. They are currently ROS 1
+# (catkin) on main/master, so importing them into this Jazzy colcon workspace
+# would (a) fail to build and (b) collide with CAC's own ROS 2 `cartographer` /
+# `particle_filter` package names.
+#
+# Enable each ONLY after it has a ROS 2 (jazzy) branch, and when you do,
+# COLCON_IGNORE the same-named package on the CAC side (one owner per name —
+# see README "Package ownership"). `ccma` is a pure-Python lib (no package.xml,
+# installed via pip) pinned to an exact commit for reproducibility.
+#
+#  cartographer_unicorn:
+#    type: git
+#    url: https://github.com/jsryu118/cartographer_unicorn.git
+#    version: main          # TODO: switch to the jazzy branch once ported
+#  particle_filter_python3:
+#    type: git
+#    url: https://github.com/jsryu118/particle_filter_python3.git
+#    version: master        # TODO: switch to the jazzy branch once ported
+#  ccma:
+#    type: git
+#    url: https://github.com/ForzaETH/ccma.git
+#    version: 6b8a80e20e0dfda40b9fe60c7b839e086291b3d5

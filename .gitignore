@@ -1,0 +1,19 @@
+# This meta-repo carries only orchestration (unicorn.repos, CI, build scripts).
+# Component repos are imported by vcstool into the PARENT workspace's src/ as
+# siblings (see build scripts) — they are never nested inside this repo.
+
+# colcon build artifacts (should not appear here, but ignore defensively)
+build/
+install/
+log/
+
+# Python
+*.pyc
+__pycache__/
+*.egg
+*.egg-info/
+dist/
+
+# IDE / local
+.idea/
+.claude/

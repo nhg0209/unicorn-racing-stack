@@ -1,0 +1,5 @@
+repositories:
+  creating_autonomous_car:
+    type: git
+    url: https://github.com/HMCL-UNIST/creating_autonomous_car.git
+    version: 8d6e91d554bc04a23f143630dddda6dbf5785852

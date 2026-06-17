@@ -1,0 +1,31 @@
+services:
+  dev:
+    # Run `docker compose` from this meta-repo dir (<workspace>/src/unicorn-racing-stack).
+    # Build context is the meta-repo; the runtime mount is the whole workspace.
+    build:
+      context: .
+      dockerfile: .devcontainer/Dockerfile
+      args:
+        - USERNAME=${USER}
+        - UID=${UID:-1000}
+        - GID=${GID:-1000}
+        - INPUT_GID=${INPUT_GID}
+    image: unicorn_racing_stack_ros2:jazzy
+    container_name: unicorn_racing_stack_dev
+    privileged: true
+    network_mode: host
+    environment:
+      - DISPLAY=${DISPLAY}
+      - XAUTHORITY=/tmp/.Xauthority
+      - ROS_DOMAIN_ID=1
+      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+    volumes:
+      # Mount the workspace root (two levels up from this meta-repo) at /ws so
+      # sibling component repos under src/ are visible to colcon.
+      - ${PWD}/../..:/ws
+      - ${HOME}/.Xauthority:/tmp/.Xauthority
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - /dev/input:/dev/input
+    working_dir: /ws
+    stdin_open: true
+    tty: true

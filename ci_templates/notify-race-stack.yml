@@ -1,0 +1,40 @@
+# notify-race-stack.yml — TEMPLATE. This file is NOT active in the meta-repo.
+#
+# COPY it into EACH component repo you control, at:
+#     .github/workflows/notify-race-stack.yml
+# (e.g. HMCL-UNIST/creating_autonomous_car, jsryu118/cartographer_unicorn,
+#  jsryu118/particle_filter_python3).
+#
+# On every push to the tracked branch it fires a repository_dispatch at the
+# meta-repo (HMCL-UNIST/unicorn-racing-stack), which triggers integration.yml
+# to re-import + re-validate the stack immediately.
+#
+# ── Prerequisite: the RACE_STACK_TOKEN secret ──────────────────────────────
+# Create a fine-grained Personal Access Token scoped to ONLY
+# HMCL-UNIST/unicorn-racing-stack with permission:  Contents: Read and write.
+# Add it as an ORGANISATION secret named RACE_STACK_TOKEN (HMCL-UNIST →
+# Settings → Secrets and variables → Actions), restricted to the component
+# repos above. An org secret means one token to rotate, not one per repo.
+# Note: ForzaETH/ccma is third-party — you cannot add this workflow there;
+# pin it to a commit in unicorn.repos (and/or add an `on: schedule` run).
+#
+# ── Per-repo edit: set `branches` to the branch unicorn.repos tracks ───────
+name: notify-race-stack
+
+on:
+  push:
+    branches: [jazzy]   # CAC=jazzy ; jsryu118 repos = main/master (or their jazzy branch once ported)
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch integration build in unicorn-racing-stack
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.RACE_STACK_TOKEN }}
+          repository: HMCL-UNIST/unicorn-racing-stack
+          event-type: submodule_updated
+          # Informational only — integration.yml re-imports the tip and does NOT
+          # interpolate this payload into any shell (avoids command injection).
+          client-payload: '{"repo": "${{ github.repository }}", "sha": "${{ github.sha }}"}'

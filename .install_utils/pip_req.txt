@@ -1,0 +1,9 @@
+gymnasium==0.29.1
+numpy
+Pillow>=9.0.1
+scipy>=1.7.3
+numba>=0.55.2
+pyglet==1.5.20
+PyOpenGL
+PyOpenGL_accelerate
+scikit-image
