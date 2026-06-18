@@ -155,7 +155,7 @@ class ObstacleSpliner(Node):
         self.wait_for_messages()
 
         self.converter = self.initialize_converter()
-        self.map_filter = GridFilter(map_topic="/map", debug=False)
+        self.map_filter = GridFilter(node=self, map_topic="/map", debug=False)
         self.map_filter.set_erosion_kernel_size(self.kernel_size)
 
         # Main loop at 40 Hz

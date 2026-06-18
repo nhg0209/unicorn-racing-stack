@@ -99,7 +99,7 @@ class ObstacleSpliner(Node):
         self.n_loc_wpnts = 80
         self.width_car = 0.30
 
-        self.map_filter = GridFilter(map_topic="/map", debug=False)
+        self.map_filter = GridFilter(node=self, map_topic="/map", debug=False)
         self.map_filter.set_erosion_kernel_size(self.kernel_size)
 
         self.declare_all_parameters()

@@ -87,7 +87,7 @@ class ObstacleSpliner(Node):
         self.post_max_dist = 5.0
         self.kernel_size = 4
 
-        self.map_filter = GridFilter(map_topic="/map", debug=False)
+        self.map_filter = GridFilter(node=self, map_topic="/map", debug=False)
         self.map_filter.set_erosion_kernel_size(self.kernel_size)
 
         # dyn params default

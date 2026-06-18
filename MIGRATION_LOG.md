@@ -76,3 +76,13 @@ lap_analyser, sector_tuner, overtaking_sector_tuner, set_pose, random_obstacle_p
 - NOTE: ament_python "build" = structural (entry points/setup) only; runtime imports NOT checked.
   Known runtime TODOs: grid_filter Python class still imports rospy; sqp_planner calls removed
   FrenetConverter.get_e_psi; planners need pip libs tph (trajectory_planning_helpers) + ccma.
+
+### Phase 5a (runtime imports) — 24/24 node modules import OK
+- Ported grid_filter Python GridFilter rospy->rclpy (takes node=; subscribes via node). Patched 6
+  consumers to pass node=self (recovery_spliner, spliner static/start*, spliner_planner, lane_change_planner).
+- pip RUNTIME deps (install to ~/.local): trajectory_planning_helpers, ccma (git+ForzaETH/CCMA),
+  quadprog, casadi, tqdm, transforms3d.
+- **numpy conflict FIX**: pip pulled numpy 2.4.6 into ~/.local, clashing with ROS system numpy 1.26.4
+  (dtype ABI + np.Inf removed). Removed ~/.local numpy; rebuilt quadprog from source --no-build-isolation
+  against 1.26.4. KEEP system numpy 1.26.4. For Docker: install pip deps WITHOUT upgrading numpy
+  (use --no-deps for quadprog/casadi or constrain numpy<2).
