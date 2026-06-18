@@ -384,6 +384,9 @@ class GymBridge(Node):
         self.rc_backend = self.declare_parameter('raycaster_backend', 'rm').value
         self.rc_max_range = self.declare_parameter('raycaster_max_range', 10.0).value
         self.rc_nan_on_miss = self.declare_parameter('raycaster_nan_on_miss', True).value
+        # additive Gaussian range noise per beam (sim realism) — matches f1tenth_gym's std_dev=0.01 m
+        self.rc_noise_std = self.declare_parameter('raycaster_scan_noise_std', 0.01).value
+        self._scan_rng = np.random.default_rng()
         self.engine = None
         if not self.use_raycaster:
             self.get_logger().info('[GymBridge] use_raycaster=false -> gym internal numba scan + DT rebuild')
@@ -426,6 +429,8 @@ class GymBridge(Node):
         scan = self.engine.scan_with_dynamics(
             self._lidar_pose(agent), self.scan_beams, self.scan_fov,
             opp_poses=opp, obstacles=obstacles, miss=miss)
+        if self.rc_noise_std > 0.0:                          # gym-equivalent white noise (NaN beams stay NaN)
+            scan = scan + self._scan_rng.normal(0.0, self.rc_noise_std, scan.shape)
         return scan.astype(np.float64).tolist()
 
     def _static_obstacles_cb(self, msg: MarkerArray):
