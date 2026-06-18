@@ -11,6 +11,7 @@
   <depend>rclpy</depend>
   <depend>f110_msgs</depend>
   <depend>frenet_conversion</depend>
+  <depend>frenet_conversion_msgs</depend>
   <exec_depend>python3-numpy</exec_depend>
 
   <test_depend>ament_copyright</test_depend>

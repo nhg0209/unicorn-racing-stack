@@ -62,3 +62,17 @@ lap_analyser, sector_tuner, overtaking_sector_tuner, set_pose, random_obstacle_p
 - **sudo needs password → NO local apt**. Hardware/apt-dep pkgs deferred to Docker build:
   vesc* (needs ros-jazzy-serial-driver), urg_node (nested vcs), cartographer (apt).
   Local builds use `--packages-ignore vesc_driver vesc_ackermann vesc vesc_msgs urg_node`.
+
+### Phase 3 (ROS1 ports) — ALL BUILD OK
+- Ported via 6 parallel agents: frenet_conversion(+_msgs split), frenet_conversion_server,
+  frenet_odom_republisher, steering_lookup, id_controller, state_machine, sector_tuner,
+  overtaking_sector_tuner, lap_analyser, set_pose, random_obstacle_publisher, grid_filter,
+  polygon_filter, vel_planner, gb_optimizer, spliner, spliner_planner, sqp_planner,
+  recovery_spliner, lane_change_planner.
+- Fix: frenet_conversion had rosidl+ament_python in one ament_cmake pkg -> egg target clash.
+  SPLIT into frenet_conversion (ament_python class) + frenet_conversion_msgs (ament_cmake srvs).
+  frenet_conversion_server now imports frenet_conversion_msgs.srv.
+- Fix: unescaped '<' in package.xml <description> (Frenet<->global) -> XML parse error.
+- NOTE: ament_python "build" = structural (entry points/setup) only; runtime imports NOT checked.
+  Known runtime TODOs: grid_filter Python class still imports rospy; sqp_planner calls removed
+  FrenetConverter.get_e_psi; planners need pip libs tph (trajectory_planning_helpers) + ccma.

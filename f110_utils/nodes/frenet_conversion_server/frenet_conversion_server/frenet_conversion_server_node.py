@@ -5,7 +5,7 @@ import numpy as np
 
 from f110_msgs.msg import WpntArray
 from frenet_conversion.frenet_converter import FrenetConverter
-from frenet_conversion.srv import (
+from frenet_conversion_msgs.srv import (
     Frenet2Glob,
     Frenet2GlobArr,
     Glob2Frenet,

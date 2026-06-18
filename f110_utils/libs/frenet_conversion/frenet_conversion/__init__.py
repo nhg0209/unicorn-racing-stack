@@ -1,1 +1,1 @@
-from frenet_conversion import frenet_converter
+from frenet_conversion.frenet_converter import FrenetConverter
