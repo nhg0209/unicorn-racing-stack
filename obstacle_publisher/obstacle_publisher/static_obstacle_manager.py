@@ -22,7 +22,7 @@ class StaticObstacleManager(Node):
         super().__init__('static_obstacle_manager')
 
         # ===== Parameters =====
-        self.declare_parameter('obstacle_diameter_m', 0.5)
+        self.declare_parameter('obstacle_diameter_m', 0.3)   # square side length (m)
         self.obstacle_diameter_m = self.get_parameter('obstacle_diameter_m').value
 
         # ===== Static obstacles list =====
