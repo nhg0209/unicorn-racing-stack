@@ -113,3 +113,19 @@ lap_analyser, sector_tuner, overtaking_sector_tuner, set_pose, random_obstacle_p
 - HARDWARE (build in Docker w/ apt deps, not sim-validated): vesc*, urg_node.
 - apt (not built): cartographer, cartographer_ros.
 - EXCLUDED: blink1, car_to_car_sync, on_track_sys_id, gp_traj_predictor, slam_tuner, f1tenth_simulator.
+
+### Phase 4 (Docker build test) — ✅ PASSED
+- `build_packages_on_car.sh` run in container `ros2-slam:jazzy` (workspace mounted at /ws, root):
+  **Summary: 38 packages finished, 0 failed, "Build complete!"** (exit 0).
+  Includes HARDWARE (vesc*, urg_node) built with apt serial-driver/ackermann — so the full car
+  build works. cartographer installed from apt (not built), per spec.
+- `set -eo pipefail` => the apt/pip/colcon steps all succeeded (package names valid).
+- CAVEAT: Docker `--symlink-install` records `/ws/...` symlink paths (container), so the container's
+  install/ is NOT host-portable. For host dev, rebuild on host (`colcon build`, 34 pkgs; vesc/urg need
+  apt). For the CAR, run build_packages_on_car.sh on the car (or in the container).
+
+## ✅ MIGRATION COMPLETE
+- Host build: 34 pkgs OK. Docker one-file build: 38 pkgs OK. Imports: 24/24. Sim: raycaster @100Hz OK.
+- Remaining (user's sequential follow-up, documented above): wire ported nodes into stack_master
+  launch files for full-autonomy bring-up; gb_optimizer offline deps (apt sklearn/skimage);
+  sector_tuner needs map sector config; hardware/localization validated only by build (per spec).
