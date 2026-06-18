@@ -468,9 +468,9 @@ class GymBridge(Node):
 
         # Static obstacles (circles)
         for obs in self.static_obstacles:
-            center_px = self._meters_to_pixels(obs['x'], obs['y'])
-            radius_px = max(1, int(obs['radius'] / self.map_resolution))
-            cv2.circle(self.current_map_img, center_px, radius_px, 0, -1)
+            cx, cy = self._meters_to_pixels(obs['x'], obs['y'])
+            half = max(1, int(obs['radius'] / self.map_resolution))   # square half-side
+            cv2.rectangle(self.current_map_img, (cx - half, cy - half), (cx + half, cy + half), 0, -1)
 
         # Dynamic obstacle (rotated rectangle)
         if self.dynamic_obstacle is not None:
