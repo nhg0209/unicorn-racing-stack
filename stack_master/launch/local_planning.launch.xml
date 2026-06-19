@@ -1,0 +1,69 @@
+<launch>
+  <!--
+    local_planning.launch.xml
+    =========================
+    Local planner + waypoint_publisher + Pure Pursuit.
+
+    Modes (arg `mode`):
+      free          : follow raceline, ignore obstacles
+      trailing      : follow raceline, cap speed behind opponent
+      spline_avoid  : evaluate L/R spline candidates; fallback to trailing if infeasible
+
+    Data flow:
+      waypoint_publisher -> /global_waypoints
+                         -> local_planning.py -> /local_waypoints
+                         -> pp_node (subscribes /local_waypoints directly)
+                         -> /vesc/high_level/ackermann_cmd
+
+    Run (sim):
+      ros2 launch stack_master low_level.launch.xml sim:=true map:=f
+      ros2 launch stack_master local_planning.launch.xml map:=f sim:=true mode:=spline_avoid
+
+    Run (real car):
+      ros2 launch stack_master middle_level.launch.xml map:=f
+      ros2 launch stack_master local_planning.launch.xml map:=f mode:=spline_avoid
+  -->
+
+  <arg name="map"    description="Map name (folder in stack_master/maps/)"/>
+  <arg name="sim"    default="false" description="true: sim odom (/vesc/odom); false: real car odom (/car_state/odom)"/>
+  <arg name="config" default="$(find-pkg-share stack_master)/config/ppc.yaml"/>
+  <arg name="mode"   default="spline_avoid"
+       description="free | trailing | spline_avoid"/>
+  <arg name="planner_config"
+       default="$(find-pkg-share stack_master)/config/local_planning.yaml"
+       description="YAML file with local_planning tunable parameters"/>
+  <arg name="planner_path"
+       default="$(env COLCON_PREFIX_PATH)/../src/creating_autonomous_car/planner/planner/local_planning.py"
+       description="Path to the local_planning python file (resolved from workspace install dir)"/>
+
+  <!-- 1. Publish global raceline from stack_master/maps/<map>/global_waypoints.csv -->
+  <node pkg="planner" exec="waypoint_publisher" name="waypoint_publisher" output="screen">
+    <param name="map_name" value="$(var map)"/>
+  </node>
+
+  <!-- 2. Local planner. Tunables come from planner_config YAML.
+          `mode` and `odom_topic` are passed via -p to override the YAML so
+          they can still be flipped from the command line at launch time. -->
+  <group if="$(var sim)">
+    <executable cmd="/usr/bin/python3 $(var planner_path) --ros-args --params-file $(var planner_config) -p mode:=$(var mode) -p odom_topic:=/vesc/odom"
+                output="screen"/>
+  </group>
+  <group unless="$(var sim)">
+    <executable cmd="/usr/bin/python3 $(var planner_path) --ros-args --params-file $(var planner_config) -p mode:=$(var mode) -p odom_topic:=/car_state/odom"
+                output="screen"/>
+  </group>
+
+  <!-- 3. Pure Pursuit. PP subscribes to /local_waypoints directly. -->
+  <group if="$(var sim)">
+    <node pkg="controller" exec="pp_node" name="pp" output="screen">
+      <param from="$(var config)"/>
+    </node>
+  </group>
+  <group unless="$(var sim)">
+    <node pkg="controller" exec="pp_node" name="pp" output="screen">
+      <param from="$(var config)"/>
+      <remap from="/vesc/odom" to="/car_state/odom"/>
+    </node>
+  </group>
+
+</launch>

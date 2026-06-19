@@ -1,0 +1,41 @@
+<launch>
+  <!--
+    ppc.launch.xml
+    ====================
+    Pure Pursuit controller + global waypoints publisher.
+
+    Run AFTER:
+      sim  : ros2 launch stack_master low_level.launch.xml sim:=true map:=f
+      real : ros2 launch stack_master middle_level.launch.xml map:=f
+
+    Usage:
+      sim  : ros2 launch stack_master ppc.launch.xml map:=f sim:=true
+      real : ros2 launch stack_master ppc.launch.xml map:=f
+  -->
+
+  <arg name="map"    description="Map name (folder in stack_master/maps/)"/>
+  <arg name="sim"    default="false" description="true: sim (/vesc/odom from gym_bridge, map frame); false: real car (remap to /car_state/odom from EKF)"/>
+  <arg name="config" default="$(find-pkg-share stack_master)/config/ppc.yaml"/>
+
+  <!-- Global waypoints publisher (loads stack_master/maps/<map>/global_waypoints.csv) -->
+  <node pkg="planner" exec="waypoint_publisher" name="waypoint_publisher" output="screen">
+    <param name="map_name" value="$(var map)"/>
+  </node>
+
+  <!-- Pure Pursuit controller.
+       sim : gym_bridge publishes /vesc/odom directly in map frame (GT), no remap needed.
+       real: VESC /vesc/odom is wheel-only in odom frame (drifts), use EKF-filtered
+             /car_state/odom (map frame) by remapping the subscription. -->
+  <group if="$(var sim)">
+    <node pkg="controller" exec="pp_node" name="pp" output="screen">
+      <param from="$(var config)"/>
+    </node>
+  </group>
+  <group unless="$(var sim)">
+    <node pkg="controller" exec="pp_node" name="pp" output="screen">
+      <param from="$(var config)"/>
+      <remap from="/vesc/odom" to="/car_state/odom"/>
+    </node>
+  </group>
+
+</launch>

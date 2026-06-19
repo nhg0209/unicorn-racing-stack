@@ -1,0 +1,39 @@
+local_planning:
+  ros__parameters:
+
+    # ---- mode --------------------------------------------------------------
+    # free          : raceline forward window only
+    # trailing      : raceline + trailing PD speed cap
+    # spline_avoid  : left/right spline candidates; trailing fallback
+    mode: spline_avoid
+
+    # ---- topics ------------------------------------------------------------
+    scan_topic:   /scan
+    odom_topic:   /vesc/odom        # launch overrides to /car_state/odom on real car
+    global_topic: /global_waypoints
+    local_topic:  /local_waypoints
+
+    # ---- forward window (Frenet slice) -------------------------------------
+    local_horizon: 5.0     # [m]  total length of published waypoints
+    ds_step:       0.25    # [m]  spacing between samples
+    s_blend:       3.0     # [m]  cosine blend distance (~ 2 * pp_lookahead)
+
+    # ---- spline_avoid: avoidance geometry ----------------------------------
+    d_safe:        0.7     # [m]  peak lateral offset (±, left/right candidates)
+    s_in:          2.0     # [m]  min approach gap; closer than this -> trailing
+    s_out:         2.5     # [m]  distance from peak back to raceline rejoin
+    trigger_range: 10.0     # [m]  start considering avoidance within this gap
+    margin:        0.1     # [m]  wall/obstacle safety margin
+    obs_radius:    0.4     # [m]  obstacle inflation radius
+    track_half_w:  0.8     # [m]  fallback track half-width if CSV lacks dl/dr
+
+    # ---- spline_avoid: speed limits ----------------------------------------
+    a_lat_max:      6.0    # [m/s^2] lateral accel cap (curvature-based vx cap)
+    vx_scale_avoid: 0.5    # [-]     speed multiplier while on avoidance spline
+
+    # ---- spline_avoid: wall clamping (forces wall feasibility) -------------
+    # Per-point clamp wall-violating samples back inside the corridor, then
+    # PCHIP-refit. Obstacle clearance is still enforced (safety preserved).
+    clamp_to_walls:  true   # [bool] enable clamp + PCHIP smoothing
+    clamp_buffer:    0.05   # [m]    extra inward buffer beyond margin
+

@@ -1,0 +1,31 @@
+<launch>
+  <!--
+    reactive.launch.xml
+    ====================
+    Run AFTER:
+      ros2 launch stack_master low_level.launch.xml sim:=true map:=f
+
+    Usage:
+      ros2 launch stack_master reactive.launch.xml mode:=gap_follow
+      ros2 launch stack_master reactive.launch.xml mode:=wall_follow
+  -->
+
+  <arg name="mode"   default="gap"
+       description="Controller mode: gap | wall"/>
+  <arg name="config" default="$(find-pkg-share stack_master)/config/reactive_controller.yaml"/>
+
+  <!-- Gap Follow -->
+  <node pkg="controller" exec="gap_follow_node" name="gap_follow" output="screen"
+        if="$(eval '\'$(var mode)\' == \'gap\'')">
+    <param from="$(var config)"/>
+  </node>
+
+  <!-- Wall Follow -->
+  <node pkg="controller" exec="wall_follow_node" name="wall_follow" output="screen"
+        if="$(eval '\'$(var mode)\' == \'wall\'')">
+    <param from="$(var config)"/>
+  </node>
+
+  
+
+</launch>

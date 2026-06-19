@@ -1,0 +1,67 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Arguments -->
+  <arg name="sim"            default="false"      description="Use simulator (true) or real hardware (false)"/>
+  <arg name="vehicle_config" default="$(find-pkg-share stack_master)/config/vehicle_config.yaml"/>
+  <arg name="use_estop"      default="false"               description="Use emergency stop (true) or not (false)"/>
+
+  <!-- ========== REAL HARDWARE SENSORS ========== -->
+  <group unless="$(var sim)">
+    <!-- VESC: motor driver + ackermann converter + wheel odometry (/vesc/odom) -->
+    <group>
+      <push_ros_namespace namespace="vesc"/>
+      <node pkg="vesc_driver" exec="vesc_driver_node" name="vesc_driver_node" output="screen">
+        <param from="$(var vehicle_config)"/>
+      </node>
+      <include file="$(find-pkg-share vesc_ackermann)/launch/ackermann_to_vesc_node.launch.xml">
+        <arg name="vesc_config" value="$(var vehicle_config)"/>
+      </include>
+      <include file="$(find-pkg-share vesc_ackermann)/launch/vesc_to_odom_node.launch.xml">
+        <arg name="vesc_config" value="$(var vehicle_config)"/>
+      </include>
+    </group>
+
+    <!-- LiDAR: publishes /scan (frame_id: laser) -->
+    <node pkg="urg_node" exec="urg_node_driver" name="urg_node" output="screen">
+      <param from="$(var vehicle_config)"/>
+    </node>
+
+    <!-- Static TF: base_link → laser -->
+    <node pkg="tf2_ros" exec="static_transform_publisher" name="base_to_laser_broadcaster"
+          args="--x 0.27 --y 0 --z 0.11 --qx 0 --qy 0 --qz 0 --qw 1 --frame-id base_link --child-frame-id laser"/>
+    <!-- Static TF: base_link → vesc_imu (yaw +90도, Z축은 base_link와 동일) -->
+    <node pkg="tf2_ros" exec="static_transform_publisher" name="base_to_vesc_imu_broadcaster"
+          args="--x 0 --y 0 --z 0.0 --roll 0 --pitch 0 --yaw 1.5707963 --frame-id base_link --child-frame-id vesc_imu"/>
+    <!-- Static TF: vesc_imu → vesc_imu_rot (역회전 yaw=-90도: base_link와 동일한 orientation) -->
+    <node pkg="tf2_ros" exec="static_transform_publisher" name="vesc_imu_to_rot_broadcaster"
+          args="--x 0 --y 0 --z 0 --roll 0 --pitch 0 --yaw -1.5707963 --frame-id vesc_imu --child-frame-id vesc_imu_rot"/>
+
+  </group>
+
+  <!-- ========== SIMULATOR ========== -->
+  <!-- gym_bridge: virtual /scan + odometry, optional TF -->
+  <group if="$(var sim)">
+    <arg name="map"                     description="Map name (required when sim=true)"/>
+
+    <let name="maps_dir" value="$(find-pkg-share stack_master)/maps"/>
+    <let name="map_path" value="$(var maps_dir)/$(var map)/$(var map)"/>
+    <include file="$(find-pkg-share f1tenth_gym_ros)/launch/gym_bridge_launch.py">
+      <arg name="map_yaml_path"  value="$(var map_path).yaml"/>
+    </include>
+    <include file="$(find-pkg-share obstacle_publisher)/launch/obstacle_publisher.launch.xml">
+      <arg name="map_name" value="$(var map)"/>
+    </include>
+  </group>
+
+  <!-- ========== ALWAYS ========== -->
+  <!-- Joystick / Command mux -->
+  <node pkg="stack_master" exec="simple_mux_node.py" name="simple_mux" output="log">
+    <param from="$(var vehicle_config)"/>
+    <param name="in_topic"      value="/vesc/high_level/ackermann_cmd"/>
+    <param name="out_topic"     value="/vesc/ackermann_cmd"/>
+    <param name="joy_max_speed" value="4.0"/>
+    <param name="use_estop" value="$(var use_estop)"/>
+    <param name="sim" value="$(var sim)"/>
+  </node>
+
+</launch>

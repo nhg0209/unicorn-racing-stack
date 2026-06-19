@@ -1,0 +1,8 @@
+trajectory_optimizer:
+  ros__parameters:
+    input_csv:     'centerline.csv'
+    output_csv:    'global_waypoints.csv'
+    safety_margin: 0.4   # [m]   minimum clearance from each wall
+    v_max:         6.0    # [m/s] vehicle speed cap
+    a_lat_max:     6.0    # [m/s^2] lateral grip limit (curvature -> v)
+    a_long_max:    4.0    # [m/s^2] long. accel limit (fwd/bwd smoothing)
