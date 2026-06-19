@@ -39,7 +39,7 @@ from geometry_msgs.msg import TransformStamped
 from geometry_msgs.msg import Transform
 from ackermann_msgs.msg import AckermannDriveStamped
 from visualization_msgs.msg import Marker, MarkerArray
-from f110_msgs.msg import ObstacleArray
+from f110_msgs.msg import ObstacleArray, WpntArray
 from tf2_ros import TransformBroadcaster
 
 # Make f110_gym import & scan without numba (numpy>=2.1 breaks numba 0.60).
@@ -285,6 +285,13 @@ class GymBridge(Node):
             '/initialpose',
             self.ego_reset_callback,
             qos_profile=best_effort_qos_profile)
+        # Raceline for crash recovery: if the ego stays wedged against a virtual
+        # obstacle, respawn it on the nearest raceline point so an endurance run
+        # never dead-locks (the collision-stop alone would freeze it forever).
+        self._raceline = None        # (N,3) [x, y, psi]
+        self._collision_ticks = 0
+        self.create_subscription(WpntArray, '/global_waypoints',
+                                 self._raceline_callback, 10)
         # opponent control — only when gym owns the opponent. With the external
         # `opponent` package these topics (/goal_pose, /opp_drive, /sim/remove_opponent,
         # /sim/opp_speed_delta) are owned by that package instead.
@@ -709,7 +716,33 @@ class GymBridge(Node):
             self.ego_requested_speed = 0.0
             if not self.ego_collision:
                 self.get_logger().warn('[GymBridge] ego collision with virtual obstacle -> stopped')
+            self._collision_ticks += 1
+            # Wedged against the obstacle for too long -> respawn on the raceline
+            # so the run recovers instead of dead-locking (speed is forced to 0
+            # every tick, so the ego could never drive itself free).
+            if self._collision_ticks > 150 and self._raceline is not None:
+                self._respawn_on_raceline(ex, ey)
+                self._collision_ticks = 0
+                hit = False
+        else:
+            self._collision_ticks = 0
         self.ego_collision = hit
+
+    def _raceline_callback(self, msg: WpntArray):
+        if len(msg.wpnts) >= 3:
+            self._raceline = np.array([[w.x_m, w.y_m, w.psi_rad] for w in msg.wpnts])
+
+    def _respawn_on_raceline(self, ex, ey):
+        rl = self._raceline
+        i = int(np.argmin((rl[:, 0] - ex) ** 2 + (rl[:, 1] - ey) ** 2))
+        rx, ry, rpsi = float(rl[i, 0]), float(rl[i, 1]), float(rl[i, 2])
+        opp_pose = ([self.obs['poses_x'][1], self.obs['poses_y'][1], self.obs['poses_theta'][1]]
+                    if self.has_opp else self.OPP_PARK_POSE)
+        self.obs, _, self.done, _ = self.env.reset(
+            poses=np.array([[rx, ry, rpsi], opp_pose]))
+        self.ego_requested_speed = 0.0
+        self.get_logger().warn(
+            f'[GymBridge] crash recovery -> respawn on raceline at ({rx:.1f}, {ry:.1f})')
 
     def scan_timer_callback(self):
         # ---- lidar scans (runs at scan_hz, decoupled from physics) ----
