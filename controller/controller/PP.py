@@ -13,6 +13,10 @@ PARAMS = {
     'pp_lookahead':     1.0,
     'pp_wheelbase':    0.33,
     'pp_max_steer':     0.4,
+    # which WpntArray to follow: '/global_waypoints' (time-trial) or
+    # '/local_waypoints' (head-to-head: state-machine output w/ avoidance)
+    'waypoint_topic':  '/global_waypoints',
+    'odom_topic':      '/vesc/odom',
 }
 
 
@@ -38,8 +42,13 @@ class PPNode(Node):
             reliability=QoSReliabilityPolicy.RELIABLE,
         )
 
-        self.create_subscription(Odometry,   '/vesc/odom',        self._odom_cb, 10)
-        self.create_subscription(WpntArray,  '/global_waypoints', self._wp_cb, latched)
+        self.create_subscription(Odometry,   p('odom_topic'),      self._odom_cb, 10)
+        # Use a plain VOLATILE depth-10 QoS for the waypoint source: it is
+        # compatible with BOTH the state machine's volatile /local_waypoints
+        # (head-to-head) and waypoint_publisher's TRANSIENT_LOCAL
+        # /global_waypoints (time-trial, republished at 1 Hz). A TRANSIENT_LOCAL
+        # subscriber would silently reject the volatile /local_waypoints.
+        self.create_subscription(WpntArray,  p('waypoint_topic'),  self._wp_cb, 10)
         self.drive_pub     = self.create_publisher(AckermannDriveStamped, '/vesc/high_level/ackermann_cmd', 10)
         self.lookahead_pub = self.create_publisher(Marker, '/pp/lookahead', 10)
         self.create_timer(1.0 / p('control_rate_hz'), self._loop)
@@ -111,11 +120,53 @@ class PPNode(Node):
         #       (or average a few waypoints around the lookahead)
         #     - if vx is 0 or negative, fall back to a sane default (e.g. 1.5 m/s)
 
-        #TODO
+        # Step 1. vehicle pose (waypoints are in the map frame; sim /vesc/odom is GT in map)
+        p = self.odom.pose.pose.position
+        q = self.odom.pose.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        cy, sy = math.cos(-yaw), math.sin(-yaw)
 
-        raise NotImplementedError('PPNode._compute is not implemented yet')
+        # Speed-adaptive lookahead keeps PP stable across the speed profile
+        v_now = math.hypot(self.odom.twist.twist.linear.x, self.odom.twist.twist.linear.y)
+        Ld = min(3.0, max(self.lookahead, 0.5 + 0.30 * v_now))
 
-        #TODO
+        # Step 2. transform waypoints into the vehicle frame, pick the lookahead point
+        target_idx = -1
+        best_err = float('inf')
+        tx = ty = 0.0
+        for i, w in enumerate(self.waypoints):
+            dx = float(w.x_m) - p.x
+            dy = float(w.y_m) - p.y
+            lx = cy * dx - sy * dy          # forward (+x ahead of the car)
+            ly = sy * dx + cy * dy          # left
+            if lx <= 0.0:
+                continue                    # only consider points ahead
+            err = abs(math.hypot(lx, ly) - Ld)
+            if err < best_err:
+                best_err = err
+                target_idx = i
+                tx, ty = lx, ly
+
+        if target_idx < 0:
+            # nothing ahead (e.g. just spawned facing away) → creep straight to recover
+            return 0.0, 1.0
+
+        # Step 3. curvature → steering (bicycle model)
+        L2 = tx * tx + ty * ty
+        if L2 < 1e-6:
+            return 0.0, 1.0
+        curvature = 2.0 * ty / L2
+        steer = math.atan(self.wheelbase * curvature)
+        steer = max(-self.max_steer, min(self.max_steer, steer))
+
+        self._publish_lookahead(self.waypoints[target_idx])
+
+        # Step 4. speed from the target waypoint's profile velocity
+        speed = float(self.waypoints[target_idx].vx_mps)
+        if speed <= 0.1:
+            speed = 1.5
+        return steer, speed
 
 
 def main(args=None):

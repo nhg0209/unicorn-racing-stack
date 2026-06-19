@@ -35,6 +35,7 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker, MarkerArray
@@ -91,7 +92,10 @@ class DetectNode(Node):
         # ----------------------------------------------------------------
         # Subscriptions
         # ----------------------------------------------------------------
-        self.create_subscription(LaserScan, '/scan', self._scan_callback, 10)
+        # /scan is published best-effort (SENSOR_DATA) by the sim/lidar driver and
+        # the scan_augmentor; match it or no scans are delivered.
+        self.create_subscription(LaserScan, '/scan', self._scan_callback,
+                                 qos_profile_sensor_data)
 
         # ----------------------------------------------------------------
         # Publishers

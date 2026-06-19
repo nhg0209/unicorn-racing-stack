@@ -41,10 +41,11 @@ class WaypointPublisher(Node):
             self.get_logger().error('[WaypointPublisher] map_name parameter is required!')
             return
 
-        # Resolve source map directory from __file__ (realpath resolves symlinks)
-        # __file__: .../creating_autonomous_car/planner/planner/waypoint_publisher.py
-        pkg_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-        self.map_dir = os.path.join(pkg_root, 'stack_master', 'maps', self.map_name)
+        # Resolve the maps directory robustly. The packages were regrouped
+        # (planner/planner/planner/...) so a fixed dirname() chain no longer
+        # reaches the repo root; ascend until stack_master/maps/<map> is found,
+        # then fall back to the installed stack_master share dir.
+        self.map_dir = self._find_maps_dir(self.map_name)
         self.get_logger().info(f'[WaypointPublisher] map_dir: {self.map_dir}')
 
         # Load track boundaries for d_right/d_left computation
@@ -69,6 +70,13 @@ class WaypointPublisher(Node):
             WpntArray, '/centerline_waypoints', latched_qos)
         self.global_wp_wpnt_pub = self.create_publisher(
             WpntArray, '/global_waypoints', latched_qos)
+        # Downstream (state_machine, planners) consume the speed-scaled raceline
+        # and an overtaking reference line. Without a sector/velocity scaler we
+        # publish identity copies of the global raceline so the pipeline runs.
+        self.global_wp_scaled_pub = self.create_publisher(
+            WpntArray, '/global_waypoints_scaled', latched_qos)
+        self.global_wp_ot_pub = self.create_publisher(
+            WpntArray, '/global_waypoints/overtaking', latched_qos)
 
         # Load and publish
         self._centerline_marker = None
@@ -85,6 +93,21 @@ class WaypointPublisher(Node):
         self.timer = self.create_timer(1.0, self._republish)
 
         self.get_logger().info(f'[WaypointPublisher] Initialized for map: {self.map_name}')
+
+    def _find_maps_dir(self, map_name):
+        """Ascend from this file to find stack_master/maps/<map>; fall back to
+        the installed stack_master share directory."""
+        here = os.path.dirname(os.path.realpath(__file__))
+        for _ in range(8):
+            cand = os.path.join(here, 'stack_master', 'maps', map_name)
+            if os.path.isdir(cand):
+                return cand
+            here = os.path.dirname(here)
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            return os.path.join(get_package_share_directory('stack_master'), 'maps', map_name)
+        except Exception:
+            return os.path.join('stack_master', 'maps', map_name)
 
     def _load_csv(self, filename):
         """Load CSV file, return list of dicts or None if not found."""
@@ -247,6 +270,9 @@ class WaypointPublisher(Node):
         # WpntArray
         self._global_wp_wpnt = self._csv_to_wpnt_array(data)
         self.global_wp_wpnt_pub.publish(self._global_wp_wpnt)
+        # Identity copies for scaled + overtaking reference lines
+        self.global_wp_scaled_pub.publish(self._global_wp_wpnt)
+        self.global_wp_ot_pub.publish(self._global_wp_wpnt)
 
     def _create_line_strip(self, x, y, ns, marker_id, r, g, b, a=1.0, width=0.03):
         """Create a single LINE_STRIP marker."""
@@ -299,6 +325,8 @@ class WaypointPublisher(Node):
         if self._global_wp_wpnt:
             self._global_wp_wpnt.header.stamp = self.get_clock().now().to_msg()
             self.global_wp_wpnt_pub.publish(self._global_wp_wpnt)
+            self.global_wp_scaled_pub.publish(self._global_wp_wpnt)
+            self.global_wp_ot_pub.publish(self._global_wp_wpnt)
 
 
     def cleanup_markers(self):

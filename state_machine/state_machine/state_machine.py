@@ -532,6 +532,10 @@ class StateMachine(Node):
         self.num_glb_wpnts = len(data.wpnts)
         self.n_loc_wpnts = min(self.n_loc_wpnts, int(self.num_glb_wpnts / 2))
         self.max_s = data.wpnts[-1].s_m
+        # Derive the track length from the global raceline so s-wrapping is
+        # correct for any map (the param default is only a placeholder).
+        if self.max_s > 1.0:
+            self.track_length = self.max_s
         self.wpnt_dist = data.wpnts[1].s_m - data.wpnts[0].s_m
         self.gb_max_idx = data.wpnts[-1].id
         if self.ot_planner == "graph_based":

@@ -1,0 +1,64 @@
+<?xml version="1.0"?>
+<!--
+  headtohead.launch.xml  (ROS2 port of the ROS1 stack_master/headtohead.launch)
+  ==============================================================================
+  Full head-to-head racing autonomy on top of base_system:
+
+    perception   : detect_node + tracking_node      (/scan -> /detections -> /tracked_obstacles)
+    state machine: state_machine                     (/tracking/obstacles + raceline -> /local_waypoints, /behavior_strategy, /state_machine)
+    planning     : spliner_node                      (avoidance spline -> /planner/avoidance/otwpnts)
+    control      : pp_node                           (follows /local_waypoints -> /vesc/high_level/ackermann_cmd)
+
+  The virtual opponent and its obstacle injection (/tracking/obstacles with
+  Frenet fields) come from base_system -> low_level -> opponent pkg
+  (scan_augmentor overlays the box on /scan; obstacle_merger publishes
+  /tracking/obstacles). Spawn / drive the opponent from the RViz Sim Control
+  panel (2D Goal Pose, then Path/FTG).
+
+  SIM : ros2 launch stack_master headtohead.launch.xml map:=f sim:=true
+  REAL: ros2 launch stack_master headtohead.launch.xml map:=f sim:=false
+-->
+<launch>
+  <arg name="map"        description="Map name (folder in stack_master/maps/)"/>
+  <arg name="sim"        default="false" description="Use simulator (true) or real hardware (false)"/>
+  <arg name="ot_planner" default="spliner" description="overtake planner the state machine listens to"/>
+  <arg name="control_topic" default="/local_waypoints"
+       description="WpntArray the controller follows: /local_waypoints (state-machine output w/ avoidance) or /global_waypoints (robust raceline)"/>
+
+  <!-- ===== Base system: sensors/sim + opponent + raceline + frenet odom ===== -->
+  <include file="$(find-pkg-share stack_master)/launch/base_system.launch.xml">
+    <arg name="map" value="$(var map)"/>
+    <arg name="sim" value="$(var sim)"/>
+  </include>
+
+  <!-- ===== Perception: LiDAR obstacle detection + tracking ===== -->
+  <node pkg="perception" exec="detect_node" name="detect_node" output="screen"/>
+  <node pkg="perception" exec="tracking_node" name="tracking_node" output="screen"/>
+
+  <!-- ===== State machine: the racing brain ===== -->
+  <node pkg="state_machine" exec="state_machine" name="state_machine" output="screen">
+    <param from="$(find-pkg-share state_machine)/config/state_machine_params.yaml"/>
+    <param name="sim"             value="$(var sim)"/>
+    <param name="timetrials_only" value="false"/>
+    <param name="ot_planner"      value="$(var ot_planner)"/>
+  </node>
+
+  <!-- ===== Planning: spliner avoidance (publishes /planner/avoidance/otwpnts) ===== -->
+  <node pkg="spliner" exec="spliner_node" name="spliner_node" output="screen"/>
+
+  <!-- ===== Control: Pure Pursuit following the state machine's local waypoints ===== -->
+  <group if="$(var sim)">
+    <node pkg="controller" exec="pp_node" name="pp" output="screen">
+      <param from="$(find-pkg-share stack_master)/config/ppc.yaml"/>
+      <param name="waypoint_topic" value="$(var control_topic)"/>
+      <param name="odom_topic"     value="/vesc/odom"/>
+    </node>
+  </group>
+  <group unless="$(var sim)">
+    <node pkg="controller" exec="pp_node" name="pp" output="screen">
+      <param from="$(find-pkg-share stack_master)/config/ppc.yaml"/>
+      <param name="waypoint_topic" value="$(var control_topic)"/>
+      <param name="odom_topic"     value="/car_state/odom"/>
+    </node>
+  </group>
+</launch>

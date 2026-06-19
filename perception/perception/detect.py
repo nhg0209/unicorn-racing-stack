@@ -39,11 +39,14 @@ class LidarDetector:
         min_points: int = 3,
         max_range: float = 10.0,
         min_range: float = 0.05,
+        max_size: float = 1.0,
     ) -> None:
         self.cluster_threshold = cluster_threshold
         self.min_points = min_points
         self.max_range = max_range
         self.min_range = min_range
+        # clusters larger than this are walls / track boundaries, not obstacles
+        self.max_size = max_size
 
     def detect(
         self,
@@ -53,14 +56,23 @@ class LidarDetector:
     ) -> List[DetectedObstacle]:
         """Return detected obstacles for one scan.
 
-        TODO:
-        1. Filter invalid ranges and convert polar -> Cartesian points.
-        2. Cluster adjacent points using jump-distance threshold.
-        3. Fit centroid / bounding box for each cluster.
-        4. Return list[DetectedObstacle].
+        Jump-distance clustering: polar->Cartesian, split on range jumps,
+        keep compact clusters (drops the long wall/boundary clusters).
         """
-        _ = (ranges, angle_min, angle_increment)
-        return []
+        points = self._scan_to_cartesian(ranges, angle_min, angle_increment)
+        clusters = self._cluster(points)
+
+        obstacles: List[DetectedObstacle] = []
+        oid = 0
+        for cl in clusters:
+            if len(cl) < self.min_points:
+                continue
+            obs = self._cluster_to_obstacle(cl, oid)
+            if max(obs.width, obs.height) > self.max_size:
+                continue                      # wall / boundary, not an obstacle
+            obstacles.append(obs)
+            oid += 1
+        return obstacles
 
     def _scan_to_cartesian(
         self,
@@ -68,23 +80,49 @@ class LidarDetector:
         angle_min: float,
         angle_increment: float,
     ) -> List[Point2D]:
-        """TODO: Convert valid LiDAR ranges to Point2D list."""
-        _ = (ranges, angle_min, angle_increment)
-        return []
+        """Valid LiDAR ranges -> ordered Point2D list (sensor frame)."""
+        pts: List[Point2D] = []
+        for i, r in enumerate(ranges):
+            r = float(r)
+            if not math.isfinite(r) or r < self.min_range or r > self.max_range:
+                continue
+            ang = angle_min + i * angle_increment
+            pts.append(Point2D(r * math.cos(ang), r * math.sin(ang)))
+        return pts
 
     def _cluster(self, points: List[Point2D]) -> List[List[Point2D]]:
-        """TODO: Split ordered points into clusters using jump distance."""
-        _ = points
-        return []
+        """Split ordered points into clusters at jump-distance discontinuities."""
+        if not points:
+            return []
+        clusters: List[List[Point2D]] = []
+        cur: List[Point2D] = [points[0]]
+        for p in points[1:]:
+            if math.hypot(p.x - cur[-1].x, p.y - cur[-1].y) > self.cluster_threshold:
+                clusters.append(cur)
+                cur = [p]
+            else:
+                cur.append(p)
+        clusters.append(cur)
+        return clusters
 
     def _cluster_to_obstacle(
         self,
         cluster: List[Point2D],
         idx: int,
     ) -> DetectedObstacle:
-        """TODO: Compute centroid and AABB from one cluster."""
-        _ = (cluster, idx)
-        return DetectedObstacle()
+        """Centroid + axis-aligned bounding box of one cluster."""
+        xs = [p.x for p in cluster]
+        ys = [p.y for p in cluster]
+        n = len(cluster)
+        return DetectedObstacle(
+            cx=sum(xs) / n,
+            cy=sum(ys) / n,
+            width=max(xs) - min(xs),
+            height=max(ys) - min(ys),
+            num_points=n,
+            points=list(cluster),
+            id=idx,
+        )
 
 
 class DBSCANDetector:

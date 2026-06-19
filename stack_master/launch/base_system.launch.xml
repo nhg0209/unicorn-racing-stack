@@ -1,0 +1,56 @@
+<?xml version="1.0"?>
+<!--
+  base_system.launch.xml  (ROS2 port of the ROS1 stack_master/base_system.launch)
+  ================================================================================
+  The always-on foundation that both time-trial and head-to-head build on:
+
+    sensors / simulator + localization      (low_level / middle_level)
+    + global raceline publisher             (planner/waypoint_publisher)
+    + Frenet odometry republisher           (/car_state/odom_frenet)
+
+  SIM : ros2 launch stack_master base_system.launch.xml map:=f sim:=true
+        gym_bridge provides /scan, /car_state/odom, /map and map->base_link TF;
+        the virtual opponent (opponent pkg) is included by low_level.
+  REAL: ros2 launch stack_master base_system.launch.xml map:=f localization:=pf
+-->
+<launch>
+  <arg name="map"          description="Map name (folder in stack_master/maps/)"/>
+  <arg name="sim"          default="false" description="Use simulator (true) or real hardware (false)"/>
+  <arg name="localization" default="gt"    description="gt (sim) | cartographer | pf (real)"/>
+  <arg name="vehicle_config" default="$(find-pkg-share stack_master)/config/vehicle_config.yaml"/>
+
+  <!-- ===== Sensors / Simulator (+ opponent) + Localization ===== -->
+  <!-- SIM: low_level brings up gym_bridge (gt localization) + virtual opponent + mux. -->
+  <group if="$(var sim)">
+    <include file="$(find-pkg-share stack_master)/launch/low_level.launch.xml">
+      <arg name="sim"            value="true"/>
+      <arg name="map"            value="$(var map)"/>
+      <arg name="vehicle_config" value="$(var vehicle_config)"/>
+    </include>
+  </group>
+  <!-- REAL: middle_level adds VESC/LiDAR + the chosen localization stack. -->
+  <group unless="$(var sim)">
+    <include file="$(find-pkg-share stack_master)/launch/middle_level.launch.xml">
+      <arg name="sim"            value="false"/>
+      <arg name="map"            value="$(var map)"/>
+      <arg name="localization"   value="$(var localization)"/>
+      <arg name="vehicle_config" value="$(var vehicle_config)"/>
+    </include>
+  </group>
+
+  <!-- ===== Global raceline =====
+       Publishes /global_waypoints (+ /global_waypoints_scaled and
+       /global_waypoints/overtaking, consumed by the state machine & planners)
+       and /centerline_waypoints from stack_master/maps/<map>/. -->
+  <node pkg="planner" exec="waypoint_publisher" name="waypoint_publisher" output="screen">
+    <param name="map_name" value="$(var map)"/>
+  </node>
+
+  <!-- ===== Frenet odometry =====
+       /car_state/odom -> /car_state/odom_frenet (s, d) for the planners + SM.
+       The node publishes /car_state/frenet/odom; remap to the stack convention. -->
+  <node pkg="frenet_odom_republisher" exec="frenet_odom_republisher_node"
+        name="frenet_odom_republisher" output="screen">
+    <remap from="/car_state/frenet/odom" to="/car_state/odom_frenet"/>
+  </node>
+</launch>

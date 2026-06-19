@@ -580,7 +580,9 @@ class ObstacleSpliner(Node):
             obs.d_center += delta_d
             obs.d_right += delta_d
 
-            resp = self.converter.get_cartesian([obs.s_center], [obs.d_center])
+            # NOTE: pass scalars (not 1-element lists) so get_cartesian returns
+            # 0-d arrays; float() on a size-1 1-d array raises under numpy 2.x.
+            resp = self.converter.get_cartesian(obs.s_center, obs.d_center)
 
             marker = self.xy_to_point(resp[0], resp[1], opponent=True)
             self.pub_propagated.publish(marker)
