@@ -537,6 +537,12 @@ class StateMachine(Node):
         if self.max_s > 1.0:
             self.track_length = self.max_s
         self.wpnt_dist = data.wpnts[1].s_m - data.wpnts[0].s_m
+        # waypoints_dist drives all s->index math (local window start, sectors).
+        # It defaulted to the ROS1 raceline resolution (0.1 m); use the ACTUAL
+        # spacing of this map's raceline or the local window is mis-centered
+        # (was ~2.5x ahead with a 0.25 m raceline -> the car cut corners).
+        if self.wpnt_dist > 1e-3:
+            self.waypoints_dist = self.wpnt_dist
         self.gb_max_idx = data.wpnts[-1].id
         if self.ot_planner == "graph_based":
             self.gb_wpnts_arr = np.array([
@@ -625,6 +631,13 @@ class StateMachine(Node):
             return np.abs(self.cur_d) < np.deg2rad(threshold_deg)
 
     def _check_ot_sector(self) -> bool:
+        # No overtake sectors configured -> treat the whole track as overtakable
+        # (sim / tracks without an ot_sectors.yaml). Otherwise overtaking could
+        # never trigger and the car would only ever trail (and stop behind a
+        # static obstacle).
+        if len(self.overtake_zones) == 0:
+            self.ot_section_check_pub.publish(Bool(data=True))
+            return True
         for sector in self.overtake_zones:
             if sector[0] <= self.cur_s / self.waypoints_dist <= sector[1]:
                 self.ot_section_check_pub.publish(Bool(data=True))

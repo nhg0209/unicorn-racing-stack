@@ -28,7 +28,13 @@ class FrenetConverter:
             self.waypoints_s.append(self.waypoints_s[-1] + dist)
         self.spline_x = CubicSpline(self.waypoints_s, self.waypoints_x)
         self.spline_y = CubicSpline(self.waypoints_s, self.waypoints_y)
+        self.waypoints_s = np.asarray(self.waypoints_s)
         self.raceline_length = self.waypoints_s[-1]
+        # Actual mean waypoint spacing. MUST match the raceline or the approx-s
+        # seed (index*spacing) lands on the wrong part of the track and the
+        # projection diverges (was hardcoded 0.1 -> broke any non-0.1 m line).
+        if len(self.waypoints_x) > 1:
+            self.waypoints_distance_m = self.raceline_length / (len(self.waypoints_x) - 1)
 
     def get_frenet(self, x, y, s=None) -> np.array:
         # Compute Frenet coordinates for a given (x, y) point
@@ -49,7 +55,10 @@ class FrenetConverter:
         lenx = len(x)
         dist_x = x - np.tile(self.waypoints_x, (lenx, 1)).T
         dist_y = y - np.tile(self.waypoints_y, (lenx, 1)).T
-        return np.argmin(np.linalg.norm([dist_x.T, dist_y.T], axis=0), axis=1)*self.waypoints_distance_m
+        idx = np.argmin(np.linalg.norm([dist_x.T, dist_y.T], axis=0), axis=1)
+        # Use the TRUE cumulative arc-length at the nearest waypoint (not
+        # index*spacing, which assumes uniform 0.1 m spacing).
+        return self.waypoints_s[idx]
 
     def get_frenet_velocities(self, vx, vy, theta) -> np.array:
         """

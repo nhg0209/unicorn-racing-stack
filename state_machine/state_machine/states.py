@@ -14,11 +14,15 @@ Every function should be fairly concise, and output an array of f110_msgs.Wpnt
 
 
 def GlobalTracking(state_machine: "StateMachine") -> List[Wpnt]:
-    s = int(state_machine.cur_s / state_machine.waypoints_dist + 0.5)
-    return [
-        state_machine.cur_gb_wpnts.list[(s + i) % state_machine.num_glb_wpnts]
-        for i in range(state_machine.n_loc_wpnts)
-    ]
+    # Start the local window at the waypoint whose arc-length is closest to the
+    # car's s. The old `cur_s / waypoints_dist` index assumes a uniformly spaced
+    # raceline (ROS1 used 0.1 m); a non-uniform raceline made the window start
+    # several metres AHEAD of the car, so Pure Pursuit cut corners into the wall.
+    wl = state_machine.cur_gb_wpnts.list
+    n = state_machine.num_glb_wpnts
+    cur_s = state_machine.cur_s
+    s = min(range(n), key=lambda i: abs(wl[i].s_m - cur_s))
+    return [wl[(s + i) % n] for i in range(state_machine.n_loc_wpnts)]
 
 
 def Overtaking(state_machine: "StateMachine") -> List[Wpnt]:
