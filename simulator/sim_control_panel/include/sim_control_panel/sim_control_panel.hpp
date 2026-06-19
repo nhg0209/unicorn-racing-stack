@@ -30,6 +30,7 @@ public:
 
 private Q_SLOTS:
   void onRemoveOpponent();
+  void onClearObstacles();
   void onSpeedUp();
   void onSpeedDown();
   void onModeManual();
@@ -44,6 +45,7 @@ private:
 
   rclcpp::Node::SharedPtr node_;
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr remove_pub_;
+  rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr clear_obstacles_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr speed_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr mode_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr ego_lidar_pub_;

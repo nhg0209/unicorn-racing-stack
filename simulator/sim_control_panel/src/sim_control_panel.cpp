@@ -24,8 +24,12 @@ SimControlPanel::SimControlPanel(QWidget * parent)
   hint->setWordWrap(true);
   layout->addWidget(hint);
 
+  auto * obs_row = new QHBoxLayout;
   auto * remove_btn = new QPushButton("Remove opponent");
-  layout->addWidget(remove_btn);
+  auto * clear_obs_btn = new QPushButton("Clear static obstacles");
+  obs_row->addWidget(remove_btn);
+  obs_row->addWidget(clear_obs_btn);
+  layout->addLayout(obs_row);
 
   auto * line0 = new QFrame;
   line0->setFrameShape(QFrame::HLine);
@@ -82,6 +86,7 @@ SimControlPanel::SimControlPanel(QWidget * parent)
   setLayout(layout);
 
   connect(remove_btn, &QPushButton::clicked, this, &SimControlPanel::onRemoveOpponent);
+  connect(clear_obs_btn, &QPushButton::clicked, this, &SimControlPanel::onClearObstacles);
   connect(up_btn, &QPushButton::clicked, this, &SimControlPanel::onSpeedUp);
   connect(down_btn, &QPushButton::clicked, this, &SimControlPanel::onSpeedDown);
   connect(manual_btn, &QPushButton::clicked, this, &SimControlPanel::onModeManual);
@@ -95,6 +100,7 @@ void SimControlPanel::onInitialize()
 {
   node_ = getDisplayContext()->getRosNodeAbstraction().lock()->get_raw_node();
   remove_pub_ = node_->create_publisher<std_msgs::msg::Empty>("/sim/remove_opponent", 10);
+  clear_obstacles_pub_ = node_->create_publisher<std_msgs::msg::Empty>("/sim/clear_obstacles", 10);
   speed_pub_ = node_->create_publisher<std_msgs::msg::Float32>("/sim/opp_speed_delta", 10);
   mode_pub_ = node_->create_publisher<std_msgs::msg::String>("/sim/opp_mode", 10);
   ego_lidar_pub_ = node_->create_publisher<std_msgs::msg::Bool>("/sim/ego_lidar_enable", 10);
