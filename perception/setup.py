@@ -24,6 +24,7 @@ setup(
         'console_scripts': [
             'detect_node   = perception.detect_ros:main',
             'tracking_node = perception.tracking_ros:main',
+            'opponent_predictor = perception.opponent_predictor:main',
         ],
     },
 )

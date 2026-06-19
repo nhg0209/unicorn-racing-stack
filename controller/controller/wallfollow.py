@@ -3,6 +3,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
+from rclpy.qos import qos_profile_sensor_data
 from nav_msgs.msg import Odometry
 from ackermann_msgs.msg import AckermannDriveStamped
 
@@ -35,6 +36,7 @@ class WallFollowNode(Node):
         self.speed       = p('wf_speed')
         self.lookahead   = p('wf_lookahead')
         self.desired_d   = p('wf_target_dist')
+        self.max_steer   = p('wf_max_steer')
 
         self._prev_error = 0.0
         self._integral_error = 0.0
@@ -43,7 +45,7 @@ class WallFollowNode(Node):
         self.odom    = None
         self._prev_t = None
 
-        self.create_subscription(LaserScan, '/scan',      self._scan_cb, 10)
+        self.create_subscription(LaserScan, '/scan', self._scan_cb, qos_profile_sensor_data)
         self.create_subscription(Odometry,  '/vesc/odom', self._odom_cb, 10)
         self.drive_pub = self.create_publisher(AckermannDriveStamped, '/vesc/high_level/ackermann_cmd', 10)
         self.create_timer(1.0 / p('control_rate_hz'), self._loop)
@@ -108,10 +110,34 @@ class WallFollowNode(Node):
         # Output:
         #   - steering [rad]
         #   - speed [m/s]
+        scan = self.scan
 
-        speed = 0.0 
-        steer = 0.0
+        def range_at(angle):
+            i = int(round((angle - scan.angle_min) / scan.angle_increment))
+            i = max(0, min(len(scan.ranges) - 1, i))
+            r = scan.ranges[i]
+            return r if (math.isfinite(r) and r > 0.0) else 10.0
 
+        # right-wall geometry: b directly to the right (-90 deg), a at theta ahead of it
+        theta = math.radians(45.0)
+        b = range_at(math.radians(-90.0))            # perpendicular to the right
+        a = range_at(math.radians(-90.0) + theta)    # -45 deg
+
+        alpha = math.atan2(a * math.cos(theta) - b, a * math.sin(theta))
+        dist = b * math.cos(alpha)                   # current distance to right wall
+        proj = dist + self.lookahead * math.sin(alpha)   # projected forward
+
+        error = self.desired_d - proj
+        self._integral_error += error * dt
+        self._integral_error = max(-2.0, min(2.0, self._integral_error))  # anti-windup
+        deriv = (error - self._prev_error) / max(dt, 1e-3)
+        self._prev_error = error
+
+        steer = self.kp * error + self.ki * self._integral_error + self.kd * deriv
+        steer = max(-self.max_steer, min(self.max_steer, steer))
+
+        speed = self.speed * (1.0 - 0.5 * abs(steer) / self.max_steer)
+        speed = max(0.6, speed)
         return steer, speed
 
 

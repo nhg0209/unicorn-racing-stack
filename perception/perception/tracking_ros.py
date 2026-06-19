@@ -34,6 +34,9 @@ import math
 
 import rclpy
 from rclpy.node import Node
+from rclpy.duration import Duration
+
+import tf2_ros
 
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import Header
@@ -56,11 +59,24 @@ class TrackingNode(Node):
         self.declare_parameter('association_threshold', 1.0)
         self.declare_parameter('min_hits', 1)
         self.declare_parameter('publish_markers', True)
+        # Tracks are output in the MAP frame (transformed from the sensor frame
+        # via TF) so the obstacle_merger can fill the Frenet (s/d) fields.
+        # Default topic is /tracked_obstacles (object-seam: merger injects the
+        # virtual obstacles directly). Set output_topic:=/tracking/obstacles_raw
+        # for the overlay seam, where the merger concatenates REAL perception
+        # (this output) with the virtual obstacles overlaid on /scan.
+        self.declare_parameter('output_topic', '/tracked_obstacles')
+        self.declare_parameter('target_frame', 'map')
 
         max_coast = self.get_parameter('max_coasting').value
         assoc_th = self.get_parameter('association_threshold').value
         min_hits = self.get_parameter('min_hits').value
         self.publish_markers = self.get_parameter('publish_markers').value
+        self.target_frame = self.get_parameter('target_frame').value
+
+        # TF for sensor-frame -> map-frame obstacle transform
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # ----------------------------------------------------------------
         # Tracker (ROS-free)
@@ -88,7 +104,7 @@ class TrackingNode(Node):
         # ----------------------------------------------------------------
         self.tracked_pub = self.create_publisher(
             ObstacleArray,
-            '/tracked_obstacles',
+            self.get_parameter('output_topic').value,
             10,
         )
 
@@ -157,25 +173,54 @@ class TrackingNode(Node):
             ))
         return dets
 
+    def _map_transform(self, frame_id: str, stamp):
+        """Return (tx, ty, yaw) of target_frame <- frame_id, or None."""
+        if not frame_id or frame_id == self.target_frame:
+            return (0.0, 0.0, 0.0)
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.target_frame, frame_id, stamp, timeout=Duration(seconds=0.05))
+        except Exception:
+            try:  # fall back to the latest available transform
+                tf = self.tf_buffer.lookup_transform(
+                    self.target_frame, frame_id, rclpy.time.Time())
+            except Exception:
+                return None
+        tr = tf.transform.translation
+        q = tf.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        return (tr.x, tr.y, yaw)
+
     def _to_obstacle_array(
         self,
         header: Header,
         tracks: list[TrackedObstacle],
     ) -> ObstacleArray:
-        """Convert list[TrackedObstacle] → f110_msgs/ObstacleArray."""
+        """Convert list[TrackedObstacle] → f110_msgs/ObstacleArray, transformed
+        from the sensor frame into the map frame (so the merger can fill Frenet)."""
         arr = ObstacleArray()
-        arr.header = header
+        arr.header.stamp = header.stamp
+        tf = self._map_transform(header.frame_id, header.stamp)
+        if tf is not None:
+            arr.header.frame_id = self.target_frame
+            tx, ty, yaw = tf
+            c, s = math.cos(yaw), math.sin(yaw)
+        else:                                   # no TF yet -> keep sensor frame
+            arr.header.frame_id = header.frame_id
+            tx = ty = yaw = 0.0
+            c, s = 1.0, 0.0
 
         for t in tracks:
             obs = Obstacle()
             obs.id = t.track_id
-            obs.x_m = t.cx
-            obs.y_m = t.cy
+            obs.x_m = tx + c * t.cx - s * t.cy
+            obs.y_m = ty + s * t.cx + c * t.cy
+            obs.theta = yaw
             obs.size = max(t.width, t.height, 0.05)
-            # Note: vs/vd are Frenet velocities in this message. Here we only
-            # have Cartesian tracking outputs, so expose vx/vy as a best-effort placeholder.
-            obs.vs = t.vx
-            obs.vd = t.vy
+            # Cartesian (map-frame) velocity; the merger/Frenet stage refines s/d.
+            obs.vs = c * t.vx - s * t.vy
+            obs.vd = s * t.vx + c * t.vy
             obs.is_static = math.hypot(t.vx, t.vy) < 0.1
             obs.is_visible = True
 

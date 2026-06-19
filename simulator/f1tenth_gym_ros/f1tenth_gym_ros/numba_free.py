@@ -26,17 +26,26 @@ import importlib.util
 import numpy as np
 
 def _find_raycaster_dir():
+    # Ascend from this file and look for race_utils/raycaster/raycaster.py under
+    # any ancestor. Robust to the source, build/ and install/ layouts (the old
+    # fixed dirname() chain pointed at a non-existent path under build/).
     _here = os.path.dirname(os.path.abspath(__file__))
-    # Source layout: .../simulator/f1tenth_gym_ros/f1tenth_gym_ros/numba_free.py
-    # Install layout: .../install/f1tenth_gym_ros/lib/pythonX.Y/site-packages/f1tenth_gym_ros/numba_free.py
-    candidates = [
-        os.path.normpath(os.path.join(_here, "..", "..", "..", "race_utils", "raycaster")),
-        os.path.normpath(os.path.join(_here, "..", "..", "..", "..", "..", "..", "src", "unicorn-racing-stack", "race_utils", "raycaster")),
-    ]
-    for c in candidates:
-        if os.path.isfile(os.path.join(c, "raycaster.py")):
-            return c
-    return candidates[0]
+    rels = (
+        ("race_utils", "raycaster"),
+        ("src", "unicorn-racing-stack", "race_utils", "raycaster"),
+        ("unicorn-racing-stack", "race_utils", "raycaster"),
+    )
+    d = _here
+    for _ in range(12):
+        for rel in rels:
+            cand = os.path.join(d, *rel)
+            if os.path.isfile(os.path.join(cand, "raycaster.py")):
+                return cand
+        nd = os.path.dirname(d)
+        if nd == d:
+            break
+        d = nd
+    return os.path.normpath(os.path.join(_here, "..", "..", "..", "race_utils", "raycaster"))
 
 
 _RAYCASTER_DIR = os.environ.get("RAYCASTER_DIR") or _find_raycaster_dir()

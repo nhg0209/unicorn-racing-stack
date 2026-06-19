@@ -24,6 +24,8 @@
   <arg name="ot_planner" default="spliner" description="overtake planner the state machine listens to"/>
   <arg name="control_topic" default="/local_waypoints"
        description="WpntArray the controller follows: /local_waypoints (state-machine output w/ avoidance) or /global_waypoints (robust raceline)"/>
+  <arg name="perception_seam" default="object"
+       description="object: obstacle_merger injects the known virtual obstacles (ground truth). overlay: the REAL detect->track pipeline (transformed to map+Frenet) feeds /tracking/obstacles_raw and the virtual object-injection is disabled (the opponent is still overlaid on /scan)."/>
 
   <!-- ===== Base system: sensors/sim + opponent + raceline + frenet odom ===== -->
   <include file="$(find-pkg-share stack_master)/launch/base_system.launch.xml">
@@ -33,7 +35,16 @@
 
   <!-- ===== Perception: LiDAR obstacle detection + tracking ===== -->
   <node pkg="perception" exec="detect_node" name="detect_node" output="screen"/>
-  <node pkg="perception" exec="tracking_node" name="tracking_node" output="screen"/>
+  <node pkg="perception" exec="tracking_node" name="tracking_node" output="screen">
+    <!-- object seam: viz-only /tracked_obstacles. overlay seam: feed the merger. -->
+    <param name="output_topic"
+           value="$(eval '\'/tracking/obstacles_raw\' if \'$(var perception_seam)\' == \'overlay\' else \'/tracked_obstacles\'')"/>
+  </node>
+  <!-- overlay seam: disable only the object-level virtual injection (scan
+       overlay stays ON, so the REAL detector still sees the opponent). -->
+  <group if="$(eval '\'$(var perception_seam)\' == \'overlay\'')">
+    <executable cmd="ros2 topic pub /vil/merge_virtual std_msgs/msg/Bool '{data: false}' -r 2" output="log"/>
+  </group>
 
   <!-- ===== State machine: the racing brain ===== -->
   <node pkg="state_machine" exec="state_machine" name="state_machine" output="screen">
@@ -42,6 +53,11 @@
     <param name="timetrials_only" value="false"/>
     <param name="ot_planner"      value="$(var ot_planner)"/>
   </node>
+
+  <!-- ===== Opponent prediction (constant-velocity along the raceline) =====
+       Feeds /opponent_prediction/obstacles(_pred) to the state machine and the
+       predictive planners. -->
+  <node pkg="perception" exec="opponent_predictor" name="opponent_predictor" output="screen"/>
 
   <!-- ===== Planning: spliner avoidance (publishes /planner/avoidance/otwpnts) ===== -->
   <node pkg="spliner" exec="spliner_node" name="spliner_node" output="screen"/>

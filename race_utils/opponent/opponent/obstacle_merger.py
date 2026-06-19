@@ -35,9 +35,19 @@ class ObstacleMerger(Node):
                                ['/sim/dynamic_obstacles', '/sim/static_obstacles'])
         self.declare_parameter('rate_hz', 25.0)
         self.declare_parameter('watchdog_sec', 0.5)
+        # Reject obstacles whose lateral Frenet offset exceeds this (they are
+        # off the racing corridor — i.e. walls picked up by the simple detector
+        # in the overlay seam). 0 disables the filter.
+        self.declare_parameter('max_obstacle_d', 1.0)
 
         self.watchdog = float(self.get_parameter('watchdog_sec').value)
-        self.enabled = True
+        self.max_obstacle_d = float(self.get_parameter('max_obstacle_d').value)
+        self.enabled = True          # master VIL gate (also gates the scan overlay)
+        # Separate gate for the OBJECT-level virtual injection only. In the
+        # overlay seam we want the scan overlay ON (so the real detector still
+        # sees the opponent) but the object injection OFF -> publish
+        # /vil/merge_virtual=false (without touching /vil/enable).
+        self.merge_virtual = True
         self.real = None             # (obstacles, time)
         self.virt = {}               # topic -> (obstacles, time)
 
@@ -47,6 +57,7 @@ class ObstacleMerger(Node):
         self.create_subscription(ObstacleArray, self.get_parameter('in_topic').value,
                                  self._real_cb, 10)
         self.create_subscription(Bool, '/vil/enable', self._en_cb, 10)
+        self.create_subscription(Bool, '/vil/merge_virtual', self._mv_cb, 10)
         # Global raceline -> Frenet converter, so the merged obstacles carry
         # Frenet fields (s/d) that the planners & state machine consume. The
         # virtual sources only fill Cartesian (x_m,y_m,theta); real tracking
@@ -68,6 +79,9 @@ class ObstacleMerger(Node):
     def _en_cb(self, msg):
         self.enabled = bool(msg.data)
 
+    def _mv_cb(self, msg):
+        self.merge_virtual = bool(msg.data)
+
     def _gb_cb(self, msg):
         if FrenetConverter is None or len(msg.wpnts) < 3:
             return
@@ -80,26 +94,31 @@ class ObstacleMerger(Node):
             self.get_logger().warn(f'[obstacle_merger] FrenetConverter init failed: {e}')
 
     def _fill_frenet(self, obstacles):
-        """Populate Frenet fields (s/d) from Cartesian (x_m,y_m) for obstacles
-        that lack them (virtual sources). Real tracking obstacles already set."""
+        """Populate Frenet fields (s/d) from Cartesian (x_m,y_m), and drop
+        obstacles that fall outside the racing corridor (walls). Returns the
+        kept list."""
         if self.converter is None:
-            return
+            return obstacles
+        kept = []
         for o in obstacles:
             already = (o.s_center != 0.0 or o.s_start != 0.0 or o.d_center != 0.0)
-            if already:
-                continue
-            try:
-                fr = self.converter.get_frenet(np.array([o.x_m]), np.array([o.y_m]))
-                s = float(fr[0, 0]); d = float(fr[1, 0])
-            except Exception:
-                continue
-            half = max(o.size, 0.05) * 0.5
-            o.s_center = s
-            o.d_center = d
-            o.s_start = s - half
-            o.s_end = s + half
-            o.d_left = d + half
-            o.d_right = d - half
+            if not already:
+                try:
+                    fr = self.converter.get_frenet(np.array([o.x_m]), np.array([o.y_m]))
+                    s = float(fr[0, 0]); d = float(fr[1, 0])
+                except Exception:
+                    continue
+                half = max(o.size, 0.05) * 0.5
+                o.s_center = s
+                o.d_center = d
+                o.s_start = s - half
+                o.s_end = s + half
+                o.d_left = d + half
+                o.d_right = d - half
+            if self.max_obstacle_d > 0.0 and abs(o.d_center) > self.max_obstacle_d:
+                continue                       # off-corridor -> wall, drop it
+            kept.append(o)
+        return kept
 
     def _fresh(self, entry):
         if entry is None:
@@ -114,10 +133,10 @@ class ObstacleMerger(Node):
         out.header.stamp = self.get_clock().now().to_msg()
         out.header.frame_id = 'map'
         out.obstacles = list(self._fresh(self.real))
-        if self.enabled:
+        if self.enabled and self.merge_virtual:
             for entry in self.virt.values():
                 out.obstacles.extend(self._fresh(entry))
-        self._fill_frenet(out.obstacles)
+        out.obstacles = self._fill_frenet(out.obstacles)
         self.pub.publish(out)
 
 

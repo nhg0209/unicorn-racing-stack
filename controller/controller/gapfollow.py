@@ -3,6 +3,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
+from rclpy.qos import qos_profile_sensor_data
 from nav_msgs.msg import Odometry
 from ackermann_msgs.msg import AckermannDriveStamped
 
@@ -35,7 +36,7 @@ class GapFollowNode(Node):
         self.scan = None
         self.odom = None
 
-        self.create_subscription(LaserScan, '/scan',      self._scan_cb, 10)
+        self.create_subscription(LaserScan, '/scan', self._scan_cb, qos_profile_sensor_data)
         self.create_subscription(Odometry,  '/vesc/odom', self._odom_cb, 10)
         self.drive_pub = self.create_publisher(AckermannDriveStamped, '/vesc/high_level/ackermann_cmd', 10)
         self.create_timer(1.0 / p('control_rate_hz'), self._loop)
@@ -59,43 +60,58 @@ class GapFollowNode(Node):
         self.drive_pub.publish(msg)
 
     def _compute(self):
-        # TODO: Implement Follow-the-Gap (FTG) using LiDAR free-space selection
-        #
-        # Goal:
-        #   - Use LiDAR scan data to find a collision-free gap
-        #   - Select a safe target direction inside the best gap
-        #   - Convert the target direction into a steering command
-        #
-        # You should return (steering, speed) from this function.
-        #
-        # Useful information:
-        #   - self.scan.ranges             : LiDAR distance array [m]
-        #   - self.scan.angle_min          : angle of first beam [rad]
-        #   - self.scan.angle_increment    : angular step between beams [rad]
-        #   - self.bubble_radius           : safety bubble radius around closest obstacle [m]
-        #   - self.max_range               : cap LiDAR ranges to suppress outliers [m]
-        #   - self.max_steer               : steering clamp [rad]
-        #   - self.speed                   : nominal driving speed [m/s]
-        #   - self.odom                    : current vehicle motion (optional for speed adjustment)
-        #
-        # Suggested approach (FTG pipeline):
-        #   - Preprocess ranges:
-        #       * replace NaN/Inf/invalid values
-        #       * clip ranges to [0, self.max_range]
-        #       * optionally focus on a front field-of-view
-        #   - Find the closest obstacle beam
-        #   - Create a safety bubble around that obstacle (zero-out nearby beams)
-        #   - Find the longest contiguous non-zero gap
-        #   - Choose the best target beam in the gap
-        #       * e.g., farthest beam or weighted by distance and heading
-        #   - Convert target beam index to steering angle
-        #   - Clamp steering to +/- self.max_steer
-        #   - Optionally reduce speed when |steering| is large or obstacle is close
-        #
-        # Output:
-        #   - steering [rad]
-        #   - speed [m/s]
-        return 0.0, 0.0
+        scan = self.scan
+        n = len(scan.ranges)
+        rng = np.asarray(scan.ranges, dtype=np.float32)
+        # 1. preprocess: invalid -> 0, clip to max_range
+        rng = np.nan_to_num(rng, nan=0.0, posinf=self.max_range, neginf=0.0)
+        rng = np.clip(rng, 0.0, self.max_range)
+
+        # restrict to the front field of view (+/- 90 deg) so we never aim behind
+        ang = scan.angle_min + np.arange(n) * scan.angle_increment
+        front = np.abs(ang) <= math.radians(90.0)
+        proc = np.where(front, rng, 0.0)
+
+        # 2. safety bubble around the closest (valid) beam
+        valid = proc[front]
+        if valid.size == 0 or np.all(valid == 0.0):
+            return 0.0, self.speed * 0.5
+        closest = int(np.argmin(np.where(proc > 0.05, proc, np.inf)))
+        if np.isfinite(proc[closest]) and proc[closest] > 0.05:
+            bubble_beams = int(
+                math.atan2(self.bubble_radius, max(proc[closest], 0.1)) /
+                max(scan.angle_increment, 1e-4))
+            lo = max(0, closest - bubble_beams)
+            hi = min(n, closest + bubble_beams + 1)
+            proc[lo:hi] = 0.0
+
+        # 3. longest contiguous non-zero gap
+        free = proc > 0.05
+        best_start = best_len = cur_start = cur_len = 0
+        for i in range(n):
+            if free[i]:
+                if cur_len == 0:
+                    cur_start = i
+                cur_len += 1
+                if cur_len > best_len:
+                    best_len, best_start = cur_len, cur_start
+            else:
+                cur_len = 0
+        if best_len == 0:
+            return 0.0, self.speed * 0.5
+
+        # 4. best beam in the gap: farthest point (deepest free space)
+        gap = proc[best_start:best_start + best_len]
+        target = best_start + int(np.argmax(gap))
+
+        # 5. beam -> steering, clamped
+        steer = float(ang[target])
+        steer = max(-self.max_steer, min(self.max_steer, steer))
+
+        # 6. slow down for sharp turns / nearby obstacles
+        speed = self.speed * (1.0 - 0.6 * abs(steer) / self.max_steer)
+        speed = max(0.6, speed)
+        return steer, speed
 
 
 def main(args=None):

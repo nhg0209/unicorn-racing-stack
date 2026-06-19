@@ -7,31 +7,38 @@ from nav_msgs.msg import Odometry
 
 class EStop:
     def __init__(self, node):
-        p = lambda name: node.get_parameter(name).value
-        self._logger     = node.get_logger()
+        self._logger = node.get_logger()
+        # iTTC threshold [s]: stop if any front beam will be hit sooner than this.
+        try:
+            if not node.has_parameter('estop_ttc_threshold'):
+                node.declare_parameter('estop_ttc_threshold', 0.35)
+            self.ttc_thresh = float(node.get_parameter('estop_ttc_threshold').value)
+        except Exception:
+            self.ttc_thresh = 0.35
+        self._fov = math.radians(70.0)
 
     def should_stop(self, scan: LaserScan, odom: Odometry, cmd=None):
         if cmd is None:
             cmd = AckermannDriveStamped()
+        if scan is None or odom is None:
+            return cmd
 
-        # TODO: Implement an emergency stop (E-Stop) using:
-        #   - 2D LiDAR scan data
-        #   - Wheel odometry data from the VESC
-        #   - TTC (Time-to-Collision) based logic
-        #
-        # You may modify `cmd` (the original control command) in this function.
-        #
-        # Useful information:
-        #   - scan.ranges                  : distance array [m] for each LiDAR beam
-        #   - scan.angle_min               : angle of the first beam [rad]
-        #   - scan.angle_max               : angle of the last beam [rad]
-        #   - scan.angle_increment         : angular step between beams [rad]
-        #   - odom.twist.twist.linear.x    : vehicle forward speed [m/s]
-        #   - odom.twist.twist.angular.z   : vehicle yaw rate [rad/s]
+        v = odom.twist.twist.linear.x
+        if v <= 0.1:                       # not driving forward -> nothing to hit
+            return cmd
 
-        if True:
-            self._logger.warn(f'EStop triggered')
+        ranges = np.asarray(scan.ranges, dtype=np.float32)
+        n = ranges.shape[0]
+        angles = scan.angle_min + np.arange(n) * scan.angle_increment
+        # instantaneous TTC: range / range-closing-rate (v*cos(angle))
+        closing = np.maximum(v * np.cos(angles), 0.01)
+        ittc = ranges / closing
+        valid = (np.abs(angles) < self._fov) & np.isfinite(ranges) & (ranges > 0.05)
+
+        if np.any(valid & (ittc < self.ttc_thresh)):
             cmd.drive.speed = 0.0
+            self._logger.warn('EStop: TTC below threshold -> stop',
+                              throttle_duration_sec=1.0)
         return cmd
     
     

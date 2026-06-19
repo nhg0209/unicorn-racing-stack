@@ -115,6 +115,14 @@ void SimControlPanel::onRemoveOpponent()
   }
 }
 
+void SimControlPanel::onClearObstacles()
+{
+  if (clear_obstacles_pub_) {
+    clear_obstacles_pub_->publish(std_msgs::msg::Empty());
+    if (status_label_) {status_label_->setText("Cleared static obstacles");}
+  }
+}
+
 void SimControlPanel::publishSpeedDelta(float delta)
 {
   if (!speed_pub_) {return;}
