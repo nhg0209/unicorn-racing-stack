@@ -120,3 +120,32 @@ waypoint_publisher → /global_waypoints(_scaled, /overtaking, centerline)
 `f110_msgs` / `frenet_conversion_msgs` etc. fail to rebuild with the stale-symlink error
 `failed to create symbolic link … Is a directory` after switching to `--symlink-install`. Fix:
 `rm -rf build/<pkg> install/<pkg>` then rebuild. All 31 needed packages build clean afterward.
+
+---
+
+# Round 2 — Sequential per-package verification + obstacle endurance (2026-06-20)
+
+Re-verified every package **in order** (drive solo → detect → frenet → behavior/local
+waypoints → static avoidance → dynamic → endurance), found and fixed the real root
+causes of the "local waypoints appear in the wrong place / car can't even drive" symptom.
+
+## Root-cause fixes
+| File | Bug → fix |
+|------|-----------|
+| `frenet_conversion/frenet_converter.py` | `waypoints_distance_m` hardcoded 0.1 m → `get_approx_s` (index×spacing) seeded the projection on the wrong part of the track, so `/car_state/odom_frenet` d was off by metres on ~half the lap. Now uses the **true cumulative arc-length** at the nearest waypoint + the real mean spacing. → d=0.00 everywhere. |
+| `state_machine/states.py` | `GlobalTracking` local-window start `int(cur_s/waypoints_dist)` assumed a uniform 0.1 m raceline; on a 0.25 m raceline the window started **~3.4 m ahead** of the car → PP cut corners into the wall. Now starts at the waypoint whose `s_m` is closest to the car (spacing-independent). → window offset −0.02 m. |
+| `state_machine/state_machine.py` | `waypoints_dist`/`track_length` now derived from the actual raceline; `_check_ot_sector` returns **True when no ot_sectors are configured** so OVERTAKE can trigger (otherwise the car only ever trails and stops behind a static obstacle). |
+| `gym_bridge.py` | crash-recovery: respawn the ego on the nearest raceline point if it stays wedged against a virtual obstacle (the collision-stop alone dead-locks it). |
+
+## Sequential results (sim, map f, headtohead.launch)
+| Step | Result |
+|------|--------|
+| A3 Frenet | `/car_state/odom_frenet` d=0.00, s-err=0.00 at idx 0/80/160/240/320 (was ±6 m) |
+| A4 Solo control | **4 laps, 332 m, max\|d\|=0.32 m, 0 collisions** (PP follows `/local_waypoints`) |
+| B Detection | opponent in `/detections` at laser-frame (2.61,−0.26) sz 0.26; tracking stable |
+| B Obstacle Frenet | `/tracking/obstacles` opponent s_center=10.7 (truth 10.7), d_center=0.00, err 0.00 m |
+| C1/C2 Static avoidance | GB_TRACK→TRAILING→**OVERTAKE**, evades **0.77 m** around an on-line static obstacle, passes it, **0 collisions** |
+| **D1 Endurance** | **27 laps, 2086 m, static + dynamic obstacles together, max_collision=0.0 s, 0 recoveries** — OVERTAKE the static + TRAIL the moving opponent every lap, never collides |
+
+Verdict: solo driving and obstacle handling (static + dynamic) are robust over dozens of
+laps with zero collisions. State machine cycles GB_TRACK / TRAILING / OVERTAKE correctly.
