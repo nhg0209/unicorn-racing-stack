@@ -33,6 +33,8 @@
 
 #include <urg_node/urg_c_wrapper.hpp>
 
+#include <unistd.h>
+
 #include <chrono>
 #include <cinttypes>
 #include <limits>

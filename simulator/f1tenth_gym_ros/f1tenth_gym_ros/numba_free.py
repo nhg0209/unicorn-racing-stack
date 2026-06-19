@@ -25,10 +25,21 @@ import importlib.util
 
 import numpy as np
 
-_RAYCASTER_DIR = os.environ.get(
-    "RAYCASTER_DIR",
-    "/home/js/unicorn_racing_stack/src/unicorn-racing-stack/race_utils/raycaster",
-)
+def _find_raycaster_dir():
+    _here = os.path.dirname(os.path.abspath(__file__))
+    # Source layout: .../simulator/f1tenth_gym_ros/f1tenth_gym_ros/numba_free.py
+    # Install layout: .../install/f1tenth_gym_ros/lib/pythonX.Y/site-packages/f1tenth_gym_ros/numba_free.py
+    candidates = [
+        os.path.normpath(os.path.join(_here, "..", "..", "..", "race_utils", "raycaster")),
+        os.path.normpath(os.path.join(_here, "..", "..", "..", "..", "..", "..", "src", "unicorn-racing-stack", "race_utils", "raycaster")),
+    ]
+    for c in candidates:
+        if os.path.isfile(os.path.join(c, "raycaster.py")):
+            return c
+    return candidates[0]
+
+
+_RAYCASTER_DIR = os.environ.get("RAYCASTER_DIR") or _find_raycaster_dir()
 
 
 # --------------------------------------------------------------------------- #
