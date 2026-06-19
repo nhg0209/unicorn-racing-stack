@@ -1,3 +1,0 @@
-[submodule "tools/raycaster"]
-	path = tools/raycaster
-	url = https://github.com/jeongsang-ryu/2D-RayCaster.git

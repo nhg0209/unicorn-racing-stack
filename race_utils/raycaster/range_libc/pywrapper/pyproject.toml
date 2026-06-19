@@ -1,0 +1,6 @@
+[build-system]
+# setup.py imports numpy + Cython at top, so they must be present in the
+# (isolated) build environment. This lets `pip install [-e] .` work cleanly,
+# including from environment.yml on a fresh `conda env create`.
+requires = ["setuptools>=64", "wheel", "numpy", "cython"]
+build-backend = "setuptools.build_meta"

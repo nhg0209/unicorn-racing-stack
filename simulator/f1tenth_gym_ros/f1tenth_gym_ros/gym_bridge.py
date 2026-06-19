@@ -31,6 +31,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry, OccupancyGrid
+from std_msgs.msg import Empty, Float32, Bool
 from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from geometry_msgs.msg import Twist
@@ -38,7 +39,13 @@ from geometry_msgs.msg import TransformStamped
 from geometry_msgs.msg import Transform
 from ackermann_msgs.msg import AckermannDriveStamped
 from visualization_msgs.msg import Marker, MarkerArray
+from f110_msgs.msg import ObstacleArray
 from tf2_ros import TransformBroadcaster
+
+# Make f110_gym import & scan without numba (numpy>=2.1 breaks numba 0.60).
+# Installs a numba shim and swaps ScanSimulator2D -> range_libc RayMarching.
+# MUST run before gym.make('f110_gym:...').
+from f1tenth_gym_ros import numba_free  # noqa: F401
 
 import gymnasium as gym
 import numpy as np
@@ -51,6 +58,16 @@ import os.path
 
 
 class GymBridge(Node):
+    def _param(self, name, default):
+        """Read a parameter, declaring `default` only if it was not already
+        auto-declared from a params-file override. The node is created with
+        automatically_declare_parameters_from_overrides=True, so any override
+        (e.g. use_external_opponent from the launch file) is pre-declared and a
+        second declare_parameter() would raise ParameterAlreadyDeclared."""
+        if not self.has_parameter(name):
+            self.declare_parameter(name, default)
+        return self.get_parameter(name).value
+
     def __init__(self):
         super().__init__('gym_bridge',
                          automatically_declare_parameters_from_overrides=True)
@@ -134,11 +151,26 @@ class GymBridge(Node):
 
         # env backend
         map_yaml_path = os.path.abspath(self.get_parameter('map_path').value)
+        # Decoupled rates: physics/dynamics step vs lidar scan.
+        self.sim_step_hz = float(self._param('sim_step_hz', 80.0))
+        self.scan_hz = float(self._param('scan_hz', 40.0))
+        # When true, the opponent is owned by the external `opponent` package
+        # (kinematic virtual car + scan_augmentor) so the SAME method works on the
+        # real car. gym_bridge then runs EGO-ONLY: no opp subs/pubs/TF/overlay,
+        # and its ego scan is meant to be remapped to /scan_raw for the augmentor.
+        self.external_opp = bool(self._param('use_external_opponent', False))
+
+        # Always build the env with 2-agent CAPACITY so an opponent can be
+        # spawned/removed at runtime (gym fixes the agent count at make-time).
+        # Whether an opponent actually exists is the runtime flag self.has_opp;
+        # when absent the 2nd car is parked far off-map and ignored.
+        # timestep = 1/sim_step_hz keeps sim-time aligned with wall-clock.
         self.env = gym.make('f110_gym:f110-v0',
                             map=map_yaml_path.split('.')[0],
                             map_ext=self.get_parameter('map_img_ext').value,
                             params=sim_params,
-                            num_agents=num_agents,
+                            num_agents=2,
+                            timestep=1.0 / self.sim_step_hz,
                             num_beams=scan_beams,
                             scan_fov=scan_fov,
                             disable_env_checker=True)
@@ -165,42 +197,54 @@ class GymBridge(Node):
             'scan_distance_to_base_link').value
         self.ts = self.get_clock().now().to_msg()
 
-        if num_agents == 2:
-            self.has_opp = True
-            self.opp_namespace = self.get_parameter('opp_namespace').value
-            sx1 = self.get_parameter('sx1').value
-            sy1 = self.get_parameter('sy1').value
-            stheta1 = self.get_parameter('stheta1').value
-            self.opp_pose = [sx1, sy1, stheta1]
-            self.opp_speed = [0.0, 0.0, 0.0]
-            self.opp_requested_speed = 0.0
-            self.opp_steer = 0.0
-            self.opp_collision = False
-            self.obs, _, self.done, _ = self.env.reset(
-                poses=np.array([[sx, sy, stheta], [sx1, sy1, stheta1]]))
-            self.ego_scan = list(self.obs['scans'][0])
-            self.opp_scan = list(self.obs['scans'][1])
+        # Opponent state (always allocated; presence is the runtime flag has_opp).
+        self.OPP_PARK_POSE = [1000.0, 1000.0, 0.0]  # off-map "garage" when absent
+        self.has_opp = (num_agents == 2) and not self.external_opp   # external pkg owns the opp
+        # gym pose is at base_link (rear axle); shift the overlay box forward to
+        # the vehicle centre (mid-wheelbase) so the footprint matches the car body.
+        self.opp_center_offset = 0.5 * (sim_params.get('lf', 0.16) + sim_params.get('lr', 0.17))
+        # per-vehicle lidar enable (panel toggles) — lets you skip unused scans
+        self.ego_lidar_on = True
+        self.opp_lidar_on = True
+        self.opp_namespace = self.get_parameter('opp_namespace').value
+        sx1 = self.get_parameter('sx1').value
+        sy1 = self.get_parameter('sy1').value
+        stheta1 = self.get_parameter('stheta1').value
+        self.opp_pose = [sx1, sy1, stheta1]
+        self.opp_speed = [0.0, 0.0, 0.0]
+        self.opp_requested_speed = 0.0
+        self.opp_steer = 0.0
+        self.opp_collision = False
+        self.opp_max_speed = float(sim_params.get('v_max', 8.0))
+        # geometric collision stop vs virtual obstacles (overlay arch has no gym
+        # collision for them): ego footprint vs f110_msgs/Obstacle boxes.
+        self.ego_half = 0.5 * float(sim_params.get('length', 0.58))
+        self.ego_collision = False
+        self._dyn_obs = []     # [(x, y, half), ...]
+        self._stat_obs = []
 
-            opp_scan_topic = self.get_parameter('opp_scan_topic').value
-            opp_odom_topic = self.opp_namespace + '/' + \
-                self.get_parameter('opp_odom_topic').value
-            opp_drive_topic = self.get_parameter('opp_drive_topic').value
+        init_opp = [sx1, sy1, stheta1] if self.has_opp else self.OPP_PARK_POSE
+        self.obs, _, self.done, _ = self.env.reset(
+            poses=np.array([[sx, sy, stheta], init_opp]))
+        self.ego_scan = list(self.obs['scans'][0])
+        self.opp_scan = list(self.obs['scans'][1])
 
-            ego_opp_odom_topic = self.ego_namespace + '/' + \
-                self.get_parameter('ego_opp_odom_topic').value
-            opp_ego_odom_topic = self.opp_namespace + '/' + \
-                self.get_parameter('opp_ego_odom_topic').value
-        else:
-            self.has_opp = False
-            self.obs, _, self.done, _ = self.env.reset(
-                poses=np.array([[sx, sy, stheta]]))
-            self.ego_scan = list(self.obs['scans'][0])
+        opp_scan_topic = self.get_parameter('opp_scan_topic').value
+        opp_odom_topic = self.opp_namespace + '/' + \
+            self.get_parameter('opp_odom_topic').value
+        opp_drive_topic = self.get_parameter('opp_drive_topic').value
+        ego_opp_odom_topic = self.ego_namespace + '/' + \
+            self.get_parameter('ego_opp_odom_topic').value
+        opp_ego_odom_topic = self.opp_namespace + '/' + \
+            self.get_parameter('opp_ego_odom_topic').value
 
         # sim physical step timer
         cb_group1= ReentrantCallbackGroup()
-        self.drive_timer = self.create_timer(0.01, self.drive_timer_callback, callback_group=cb_group1)
-        # topic publishing timer
-        self.timer = self.create_timer(0.01, self.timer_callback, callback_group=cb_group1)
+        self.drive_timer = self.create_timer(
+            1.0 / self.sim_step_hz, self.drive_timer_callback, callback_group=cb_group1)
+        # lidar scan timer (decoupled, slower than physics)
+        self.scan_timer = self.create_timer(
+            1.0 / self.scan_hz, self.scan_timer_callback, callback_group=cb_group1)
 
         # transform broadcaster
         self.br = TransformBroadcaster(self)
@@ -212,7 +256,9 @@ class GymBridge(Node):
         self.fake_vesc_odom_pub = self.create_publisher(Odometry, '/vesc/odom', 10)
         self.ego_pose_pub = self.create_publisher(PoseStamped, ego_pose_topic, 10)
         self.ego_drive_published = False
-        if num_agents == 2:
+        self.opp_drive_published = False
+        # opponent publishers exist only when gym owns the opponent (internal mode)
+        if not self.external_opp:
             self.opp_scan_pub = self.create_publisher(
                 LaserScan, opp_scan_topic, 10)
             self.ego_opp_odom_pub = self.create_publisher(
@@ -221,7 +267,6 @@ class GymBridge(Node):
                 Odometry, opp_odom_topic, 10)
             self.opp_ego_odom_pub = self.create_publisher(
                 Odometry, opp_ego_odom_topic, 10)
-            self.opp_drive_published = False
 
         # QoS Profiles
         best_effort_qos_profile = QoSProfile(
@@ -240,17 +285,38 @@ class GymBridge(Node):
             '/initialpose',
             self.ego_reset_callback,
             qos_profile=best_effort_qos_profile)
-        if num_agents == 2:
+        # opponent control — only when gym owns the opponent. With the external
+        # `opponent` package these topics (/goal_pose, /opp_drive, /sim/remove_opponent,
+        # /sim/opp_speed_delta) are owned by that package instead.
+        if not self.external_opp:
             self.opp_drive_sub = self.create_subscription(
                 AckermannDriveStamped,
                 opp_drive_topic,
                 self.opp_drive_callback,
                 10)
+            # RViz "2D Goal Pose" tool: spawns the opponent if absent, else moves it
             self.opp_reset_sub = self.create_subscription(
                 PoseStamped,
                 '/goal_pose',
                 self.opp_reset_callback,
                 10)
+            # RViz control-panel buttons
+            self.remove_opp_sub = self.create_subscription(
+                Empty, '/sim/remove_opponent', self.remove_opponent_callback, 10)
+            self.opp_speed_sub = self.create_subscription(
+                Float32, '/sim/opp_speed_delta', self.opp_speed_delta_callback, 10)
+            self.opp_lidar_sub = self.create_subscription(
+                Bool, '/sim/opp_lidar_enable', self.opp_lidar_callback, 10)
+        # ego lidar toggle is always available
+        self.ego_lidar_sub = self.create_subscription(
+            Bool, '/sim/ego_lidar_enable', self.ego_lidar_callback, 10)
+        # virtual obstacles (opponent + static) for the ego collision-stop check
+        self.create_subscription(
+            ObstacleArray, '/sim/dynamic_obstacles',
+            lambda m: setattr(self, '_dyn_obs', [(o.x_m, o.y_m, 0.5 * o.size) for o in m.obstacles]), 10)
+        self.create_subscription(
+            ObstacleArray, '/sim/static_obstacles',
+            lambda m: setattr(self, '_stat_obs', [(o.x_m, o.y_m, 0.5 * o.size) for o in m.obstacles]), 10)
 
         if self.get_parameter('kb_teleop').value:
             self.teleop_sub = self.create_subscription(
@@ -311,26 +377,73 @@ class GymBridge(Node):
         rqz = pose_msg.pose.pose.orientation.z
         rqw = pose_msg.pose.pose.orientation.w
         _, _, rtheta = euler.quat2euler([rqw, rqx, rqy, rqz], axes='sxyz')
-        if self.has_opp:
-            opp_pose = [self.obs['poses_x'][1], self.obs['poses_y']
-                        [1], self.obs['poses_theta'][1]]
-            self.obs, _, self.done, _ = self.env.reset(
-                poses=np.array([[rx, ry, rtheta], opp_pose]))
-        else:
-            self.obs, _, self.done, _ = self.env.reset(
-                poses=np.array([[rx, ry, rtheta]]))
+        # env always has 2-agent capacity -> reset must pass 2 poses. Keep the
+        # opponent where it is (or parked off-map when absent).
+        opp_pose = ([self.obs['poses_x'][1], self.obs['poses_y'][1], self.obs['poses_theta'][1]]
+                    if self.has_opp else self.OPP_PARK_POSE)
+        self.obs, _, self.done, _ = self.env.reset(
+            poses=np.array([[rx, ry, rtheta], opp_pose]))
 
     def opp_reset_callback(self, pose_msg):
-        if self.has_opp:
-            rx = pose_msg.pose.position.x
-            ry = pose_msg.pose.position.y
-            rqx = pose_msg.pose.orientation.x
-            rqy = pose_msg.pose.orientation.y
-            rqz = pose_msg.pose.orientation.z
-            rqw = pose_msg.pose.orientation.w
-            _, _, rtheta = euler.quat2euler([rqw, rqx, rqy, rqz], axes='sxyz')
-            self.obs, _, self.done, _ = self.env.reset(
-                poses=np.array([list(self.ego_pose), [rx, ry, rtheta]]))
+        """RViz '2D Goal Pose' (/goal_pose): spawn the opponent if it doesn't
+        exist yet, otherwise just relocate it. Ego is left untouched."""
+        rx = pose_msg.pose.position.x
+        ry = pose_msg.pose.position.y
+        rqx = pose_msg.pose.orientation.x
+        rqy = pose_msg.pose.orientation.y
+        rqz = pose_msg.pose.orientation.z
+        rqw = pose_msg.pose.orientation.w
+        _, _, rtheta = euler.quat2euler([rqw, rqx, rqy, rqz], axes='sxyz')
+        self._place_opponent(rx, ry, rtheta)
+        if not self.has_opp:
+            self.has_opp = True
+            self.get_logger().info(
+                f'[GymBridge] opponent SPAWNED at ({rx:.2f}, {ry:.2f}, {rtheta:.2f})')
+        else:
+            self.get_logger().info(
+                f'[GymBridge] opponent moved to ({rx:.2f}, {ry:.2f}, {rtheta:.2f})')
+
+    def _place_opponent(self, x, y, theta):
+        """Directly set the 2nd gym agent's state (no env.reset -> ego undisturbed)."""
+        agent = self.env.unwrapped.sim.agents[1]
+        agent.state[:] = 0.0
+        agent.state[0] = x
+        agent.state[1] = y
+        agent.state[4] = theta
+        agent.in_collision = False
+        self.opp_pose = [x, y, theta]
+        self.opp_requested_speed = 0.0
+        self.opp_steer = 0.0
+        self.opp_collision = False
+
+    def remove_opponent_callback(self, msg):
+        """RViz panel 'Remove opponent': park the 2nd car off-map and stop
+        computing/publishing it."""
+        if not self.has_opp:
+            return
+        self.has_opp = False
+        self._place_opponent(*self.OPP_PARK_POSE)
+        self.get_logger().info('[GymBridge] opponent REMOVED (parked off-map)')
+
+    def opp_speed_delta_callback(self, msg):
+        """RViz panel speed +/-: nudge the opponent's target speed."""
+        if not self.has_opp:
+            self.get_logger().warn('[GymBridge] no opponent present; spawn one first')
+            return
+        self.opp_requested_speed = float(
+            np.clip(self.opp_requested_speed + msg.data, 0.0, self.opp_max_speed))
+        self.opp_drive_published = True
+        self.get_logger().info(
+            f'[GymBridge] opponent target speed -> {self.opp_requested_speed:.2f} m/s')
+
+    def ego_lidar_callback(self, msg):
+        self.ego_lidar_on = bool(msg.data)
+        self.get_logger().info(f'[GymBridge] ego lidar {"ON" if self.ego_lidar_on else "OFF"}')
+
+    def opp_lidar_callback(self, msg):
+        self.opp_lidar_on = bool(msg.data)
+        self.get_logger().info(f'[GymBridge] opp lidar {"ON" if self.opp_lidar_on else "OFF"} '
+                               '(FTG needs it ON)')
 
     def teleop_callback(self, twist_msg):
         if not self.ego_drive_published:
@@ -380,12 +493,12 @@ class GymBridge(Node):
         (min(static, ray)) — NO distance-transform rebuild on obstacle change."""
         # NOTE: the sim does SINGLE scans (ego/opp) -> no batch parallelism here.
         # raycaster_threads belongs to the particle-filter (many poses), not the sim.
-        self.use_raycaster = self.declare_parameter('use_raycaster', True).value
-        self.rc_backend = self.declare_parameter('raycaster_backend', 'rm').value
-        self.rc_max_range = self.declare_parameter('raycaster_max_range', 10.0).value
-        self.rc_nan_on_miss = self.declare_parameter('raycaster_nan_on_miss', True).value
+        self.use_raycaster = self._param('use_raycaster', True)
+        self.rc_backend = self._param('raycaster_backend', 'rm')
+        self.rc_max_range = self._param('raycaster_max_range', 10.0)
+        self.rc_nan_on_miss = self._param('raycaster_nan_on_miss', True)
         # additive Gaussian range noise per beam (sim realism) — matches f1tenth_gym's std_dev=0.01 m
-        self.rc_noise_std = self.declare_parameter('raycaster_scan_noise_std', 0.01).value
+        self.rc_noise_std = self._param('raycaster_scan_noise_std', 0.01)
         self._scan_rng = np.random.default_rng()
         self.engine = None
         if not self.use_raycaster:
@@ -394,7 +507,7 @@ class GymBridge(Node):
         try:
             rc_path = os.environ.get(
                 'RAYCASTER_PATH',
-                '/home/js/unicorn_racing_stack/src/unicorn-racing-stack/tools/raycaster')
+                '/home/js/unicorn_racing_stack/src/unicorn-racing-stack/race_utils/raycaster')
             for p in (rc_path, os.path.join(rc_path, 'range_libc', 'pywrapper')):
                 if p not in sys.path:
                     sys.path.insert(0, p)
@@ -420,11 +533,18 @@ class GymBridge(Node):
         """Overlay scan for one agent: static map + the OTHER car (box) + static
         obstacles (circles). NaN where a beam returns nothing (real-sensor style)."""
         with self._obstacle_lock:
-            obstacles = [[o['x'], o['y'], o['radius']] for o in self.static_obstacles] or None
+            # snap half-side to the grid (same cell count the map renders) so the
+            # raycaster footprint matches the occupancy grid exactly
+            obstacles = [[o['x'], o['y'],
+                          max(1, int(round(o['radius'] / self.map_resolution))) * self.map_resolution]
+                         for o in self.static_obstacles] or None
         opp = None
         if other_agent is not None:
-            opp = [[self.obs['poses_x'][other_agent], self.obs['poses_y'][other_agent],
-                    self.obs['poses_theta'][other_agent]]]
+            oth = self.obs['poses_theta'][other_agent]
+            c = self.opp_center_offset   # base_link(rear axle) -> vehicle centre
+            opp = [[self.obs['poses_x'][other_agent] + c * math.cos(oth),
+                    self.obs['poses_y'][other_agent] + c * math.sin(oth),
+                    oth]]
         miss = np.nan if self.rc_nan_on_miss else None
         scan = self.engine.scan_with_dynamics(
             self._lidar_pose(agent), self.scan_beams, self.scan_fov,
@@ -474,8 +594,9 @@ class GymBridge(Node):
         # Static obstacles (circles)
         for obs in self.static_obstacles:
             cx, cy = self._meters_to_pixels(obs['x'], obs['y'])
-            half = max(1, int(obs['radius'] / self.map_resolution))   # square half-side
-            cv2.rectangle(self.current_map_img, (cx - half, cy - half), (cx + half, cy + half), 0, -1)
+            half = max(1, int(round(obs['radius'] / self.map_resolution)))   # square half-side (cells)
+            # draw a 2*half-cell span (even) so the footprint == raycaster's 2*r box
+            cv2.rectangle(self.current_map_img, (cx - half, cy - half), (cx + half - 1, cy + half - 1), 0, -1)
 
         # Dynamic obstacle (rotated rectangle)
         if self.dynamic_obstacle is not None:
@@ -555,37 +676,61 @@ class GymBridge(Node):
         self.map_pub.publish(grid_msg)
 
     def drive_timer_callback(self):
-        # Update map if obstacles changed (DT recalculation)
+        # ---- physics / dynamics step (runs at sim_step_hz) ----
         if self.map_needs_update:
             self._update_gym_map()
 
-        # Always step the simulation to generate new scan noise
-        if not self.has_opp:
-            self.obs, _, self.done, _ = self.env.step(
-                np.array([[self.ego_steer, self.ego_requested_speed]]))
-        elif self.has_opp and self.opp_drive_published:
-            self.obs, _, self.done, _ = self.env.step(np.array(
-                [[self.ego_steer, self.ego_requested_speed], [self.opp_steer, self.opp_requested_speed]]))
+        # Env always has 2-agent capacity -> always step a (2, 2) action.
+        # When the opponent is absent it stays parked off-map with zero command.
+        # While in collision with a virtual obstacle, the ego is held at 0 speed.
+        ego_speed = 0.0 if self.ego_collision else self.ego_requested_speed
+        ego_act = [self.ego_steer, ego_speed]
+        opp_act = [self.opp_steer, self.opp_requested_speed] if self.has_opp else [0.0, 0.0]
+        self.obs, _, self.done, _ = self.env.step(np.array([ego_act, opp_act]))
         self.ts = self.get_clock().now().to_msg()
-        self._update_sim_state()
+        self._update_state()
+        self._check_collision()
+        # odom + tf track the physics rate
+        self._publish_odom(self.ts)
+        self._publish_transforms(self.ts)
+        self._publish_wheel_transforms(self.ts)
 
-    def timer_callback(self):
-        # pub scans
-        scan = LaserScan()
-        scan.header.stamp = self.ts
-        scan.header.frame_id = (self.ego_namespace + '/laser') if self.ego_namespace else 'laser'
-        scan.angle_min = self.angle_min
-        scan.angle_max = self.angle_max
-        scan.angle_increment = self.angle_inc
-        scan.range_min = 0.
-        scan.range_max = 30.
-        scan.ranges = self.ego_scan
-        scan.intensities = self.ego_scan  # Use range as intensity for rainbow coloring
-        self.ego_scan_pub.publish(scan)
+    def _check_collision(self):
+        """Geometric ego-vs-virtual-obstacle collision (opponent + static).
+        Overlay obstacles aren't in the gym physics, so stop the ego here."""
+        ex, ey = self.obs['poses_x'][0], self.obs['poses_y'][0]
+        hit = False
+        for x, y, half in (self._dyn_obs + self._stat_obs):
+            if math.hypot(ex - x, ey - y) < self.ego_half + half:
+                hit = True
+                break
+        if hit:
+            self.env.unwrapped.sim.agents[0].state[3] = 0.0   # zero ego speed now
+            self.ego_requested_speed = 0.0
+            if not self.ego_collision:
+                self.get_logger().warn('[GymBridge] ego collision with virtual obstacle -> stopped')
+        self.ego_collision = hit
 
-        if self.has_opp:
+    def scan_timer_callback(self):
+        # ---- lidar scans (runs at scan_hz, decoupled from physics) ----
+        self._update_scans()
+        stamp = self.get_clock().now().to_msg()
+        if self.ego_lidar_on:
+            scan = LaserScan()
+            scan.header.stamp = stamp
+            scan.header.frame_id = (self.ego_namespace + '/laser') if self.ego_namespace else 'laser'
+            scan.angle_min = self.angle_min
+            scan.angle_max = self.angle_max
+            scan.angle_increment = self.angle_inc
+            scan.range_min = 0.
+            scan.range_max = 30.
+            scan.ranges = self.ego_scan
+            scan.intensities = self.ego_scan  # Use range as intensity for rainbow coloring
+            self.ego_scan_pub.publish(scan)
+
+        if self.has_opp and self.opp_lidar_on:
             opp_scan = LaserScan()
-            opp_scan.header.stamp = self.ts
+            opp_scan.header.stamp = stamp
             opp_scan.header.frame_id = self.opp_namespace + '/laser'
             opp_scan.angle_min = self.angle_min
             opp_scan.angle_max = self.angle_max
@@ -595,25 +740,14 @@ class GymBridge(Node):
             opp_scan.ranges = self.opp_scan
             self.opp_scan_pub.publish(opp_scan)
 
-        # pub tf
-        self._publish_odom(self.ts)
-        self._publish_transforms(self.ts)
-        self._publish_wheel_transforms(self.ts)
-
-    def _update_sim_state(self):
-        if self.use_raycaster and self.engine is not None:
-            # published scan from the raycaster: static (rm, exact) + OVERLAY opponent & obstacles
-            self.ego_scan = self._raycast_scan(0, 1 if self.has_opp else None)
-        else:
-            self.ego_scan = list(self.obs['scans'][0])
+    def _update_state(self):
+        # cheap per-step state (poses/speeds) at physics rate.
+        # opponent pose ALWAYS tracked from obs (parked pose 1000 -> TF follows
+        # the model off-screen when removed).
+        self.opp_pose[0] = self.obs['poses_x'][1]
+        self.opp_pose[1] = self.obs['poses_y'][1]
+        self.opp_pose[2] = self.obs['poses_theta'][1]
         if self.has_opp:
-            if self.use_raycaster and self.engine is not None:
-                self.opp_scan = self._raycast_scan(1, 0)
-            else:
-                self.opp_scan = list(self.obs['scans'][1])
-            self.opp_pose[0] = self.obs['poses_x'][1]
-            self.opp_pose[1] = self.obs['poses_y'][1]
-            self.opp_pose[2] = self.obs['poses_theta'][1]
             self.opp_speed[0] = self.obs['linear_vels_x'][1]
             self.opp_speed[1] = self.obs['linear_vels_y'][1]
             self.opp_speed[2] = self.obs['ang_vels_z'][1]
@@ -624,6 +758,19 @@ class GymBridge(Node):
         self.ego_speed[0] = self.obs['linear_vels_x'][0]
         self.ego_speed[1] = self.obs['linear_vels_y'][0]
         self.ego_speed[2] = self.obs['ang_vels_z'][0]
+
+    def _update_scans(self):
+        # raycaster scans at scan rate (reads the latest stepped obs).
+        if self.ego_lidar_on:
+            if self.use_raycaster and self.engine is not None:
+                self.ego_scan = self._raycast_scan(0, 1 if self.has_opp else None)
+            else:
+                self.ego_scan = list(self.obs['scans'][0])
+        if self.has_opp and self.opp_lidar_on:
+            if self.use_raycaster and self.engine is not None:
+                self.opp_scan = self._raycast_scan(1, 0)
+            else:
+                self.opp_scan = list(self.obs['scans'][1])
 
     def _publish_odom(self, ts):
         ego_odom = Odometry()
@@ -686,24 +833,28 @@ class GymBridge(Node):
         ego_ts.child_frame_id = (self.ego_namespace + '/base_link') if self.ego_namespace else 'base_link'
         self.br.sendTransform(ego_ts)
 
-        if self.has_opp:
-            opp_t = Transform()
-            opp_t.translation.x = self.opp_pose[0]
-            opp_t.translation.y = self.opp_pose[1]
-            opp_t.translation.z = 0.0
-            opp_quat = euler.euler2quat(
-                0.0, 0.0, self.opp_pose[2], axes='sxyz')
-            opp_t.rotation.x = opp_quat[1]
-            opp_t.rotation.y = opp_quat[2]
-            opp_t.rotation.z = opp_quat[3]
-            opp_t.rotation.w = opp_quat[0]
+        # Opponent base_link TF (only in internal-opponent mode; the external
+        # `opponent` package publishes it otherwise). Parked off-map (~1000 m)
+        # when removed, so the RViz model follows off-screen instead of freezing.
+        if self.external_opp:
+            return
+        opp_t = Transform()
+        opp_t.translation.x = self.opp_pose[0]
+        opp_t.translation.y = self.opp_pose[1]
+        opp_t.translation.z = 0.0
+        opp_quat = euler.euler2quat(
+            0.0, 0.0, self.opp_pose[2], axes='sxyz')
+        opp_t.rotation.x = opp_quat[1]
+        opp_t.rotation.y = opp_quat[2]
+        opp_t.rotation.z = opp_quat[3]
+        opp_t.rotation.w = opp_quat[0]
 
-            opp_ts = TransformStamped()
-            opp_ts.transform = opp_t
-            opp_ts.header.stamp = ts
-            opp_ts.header.frame_id = 'map'
-            opp_ts.child_frame_id = self.opp_namespace + '/base_link'
-            self.br.sendTransform(opp_ts)
+        opp_ts = TransformStamped()
+        opp_ts.transform = opp_t
+        opp_ts.header.stamp = ts
+        opp_ts.header.frame_id = 'map'
+        opp_ts.child_frame_id = self.opp_namespace + '/base_link'
+        self.br.sendTransform(opp_ts)
 
     def _publish_wheel_transforms(self, ts):
         ego_wheel_ts = TransformStamped()

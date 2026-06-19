@@ -23,6 +23,8 @@ Panels:
       - /Current View1
     Name: Views
     Splitter Ratio: 0.5
+  - Class: sim_control_panel/SimControlPanel
+    Name: Sim Control
 Visualization Manager:
   Class: ""
   Displays:

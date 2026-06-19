@@ -63,8 +63,12 @@ def generate_launch_description():
                     {'map_path': map_yaml_path},
                     {'sim_params': os.path.join(get_package_share_directory('stack_master'), 'config', 'SIM', 'sim_params.yaml')},
                     {'ego_odom_topic': ego_odom_topic},
-                    {'publish_tf': publish_tf}],
-        remappings=[('/initialpose', '/sim/initialpose')]
+                    {'publish_tf': publish_tf},
+                    # ego-only: the `opponent` package owns the opponent (same as on the real car)
+                    {'use_external_opponent': True}],
+        # ego scan goes to /scan_raw; scan_augmentor overlays the opponent -> /scan
+        remappings=[('/initialpose', '/sim/initialpose'),
+                    ('/scan', '/scan_raw')]
     )
     rviz_node = Node(
         package='rviz2',
@@ -91,6 +95,9 @@ def generate_launch_description():
             get_package_share_directory('f1tenth_gym_ros'), 'config', 'opp_racecar.xacro')])}],
         remappings=[('/robot_description', 'opp_robot_description')]
     )
+    # The opponent (vehicle + controller + scan_augmentor) is provided by the
+    # separate `opponent` package, included from low_level.launch.xml so the SAME
+    # setup runs on the real car. gym_bridge here is ego-only.
     # TODO: add IMU
 
     # finalize
@@ -100,7 +107,9 @@ def generate_launch_description():
     ld.add_action(rviz_node)
     ld.add_action(bridge_node)
     ld.add_action(ego_robot_publisher)
-    if has_opp:
-        ld.add_action(opp_robot_publisher)
+    # Always run the opponent's robot_state_publisher so a runtime-spawned
+    # opponent (via the RViz 2D Goal Pose tool) shows up as a car mesh. Its
+    # base TF is only published by the bridge while an opponent exists.
+    ld.add_action(opp_robot_publisher)
 
     return ld

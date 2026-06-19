@@ -22,10 +22,13 @@ setup(
     maintainer_email='billyzheng.bz@gmail.com',
     description='Bridge for using f1tenth_gym in ROS2',
     license='MIT',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'gym_bridge = f1tenth_gym_ros.gym_bridge:main'
+            'gym_bridge = f1tenth_gym_ros.gym_bridge:main',
+            # (opponent_controller moved to the standalone `opponent` package)
+            # absorbed from the former standalone opponent_publisher package
+            'obstacle_publisher = f1tenth_gym_ros.obstacle_publisher:main',
+            'collision_detector = f1tenth_gym_ros.collision_detector:main'
         ],
     },
 )

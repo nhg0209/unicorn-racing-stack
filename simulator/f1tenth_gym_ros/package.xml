@@ -19,7 +19,12 @@
   <exec_depend>xacro</exec_depend>
   <exec_depend>visualization_msgs</exec_depend>
   <exec_depend>teleop_twist_keyboard</exec_depend>
-  
+  <exec_depend>std_msgs</exec_depend>
+  <!-- absorbed opponent_publisher / collision_detector node deps -->
+  <exec_depend>f110_msgs</exec_depend>
+  <exec_depend>frenet_conversion</exec_depend>
+  <exec_depend>tf_transformations</exec_depend>
+
   <depend>python-transforms3d-pip</depend>
 
   <test_depend>ament_copyright</test_depend>

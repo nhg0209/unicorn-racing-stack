@@ -1,0 +1,31 @@
+# unicorn-racing-stack — PyPI-only Python deps (INSTALL.md A5)
+#
+# These are NOT on the conda/robostack channels, so they go through pip.
+# Versions captured from the verified-working environment (Linux, 2026-06).
+#
+# Install AFTER `conda activate unicorn`:
+#     pip install -r requirements.txt
+#
+# Then install the gym core editable (it carries a COLCON_IGNORE, so colcon
+# does not build it):
+#     pip install -e simulator/f1tenth_gym      # provides f110_gym
+#
+# NOTE: in the captured env f110_gym was installed editable from an *external*
+# tree (creating_autonomous_car_ws/.../f1tenth_gym/gym), not this repo's
+# simulator/f1tenth_gym. Use this repo's copy for a self-contained setup.
+
+numba==0.60.0
+gymnasium==0.29.1
+casadi==3.7.2
+trajectory_planning_helpers==0.79
+
+# scipy is pinned here because the verified env had a pip scipy shadowing the
+# conda one. If you prefer the conda build, move this to environment.yml instead.
+scipy==1.17.1
+
+# --- Listed in INSTALL.md A5 but ABSENT from the verified-working env ---
+# The build succeeded without them, so they are commented out. Uncomment if a
+# module that imports them ends up on your build/run path.
+# scikit-learn
+# scikit-image
+# shapely

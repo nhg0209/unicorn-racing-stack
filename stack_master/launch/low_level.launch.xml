@@ -48,8 +48,9 @@
     <include file="$(find-pkg-share f1tenth_gym_ros)/launch/gym_bridge_launch.py">
       <arg name="map_yaml_path"  value="$(var map_path).yaml"/>
     </include>
-    <include file="$(find-pkg-share obstacle_publisher)/launch/obstacle_publisher.launch.xml">
-      <arg name="map_name" value="$(var map)"/>
+    <!-- virtual opponent (same package the real car uses); injects into /scan via scan_augmentor -->
+    <include file="$(find-pkg-share opponent)/launch/opponent.launch.xml">
+      <arg name="map_path" value="$(var map_path).yaml"/>
     </include>
   </group>
 
