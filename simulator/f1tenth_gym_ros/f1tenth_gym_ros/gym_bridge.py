@@ -512,9 +512,7 @@ class GymBridge(Node):
             self.get_logger().info('[GymBridge] use_raycaster=false -> gym internal numba scan + DT rebuild')
             return
         try:
-            rc_path = os.environ.get(
-                'RAYCASTER_PATH',
-                '/home/js/unicorn_racing_stack/src/unicorn-racing-stack/race_utils/raycaster')
+            rc_path = os.environ.get('RAYCASTER_PATH') or os.environ.get('RAYCASTER_DIR') or numba_free._find_raycaster_dir()
             for p in (rc_path, os.path.join(rc_path, 'range_libc', 'pywrapper')):
                 if p not in sys.path:
                     sys.path.insert(0, p)
