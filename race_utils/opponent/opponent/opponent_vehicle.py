@@ -37,6 +37,29 @@ from tf2_ros import TransformBroadcaster
 from transforms3d import euler
 
 
+def _find_raycaster_dir():
+    """Locate race_utils/raycaster (which holds raycaster.py) without hardcoding
+    an absolute path, so this works in both the source tree and a colcon install
+    on any machine. Override with the RAYCASTER_DIR env var if needed."""
+    env = os.environ.get('RAYCASTER_DIR')
+    if env:
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        # source layout:  race_utils/opponent/opponent/ -> race_utils/raycaster
+        os.path.normpath(os.path.join(here, '..', '..', 'raycaster')),
+        # install layout: .../install/opponent/lib/pythonX.Y/site-packages/opponent/
+        #                 -> <ws>/src/unicorn-racing-stack/race_utils/raycaster
+        os.path.normpath(os.path.join(here, *(['..'] * 6),
+                                      'src', 'unicorn-racing-stack',
+                                      'race_utils', 'raycaster')),
+    ]
+    for c in candidates:
+        if os.path.isfile(os.path.join(c, 'raycaster.py')):
+            return c
+    return candidates[0]
+
+
 def _load_RaycastEngine(rc_dir):
     path = os.path.join(rc_dir, 'raycaster.py')
     spec = importlib.util.spec_from_file_location('raycaster', path)
@@ -56,8 +79,7 @@ class OpponentVehicle(Node):
         super().__init__('opponent_vehicle')
 
         self.declare_parameter('map_path', '')
-        self.declare_parameter('raycaster_dir',
-                               '/home/js/unicorn_racing_stack/src/unicorn-racing-stack/race_utils/raycaster')
+        self.declare_parameter('raycaster_dir', _find_raycaster_dir())
         self.declare_parameter('ego_odom_topic', '/car_state/odom')
         self.declare_parameter('opp_drive_topic', '/opp_drive')
         self.declare_parameter('opp_scan_topic', '/opp_scan')

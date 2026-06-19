@@ -50,6 +50,19 @@ conda activate unicorn
 > hooks set up the ROS environment automatically. Do **not** also `source /opt/ros/...`;
 > mixing system ROS with RoboStack breaks the build.
 
+#### A1b. range_libc (optional — localization / non-`lut` raycaster)
+
+`range_libc` is **not** in `environment.yml` because pip's build isolation pulls a
+fresh PyPI numpy to compile it, which is broken on some macOS (Accelerate ILP64).
+Install it against the conda numpy instead — only needed for `particle_filter`
+localization and the raycaster `rm`/`cddt`/`glt` backends (the default `lut`
+backend runs without it):
+
+```bash
+# after `conda activate unicorn`, from the repo root
+pip install --no-build-isolation -e ./race_utils/raycaster/range_libc/pywrapper
+```
+
 ### A2. Build
 
 ```bash
