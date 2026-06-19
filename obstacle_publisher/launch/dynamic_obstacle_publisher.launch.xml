@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Dynamic Obstacle Launcher -->
+  <arg name="map" description="Map name to use (same as low_level.launch.xml)"/>
+  <arg name="trajectory_csv" default="centerline.csv" description="CSV file name for obstacle trajectory (in maps/[map]/ directory)"/>
+  <arg name="speed_scaler" default="0.7" description="Speed multiplier for dynamic obstacle"/>
+  <arg name="constant_speed" default="false" description="Use constant speed instead of trajectory speed"/>
+  <arg name="starting_s" default="0.0" description="Initial position on trajectory (meters)"/>
+  <arg name="obstacle_length_m" default="0.6" description="Obstacle length (meters)"/>
+  <arg name="obstacle_width_m" default="0.3" description="Obstacle width (meters)"/>
+  <arg name="reactive" default="false" description="Enable reactive mode (sine-wave lateral oscillation around path)"/>
+  <arg name="reactive_freq" default="0.3" description="Reactive oscillation frequency in Hz (lower = slower)"/>
+
+  <node pkg="obstacle_publisher" exec="dynamic_obstacle_publisher" name="dynamic_obstacle_publisher" output="screen">
+    <param name="map_name" value="$(var map)"/>
+    <param name="trajectory_csv" value="$(var trajectory_csv)"/>
+    <param name="speed_scaler" value="$(var speed_scaler)"/>
+    <param name="constant_speed" value="$(var constant_speed)"/>
+    <param name="starting_s" value="$(var starting_s)"/>
+    <param name="obstacle_length_m" value="$(var obstacle_length_m)"/>
+    <param name="obstacle_width_m" value="$(var obstacle_width_m)"/>
+    <param name="reactive" value="$(var reactive)"/>
+    <param name="reactive_freq" value="$(var reactive_freq)"/>
+    <param name="update_rate" value="20"/>
+  </node>
+
+</launch>
