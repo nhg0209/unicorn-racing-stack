@@ -17,9 +17,27 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate unicorn
 
 # Never let ~/.local user-site packages shadow the conda env. Stale ~/.local
-# copies (numba, rosidl_generator_c, ...) silently override the env on some
-# machines and break the build/run — same class of bug on every platform.
+# copies (numba, ...) silently override the env on some machines.
 export PYTHONNOUSERSITE=1
+
+# Strip any system-ROS (/opt/ros/*) leakage so it can't shadow the conda env.
+# A `source /opt/ros/<distro>/setup.bash` left in ~/.bashrc puts the wrong-distro
+# rosidl/ament on PYTHONPATH and breaks msg codegen
+# (e.g. "generate_c() takes 1 positional argument but 2 were given"). Same fix on
+# every platform: the conda env already provides ROS, so just drop /opt/ros/*.
+_urs_strip_opt_ros() {
+    local var p new parts
+    for var in PYTHONPATH AMENT_PREFIX_PATH CMAKE_PREFIX_PATH COLCON_PREFIX_PATH LD_LIBRARY_PATH PATH; do
+        IFS=: read -ra parts <<< "${!var-}"
+        new=""
+        for p in "${parts[@]}"; do
+            [[ "$p" == /opt/ros/* ]] && continue
+            new="${new:+$new:}$p"
+        done
+        export "$var=$new"
+    done
+}
+_urs_strip_opt_ros
 
 # --- 2) middleware + ROS domain ---
 # CycloneDDS is far lighter than the default FastDDS on this many-node single-host
