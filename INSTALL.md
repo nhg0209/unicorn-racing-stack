@@ -15,19 +15,20 @@ The **build command is identical** in both environments
 
 ## 0. Clone the repository (REQUIRED: submodules)
 
-`tools/raycaster` is a git **submodule**, so a plain clone will leave it empty.
+`race_utils/raycaster` is a git **submodule**, so a plain clone will leave it empty.
+Clone it **into the `src/` of a colcon workspace**:
 
 ```bash
-git clone --recursive https://github.com/<you>/unicorn-racing-stack.git
-cd unicorn-racing-stack
+mkdir -p ~/unicorn_ws/src && cd ~/unicorn_ws/src
+git clone --recursive https://github.com/hmcl-unist/unicorn-racing-stack.git
 # if you already cloned without --recursive:
-git submodule update --init --recursive
+#   cd unicorn-racing-stack && git submodule update --init --recursive
 ```
 
-> Throughout this guide the **colcon workspace root** is the directory that contains
-> `src/` (with this repo under `src/`). Adjust paths to your layout. In the reference
-> setup that is `~/unicorn_racing_stack` and the repo lives at
-> `~/unicorn_racing_stack/src/unicorn-racing-stack`.
+> Throughout this guide the **colcon workspace root** is `~/unicorn_ws` (the
+> directory that contains `src/`), and this repo lives at
+> `~/unicorn_ws/src/unicorn-racing-stack`. Build commands run from the workspace
+> root; `unicorn.sh` resolves these paths automatically.
 
 ---
 
@@ -107,6 +108,32 @@ pip uninstall -y quadprog && conda install -y -c conda-forge quadprog=0.1.13
 colcon build --symlink-install --base-paths src/unicorn-racing-stack \
   --cmake-args -DCMAKE_BUILD_TYPE=Release
 ```
+
+### A3. One-command environment (`unicorn.sh` + alias)
+
+`unicorn.sh` (repo root) enters the whole dev environment in one step: it
+activates the `unicorn` conda env, **selects CycloneDDS**, sets the ROS domain,
+sources the colcon workspace, and adds `cbuild` / `ros2kill` helpers. It must be
+**sourced** — `RMW_IMPLEMENTATION` has to be set *after* `conda activate` (which
+clears it), and the default FastDDS busy-spins a core on this many-node graph
+(~22 Hz sim) while CycloneDDS idles at ~21% CPU and hits the full ~80 Hz.
+
+Add an alias once (run from the repo root so the path resolves), then a single
+word enters the environment:
+
+```bash
+# from the repo root (src/unicorn-racing-stack)
+echo "alias unicorn='source $(pwd)/unicorn.sh'" >> ~/.bashrc
+exec bash                # reload the shell
+
+unicorn                  # env active + workspace sourced + CycloneDDS selected
+cbuild [pkgs...]         # colcon build (Release) + re-source; no args = whole ws
+ros2kill                 # kill every ROS 2 node / launcher / daemon
+```
+
+> On the **car** (network `192.168.60.x`), `unicorn.sh` also points
+> `CYCLONEDDS_URI` at the repo's `cyclonedds.xml`; on a laptop it stays on
+> CycloneDDS defaults. Adjust `ROS_DOMAIN_ID` (default `1`) as needed.
 
 <details>
 <summary><b>Manual bootstrap</b> — only if you can't / don't want to use <code>environment.yml</code> (installs the latest conda packages, step by step)</summary>

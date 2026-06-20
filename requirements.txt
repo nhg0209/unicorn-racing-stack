@@ -14,7 +14,10 @@
 # tree (creating_autonomous_car_ws/.../f1tenth_gym/gym), not this repo's
 # simulator/f1tenth_gym. Use this repo's copy for a self-contained setup.
 
-numba==0.60.0
+# numba >=0.65 supports numpy 2.x (RoboStack ships numpy 2.4). The old 0.60 pin
+# hard-rejects numpy>=2.1 at import, which forced the gym onto the pure-Python
+# numba_free fallback (slow). 0.65 lets the @njit dynamics actually JIT-compile.
+numba>=0.65
 gymnasium==0.29.1
 casadi==3.7.2
 trajectory_planning_helpers==0.79

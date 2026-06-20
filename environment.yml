@@ -40,6 +40,8 @@ dependencies:
   # vesc transport stack is VENDORED from source under sensor/transport_drivers/
   # and built by colcon. Only the base `asio` library (pinned below) comes from conda.
   - ros-jazzy-ackermann-msgs=2.0.2
+  # cartographer-ros pulls in ros-jazzy-cartographer (core) +
+  # ros-jazzy-cartographer-ros-msgs automatically, so they need not be listed.
   - ros-jazzy-cartographer-ros=2.0.9003
   - ros-jazzy-diagnostic-updater=4.2.6
   - ros-jazzy-foxglove-bridge=3.2.4
