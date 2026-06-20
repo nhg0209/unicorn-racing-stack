@@ -2,6 +2,11 @@
 build/
 install/
 log/
+# container scratch: transient build/smoke logs + the superseded docker/ dir
+.docker/build_*.log
+.docker/smoke_*.log
+.docker/driver_*.out
+docker/
 **/.git
 **/__pycache__/
 **/*.pyc
