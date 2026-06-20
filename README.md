@@ -35,4 +35,15 @@ ros2 launch stack_master headtohead.launch.xml sim:=true map:=f   # full autonom
 #   low_level.launch.xml = vehicle + sensors only
 ```
 
-Per-platform build/smoke status: **[BUILD.md](BUILD.md)**.
+## Verified platforms
+
+RoboStack (conda) makes the build OS- and arch-agnostic. Verified working:
+
+| Platform | Hardware | Status |
+|---|---|---|
+| Ubuntu **x86_64** | NUC, desktop | ✅ verified |
+| Ubuntu **arm64** | Jetson (Orin) | ✅ verified |
+| macOS **arm64** | Mac mini, MacBook (Apple silicon) | ✅ verified |
+| **Windows** (conda) | — | ⬜ not yet tested — should work via conda |
+
+Per-platform build/smoke detail: **[BUILD.md](BUILD.md)**.
