@@ -23,7 +23,7 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
 
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
@@ -191,8 +191,13 @@ class OpponentController(Node):
 
         self.drive_pub = self.create_publisher(
             AckermannDriveStamped, self.get_parameter('opp_drive_topic').value, 10)
-        # so selecting FTG can auto-enable the opponent lidar it depends on
-        self.opp_lidar_pub = self.create_publisher(Bool, '/sim/opp_lidar_enable', 10)
+        # so selecting FTG can auto-enable the opponent lidar it depends on.
+        # Latched (transient_local) so the enable survives a discovery race or an
+        # opponent_vehicle restart, and so launching directly with mode:=ftg works.
+        _latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.opp_lidar_pub = self.create_publisher(Bool, '/sim/opp_lidar_enable', _latched)
+        if self.mode == 'ftg':
+            self.opp_lidar_pub.publish(Bool(data=True))
 
         self.timer = self.create_timer(0.025, self._loop)   # 40 Hz
         self.get_logger().info(

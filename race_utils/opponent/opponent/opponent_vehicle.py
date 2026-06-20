@@ -24,7 +24,7 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
 
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
@@ -143,7 +143,10 @@ class OpponentVehicle(Node):
         self.create_subscription(Odometry,
                                  self.get_parameter('ego_odom_topic').value, self._ego_cb, 10)
         # opp self-lidar enable (default OFF; FTG / panel turns it on)
-        self.create_subscription(Bool, '/sim/opp_lidar_enable', self._lidar_cb, 10)
+        # latched to match the controller's transient_local enable (so a late
+        # spawn / restart still picks up "FTG -> lidar on")
+        self.create_subscription(Bool, '/sim/opp_lidar_enable', self._lidar_cb,
+                                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         # opponent as f110_msgs/Obstacle -> overlay (scan_augmentor) AND concat (obstacle_merger)
         self.obs_pub = self.create_publisher(
