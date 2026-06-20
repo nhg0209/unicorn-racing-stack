@@ -1,0 +1,53 @@
+# Manage the RoboStack/conda (INSTALL.md Path A) build + sim from one place.
+#
+#   cd <repo root>   # the dir that holds .docker/ (src/unicorn-racing-stack)
+#
+#   # build the stack in a clean container (the build IS the build test):
+#   docker compose -f .docker/docker-compose.yml build buildtest
+#   # smoke test (low_level + headtohead, headless):
+#   docker compose -f .docker/docker-compose.yml run --rm smoke
+#   # interactive sim (needs X11 from the host: `xhost +local:` first):
+#   docker compose -f .docker/docker-compose.yml run --rm sim
+#
+#   # other platforms (override BASE + IMAGE):
+#   BASE=ubuntu:22.04 IMAGE=urs:22.04 docker compose -f .docker/docker-compose.yml build buildtest
+#   # arm64 on an x86 host (after: docker run --privileged --rm tonistiigi/binfmt --install arm64):
+#   BASE=ubuntu:24.04 IMAGE=urs:24.04-arm docker compose -f .docker/docker-compose.yml build buildtest   # add platform below
+name: unicorn-racing-stack
+
+services:
+  # Build test: building this image runs miniforge -> conda env -> range_libc
+  # -> quadprog -> colcon build. A successful build == the stack builds.
+  buildtest:
+    image: ${IMAGE:-urs:24.04}
+    build:
+      context: ..
+      dockerfile: .docker/Dockerfile
+      args:
+        BASE: ${BASE:-ubuntu:24.04}
+      # for arm64 on an x86 host, uncomment (and set up qemu binfmt):
+      # platforms: ["linux/arm64"]
+    command: ["true"]
+
+  # Smoke test: bring up low_level + headtohead headless and check core topics.
+  smoke:
+    image: ${IMAGE:-urs:24.04}
+    command: ["bash", "/ws/src/unicorn-racing-stack/.docker/smoke_test.sh"]
+
+  # Interactive sim. RViz/pygame render to the host X server:
+  #   xhost +local:    # on the host, once
+  sim:
+    image: ${IMAGE:-urs:24.04}
+    network_mode: host
+    environment:
+      DISPLAY: ${DISPLAY:-:0}
+      RAYCASTER_DIR: /ws/src/unicorn-racing-stack/race_utils/raycaster
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    command:
+      - bash
+      - -lc
+      - ". /opt/conda/etc/profile.d/conda.sh && conda activate unicorn &&
+         source /ws/install/setup.bash &&
+         ros2 launch stack_master headtohead.launch.xml map:=f sim:=true"

@@ -1,12 +1,17 @@
 # Build-test image for unicorn-racing-stack (RoboStack / conda, ROS 2 Jazzy).
-# The image build IS the build test: miniforge -> conda env (environment.yml)
-# -> range_libc -> colcon build. If it builds, the stack builds on this base.
+# The image build IS the build test: Miniforge -> conda env (environment.yml)
+# -> range_libc -> quadprog -> colcon build. If it builds, the stack builds on
+# this base. This mirrors INSTALL.md Path A exactly.
 #
-#   docker build -f docker/Dockerfile --build-arg BASE=ubuntu:24.04 -t urs:24.04 .
-#   docker run --rm urs:24.04 bash /ws/src/unicorn-racing-stack/docker/smoke_test.sh
+#   # via docker compose (preferred):
+#   BASE=ubuntu:24.04 IMAGE=urs:24.04 docker compose -f .docker/docker-compose.yml build buildtest
+#   IMAGE=urs:24.04 docker compose -f .docker/docker-compose.yml run --rm smoke
 #
-# Works for x86_64 and aarch64 (miniforge URL is arch-aware); on an x86 host the
-# aarch64 base needs `docker run --platform linux/arm64` + qemu binfmt.
+#   # or directly:
+#   docker build -f .docker/Dockerfile --build-arg BASE=ubuntu:24.04 -t urs:24.04 .
+#
+# x86_64 and aarch64 (Miniforge URL is arch-aware); aarch64 on an x86 host needs
+# `--platform linux/arm64` + qemu binfmt (docker run --privileged --rm tonistiigi/binfmt --install arm64).
 ARG BASE=ubuntu:24.04
 FROM ${BASE}
 
@@ -38,15 +43,15 @@ RUN conda env create -f environment.yml
 RUN . /opt/conda/etc/profile.d/conda.sh && conda activate unicorn && \
     pip install --no-build-isolation -e ./race_utils/raycaster/range_libc/pywrapper
 
-# 2b) quadprog: trajectory_planning_helpers pins quadprog==0.1.7, whose PyPI wheel
-#     links the wrong libgfortran in a fresh env (import fails with
-#     `undefined symbol: ...qpgen2_...` and crashes the state machine). Replace it
-#     with the conda-forge build (correct linkage; API-compatible at runtime).
+# 2b) quadprog (INSTALL.md A1c): trajectory_planning_helpers pins quadprog==0.1.7,
+#     whose PyPI wheel links the wrong libgfortran in a fresh env (import fails
+#     with `undefined symbol: ...qpgen2_...` -> crashes the state machine).
+#     Replace it with the conda-forge build (correct linkage; API-compatible).
 RUN . /opt/conda/etc/profile.d/conda.sh && conda activate unicorn && \
     pip uninstall -y quadprog && conda install -y -c conda-forge quadprog=0.1.13
 
-# 3) colcon build (the actual build test). Fails the image build on error so the
-#    docker build exit code reflects build success/failure; the log is tee'd.
+# 3) colcon build (the actual build test). pipefail makes the image build fail on
+#    a colcon error; the log is tee'd to /ws/colcon_build.log.
 WORKDIR /ws
 RUN . /opt/conda/etc/profile.d/conda.sh && conda activate unicorn && \
     export ROS_VERSION="${ROS_VERSION:-2}" ROS_DISTRO="${ROS_DISTRO:-jazzy}" && \
@@ -54,4 +59,4 @@ RUN . /opt/conda/etc/profile.d/conda.sh && conda activate unicorn && \
     colcon build --symlink-install --base-paths src/unicorn-racing-stack \
         --cmake-args -DCMAKE_BUILD_TYPE=Release 2>&1 | tee /ws/colcon_build.log
 
-CMD ["bash", "/ws/src/unicorn-racing-stack/docker/smoke_test.sh"]
+CMD ["bash", "/ws/src/unicorn-racing-stack/.docker/smoke_test.sh"]

@@ -11,16 +11,16 @@ LABEL="${2:?usage: BASE LABEL [PLATFORM]}"
 PLATFORM="${3:-}"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-RESULTS="$REPO/docker/results.txt"
+RESULTS="$REPO/.docker/results.txt"
 TAG="urs-test:${LABEL}"
-BLOG="$REPO/docker/build_${LABEL}.log"
-SLOG="$REPO/docker/smoke_${LABEL}.log"
+BLOG="$REPO/.docker/build_${LABEL}.log"
+SLOG="$REPO/.docker/smoke_${LABEL}.log"
 
 plat=()
 [ -n "$PLATFORM" ] && plat=(--platform "$PLATFORM")
 
 echo "=== [$LABEL] docker build (BASE=$BASE ${PLATFORM:+PLATFORM=$PLATFORM}) ==="
-if docker build "${plat[@]}" -f "$REPO/docker/Dockerfile" \
+if docker build "${plat[@]}" -f "$REPO/.docker/Dockerfile" \
         --build-arg BASE="$BASE" -t "$TAG" "$REPO" > "$BLOG" 2>&1; then
   build="BUILD_OK"
 else

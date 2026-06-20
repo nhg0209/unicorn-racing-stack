@@ -11,25 +11,27 @@ setup* from a clean OS:
 5. **smoke**: `ros2 launch stack_master low_level.launch.xml map:=f sim:=true`
    and `headtohead.launch.xml map:=f sim:=true` come up headless (core topics/nodes alive)
 
-Steps 1–5 are exactly what `docker/Dockerfile` + `docker/smoke_test.sh` run, so a
-green Docker row == the INSTALL.md flow works from scratch on that base.
+Steps 1–5 are exactly what `.docker/Dockerfile` + `.docker/smoke_test.sh` run, so a
+green Docker row == the INSTALL.md flow works from scratch on that base. The same
+flow backs the `.devcontainer/` (dev) — see `.docker/README.md`.
 
 ## How to run a platform test
 
 ```bash
 # x86 (native on an x86 host):
-docker/run_platform_test.sh ubuntu:24.04 24.04-x86
-docker/run_platform_test.sh ubuntu:22.04 22.04-x86
+.docker/run_platform_test.sh ubuntu:24.04 24.04-x86
+.docker/run_platform_test.sh ubuntu:22.04 22.04-x86
 
 # arm64 (needs qemu binfmt on an x86 host, or run on real arm hardware):
 docker run --privileged --rm tonistiigi/binfmt --install arm64   # one-time, x86 host
-docker/run_platform_test.sh ubuntu:24.04 24.04-arm linux/arm64
+.docker/run_platform_test.sh ubuntu:24.04 24.04-arm linux/arm64
 
-# bare metal (Mac / Orin / etc.) — follow INSTALL.md Path A directly, then:
-bash docker/smoke_test.sh   # (after adapting paths: it expects /ws layout)
+# or via docker compose (see .docker/README.md):
+docker compose -f .docker/docker-compose.yml build buildtest
+docker compose -f .docker/docker-compose.yml run --rm smoke
 ```
-Results append to `docker/results.txt`; per-run logs are `docker/build_<label>.log`
-and `docker/smoke_<label>.log`.
+Results append to `.docker/results.txt`; per-run logs are `.docker/build_<label>.log`
+and `.docker/smoke_<label>.log`.
 
 ## Target platforms
 
@@ -38,8 +40,8 @@ and `docker/smoke_<label>.log`.
 | Ubuntu 24.04 (host)   | x86  | native (ros_env)      | ✅    | ✅ 27-lap run           | dev machine; SIM_VERIFICATION_REPORT.md |
 | Ubuntu 24.04          | x86  | docker `ubuntu:24.04` | ✅ 42 pkgs | ✅ low_level + h2h     | NUC, 24.04 x86 laptop (2026-06-20) |
 | Ubuntu 22.04          | x86  | docker `ubuntu:22.04` | ✅ 42 pkgs | ✅ low_level + h2h     | 22.04 x86 laptop (2026-06-20) |
-| Ubuntu 24.04 (Orin)   | arm  | hardware / qemu       | ⬜    | ⬜                      | qemu full build impractical; run on the Orin |
-| Ubuntu 24.04          | arm  | hardware / qemu       | ⬜    | ⬜                      | arm laptop |
+| Ubuntu 24.04 (Orin)   | arm  | hardware / qemu       | ⬜    | ⬜                      | run on the Orin; qemu cross-build also works (slow) |
+| Ubuntu 24.04          | arm  | docker `--platform linux/arm64` (qemu) | ⏳ | ⏳        | cross-built on x86 host via qemu binfmt (slow, in progress) |
 | Ubuntu 22.04          | arm  | hardware / qemu       | ⬜    | ⬜                      | arm laptop |
 | macOS (MacBook M4)    | arm  | native (INSTALL.md A) | ⬜    | ⬜                      | **owner fills in** |
 | macOS (Mac mini M4)   | arm  | native (INSTALL.md A) | ⬜    | ⬜                      | **owner fills in** |
@@ -57,13 +59,15 @@ Legend: ✅ pass · ❌ fail · ⏳ in progress · ⬜ not yet run.
 
 ### Notes on coverage
 - **x86 24.04 / 22.04**: fully testable now in Docker on this host.
-- **arm Linux (Orin / arm laptop)**: the RoboStack conda env + colcon build under
-  qemu emulation on an x86 host takes hours and is unreliable; run the same
-  `docker/run_platform_test.sh ... linux/arm64` on real arm hardware (or follow
-  INSTALL.md Path A on the device). `environment.yml` is written for aarch64
-  (vendored `sensor/transport_drivers`, conda `asio` pin) so it is expected to work.
+- **arm Linux (Orin / arm laptop)**: cross-buildable on an x86 host via qemu
+  binfmt (`tonistiigi/binfmt --install arm64` then
+  `.docker/run_platform_test.sh ubuntu:24.04 24.04-arm linux/arm64`) — it works but
+  the emulated colcon build is *slow* (≈10–20× native). For routine use run the
+  same command on real arm hardware (Orin / Apple silicon via Linux VM) or follow
+  INSTALL.md Path A on the device. `environment.yml` resolves for aarch64 (vendored
+  `sensor/transport_drivers`, conda `asio` pin), so it is expected to build there.
 - **macOS**: conda/RoboStack path is supported by INSTALL.md; owner verifies on
   the M4 machines and fills the two rows.
 
 ## Results log
-See `docker/results.txt` (machine-appended, one line per run).
+See `.docker/results.txt` (machine-appended, one line per run).
