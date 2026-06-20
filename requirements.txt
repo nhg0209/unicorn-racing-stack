@@ -7,12 +7,9 @@
 #     pip install -r requirements.txt
 #
 # Then install the gym core editable (it carries a COLCON_IGNORE, so colcon
-# does not build it):
-#     pip install -e simulator/f1tenth_gym      # provides f110_gym
-#
-# NOTE: in the captured env f110_gym was installed editable from an *external*
-# tree (creating_autonomous_car_ws/.../f1tenth_gym/gym), not this repo's
-# simulator/f1tenth_gym. Use this repo's copy for a self-contained setup.
+# does not build it). It now lives in the `unicorn_gym` submodule:
+#     pip install -e race_utils/unicorn_gym/f1tenth_gym      # provides f110_gym
+# (environment.yml's pip section already does this for Path A.)
 
 # numba >=0.65 supports numpy 2.x (RoboStack ships numpy 2.4). The old 0.60 pin
 # hard-rejects numpy>=2.1 at import, which forced the gym onto the pure-Python

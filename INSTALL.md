@@ -13,7 +13,7 @@ git clone --recursive https://github.com/hmcl-unist/unicorn-racing-stack.git
 
 <details><summary>already cloned without <code>--recursive</code>? / workspace layout</summary>
 
-`race_utils/raycaster` is a submodule — populate it with:
+`race_utils/raycaster` and `race_utils/unicorn_gym` are submodules — populate them with:
 ```bash
 cd unicorn-racing-stack && git submodule update --init --recursive
 ```
@@ -119,7 +119,7 @@ rosdep install --from-paths src/unicorn-racing-stack --ignore-src -r -y
 
 # B3  python layer (same requirements.txt as Path A)
 pip install --user -r src/unicorn-racing-stack/requirements.txt
-pip install --user -e src/unicorn-racing-stack/simulator/f1tenth_gym
+pip install --user -e src/unicorn-racing-stack/race_utils/unicorn_gym/f1tenth_gym
 
 # B4  build
 colcon build --symlink-install --base-paths src/unicorn-racing-stack --cmake-args -DCMAKE_BUILD_TYPE=Release
@@ -151,7 +151,7 @@ conda install -c conda-forge -c robostack-jazzy -y \
   ros-jazzy-joint-state-publisher transforms3d opencv matplotlib-base
 
 pip install -r requirements.txt
-pip install -e simulator/f1tenth_gym
+pip install -e race_utils/unicorn_gym/f1tenth_gym
 conda install -c conda-forge -y "setuptools<80" "asio=1.29.0"   # see pin notes above
 ```
 </details>

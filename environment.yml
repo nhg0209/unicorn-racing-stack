@@ -80,7 +80,7 @@ dependencies:
   #     (incl. the setuptools<80 pin), THEN runs this pip section. ---
   - pip:
       - -r requirements.txt          # numba / gymnasium / casadi / scipy / …
-      - -e ./simulator/f1tenth_gym   # editable gym core → f110_gym (pure python, builds clean)
+      - -e ./race_utils/unicorn_gym/f1tenth_gym   # editable gym core → f110_gym (pure python, builds clean)
 
   # --- range_libc is installed as a separate step (one line) ---
   # The binding is now header-only pybind11 (no Cython, no numpy at build), so the

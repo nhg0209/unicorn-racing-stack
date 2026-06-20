@@ -89,7 +89,7 @@ python -m pip install --upgrade \
   numba gymnasium casadi scikit-learn scikit-image shapely trajectory_planning_helpers
 
 # the simulator gym core is a pip package (COLCON_IGNORE'd), install editable
-python -m pip install -e "$REPO/simulator/f1tenth_gym"
+python -m pip install -e "$REPO/race_utils/unicorn_gym/f1tenth_gym"
 
 # --- 8. summary --------------------------------------------------------------
 echo
