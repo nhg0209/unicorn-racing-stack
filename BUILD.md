@@ -41,12 +41,19 @@ and `.docker/smoke_<label>.log`.
 | Ubuntu 24.04          | x86  | docker `ubuntu:24.04` | ✅ 42 pkgs | ✅ low_level + h2h     | NUC, 24.04 x86 laptop (2026-06-20) |
 | Ubuntu 22.04          | x86  | docker `ubuntu:22.04` | ✅ 42 pkgs | ✅ low_level + h2h     | 22.04 x86 laptop (2026-06-20) |
 | Ubuntu 24.04 (Orin)   | arm  | hardware / qemu       | ⬜    | ⬜                      | run on the Orin; qemu cross-build also works (slow) |
-| Ubuntu 24.04          | arm  | docker `--platform linux/arm64` (qemu) | ⏳ | ⏳        | cross-built on x86 host via qemu binfmt (slow, in progress) |
+| Ubuntu 24.04          | arm  | docker `--platform linux/arm64` (qemu) | ✅ 42 pkgs | ⚠️ n/a  | cross-built on x86 host via qemu binfmt (2026-06-20). Smoke inconclusive under emulation — sim too slow (`scan_hz=0`); verify on real arm hw |
 | Ubuntu 22.04          | arm  | hardware / qemu       | ⬜    | ⬜                      | arm laptop |
 | macOS (MacBook M4)    | arm  | native (INSTALL.md A) | ⬜    | ⬜                      | **owner fills in** |
 | macOS (Mac mini M4)   | arm  | native (INSTALL.md A) | ⬜    | ⬜                      | **owner fills in** |
 
-Legend: ✅ pass · ❌ fail · ⏳ in progress · ⬜ not yet run.
+Legend: ✅ pass · ❌ fail · ⚠️ inconclusive · ⏳ in progress · ⬜ not yet run.
+
+> **arm64 cross-build (qemu):** the full RoboStack env + `colcon build` (all 42
+> packages, 0 failures) completes under `--platform linux/arm64` on an x86 host —
+> so the stack *builds* for aarch64. The sim **smoke** is not meaningful there: the
+> emulated f1tenth_gym is ~10–20× too slow, so `scan_hz`/`odom_hz` read 0 within
+> the sampling window and dependent nodes time out. Run the smoke on real arm
+> hardware (Orin / Apple-silicon Linux) for a true verdict.
 
 ### Fixes that the platform test surfaced (now in the repo)
 - `ROS_VERSION` empty under `/bin/sh` (RoboStack activate.d are bash) → broke
