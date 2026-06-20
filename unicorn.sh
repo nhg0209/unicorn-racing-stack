@@ -16,6 +16,11 @@ _URS_WS="$(cd "$_URS_REPO/../.." && pwd)"
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate unicorn
 
+# Never let ~/.local user-site packages shadow the conda env. Stale ~/.local
+# copies (numba, rosidl_generator_c, ...) silently override the env on some
+# machines and break the build/run — same class of bug on every platform.
+export PYTHONNOUSERSITE=1
+
 # --- 2) middleware + ROS domain ---
 # CycloneDDS is far lighter than the default FastDDS on this many-node single-host
 # graph: FastDDS busy-spins a whole core (~22 Hz sim), CycloneDDS idles at ~21%
