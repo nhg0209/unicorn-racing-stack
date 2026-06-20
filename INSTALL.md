@@ -30,19 +30,28 @@ repo lives at `~/unicorn_ws/src/unicorn-racing-stack`. Build from the workspace 
 curl -L -O "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
 bash "Miniforge3-$(uname)-$(uname -m).sh" && exec $SHELL
 
-# A1  env: ROS 2 Jazzy + pins + pip + gym, all from environment.yml
+# A1  conda env: ROS 2 Jazzy + build tooling + pinned libs (the conda layer)
 cd ~/unicorn_ws/src/unicorn-racing-stack
-conda env create -f environment.yml && conda activate unicorn
+conda env create -f environment.yml
 
-# A2  range_libc (raycaster / localization backends)
-pip install --no-build-isolation -e ./race_utils/raycaster/range_libc/pywrapper
+# A2  ENTER the env via unicorn.sh — THIS is how you enter it, now and in every new
+#     shell. It activates the env AND sets PYTHONNOUSERSITE=1 (so ~/.local can't
+#     shadow it — a real install footgun) + CycloneDDS + workspace + cbuild/ros2kill.
+echo "alias unicorn='source $(pwd)/unicorn.sh'" >> ~/.bashrc   # 'unicorn' in every new shell
+source unicorn.sh                                              # enter it NOW (this shell)
 
-# A3  quadprog (required by the state machine — swap the broken PyPI wheel)
+# A3  python (pip) layer — run UNDER unicorn (so ~/.local is ignored), from the repo
+#     root (the -e paths are relative to it)
+pip install -r requirements.txt
+pip install -e ./race_utils/unicorn_gym/f1tenth_gym                              # gym core -> f110_gym
+pip install --no-build-isolation -e ./race_utils/raycaster/range_libc/pywrapper  # range_libc
+
+# A4  quadprog — swap the broken PyPI wheel. MUST be AFTER A3 (trajectory_planning_
+#     helpers re-pulls quadprog==0.1.7, whose wheel crashes the state machine at import).
 pip uninstall -y quadprog && conda install -y -c conda-forge quadprog=0.1.13
 
-# A4  build
-cd ~/unicorn_ws
-colcon build --symlink-install --base-paths src/unicorn-racing-stack --cmake-args -DCMAKE_BUILD_TYPE=Release
+# A5  build  (cbuild = colcon build Release + re-source, provided by unicorn.sh)
+cbuild
 ```
 
 <details><summary>Why each step / which pins (read only if something breaks)</summary>
@@ -50,49 +59,63 @@ colcon build --symlink-install --base-paths src/unicorn-racing-stack --cmake-arg
 - **A0 — Miniforge, not Anaconda:** minimal conda installer that defaults to the
   `conda-forge` channel (exactly what RoboStack needs), no bundle bloat or
   commercial-license terms. `$(uname)-$(uname -m)` picks the Linux/macOS + arch build.
-- **A1 — `conda activate unicorn` is the only "source ROS" you need.** RoboStack's
-  activation hooks set up the ROS environment. Do **not** also `source /opt/ros/...`
-  — mixing system ROS with RoboStack breaks the build.
-- **A2 — range_libc** is a header-only **pybind11** binding; `--no-build-isolation`
-  compiles it entirely from the conda toolchain (no PyPI fetch). Only needed for
-  `particle_filter` localization and the `rm`/`cddt`/`glt` raycaster backends
-  (default `lut` runs without it).
-- **A3 — quadprog:** `trajectory_planning_helpers` pins `quadprog==0.1.7`, whose
-  PyPI wheel links the wrong `libgfortran` in a fresh conda env and crashes the
-  state machine at import (`undefined symbol: ...qpgen2_...`). The conda-forge
-  build has correct linkage and is API-compatible.
-- **A4 — `--base-paths`** scopes the build to THIS repo, so anything else in `src/`
-  is ignored automatically (no `COLCON_IGNORE` needed on siblings).
+- **A1 — conda layer only.** `environment.yml` installs ONLY conda packages (ROS 2
+  Jazzy + toolchain + pinned libs). The pip layer is deliberately split into A3 so it
+  runs *after* `unicorn.sh` sets `PYTHONNOUSERSITE=1`. (RoboStack's activation is the
+  only "source ROS" you need — do **not** also `source /opt/ros/...`.)
+- **A2 — always enter with `unicorn`, not bare `conda activate`.** `unicorn.sh` sets
+  `PYTHONNOUSERSITE=1`, which is what stops a stale `~/.local/lib/python*` from
+  shadowing the env. If A3 ran without it, pip would see `~/.local` copies as
+  "already satisfied", skip installing them into the env, and the nodes would then
+  fail to import them at runtime (`No module named gymnasium` / `…helpers`). It also
+  selects CycloneDDS and sources the workspace + helpers — see the toggle below.
+- **A3 — pip layer under unicorn.** `requirements.txt` (numba/gymnasium/casadi/scipy/
+  tph), the editable gym core (`f110_gym`), and `range_libc` (header-only **pybind11**
+  binding; `--no-build-isolation` builds it from the conda toolchain, no PyPI fetch —
+  only needed for `particle_filter` + the `rm`/`cddt`/`glt` raycaster backends; default
+  `lut` runs without it). Run from the repo root so the `-e` paths resolve.
+- **A4 — quadprog, LAST.** `trajectory_planning_helpers` pins `quadprog==0.1.7`, whose
+  PyPI wheel links the wrong `libgfortran` and crashes the state machine at import
+  (`undefined symbol: ...qpgen2_...`). The conda-forge build is correct and
+  API-compatible. It must come after A3 because A3 re-pulls the broken wheel.
+- **A5 — `cbuild`** runs `colcon build --symlink-install --base-paths
+  src/unicorn-racing-stack` (Release) from the workspace root and re-sources.
+  `--base-paths` scopes the build to THIS repo (no `COLCON_IGNORE` on siblings).
 - **`environment.yml` pins — do not loosen:** `setuptools<80` (colcon
   `--symlink-install` needs `setup.py develop`), `asio=1.29.0` (transport_drivers
-  use `asio::io_service`, removed in asio ≥1.30), `numba>=0.65` (accepts numpy 2.x
-  so the gym dynamics actually JIT).
+  use `asio::io_service`, removed in asio ≥1.30), `numba>=0.65` (in requirements.txt;
+  accepts numpy 2.x so the gym dynamics actually JIT).
 </details>
 
-## Enter the environment (alias)
+## Entering the env (every new shell)
+
+The `unicorn` alias was set in **A2**. From any new terminal, one word enters everything:
 
 ```bash
-cd ~/unicorn_ws/src/unicorn-racing-stack
-echo "alias unicorn='source $(pwd)/unicorn.sh'" >> ~/.bashrc && exec bash
-unicorn            # conda env + CycloneDDS + workspace, all sourced
+unicorn            # conda env + PYTHONNOUSERSITE=1 + CycloneDDS + workspace, all sourced
 cbuild [pkgs...]   # colcon build (Release) + re-source; no args = whole workspace
 ros2kill           # kill every ROS 2 node / launcher / daemon
 ```
 
-<details><summary>What <code>unicorn.sh</code> sets (and why CycloneDDS matters)</summary>
+<details><summary>What <code>unicorn.sh</code> sets — and why you always enter with it</summary>
 
-It must be **sourced**: `RMW_IMPLEMENTATION` has to be set *after* `conda activate`
-(which clears it). The default FastDDS busy-spins a core on this many-node graph
-(~22 Hz sim); **CycloneDDS** idles at ~21% CPU and hits the full ~80 Hz. On the car
-(network `192.168.60.x`) it also loads the repo's `cyclonedds.xml`; on a laptop it
-stays on CycloneDDS defaults. Adjust `ROS_DOMAIN_ID` (default `1`).
+Always enter with `unicorn` (which **sources** `unicorn.sh`), never a bare
+`conda activate`. It:
+- sets **`PYTHONNOUSERSITE=1`** so a stale `~/.local/lib/python*` can't shadow the
+  env — at install time (A3) *and* at run time;
+- selects **CycloneDDS** — `RMW_IMPLEMENTATION` must be set *after* `conda activate`
+  (which clears it). The default FastDDS busy-spins a core on this many-node graph
+  (~22 Hz sim); CycloneDDS idles at ~21% CPU and hits the full ~80 Hz. On the car
+  (`192.168.60.x`) it loads the repo's `cyclonedds.xml`; on a laptop it stays on
+  CycloneDDS defaults. Adjust `ROS_DOMAIN_ID` (default `1`);
+- **resets the ROS env to a clean baseline** so a system ROS / other workspace
+  `source`d in `~/.bashrc` (any distro/path) can't shadow the conda env (e.g.
+  `rosidl_generator_c: generate_c() takes 1 positional argument but 2 were given`).
+  Do **not** globally `source /opt/ros/<distro>/setup.bash` in `~/.bashrc`;
+- sources the colcon workspace and defines `cbuild` / `ros2kill`.
 
-It also **resets the ROS environment to a clean baseline** on entry — so a system
-ROS or another workspace `source`d in your `~/.bashrc` (any distro/path) can't
-shadow the conda env (a classic cross-platform footgun, e.g. `rosidl_generator_c`:
-`generate_c() takes 1 positional argument but 2 were given`). Do **not** globally
-`source /opt/ros/<distro>/setup.bash` in `~/.bashrc`. For a fully isolated env
-immune to any host `~/.bashrc`, use the container (`.devcontainer` / `.docker`).
+For a fully isolated env immune to any host `~/.bashrc`, use the container
+(`.devcontainer` / `.docker`).
 </details>
 
 ## Run

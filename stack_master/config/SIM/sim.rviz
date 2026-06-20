@@ -6,10 +6,9 @@ Panels:
       Expanded:
         - /Global Options1
         - /Status1
-        - /Ego Robot1
         - /Ego Robot1/Ego Scan1
       Splitter Ratio: 0.5
-    Tree Height: 733
+    Tree Height: 325
   - Class: rviz_common/Selection
     Name: Selection
   - Class: rviz_common/Tool Properties
@@ -125,9 +124,9 @@ Visualization Manager:
           Enabled: true
           Invert Rainbow: false
           Max Color: 255; 255; 255
-          Max Intensity: 2.3889546394348145
+          Max Intensity: 9.940729141235352
           Min Color: 0; 0; 0
-          Min Intensity: 0.21612448990345
+          Min Intensity: 1.1506836414337158
           Name: Ego Scan
           Position Transformer: XYZ
           Selectable: true
@@ -303,6 +302,44 @@ Visualization Manager:
             Expand Link Details: false
             Expand Tree: false
             Link Tree Style: Links in Alphabetic Order
+            opp_racecar/back_left_wheel:
+              Alpha: 1
+              Show Axes: false
+              Show Trail: false
+              Value: true
+            opp_racecar/back_right_wheel:
+              Alpha: 1
+              Show Axes: false
+              Show Trail: false
+              Value: true
+            opp_racecar/base_link:
+              Alpha: 1
+              Show Axes: false
+              Show Trail: false
+              Value: true
+            opp_racecar/front_left_hinge:
+              Alpha: 1
+              Show Axes: false
+              Show Trail: false
+            opp_racecar/front_left_wheel:
+              Alpha: 1
+              Show Axes: false
+              Show Trail: false
+              Value: true
+            opp_racecar/front_right_hinge:
+              Alpha: 1
+              Show Axes: false
+              Show Trail: false
+            opp_racecar/front_right_wheel:
+              Alpha: 1
+              Show Axes: false
+              Show Trail: false
+              Value: true
+            opp_racecar/laser:
+              Alpha: 1
+              Show Axes: false
+              Show Trail: false
+              Value: true
           Mass Properties:
             Inertia: false
             Mass: false
@@ -338,13 +375,49 @@ Visualization Manager:
       Enabled: true
       Name: MarkerArray
       Namespaces:
-        {}
+        centerline_waypoints: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /centerline_waypoints/markers
+      Value: true
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Marker
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /emergency_marker
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: MarkerArray
+      Namespaces:
+        "": true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /local_waypoints/markers
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Virtual objects (opp + static)
+      Namespaces: {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /vil/opponents_viz
       Value: true
   Enabled: true
   Global Options:
@@ -391,7 +464,7 @@ Visualization Manager:
   Value: true
   Views:
     Current:
-      Angle: 0
+      Angle: -0.004999998956918716
       Class: rviz_default_plugins/TopDownOrtho
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
@@ -401,25 +474,27 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Scale: 171.0658721923828
+      Scale: 27.760713577270508
       Target Frame: <Fixed Frame>
       Value: TopDownOrtho (rviz_default_plugins)
-      X: 1.6461740732192993
-      Y: 2.963949203491211
+      X: 9.690852165222168
+      Y: 5.7019171714782715
     Saved: ~
 Window Geometry:
   Displays:
     collapsed: false
-  Height: 1016
+  Height: 1043
   Hide Left Dock: false
   Hide Right Dock: false
-  QMainWindow State: 000000ff00000000fd0000000400000000000001c5000003a2fc0200000008fb0000001200530065006c0065006300740069006f006e00000001e10000009b0000005c00fffffffb0000001e0054006f006f006c002000500072006f007000650072007400690065007302000001ed000001df00000185000000a3fb000000120056006900650077007300200054006f006f02000001df000002110000018500000122fb000000200054006f006f006c002000500072006f0070006500720074006900650073003203000002880000011d000002210000017afb000000100044006900730070006c006100790073010000003b000003a2000000c700fffffffb0000002000730065006c0065006300740069006f006e00200062007500660066006500720200000138000000aa0000023a00000294fb00000014005700690064006500530074006500720065006f02000000e6000000d2000003ee0000030bfb0000000c004b0069006e0065006300740200000186000001060000030c000002610000000100000140000003a2fc0200000003fb0000001e0054006f006f006c002000500072006f00700065007200740069006500730100000041000000780000000000000000fb0000000a00560069006500770073010000003b000003a2000000a000fffffffb0000001200530065006c0065006300740069006f006e010000025a000000b200000000000000000000000200000490000000a9fc0100000001fb0000000a00560069006500770073030000004e00000080000002e10000019700000003000004420000003efc0100000002fb0000000800540069006d00650100000000000004420000000000000000fb0000000800540069006d0065010000000000000450000000000000000000000427000003a200000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd0000000400000000000001c5000003b9fc0200000009fb0000001200530065006c0065006300740069006f006e00000001e10000009b0000005c00fffffffb0000001e0054006f006f006c002000500072006f007000650072007400690065007302000001ed000001df00000185000000a3fb000000120056006900650077007300200054006f006f02000001df000002110000018500000122fb000000200054006f006f006c002000500072006f0070006500720074006900650073003203000002880000011d000002210000017afb000000100044006900730070006c006100790073010000003d0000020c000000c900fffffffb0000002000730065006c0065006300740069006f006e00200062007500660066006500720200000138000000aa0000023a00000294fb00000014005700690064006500530074006500720065006f02000000e6000000d2000003ee0000030bfb0000000c004b0069006e0065006300740200000186000001060000030c00000261fb0000001600530069006d00200043006f006e00740072006f006c010000024f000001a70000016400ffffff0000000100000140000003b9fc0200000003fb0000001e0054006f006f006c002000500072006f00700065007200740069006500730100000041000000780000000000000000fb0000000a00560069006500770073010000003d000003b9000000a400fffffffb0000001200530065006c0065006300740069006f006e010000025a000000b200000000000000000000000200000490000000a9fc0100000001fb0000000a00560069006500770073030000004e00000080000002e10000019700000003000004420000003efc0100000002fb0000000800540069006d00650100000000000004420000000000000000fb0000000800540069006d006501000000000000045000000000000000000000046f000003b900000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Selection:
+    collapsed: false
+  Sim Control:
     collapsed: false
   Tool Properties:
     collapsed: false
   Views:
     collapsed: false
-  Width: 1848
-  X: 1152
-  Y: 519
+  Width: 1920
+  X: 0
+  Y: 0

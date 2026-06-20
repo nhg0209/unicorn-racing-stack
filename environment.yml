@@ -3,14 +3,16 @@
 # Reproducible spec captured from a verified-working environment (Linux, 2026-06).
 # Versions are pinned (no build strings) so this also resolves on macOS.
 #
-# ONE command sets up the whole environment (conda deps + pip deps + editable
-# gym core), so run it from the repo root (src/unicorn-racing-stack):
+# This file installs the CONDA layer only (ROS 2 Jazzy + toolchain + pinned libs).
+# The pip layer (requirements.txt + editable gym core + range_libc) is a SEPARATE
+# step done AFTER you enter the env with `source unicorn.sh` — see INSTALL.md
+# (A1-A5). Running pip under unicorn.sh (which sets PYTHONNOUSERSITE=1) is what
+# keeps a stale ~/.local/lib/python* from shadowing the env during install (else
+# pip treats the ~/.local copies as "already satisfied" and skips the env).
 #
-#     conda env create -f environment.yml      # creates env `unicorn`, ALL deps
-#     conda activate unicorn
-#
-# The pip layer is pulled in via the `pip:` section at the bottom (which just
-# references requirements.txt), so you do NOT run pip separately.
+#     conda env create -f environment.yml   # conda layer -> env `unicorn`
+#     source unicorn.sh                      # enter env (sets PYTHONNOUSERSITE=1)
+#     pip install -r requirements.txt        # ...then the pip layer (INSTALL.md A3)
 
 name: unicorn
 
@@ -73,14 +75,12 @@ dependencies:
   # ros-jazzy-io-context binary which robostack does not ship everywhere.
   - asio=1.29.0
 
-  # --- PyPI-only deps + editable gym core, folded in so one `conda env create`
-  #     does everything. These paths are resolved relative to your shell's CWD,
-  #     so run `conda env create -f environment.yml` from the repo root
-  #     (src/unicorn-racing-stack). conda installs all conda deps above first
-  #     (incl. the setuptools<80 pin), THEN runs this pip section. ---
-  - pip:
-      - -r requirements.txt          # numba / gymnasium / casadi / scipy / …
-      - -e ./race_utils/unicorn_gym/f1tenth_gym   # editable gym core → f110_gym (pure python, builds clean)
+  # --- NO pip: section on purpose ---
+  # The pip layer (requirements.txt + editable gym core + range_libc) is installed
+  # as a SEPARATE step in INSTALL.md (A3), AFTER `source unicorn.sh`. That way pip
+  # runs with PYTHONNOUSERSITE=1 set (by unicorn.sh) and a stale ~/.local can't
+  # shadow the env. If it lived here, `conda env create` would run pip without that
+  # guard and silently skip packages it found under ~/.local.
 
   # --- range_libc is installed as a separate step (one line) ---
   # The binding is now header-only pybind11 (no Cython, no numpy at build), so the

@@ -10,8 +10,8 @@
     control      : pp_node                           (follows /local_waypoints -> /vesc/high_level/ackermann_cmd)
 
   The virtual opponent and its obstacle injection (/tracking/obstacles with
-  Frenet fields) come from base_system -> low_level -> opponent pkg
-  (scan_augmentor overlays the box on /scan; obstacle_merger publishes
+  Frenet fields) come from base_system -> low_level -> virtual_perception pkg
+  (scan_overlay overlays the box on /scan; tracking_merger publishes
   /tracking/obstacles). Spawn / drive the opponent from the RViz Sim Control
   panel (2D Goal Pose, then Path/FTG).
 
@@ -24,8 +24,13 @@
   <arg name="ot_planner" default="spliner" description="overtake planner the state machine listens to"/>
   <arg name="control_topic" default="/local_waypoints"
        description="WpntArray the controller follows: /local_waypoints (state-machine output w/ avoidance) or /global_waypoints (robust raceline)"/>
-  <arg name="perception_seam" default="object"
-       description="object: obstacle_merger injects the known virtual obstacles (ground truth). overlay: the REAL detect->track pipeline (transformed to map+Frenet) feeds /tracking/obstacles_raw and the virtual object-injection is disabled (the opponent is still overlaid on /scan)."/>
+  <!-- virtual_perception injection seam is chosen at RUNTIME from the Sim Control
+       panel (/vp/inject_mode: overlay | merge; default 'overlay'). In BOTH modes
+       tracking publishes /tracking/obstacles_raw and tracking_merger owns
+       /tracking/obstacles (passes the real tracking through, and adds the virtual
+       objects ONLY in 'merge' mode). So the REAL detect->track pipeline reaches the
+       state machine in 'overlay' (detection-in-the-loop), and ground-truth object
+       injection works in 'merge' — switchable live, no relaunch. -->
 
   <!-- ===== Base system: sensors/sim + opponent + raceline + frenet odom ===== -->
   <include file="$(find-pkg-share stack_master)/launch/base_system.launch.xml">
@@ -36,15 +41,9 @@
   <!-- ===== Perception: LiDAR obstacle detection + tracking ===== -->
   <node pkg="perception" exec="detect_node" name="detect_node" output="screen"/>
   <node pkg="perception" exec="tracking_node" name="tracking_node" output="screen">
-    <!-- object seam: viz-only /tracked_obstacles. overlay seam: feed the merger. -->
-    <param name="output_topic"
-           value="$(eval '\'/tracking/obstacles_raw\' if \'$(var perception_seam)\' == \'overlay\' else \'/tracked_obstacles\'')"/>
+    <!-- ALWAYS feed the merger; tracking_merger owns /tracking/obstacles. -->
+    <param name="output_topic" value="/tracking/obstacles_raw"/>
   </node>
-  <!-- overlay seam: disable only the object-level virtual injection (scan
-       overlay stays ON, so the REAL detector still sees the opponent). -->
-  <group if="$(eval '\'$(var perception_seam)\' == \'overlay\'')">
-    <executable cmd="ros2 topic pub /vil/merge_virtual std_msgs/msg/Bool '{data: false}' -r 2" output="log"/>
-  </group>
 
   <!-- ===== State machine: the racing brain ===== -->
   <node pkg="state_machine" exec="state_machine" name="state_machine" output="screen">

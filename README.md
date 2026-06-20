@@ -19,13 +19,18 @@ Full step-by-step: **[INSTALL.md](INSTALL.md)**. TL;DR:
 ```bash
 mkdir -p ~/unicorn_ws/src && cd ~/unicorn_ws/src
 git clone --recursive https://github.com/hmcl-unist/unicorn-racing-stack.git
-cd unicorn-racing-stack && conda env create -f environment.yml && conda activate unicorn
-pip install --no-build-isolation -e ./race_utils/raycaster/range_libc/pywrapper   # range_libc
-pip uninstall -y quadprog && conda install -y -c conda-forge quadprog=0.1.13       # quadprog
-cd ~/unicorn_ws && colcon build --symlink-install --base-paths src/unicorn-racing-stack
+cd unicorn-racing-stack
+conda env create -f environment.yml                       # conda layer (ROS 2 Jazzy)
+echo "alias unicorn='source $(pwd)/unicorn.sh'" >> ~/.bashrc && source unicorn.sh   # enter env
+pip install -r requirements.txt && pip install -e ./race_utils/unicorn_gym/f1tenth_gym
+pip install --no-build-isolation -e ./race_utils/raycaster/range_libc/pywrapper    # range_libc
+pip uninstall -y quadprog && conda install -y -c conda-forge quadprog=0.1.13        # quadprog (last)
+cbuild                                                     # build + re-source
 ```
 
-Add the `unicorn` alias ([INSTALL.md A3](INSTALL.md)) to enter the env in one word.
+**Enter the env with `unicorn` in every new shell** — sourcing `unicorn.sh` sets
+`PYTHONNOUSERSITE=1` (so `~/.local` can't shadow it), selects CycloneDDS, and sources
+the workspace. Details: **[INSTALL.md](INSTALL.md)**.
 
 ## Run the simulator
 
