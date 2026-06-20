@@ -4,17 +4,17 @@
 #include <vector>
 #include <string>
 
-// 생성자: 기본 커널 크기, 맵 파라미터 초기값 설정
+// constructor: set default kernel size and initial map parameters
 PolygonFilter::PolygonFilter() 
     : kernelSize(3, 3), resolution(1.0), origin(0, 0), debug(true) {
     kernel = cv::getStructuringElement(cv::MORPH_RECT, kernelSize);
 }
 
-// 소멸자
+// destructor
 PolygonFilter::~PolygonFilter() {
 }
 
-// YAML 파일에서 맵 정보를 로드하고, 이미지 파일 이름을 이용해 이미지를 불러옴
+// load map info from the YAML file and read the image using the image filename
 bool PolygonFilter::loadMapFromYAML(const std::string& yamlPath, const std::string& imagePath) {
     std::cout << "Try to open YAML file: " << yamlPath << std::endl;
     YAML::Node config = YAML::LoadFile(yamlPath);
@@ -32,7 +32,7 @@ bool PolygonFilter::loadMapFromYAML(const std::string& yamlPath, const std::stri
     std::cout << std::endl;
     std::cout << "resolution: " << resolution << std::endl;
 
-    // YAML 파일에 명시된 이미지 파일을 로드 (그레이스케일)
+    // load the image file specified in the YAML (grayscale)
     image = cv::imread(imagePath, cv::IMREAD_GRAYSCALE);
     if (image.empty()) {
         std::cerr << "Error: Could not load image: " << imagePath << std::endl;
@@ -40,22 +40,22 @@ bool PolygonFilter::loadMapFromYAML(const std::string& yamlPath, const std::stri
     }
     if(debug){
         cv::imshow("Loaded Image", image);
-        cv::waitKey(0);  // 사용자가 키를 누를 때까지 대기 (또는 원하는 시간(ms) 설정)
+        cv::waitKey(0);  // wait until a key is pressed (or set a desired time in ms)
     }
-    // 이미지 처리 (침식 및 컨투어 추출)
+    // image processing (erosion and contour extraction)
     updateContours();
 
     return true;
 }
 
-// 침식 커널 크기를 설정하고, 컨투어 재계산
+// set the erosion kernel size and recompute the contours
 void PolygonFilter::setErosionKernelSize(int pix) {
     kernelSize = cv::Size(pix, pix);
     kernel = cv::getStructuringElement(cv::MORPH_RECT, kernelSize);
     updateContours();
 }
 
-// 이미지에 침식 연산을 적용한 후 컨투어를 추출
+// apply erosion to the image, then extract contours
 void PolygonFilter::updateContours() {
     if (image.empty()) {
         std::cerr << "Error: Image not initialized." << std::endl;
@@ -84,31 +84,31 @@ void PolygonFilter::updateContours() {
     
 }
 
-// 픽셀 좌표를 글로벌 좌표로 변환
+// convert pixel coordinates to global coordinates
 cv::Point2d PolygonFilter::pixelToGlobal(const cv::Point& pixelPoint) {
     return cv::Point2d(origin.x + pixelPoint.x * resolution,
                        origin.y + pixelPoint.y * resolution);
 }
 
-// 글로벌 좌표를 픽셀 좌표로 변환한 후, 외부 컨투어 내부에 있는지 판단
+// convert global coordinates to pixel coordinates, then test if inside the external contour
 bool PolygonFilter::isPointInside(const cv::Point2d& globalPoint) {
     cv::Point pixelPoint(static_cast<int>((globalPoint.x - origin.x) / resolution),
                          static_cast<int>((globalPoint.y - origin.y) / resolution));
     for (const auto& contour : externalContours) {
         double result = cv::pointPolygonTest(contour, pixelPoint, false);
-        if (result >= 0) { // 내부 또는 경계 상에 존재하면
+        if (result >= 0) { // inside or on the boundary
             return true;
         }
     }
     return false;
 }
 
-// 컨투어를 시각화하여 결과 확인 (디버깅용)
+// visualize the contours to inspect the result (for debugging)
 void PolygonFilter::visualizeContours() {
     if (erodedImage.empty()) return;
     cv::Mat result;
     cv::cvtColor(erodedImage, result, cv::COLOR_GRAY2BGR);
-    // 외부 컨투어: 빨간색, 내부 컨투어: 파란색
+    // external contours: red, internal contours: blue
     cv::drawContours(result, externalContours, -1, cv::Scalar(0, 0, 255), 2);
     cv::drawContours(result, internalContours, -1, cv::Scalar(255, 0, 0), 2);
     cv::imshow("Contours (Red: External, Blue: Internal)", result);

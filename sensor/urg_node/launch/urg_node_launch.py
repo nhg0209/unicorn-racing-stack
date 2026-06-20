@@ -26,15 +26,15 @@ def generate_launch_description():
         )
         if os.path.exists(param_file):
             return [SetLaunchConfiguration('param', param_file)]
-        # 파일이 없으면 에러를 내고 싶다면 여기서 raise 해도 됨
+        # raise here if you want to error out when the file is missing
         return []
 
     launch_description.add_action(OpaqueFunction(function=expand_param_file_name))
 
     hokuyo_node = Node(
         package='urg_node',
-        executable='urg_node_driver',   # ✅ Jazzy에서는 executable 키가 필수
-        name='urg_node',                # (선택) 노드 이름
+        executable='urg_node_driver',   # the 'executable' key is required on Jazzy
+        name='urg_node',                # (optional) node name
         output='screen',
         parameters=[LaunchConfiguration('param')],
     )

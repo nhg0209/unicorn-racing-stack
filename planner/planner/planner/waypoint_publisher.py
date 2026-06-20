@@ -155,7 +155,7 @@ class WaypointPublisher(Node):
         x = np.array([float(r['x_m']) for r in data])
         y = np.array([float(r['y_m']) for r in data])
 
-        # TODO: s_m — 현재는 단순 누적 유클리드 거리, frenet frame 구현 시 교체
+        # TODO: s_m — currently simple cumulative Euclidean distance; replace when the frenet frame is implemented
         dx = np.diff(x, prepend=x[0])
         dy = np.diff(y, prepend=y[0])
         s = np.cumsum(np.sqrt(dx**2 + dy**2))

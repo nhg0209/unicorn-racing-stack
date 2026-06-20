@@ -29,10 +29,10 @@
     <!-- Static TF: base_link → laser -->
     <node pkg="tf2_ros" exec="static_transform_publisher" name="base_to_laser_broadcaster"
           args="--x 0.27 --y 0 --z 0.11 --qx 0 --qy 0 --qz 0 --qw 1 --frame-id base_link --child-frame-id laser"/>
-    <!-- Static TF: base_link → vesc_imu (yaw +90도, Z축은 base_link와 동일) -->
+    <!-- Static TF: base_link -> vesc_imu (yaw +90 deg, Z axis same as base_link) -->
     <node pkg="tf2_ros" exec="static_transform_publisher" name="base_to_vesc_imu_broadcaster"
           args="--x 0 --y 0 --z 0.0 --roll 0 --pitch 0 --yaw 1.5707963 --frame-id base_link --child-frame-id vesc_imu"/>
-    <!-- Static TF: vesc_imu → vesc_imu_rot (역회전 yaw=-90도: base_link와 동일한 orientation) -->
+    <!-- Static TF: vesc_imu -> vesc_imu_rot (reverse yaw=-90 deg: same orientation as base_link) -->
     <node pkg="tf2_ros" exec="static_transform_publisher" name="vesc_imu_to_rot_broadcaster"
           args="--x 0 --y 0 --z 0 --roll 0 --pitch 0 --yaw -1.5707963 --frame-id vesc_imu --child-frame-id vesc_imu_rot"/>
 

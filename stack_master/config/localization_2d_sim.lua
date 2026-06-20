@@ -31,9 +31,9 @@ options = {
   use_landmarks = false,
   num_laser_scans = 1,
   num_multi_echo_laser_scans = 0,
-  num_subdivisions_per_laser_scan = 10, --lidar 느리고, 차량속도 빠를때 올리기
+  num_subdivisions_per_laser_scan = 10, -- increase when the lidar is slow and the car is fast
   num_point_clouds = 0,
-  lookup_transform_timeout_sec = 0.2,  -- 기본값 0.2초에서 증가
+  lookup_transform_timeout_sec = 0.2,  -- increased from the default 0.2 s
   submap_publish_period_sec = 0.3,
   trajectory_publish_period_sec = 30e-3,
   rangefinder_sampling_ratio = 1.,
@@ -47,7 +47,7 @@ options = {
 }
 
 MAP_BUILDER.use_trajectory_builder_2d = true -- for 2d slam or localization
-MAP_BUILDER.num_background_threads = 6 -- Multi-threading으로 성능 최적화
+MAP_BUILDER.num_background_threads = 6 -- performance tuning via multi-threading
 
 TRAJECTORY_BUILDER_2D.min_range = 0.12
 TRAJECTORY_BUILDER_2D.max_range = 10.
@@ -65,13 +65,13 @@ POSE_GRAPH.constraint_builder.global_localization_min_score = 0.80
 TRAJECTORY_BUILDER.pure_localization_trimmer = {
   max_submaps_to_keep = 3,
 }
-POSE_GRAPH.optimize_every_n_nodes = 3 --매핑에 비해 낮춰줘야함
+POSE_GRAPH.optimize_every_n_nodes = 3 -- should be lower than for mapping
 
-POSE_GRAPH.global_sampling_ratio = 0.003 -- 0.003 -- 전역 매칭 샘플링 비율
-POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.linear_search_window = 3. -- 선형 검색 범위 (m)
-POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.angular_search_window = math.rad(30.) -- 각도 검색 범위 (deg)
+POSE_GRAPH.global_sampling_ratio = 0.003 -- 0.003 -- global matching sampling ratio
+POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.linear_search_window = 3. -- linear search window (m)
+POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.angular_search_window = math.rad(30.) -- angular search window (deg)
 
--- Localization 전용으로 설정
--- POSE_GRAPH.global_constraint_search_after_n_seconds = 10. -- 전역 제약 조건 검색 주기
+-- localization-only configuration
+-- POSE_GRAPH.global_constraint_search_after_n_seconds = 10. -- global constraint search period
 
 return options
