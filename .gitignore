@@ -17,9 +17,3 @@ dist/
 # IDE / local
 .idea/
 .claude/
-
-# Duplicate driver copies (root-owned, left on disk). The real laser_proc /
-# urg_c / urg_node_msgs packages are vendored as siblings under sensor/.
-sensor/urg_node/laser_proc/
-sensor/urg_node/urg_c/
-sensor/urg_node/urg_node_msgs/
