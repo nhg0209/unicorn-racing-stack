@@ -86,6 +86,13 @@ It must be **sourced**: `RMW_IMPLEMENTATION` has to be set *after* `conda activa
 (~22 Hz sim); **CycloneDDS** idles at ~21% CPU and hits the full ~80 Hz. On the car
 (network `192.168.60.x`) it also loads the repo's `cyclonedds.xml`; on a laptop it
 stays on CycloneDDS defaults. Adjust `ROS_DOMAIN_ID` (default `1`).
+
+It also **resets the ROS environment to a clean baseline** on entry — so a system
+ROS or another workspace `source`d in your `~/.bashrc` (any distro/path) can't
+shadow the conda env (a classic cross-platform footgun, e.g. `rosidl_generator_c`:
+`generate_c() takes 1 positional argument but 2 were given`). Do **not** globally
+`source /opt/ros/<distro>/setup.bash` in `~/.bashrc`. For a fully isolated env
+immune to any host `~/.bashrc`, use the container (`.devcontainer` / `.docker`).
 </details>
 
 ## Run

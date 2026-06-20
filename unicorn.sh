@@ -14,30 +14,39 @@ _URS_WS="$(cd "$_URS_REPO/../.." && pwd)"
 
 # --- 1) conda env: RoboStack ROS 2 Jazzy ('unicorn') ---
 source "$(conda info --base)/etc/profile.d/conda.sh"
+
+# Start from a CLEAN ROS environment. These vars are 100% ROS-owned, so reset
+# them BEFORE activating: whatever the host shell leaked — a system ROS or another
+# workspace `source`d in ~/.bashrc, ANY distro, ANY path — is discarded, and
+# conda's activation + this workspace rebuild them. You can't pattern-match every
+# user's ~/.bashrc, so don't try; reset to a known-good baseline instead.
+unset AMENT_PREFIX_PATH AMENT_CURRENT_PREFIX CMAKE_PREFIX_PATH COLCON_PREFIX_PATH \
+      ROS_DISTRO ROS_VERSION ROS_PYTHON_VERSION ROS_PACKAGE_PATH 2>/dev/null
+
 conda activate unicorn
 
-# Never let ~/.local user-site packages shadow the conda env. Stale ~/.local
-# copies (numba, ...) silently override the env on some machines.
+# Never let ~/.local user-site packages shadow the conda env (stale numba, etc.).
 export PYTHONNOUSERSITE=1
 
-# Strip any system-ROS (/opt/ros/*) leakage so it can't shadow the conda env.
-# A `source /opt/ros/<distro>/setup.bash` left in ~/.bashrc puts the wrong-distro
-# rosidl/ament on PYTHONPATH and breaks msg codegen
-# (e.g. "generate_c() takes 1 positional argument but 2 were given"). Same fix on
-# every platform: the conda env already provides ROS, so just drop /opt/ros/*.
-_urs_strip_opt_ros() {
+# The mixed path vars (PYTHONPATH/LD_LIBRARY_PATH/PATH also carry non-ROS entries
+# like CUDA) can't just be unset, so drop only the ROS leakage: /opt/ros/* and
+# apt-style ROS python dirs (.../lib/pythonX/dist-packages — conda/colcon use
+# site-packages, so dist-packages is exclusively system ROS). This is what
+# shadowed rosidl_generator_c on the Orin ("generate_c() takes 1 arg but 2 given").
+_urs_clean_paths() {
     local var p new parts
-    for var in PYTHONPATH AMENT_PREFIX_PATH CMAKE_PREFIX_PATH COLCON_PREFIX_PATH LD_LIBRARY_PATH PATH; do
+    for var in PYTHONPATH LD_LIBRARY_PATH PATH; do
         IFS=: read -ra parts <<< "${!var-}"
         new=""
         for p in "${parts[@]}"; do
             [[ "$p" == /opt/ros/* ]] && continue
+            [[ "$p" == */lib/python*/dist-packages ]] && continue
             new="${new:+$new:}$p"
         done
         export "$var=$new"
     done
 }
-_urs_strip_opt_ros
+_urs_clean_paths
 
 # --- 2) middleware + ROS domain ---
 # CycloneDDS is far lighter than the default FastDDS on this many-node single-host
