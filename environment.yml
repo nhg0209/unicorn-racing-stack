@@ -57,9 +57,10 @@ dependencies:
   - opencv=4.12.0
   - transforms3d=0.4.2
   - matplotlib-base=3.11.0
-  # cython is here (not pip) so range_libc can build with --no-build-isolation
-  # against the conda numpy — see the range_libc note below.
-  - cython
+  # pybind11 is the only build dep of range_libc (header-only binding, no Cython,
+  # no numpy at build). Having it here lets range_libc build with
+  # --no-build-isolation entirely from conda (no PyPI fetch) — see note below.
+  - pybind11
 
   # --- RoboStack compatibility pins (INSTALL.md A6) — DO NOT loosen ---
   # setuptools 80+ dropped `develop --editable`, which colcon --symlink-install needs.
@@ -79,12 +80,11 @@ dependencies:
       - -r requirements.txt          # numba / gymnasium / casadi / scipy / …
       - -e ./simulator/f1tenth_gym   # editable gym core → f110_gym (pure python, builds clean)
 
-  # --- range_libc is NOT folded in above, ON PURPOSE ---
-  # Its pyproject requires numpy+cython at build time. pip's PEP 517 build
-  # ISOLATION pulls a FRESH PyPI numpy into a throwaway env to build it — and on
-  # some macOS that PyPI numpy fails to import (Accelerate "NEWLAPACK ILP64"
-  # symbol missing), which kills `conda env create`. The conda numpy works, so
-  # build range_libc AFTER the env exists, WITHOUT isolation (uses conda numpy):
+  # --- range_libc is installed as a separate step (one line) ---
+  # The binding is now header-only pybind11 (no Cython, no numpy at build), so the
+  # old macOS build-isolation breakage is gone. We still keep it out of the pip
+  # section above and use --no-build-isolation so it builds entirely from the
+  # conda toolchain (pybind11 above) with ZERO PyPI fetch — robust on every OS:
   #
   #     conda activate unicorn
   #     pip install --no-build-isolation -e ./race_utils/raycaster/range_libc/pywrapper

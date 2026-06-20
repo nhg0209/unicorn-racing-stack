@@ -52,15 +52,28 @@ conda activate unicorn
 
 #### A1b. range_libc (optional — localization / non-`lut` raycaster)
 
-`range_libc` is **not** in `environment.yml` because pip's build isolation pulls a
-fresh PyPI numpy to compile it, which is broken on some macOS (Accelerate ILP64).
-Install it against the conda numpy instead — only needed for `particle_filter`
-localization and the raycaster `rm`/`cddt`/`glt` backends (the default `lut`
-backend runs without it):
+`range_libc` is a tiny **pybind11** binding (header-only, no Cython, no numpy at
+build). It's kept as a one-line step and built with `--no-build-isolation` so it
+compiles entirely from the conda toolchain (`pybind11` is in `environment.yml`) —
+no PyPI fetch, robust on Linux/macOS/aarch64. Only needed for `particle_filter`
+localization and the raycaster `rm`/`cddt`/`glt` backends (default `lut` runs
+without it):
 
 ```bash
 # after `conda activate unicorn`, from the repo root
 pip install --no-build-isolation -e ./race_utils/raycaster/range_libc/pywrapper
+```
+
+#### A1c. quadprog (REQUIRED for the state machine)
+
+`trajectory_planning_helpers` (a pip dep) pins `quadprog==0.1.7`, whose PyPI wheel
+links the wrong `libgfortran` in a fresh conda env and fails at import with
+`undefined symbol: ...qpgen2_...`, crashing the state machine. Replace it with the
+conda-forge build (correct linkage, API-compatible at runtime):
+
+```bash
+# after `conda activate unicorn`
+pip uninstall -y quadprog && conda install -y -c conda-forge quadprog=0.1.13
 ```
 
 ### A2. Build

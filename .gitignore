@@ -17,3 +17,8 @@ dist/
 # IDE / local
 .idea/
 .claude/
+
+# docker platform-test transient logs (keep docker/results.txt + scripts)
+docker/build_*.log
+docker/smoke_*.log
+docker/driver_*.out

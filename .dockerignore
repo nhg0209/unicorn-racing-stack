@@ -1,0 +1,13 @@
+# keep the docker build context small + reproducible
+build/
+install/
+log/
+**/.git
+**/__pycache__/
+**/*.pyc
+**/*.egg-info/
+race_utils/raycaster/range_libc/pywrapper/build/
+# root-owned duplicate driver copies (real packages are siblings under sensor/)
+sensor/urg_node/laser_proc/
+sensor/urg_node/urg_c/
+sensor/urg_node/urg_node_msgs/

@@ -1,0 +1,5 @@
+# label       base          build              smoke      date
+24.04-x86     ubuntu:24.04  BUILD_OK(42/0)     SMOKE_OK   2026-06-20
+22.04-x86     ubuntu:22.04  BUILD_OK(42/0)     SMOKE_OK   2026-06-20
+# (BUILD_OK(finished/failed) = colcon packages; SMOKE_OK = low_level + headtohead came up headless)
+# arm64 / macOS: run docker/run_platform_test.sh on the device (see BUILD.md)
