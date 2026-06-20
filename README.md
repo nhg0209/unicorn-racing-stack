@@ -1,63 +1,40 @@
 # UNICORN Racing Stack — ROS 2 Jazzy (meta-repo)
 
-This is the `jazzy` branch of `unicorn-racing-stack`, restructured as a **lean
-orchestration meta-repo**. It carries no packages of its own — it lives inside a
-colcon workspace and uses [vcstool](https://github.com/dirk-thomas/vcstool) to
-pull the component repos listed in [`unicorn.repos`](unicorn.repos) into the
-workspace `src/` as **siblings**. The stack auto-revalidates whenever a
-component repo is pushed.
+The `jazzy` branch of `unicorn-racing-stack`: a full **F1TENTH autonomous racing
+stack** on ROS 2 Jazzy — perception → tracking → prediction → planning → state
+machine → control — with an in-repo **f1tenth_gym** simulator for full
+software-in-the-loop testing.
 
-> The previous ROS 1 (catkin) stack lives on the **`main`** branch and in a
-> frozen working copy at `unicorn-racing-stack-ros1/` (submodules populated)
-> for reference during migration.
+> The ROS 1 (catkin) stack lives on the **`main`** branch (frozen, for migration reference).
 
-## Workspace layout
+## Install
 
-```
-unicorn_racing_stack/                ← colcon workspace root (run `colcon build` here)
-├── build/  install/  log/           ← generated
-└── src/
-    ├── unicorn-racing-stack/        ← THIS meta-repo (jazzy): unicorn.repos, CI, build scripts
-    │   ├── unicorn.repos            ← which component repos + branches
-    │   ├── unicorn.lock.repos       ← exact commits last built green (from CI)
-    │   ├── build_packages_on_local_pc.sh / build_packages_on_car.sh
-    │   ├── .github/workflows/integration.yml
-    │   └── ci_templates/notify-race-stack.yml
-    ├── creating_autonomous_car/     ← component: ROS 2 Jazzy base layer (active)
-    └── <future components>/         ← imported here by `vcs import`
-```
+**RoboStack (conda) is the default and only verified path.** It installs ROS 2
+Jazzy + every dependency into a conda env (`unicorn`) on **Linux and macOS**,
+without touching system ROS. A system-ROS (`apt` / `rosdep`) path is documented
+too but **not yet tested**.
 
-The build scripts resolve the workspace as `<this repo>/../..` and import
-components into that workspace's `src/`.
-
-## Quick start
+Full step-by-step is in **[INSTALL.md](INSTALL.md)**. Short version:
 
 ```bash
-# In an existing workspace that already contains src/creating_autonomous_car,
-# place this meta-repo next to it and build:
-cd <workspace>/src
-git clone -b jazzy https://github.com/HMCL-UNIST/unicorn-racing-stack.git
-cd unicorn-racing-stack
-
-# Local PC (simulation): installs deps, imports missing components, builds the
-# whole workspace. Existing component checkouts are left untouched.
-bash build_packages_on_local_pc.sh
-
-# …or on the car (full sensors / SLAM / PF)
-bash build_packages_on_car.sh
-
-# …or Docker (run from this meta-repo dir; mounts the workspace root at /ws)
-INPUT_GID=$(getent group input | cut -d: -f3) docker compose build dev
-docker compose run --rm dev
+mkdir -p ~/unicorn_ws/src && cd ~/unicorn_ws/src
+git clone --recursive https://github.com/hmcl-unist/unicorn-racing-stack.git
+cd unicorn-racing-stack && conda env create -f environment.yml && conda activate unicorn
+#   + range_libc and quadprog steps — see INSTALL.md A1b / A1c
+cd ~/unicorn_ws && colcon build --symlink-install --base-paths src/unicorn-racing-stack
 ```
 
-Managing sources by hand (run from the workspace root):
+Set up the `unicorn` alias (INSTALL.md A3) to enter the environment in one word.
+
+## Run the simulator
 
 ```bash
-vcs import src < src/unicorn-racing-stack/unicorn.repos   # clone missing components
-vcs pull   src                                            # update tracked repos in place
-vcs export --exact src > src/unicorn-racing-stack/unicorn.lock.repos   # snapshot exact commits
+unicorn   # conda env + CycloneDDS + workspace, all sourced (see INSTALL.md A3)
+ros2 launch stack_master headtohead.launch.xml sim:=true map:=f   # full autonomy + virtual opponent
+#   low_level.launch.xml = vehicle + sensors only
 ```
+
+Per-platform build/smoke status: **[BUILD.md](BUILD.md)**.
 
 ## How auto-update works
 

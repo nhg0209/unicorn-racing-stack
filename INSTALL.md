@@ -38,26 +38,19 @@ git clone --recursive https://github.com/hmcl-unist/unicorn-racing-stack.git
 `asio`/`setuptools` pins, the pip layer, and the editable gym core) is captured in
 `environment.yml`, so the whole setup is **one env command + one build**.
 
-### A0. Install Miniforge (the conda installer to use)
+### A0. Install Miniforge (skip if you already have conda/mamba)
 
-Use **Miniforge**, not Anaconda. It is the minimal conda installer (~100 MB; conda
-+ mamba) that **defaults to the `conda-forge` channel** — exactly what RoboStack
-needs — and has none of Anaconda's bundle size or commercial-license terms. Same
-`conda`/`mamba` tools, just lighter. RoboStack itself recommends it.
+Use **Miniforge**, not Anaconda — the minimal conda installer (~100 MB; conda +
+mamba) that **defaults to the `conda-forge` channel** (exactly what RoboStack
+needs), with no bundle bloat or commercial-license terms. RoboStack recommends it.
 
-Download page: <https://github.com/conda-forge/miniforge#install> · skip if you
-already have conda/mamba.
+The same command works on **any Linux (Ubuntu) or macOS**, x86_64 or arm64 —
+`$(uname)-$(uname -m)` selects the right installer:
 
 ```bash
-# Linux (auto-detects x86_64 / aarch64):
-wget -O /tmp/miniforge.sh "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-$(uname -m).sh"
-bash /tmp/miniforge.sh -b -p "$HOME/miniforge3"
-source "$HOME/miniforge3/etc/profile.d/conda.sh"
-conda init bash         # or: conda init zsh   (reopen the shell afterwards)
-
-# macOS (Apple silicon): same, with the macOS arm64 installer
-#   wget -O /tmp/miniforge.sh "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-arm64.sh"
-# (or: brew install --cask miniforge)
+curl -L -O "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
+bash "Miniforge3-$(uname)-$(uname -m).sh"     # follow prompts; let it run `conda init`
+exec $SHELL                                    # reopen the shell so `conda` is on PATH
 ```
 
 ### A1. Create the environment
@@ -187,6 +180,10 @@ Jump to **[Sourcing & running](#sourcing--running)**.
 ---
 
 # Path B — System ROS 2 Jazzy (Ubuntu 24.04)
+
+> ⚠️ **Not yet tested.** Path A (RoboStack) is the verified path. This `apt` /
+> `rosdep` route is documented for completeness but has not been validated end to
+> end — expect to fix gaps.
 
 ### B1. Install ROS 2 Jazzy
 
