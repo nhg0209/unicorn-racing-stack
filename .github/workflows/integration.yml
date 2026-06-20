@@ -53,7 +53,10 @@ jobs:
         run: |
           CAC=src/creating_autonomous_car
           if [ -d "$CAC/simulator/f1tenth_gym" ]; then
-            pip install -e "$CAC/simulator/f1tenth_gym" --break-system-packages
+            # --ignore-installed: f110_gym pulls numba->numpy 2.x, and pip cannot
+            # uninstall the apt-managed numpy ("RECORD file not found"). Installing
+            # fresh into /usr/local shadows the Debian numpy instead of removing it.
+            pip install -e "$CAC/simulator/f1tenth_gym" --break-system-packages --ignore-installed
           fi
           pip install transforms3d pynput --break-system-packages
           pip install --upgrade coverage --break-system-packages
