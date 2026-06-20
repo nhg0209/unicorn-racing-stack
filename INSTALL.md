@@ -35,8 +35,29 @@ git submodule update --init --recursive
 
 **Prerequisite — conda/mamba installed.** Everything else (ROS, build tools, the
 `asio`/`setuptools` pins, the pip layer, and the editable gym core) is captured in
-`environment.yml`, so the whole setup is **one env command + one build**. If you
-don't have conda yet, install Miniforge first (see *Manual bootstrap* below).
+`environment.yml`, so the whole setup is **one env command + one build**.
+
+### A0. Install Miniforge (the conda installer to use)
+
+Use **Miniforge**, not Anaconda. It is the minimal conda installer (~100 MB; conda
++ mamba) that **defaults to the `conda-forge` channel** — exactly what RoboStack
+needs — and has none of Anaconda's bundle size or commercial-license terms. Same
+`conda`/`mamba` tools, just lighter. RoboStack itself recommends it.
+
+Download page: <https://github.com/conda-forge/miniforge#install> · skip if you
+already have conda/mamba.
+
+```bash
+# Linux (auto-detects x86_64 / aarch64):
+wget -O /tmp/miniforge.sh "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-$(uname -m).sh"
+bash /tmp/miniforge.sh -b -p "$HOME/miniforge3"
+source "$HOME/miniforge3/etc/profile.d/conda.sh"
+conda init bash         # or: conda init zsh   (reopen the shell afterwards)
+
+# macOS (Apple silicon): same, with the macOS arm64 installer
+#   wget -O /tmp/miniforge.sh "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-arm64.sh"
+# (or: brew install --cask miniforge)
+```
 
 ### A1. Create the environment
 
@@ -90,16 +111,7 @@ colcon build --symlink-install --base-paths src/unicorn-racing-stack \
 <details>
 <summary><b>Manual bootstrap</b> — only if you can't / don't want to use <code>environment.yml</code> (installs the latest conda packages, step by step)</summary>
 
-**Install conda (Miniforge)** — skip if you already have conda/mamba:
-
-```bash
-# Linux
-wget -O /tmp/miniforge.sh https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
-bash /tmp/miniforge.sh -b -p "$HOME/miniforge3"
-source "$HOME/miniforge3/etc/profile.d/conda.sh"
-conda init bash       # or: conda init zsh
-# macOS: use Miniforge3-MacOSX-arm64.sh
-```
+**Install conda (Miniforge)** — see **A0** above (skip if you already have conda/mamba).
 
 **Create the env + pin channels:**
 
