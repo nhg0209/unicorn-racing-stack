@@ -86,7 +86,7 @@ conda install -c conda-forge -y \
 # --- 7. pure-Python deps (pip) ----------------------------------------------
 echo "==> pip install Python deps…"
 python -m pip install --upgrade \
-  numba gymnasium casadi scikit-learn scikit-image shapely trajectory_planning_helpers
+  numba gymnasium casadi scikit-learn scikit-image shapely tqdm trajectory_planning_helpers
 
 # the simulator gym core is a pip package (COLCON_IGNORE'd), install editable
 python -m pip install -e "$REPO/race_utils/unicorn_gym/f1tenth_gym"

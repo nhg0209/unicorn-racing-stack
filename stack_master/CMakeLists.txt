@@ -38,6 +38,7 @@ install(PROGRAMS
   scripts/pose_to_odom_node.py
   scripts/map_relay_node.py
   scripts/keyboard_joy_node.py
+  scripts/global_velocity_planner.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

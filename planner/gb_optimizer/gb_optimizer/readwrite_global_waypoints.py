@@ -28,8 +28,18 @@ def _waypoints_path(map_name: str) -> str:
 
     Mirrors the UNICORN ROS1 behavior which stored waypoints under
     stack_master/maps/<map_name>/global_waypoints.json .
+
+    Resolves to the SOURCE tree: get_package_share_directory points at the
+    install copy, but with colcon --symlink-install the map files inside it are
+    symlinks back to src, so following one yields the source folder (and the
+    json persists / is version-controlled) regardless of repo/workspace name.
     """
     maps_dir = os.path.join(get_package_share_directory('stack_master'), 'maps', map_name)
+    for probe in (map_name + '.yaml', map_name + '.png', map_name + '.pgm'):
+        p = os.path.join(maps_dir, probe)
+        if os.path.islink(p) or os.path.exists(p):
+            maps_dir = os.path.dirname(os.path.realpath(p))
+            break
     return os.path.join(maps_dir, 'global_waypoints.json')
 
 

@@ -11,6 +11,24 @@ from matplotlib.widgets import Slider, Button
 from matplotlib.patches import Arrow
 
 
+def _resolve_source_dir(save_dir):
+    """Resolve a colcon install share dir back to the source tree.
+
+    Launch passes the installed maps/<map> path (find-pkg-share). With colcon
+    --symlink-install the files inside it are symlinks back to src, so following
+    one yields the source folder - the yaml then lands in src (version-controlled)
+    instead of the throwaway install copy, without hardcoding the repo name.
+    Falls back to the given path if nothing resolvable is found.
+    """
+    if not save_dir or not os.path.isdir(save_dir):
+        return save_dir
+    for name in sorted(os.listdir(save_dir)):
+        p = os.path.join(save_dir, name)
+        if os.path.islink(p):
+            return os.path.dirname(os.path.realpath(p))
+    return save_dir
+
+
 class SectorSlicer(Node):
     """
     Node for listening to gb waypoints and running a GUI to tune the sectors
@@ -38,7 +56,7 @@ class SectorSlicer(Node):
         self.wpnt_sub = self.create_subscription(WpntArray, '/global_waypoints', self.glb_wpnts_cb, 10)
         self.bounds_sub = self.create_subscription(MarkerArray, '/trackbounds/markers', self.bounds_cb, 10)
 
-        self.yaml_dir = self.get_parameter('save_dir').get_parameter_value().string_value
+        self.yaml_dir = _resolve_source_dir(self.get_parameter('save_dir').get_parameter_value().string_value)
         self.get_logger().info('Waiting for global waypoints...')
 
     def glb_wpnts_cb(self, data):
