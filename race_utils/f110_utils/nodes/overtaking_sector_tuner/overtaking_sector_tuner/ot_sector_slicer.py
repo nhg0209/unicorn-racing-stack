@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import os
+import subprocess
 import yaml
 import rclpy
 from rclpy.node import Node
+from ament_index_python.packages import get_package_prefix
 from f110_msgs.msg import WpntArray
 import numpy as np
 from visualization_msgs.msg import MarkerArray
@@ -194,6 +196,26 @@ class OvertakingSectorSlicer(Node):
             yaml.dump(ros_yaml_preamble, file, sort_keys=False)
 
         self.get_logger().info("Done Slicing")
+        self._rebuild_for_next_use()
+
+    def _rebuild_for_next_use(self):
+        """Rebuild so a brand-new map's yaml gets symlinked into install.
+
+        Mirrors the ros1 ot_sector_slicing (subprocess.Popen(finish_sector.sh)):
+        the slicer wrote ot_sectors.yaml into src, then kicked off a colcon
+        build so the file is available the next time the stack launches. Without
+        this, a freshly-created map has no install symlink and ot_interpolator /
+        sector_tuner die with KeyError: 'n_sectors'.
+        """
+        script = os.path.join(get_package_prefix('overtaking_sector_tuner'),
+                              'lib', 'overtaking_sector_tuner', 'finish_sector.sh')
+        if not os.path.isfile(script):
+            self.get_logger().warn(
+                'finish_sector.sh not found at {}; skipping auto-build. '
+                'Run `cbuild stack_master` before relaunching.'.format(script))
+            return
+        self.get_logger().info('Building stack_master so the new sectors are available next launch...')
+        subprocess.Popen(['bash', script])
 
 
 def main():
