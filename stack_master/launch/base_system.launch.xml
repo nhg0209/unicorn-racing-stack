@@ -16,7 +16,7 @@
 <launch>
   <arg name="map"          description="Map name (folder in stack_master/maps/)"/>
   <arg name="sim"          default="false" description="Use simulator (true) or real hardware (false)"/>
-  <arg name="localization" default="gt"    description="gt (sim) | cartographer | pf (real)"/>
+  <arg name="localization" default="cartographer"    description="gt (sim) | cartographer | pf (real)"/>
   <arg name="virtual"      default="$(var sim)" description="Inject virtual opponent/obstacles (scan overlay etc.); on by default in sim, off on the real car"/>
 
   <!-- sim -> SIM config folder, real hardware -> CAR config folder -->

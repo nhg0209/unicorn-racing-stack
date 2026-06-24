@@ -26,7 +26,6 @@ bridge:
     ego_namespace: ''
     ego_scan_topic: 'scan'
     ego_odom_topic: 'car_state/odom'
-    ego_pose_topic: 'car_state/pose'
     ego_opp_odom_topic: 'opp_odom'
     ego_drive_topic: 'vesc/ackermann_cmd'
     opp_namespace: 'opp_racecar'

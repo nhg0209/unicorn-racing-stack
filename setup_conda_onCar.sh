@@ -90,9 +90,26 @@ pip install "git+https://github.com/ForzaETH/CCMA.git"                          
 # --- 5. quadprog — swap the broken PyPI wheel (MUST be after step 4) ---------
 # trajectory_planning_helpers re-pulls quadprog==0.1.7, whose wheel crashes the
 # state machine at import; the conda-forge build is correct + API-compatible.
+#
+# --force-reinstall is REQUIRED: a plain `conda install quadprog=0.1.13` often
+# reports "All requested packages already installed" while the files are actually
+# missing (a "ghost" install) and then does nothing -> import fails. We then
+# VERIFY the import and, if still broken, do a clean remove+reinstall and finally
+# hard-fail. Otherwise a broken quadprog silently survives the build and only
+# surfaces at runtime as `ModuleNotFoundError: No module named 'quadprog'` from
+# gb_optimizer (global_planner dies -> no global waypoints -> sector yamls never
+# get n_sectors -> sector_tuner/ot_interpolator KeyError).
 say "swapping quadprog wheel for the conda-forge build…"
-pip uninstall -y quadprog || true
-conda install -y -c conda-forge quadprog=0.1.13
+pip uninstall -y quadprog 2>/dev/null || true
+conda install -y --force-reinstall -c conda-forge quadprog=0.1.13
+if ! python -c "import quadprog" 2>/dev/null; then
+  say "quadprog still not importable after install — clean reinstall…"
+  conda remove -y --force quadprog 2>/dev/null || true
+  pip uninstall -y quadprog 2>/dev/null || true
+  conda install -y --force-reinstall -c conda-forge quadprog=0.1.13
+  python -c "import quadprog" || { echo "ERROR: quadprog import still failing after reinstall" >&2; exit 1; }
+fi
+say "quadprog OK -> $(python -c 'import quadprog; print(quadprog.__file__)')"
 
 # --- 6. OS socket buffers (so CycloneDDS can take the 10 MB cyclonedds.xml asks
 #        for; the kernel default ~212 KB caps it otherwise). Idempotent: skips

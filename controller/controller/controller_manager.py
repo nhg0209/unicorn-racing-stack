@@ -13,7 +13,7 @@ from ackermann_msgs.msg import AckermannDriveStamped
 from f110_msgs.msg import WpntArray, BehaviorStrategy
 from sensor_msgs.msg import LaserScan
 from frenet_conversion.frenet_converter import FrenetConverter
-from geometry_msgs.msg import Point, PoseStamped
+from geometry_msgs.msg import Point
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
 from std_msgs.msg import Float32, Bool
@@ -42,7 +42,7 @@ class ControllerManager(Node):
     """ROS2 port of the ROS1 unicorn controller_manager (Pure-Pursuit only; the
     MAP / steering-lookup branch was intentionally removed).
 
-    Subscribes /behavior_strategy, /car_state/odom, /car_state/pose, /imu/data,
+    Subscribes /behavior_strategy, /car_state/odom, /imu/data,
     /car_state/odom_frenet, /scan, /vesc/odom, /save_start_traj.
     Publishes the ackermann command (default high_level/ackermann_cmd -> simple_mux),
     plus lookahead/future/trailing/l1 visualization.
@@ -125,7 +125,6 @@ class ControllerManager(Node):
         # Subscribers
         self.create_subscription(BehaviorStrategy, '/behavior_strategy', self.behavior_cb, 10)
         self.create_subscription(Odometry, '/car_state/odom', self.odom_cb, 10)
-        self.create_subscription(PoseStamped, '/car_state/pose', self.car_state_cb, 10)
         self.create_subscription(Imu, '/imu/data', self.imu_cb, 10)
         self.create_subscription(Odometry, '/car_state/odom_frenet', self.car_state_frenet_cb, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_cb, qos_profile_sensor_data)
@@ -234,6 +233,14 @@ class ControllerManager(Node):
     def odom_cb(self, data: Odometry):
         self.speed_now = data.twist.twist.linear.x
         self.speed_now_y = data.twist.twist.linear.y
+        # car pose: formerly a separate /car_state/pose (PoseStamped); read it
+        # straight from /car_state/odom so it works on the real car too (nothing
+        # publishes /car_state/pose there — only the simulator used to).
+        x = data.pose.pose.position.x
+        y = data.pose.pose.position.y
+        theta = euler_from_quaternion([data.pose.pose.orientation.x, data.pose.pose.orientation.y,
+                                       data.pose.pose.orientation.z, data.pose.pose.orientation.w])[2]
+        self.position_in_map = np.array([x, y, theta])[np.newaxis]
         if self.controller is not None:
             self.controller.speed_now = self.speed_now
         self.ftg_controller.set_vel(data.twist.twist.linear.x)
@@ -241,13 +248,6 @@ class ControllerManager(Node):
     def vesc_odom_cb(self, data: Odometry):
         self.wheelspeed_now = data.twist.twist.linear.x
         self.ftg_controller.set_vel(data.twist.twist.linear.x)
-
-    def car_state_cb(self, data: PoseStamped):
-        x = data.pose.position.x
-        y = data.pose.position.y
-        theta = euler_from_quaternion([data.pose.orientation.x, data.pose.orientation.y,
-                                       data.pose.orientation.z, data.pose.orientation.w])[2]
-        self.position_in_map = np.array([x, y, theta])[np.newaxis]
 
     def car_state_frenet_cb(self, data: Odometry):
         s = data.pose.pose.position.x

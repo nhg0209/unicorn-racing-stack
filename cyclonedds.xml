@@ -9,7 +9,7 @@
             <AllowMulticast>true</AllowMulticast>
         </General>
         <Discovery>
-            <ParticipantIndex>auto</ParticipantIndex>
+            <ParticipantIndex>none</ParticipantIndex>
         </Discovery>
         <Internal>
             <SocketReceiveBufferSize min="default"/>
