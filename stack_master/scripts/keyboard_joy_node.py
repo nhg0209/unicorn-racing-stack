@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Converts keyboard input to sensor_msgs/Joy and publishes to /joy.
+Converts keyboard input to sensor_msgs/Joy and publishes to /joy_keyboard.
+simple_mux subscribes to both /joy (physical pad) and /joy_keyboard, and honours
+one of them based on the /ego/use_keyboard trigger from the pitwall panel.
 Uses pynput to detect simultaneous key presses; speed and steering are fully independent.
 
 Controls:
@@ -25,7 +27,8 @@ class KeyboardJoyNode(Node):
     def __init__(self):
         super().__init__('keyboard_joy')
 
-        self.pub = self.create_publisher(Joy, '/joy', 10)
+        self.declare_parameter('joy_topic', '/joy_keyboard')
+        self.pub = self.create_publisher(Joy, self.get_parameter('joy_topic').value, 10)
         self.create_timer(0.02, self._loop)  # 50 Hz
 
         self.speed = 0.0
