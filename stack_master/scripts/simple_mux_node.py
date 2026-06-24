@@ -101,8 +101,9 @@ class SimpleMuxNode(Node):
         zero = AckermannDriveStamped()
         zero.header.stamp = self.get_clock().now().to_msg()
 
-        if self.current_host == 'autodrive' and self._is_fresh(self.autodrive):
-            # out = self._clip(self.autodrive)
+        if self.current_host is None:
+            return
+        elif self.current_host == 'autodrive' and self._is_fresh(self.autodrive):            # out = self._clip(self.autodrive)
             out = deepcopy(self.autodrive)
         elif self.current_host == 'humandrive' and self._is_fresh(self.human_drive):
             # out = self._clip(self.human_drive)

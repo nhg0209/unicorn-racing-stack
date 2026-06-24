@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <!--
-  headtohead.launch.xml  (ROS2 port of the ROS1 stack_master/headtohead.launch)
+  race.launch.xml  (ROS2 port of the ROS1 stack_master/headtohead.launch)
   ==============================================================================
   Full head-to-head racing autonomy on top of base_system:
 
@@ -15,8 +15,8 @@
   /tracking/obstacles). Spawn / drive the opponent from the RViz Sim Control
   panel (2D Goal Pose, then Path/FTG).
 
-  SIM : ros2 launch stack_master headtohead.launch.xml map:=f sim:=true
-  REAL: ros2 launch stack_master headtohead.launch.xml map:=f sim:=false
+  SIM : ros2 launch stack_master race.launch.xml map:=f sim:=true
+  REAL: ros2 launch stack_master race.launch.xml map:=f sim:=false
 -->
 <launch>
   <arg name="map"        description="Map name (folder in stack_master/maps/)"/>

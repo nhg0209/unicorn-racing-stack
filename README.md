@@ -91,7 +91,7 @@ After the install script, open a **new shell** (or `source ~/.bashrc` / `~/.zshr
 
 ```bash
 unicorn   # enter the env: conda + PYTHONNOUSERSITE=1 + CycloneDDS + workspace, all sourced
-ros2 launch stack_master headtohead.launch.xml sim:=true map:=f   # full autonomy + virtual opponent
+ros2 launch stack_master race.launch.xml sim:=true map:=f   # full autonomy + virtual opponent
 #   low_level.launch.xml = vehicle + sensors only
 ```
 

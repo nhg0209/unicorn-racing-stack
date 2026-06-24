@@ -60,7 +60,7 @@ run_one() {  # name  <launch args...>
 
 rc=0
 run_one lowlevel  stack_master low_level.launch.xml  map:=f sim:=true || rc=1
-run_one headtohead stack_master headtohead.launch.xml map:=f sim:=true || rc=1
+run_one race stack_master race.launch.xml map:=f sim:=true || rc=1
 
 echo "================================"
 [ "$rc" -eq 0 ] && echo "SMOKE: PASS" || echo "SMOKE: FAIL"

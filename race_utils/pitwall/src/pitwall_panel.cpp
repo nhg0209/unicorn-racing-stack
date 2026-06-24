@@ -62,6 +62,12 @@ PitwallPanel::PitwallPanel(QWidget * parent)
   ego_row->addWidget(keyboard_src_btn_);
   layout->addLayout(ego_row);
 
+  // Tiny cheat-sheet for the keyboard teleop (keyboard_joy_node) controls.
+  // ASCII only — conda's libfontconfig segfaults on exotic glyphs (arrows, dots).
+  auto * ego_hint = new QLabel("Keyboard: arrows drive | H=human | A=auto");
+  ego_hint->setStyleSheet("color:gray; font-size:10px;");
+  layout->addWidget(ego_hint);
+
   // Push the controls block to the very bottom of the panel.
   layout->addStretch();
 
@@ -80,7 +86,6 @@ PitwallPanel::PitwallPanel(QWidget * parent)
   obs_row->addWidget(clear_obs_btn);
   layout->addLayout(obs_row);
 
-  layout->addWidget(new QLabel("Opponent drive mode:"));
   auto * mode_row = new QHBoxLayout;
   auto * manual_btn = new QPushButton("Manual");
   auto * path_btn = new QPushButton("Path");

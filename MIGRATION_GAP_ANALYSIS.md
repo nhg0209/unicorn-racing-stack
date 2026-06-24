@@ -24,7 +24,7 @@
 - 결과: **SIM에서는** detect→track→merger(Frenet 채움)→predictor→planner 가 이어지지만,
   **실차에서는 `tracking_merger`가 안 떠서 `/tracking/obstacles`가 발행되지 않음** →
   `opponent_predictor`, `state_machine`, `spliner/spliner_planner/sqp_planner/lane_change_planner`가
-  전부 입력을 못 받아 굶는다. (근거: `headtohead.launch.xml:42-59`, planner 구독 토픽은 §5 참조)
+  전부 입력을 못 받아 굶는다. (근거: `race.launch.xml:42-59`, planner 구독 토픽은 §5 참조)
 
 ### (b) Controller가 ROS1 컨트롤러가 아니다 (CAC 단순 PP로 대체됨) 🔴
 - ROS1 컨트롤러는 MAP(steering lookup 기반) + Pure-Pursuit 하이브리드 + heading PID + trailing(추종) +

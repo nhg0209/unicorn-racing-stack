@@ -4,7 +4,7 @@
   ================================================================================
   The always-on foundation that both time-trial and head-to-head build on:
 
-    sensors / simulator + localization      (low_level / middle_level)
+    sensors / simulator + localization      (sim: low_level / real: localization)
     + global raceline publisher             (planner/waypoint_publisher)
     + Frenet odometry republisher           (/car_state/odom_frenet)
 
@@ -34,10 +34,9 @@
       <arg name="virtual"        value="$(var virtual)"/>
     </include>
   </group>
-  <!-- REAL: middle_level adds VESC/LiDAR + the chosen localization stack. -->
+  <!-- REAL: localization brings up VESC/LiDAR + the chosen localization stack. -->
   <group unless="$(var sim)">
-    <include file="$(find-pkg-share stack_master)/launch/middle_level.launch.xml">
-      <arg name="sim"            value="false"/>
+    <include file="$(find-pkg-share stack_master)/launch/localization.launch.xml">
       <arg name="map"            value="$(var map)"/>
       <arg name="localization"   value="$(var localization)"/>
       <arg name="vehicle_config" value="$(var vehicle_config)"/>

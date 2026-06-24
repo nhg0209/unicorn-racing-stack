@@ -13,7 +13,7 @@ Everything here runs the **README "Get started"** flow (Miniforge → `conda env
 | `Dockerfile` | build-test image (the build *is* the test) |
 | `docker-compose.yml` | `buildtest` / `smoke` / `sim` services |
 | `docker-compose.dev.yml` | interactive `dev` container (host net + X11 + workspace mount) |
-| `smoke_test.sh` | bring up `low_level` + `headtohead` headless, check core topics/nodes |
+| `smoke_test.sh` | bring up `low_level` + `race` headless, check core topics/nodes |
 | `run_platform_test.sh` | build a base + run smoke + append `results.txt` (per-platform matrix driver) |
 | `results.txt` | recorded verdicts |
 

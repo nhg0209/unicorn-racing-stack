@@ -9,7 +9,7 @@
   <arg name="use_estop"      default="false"               description="Use emergency stop (true) or not (false)"/>
   <!-- Keyboard teleop: start keyboard_joy (pynput -> /joy_keyboard) and route the
        mux to it. The pitwall panel's Joy/Keyboard buttons can still switch at runtime. -->
-  <arg name="keyboard_teleop" default="false"              description="Drive the ego with the keyboard instead of a joystick"/>
+  <arg name="keyboard_teleop" default="true"              description="Drive the ego with the keyboard instead of a joystick"/>
   <!-- virtual_perception (scan_overlay + virtual opponent + static obstacles).
        Defaults ON in sim (preserves prior behavior), OFF on the real car; toggle
        with virtual:=true (e.g. to overlay a virtual opponent onto the real LiDAR). -->
@@ -84,9 +84,14 @@
   </group>
 
   <!-- ========== ALWAYS ========== -->
-  <!-- Keyboard teleop source (pynput -> /joy_keyboard); only when requested. -->
-  <node pkg="stack_master" exec="keyboard_joy_node.py" name="keyboard_joy" output="screen"
-        if="$(var keyboard_teleop)"/>
+  <!-- Keyboard teleop source (pynput -> /joy_keyboard). pynput needs a focused
+       keyboard + display, so only start it here in sim (single machine). On the
+       real (headless) car, run keyboard_joy_node on the operator laptop instead;
+       keyboard_teleop:=true still flips the mux below to honour /joy_keyboard. -->
+  <group if="$(var keyboard_teleop)">
+    <node pkg="stack_master" exec="keyboard_joy_node.py" name="keyboard_joy" output="screen"
+          if="$(var sim)"/>
+  </group>
 
   <!-- Joystick / Command mux -->
   <node pkg="stack_master" exec="simple_mux_node.py" name="simple_mux" output="log">

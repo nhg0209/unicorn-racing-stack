@@ -1,30 +1,67 @@
 <?xml version="1.0"?>
 <!--
-  mapping.launch.xml — build a new map with cartographer SLAM.
+  mapping.launch.xml — build a new map with cartographer SLAM (real car).
 
-  Thin wrapper over middle_level in mapping mode (no localization, no global
-  planner). Drive the car / sim around the track, then trigger finish_map
-  (RViz "2D Goal Pose") to save <map>.{pbstream,png,yaml} under
-  stack_master/maps/<map>/.
+  Brings up the real-car sensors + mux (low_level, virtual injection off) and the
+  cartographer SLAM stack. Drive the car around the track, then trigger finish_map
+  (RViz "2D Goal Pose") to save <map>.{pbstream,png,yaml} under stack_master/maps/<map>/.
 
-    ros2 launch stack_master mapping.launch.xml map:=YOURMAP            # real car
-    ros2 launch stack_master mapping.launch.xml map:=YOURMAP sim:=true  # sim
+  Sim is intentionally NOT handled here. Generate the global raceline afterwards
+  with raceline_generator.launch.xml.
 
-  Generate the global raceline afterwards with raceline_generator.launch.xml.
+    ros2 launch stack_master mapping.launch.xml map:=YOURMAP
 -->
 <launch>
   <arg name="map"                            description="Map name (folder created under stack_master/maps/)"/>
-  <arg name="sim"           default="false"  description="Use simulator (true) or real hardware (false)"/>
-  <let name="config_dir" value="$(find-pkg-share stack_master)/config/SIM" if="$(var sim)"/>
-  <let name="config_dir" value="$(find-pkg-share stack_master)/config/CAR" unless="$(var sim)"/>
-  <arg name="vehicle_config" default="$(var config_dir)/vehicle_config.yaml"/>
+  <arg name="vehicle_config" default="$(find-pkg-share stack_master)/config/CAR/vehicle_config.yaml"/>
   <arg name="use_estop"     default="false"  description="Use emergency stop (true) or not (false)"/>
+  <arg name="keyboard_teleop" default="false" description="Make the mux honour keyboard teleop (/joy_keyboard); run keyboard_joy_node on the operator laptop"/>
 
-  <include file="$(find-pkg-share stack_master)/launch/middle_level.launch.xml">
-    <arg name="sim"            value="$(var sim)"/>
+  <let name="cartographer_config_dir" value="$(find-pkg-share stack_master)/config"/>
+  <let name="maps_save_dir" value="$(find-pkg-prefix stack_master)/../../src/unicorn-racing-stack/stack_master/maps/$(var map)"/>
+
+  <!-- ===== Sensors + mux (real hardware; no virtual injection while mapping) ===== -->
+  <include file="$(find-pkg-share stack_master)/launch/low_level.launch.xml">
+    <arg name="sim"            value="false"/>
     <arg name="map"            value="$(var map)"/>
-    <arg name="mapping"        value="true"/>
     <arg name="vehicle_config" value="$(var vehicle_config)"/>
     <arg name="use_estop"      value="$(var use_estop)"/>
+    <arg name="virtual"        value="false"/>
+    <arg name="keyboard_teleop" value="$(var keyboard_teleop)"/>
   </include>
+
+  <!-- ===== Cartographer SLAM (no IMU, no odometry: mapping_2d.lua) =====
+       gym_bridge does NOT publish TF, but this is real-hardware only, so
+       cartographer owns the map->base_link TF via publish_to_tf. -->
+  <node pkg="cartographer_ros" exec="cartographer_node" name="cartographer_node" output="screen"
+        args="-configuration_directory $(var cartographer_config_dir) -configuration_basename mapping_2d.lua --ros-args --log-level warn">
+    <param name="use_sim_time"  value="false"/>
+    <remap from="/imu" to="/vesc/sensors/imu/raw"/>
+    <remap from="/odom" to="/vesc/odom"/>
+  </node>
+
+  <node pkg="cartographer_ros" exec="cartographer_occupancy_grid_node"
+        name="cartographer_occupancy_grid_node" output="screen"
+        args="-resolution 0.05 -publish_period_sec 1.0">
+    <param name="use_sim_time" value="false"/>
+    <remap from="/map" to="/map_carto"/>
+  </node>
+
+  <node pkg="stack_master" exec="pose_to_odom_node.py" name="pose_to_odom_node" output="screen">
+    <param name="use_sim_time" value="false"/>
+    <remap from="pose_in"  to="/tracked_pose"/>
+    <remap from="odom_out" to="/tracked_pose/odom"/>
+  </node>
+
+  <node pkg="robot_localization" exec="ekf_node" name="ekf_localization" output="screen">
+    <param from="$(find-pkg-share stack_master)/config/ekf_cartographer.yaml"/>
+    <param name="use_sim_time" value="false"/>
+    <remap from="odometry/filtered" to="/car_state/odom"/>
+  </node>
+
+  <!-- Save the map: click RViz "2D Goal Pose" to finish SLAM + write the files. -->
+  <node pkg="stack_master" exec="finish_map.py" name="finish_map_node" output="screen">
+    <param name="map_name" value="$(var map)"/>
+    <param name="maps_dir" value="$(var maps_save_dir)"/>
+  </node>
 </launch>
