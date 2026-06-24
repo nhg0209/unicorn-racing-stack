@@ -34,7 +34,7 @@ def _resolve_source_dir(save_dir):
 class OvertakingSectorSlicer(Node):
     """
     Node for listening to gb waypoints and running a GUI to tune the overtaking
-    sectors s.t. a yaml can be exported for the ot_interpolator.
+    sectors s.t. a yaml can be exported for the ot_sector_tuner.
     """
 
     def __init__(self, future):
@@ -183,7 +183,7 @@ class OvertakingSectorSlicer(Node):
                                                         'end': self.sector_pnts[i+1]
                                                         }
             dict_file['Overtaking_sector' + str(i)].update({'ot_flag': False})
-        ros_yaml_preamble = {'ot_interpolator': {'ros__parameters': dict_file}}
+        ros_yaml_preamble = {'ot_sector_tuner': {'ros__parameters': dict_file}}
 
         # Save yaml to the respective maps folder
         if not self.yaml_dir:

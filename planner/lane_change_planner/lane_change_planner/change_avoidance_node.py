@@ -671,8 +671,8 @@ class ChangeAvoidanceNode(Node):
         # inner_lane = original_center_wpnts - normals * min_center_right_gap
 
         # 2. Constant othogonal evasion
-        outer_lane = original_center_wpnts + normals * 0.25
-        inner_lane = original_center_wpnts - normals * 0.25
+        outer_lane = original_center_wpnts + normals * 0.35
+        inner_lane = original_center_wpnts - normals * 0.35
 
         outer_lane_resampled = self.resample_lane(outer_lane, resolution=0.1)
         inner_lane_resampled = self.resample_lane(inner_lane, resolution=0.1)
