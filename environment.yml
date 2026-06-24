@@ -85,6 +85,13 @@ dependencies:
   - opencv=4.12.0
   - transforms3d=0.4.2
   - matplotlib-base=3.11.0
+  # quadprog is a dependency of trajectory_planning_helpers (requirements.txt).
+  # Left to pip it pulls a PyPI build that links against the wrong numpy ABI and
+  # imports broken ("ghost install"), needing a manual
+  #   conda install --force-reinstall -c conda-forge quadprog=0.1.13
+  # Pinning the conda-forge build HERE installs it correctly in the conda layer
+  # first, so pip sees quadprog already satisfied and never builds the bad wheel.
+  - quadprog=0.1.13
   # pybind11 is the only build dep of range_libc (header-only binding, no Cython,
   # no numpy at build). Having it here lets range_libc build with
   # --no-build-isolation entirely from conda (no PyPI fetch) — see note below.

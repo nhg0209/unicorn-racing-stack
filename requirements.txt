@@ -21,6 +21,11 @@ trajectory_planning_helpers==0.79
 tqdm
 filterpy==1.4.5
 
+# pynput: global keyboard listener for stack_master/keyboard_joy_node.py
+# (keyboard teleop -> /joy_keyboard). Without it that node crashes on import
+# and `keyboard_teleop:=true` silently has no publisher.
+pynput
+
 # scipy is pinned here because the verified env had a pip scipy shadowing the
 # conda one. If you prefer the conda build, move this to environment.yml instead.
 scipy==1.17.1
