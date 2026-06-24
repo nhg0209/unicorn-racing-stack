@@ -29,6 +29,7 @@ repo lives at `~/unicorn_ws/src/unicorn-racing-stack`. Build from the workspace 
 # A0  Miniforge — skip if you already have conda/mamba. Any Linux/macOS, x86_64/arm64.
 curl -L -O "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
 bash "Miniforge3-$(uname)-$(uname -m).sh" && exec $SHELL
+conda config --set auto_activate_base false
 
 # A1  conda env: ROS 2 Jazzy + build tooling + pinned libs (the conda layer)
 cd ~/unicorn_ws/src/unicorn-racing-stack
