@@ -103,6 +103,12 @@ class ObstacleSpliner(Node):
         self.map_filter.set_erosion_kernel_size(self.kernel_size)
 
         self.declare_all_parameters()
+        # Apply loaded params to working members at startup (callback only fires on later set).
+        self.dyn_param_cb(self.get_parameters([
+            'save_params', 'kernel_size', 'post_sampling_dist', 'post_min_dist',
+            'post_max_dist', 'spline_scale', 'evasion_dist', 'obs_traj_tresh',
+            'spline_bound_mindist', 'kd_obs_pred', 'fixed_pred_time',
+        ]))
         self.add_on_set_parameters_callback(self.dyn_param_cb)
 
         # Subscribe to the topics

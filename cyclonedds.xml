@@ -12,8 +12,8 @@
             <ParticipantIndex>auto</ParticipantIndex>
         </Discovery>
         <Internal>
-            <SocketReceiveBufferSize min="10MB"/>
-            <SocketSendBufferSize min="10MB"/>
+            <SocketReceiveBufferSize min="default"/>
+            <SocketSendBufferSize min="default"/>
         </Internal>
     </Domain>
 </CycloneDDS>
