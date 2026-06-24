@@ -4,7 +4,7 @@
   <name>set_pose</name>
   <version>0.0.0</version>
   <description>Set cartographer initial pose and save cartographer maps via RViz interactions</description>
-  <maintainer email="shineejoon@unist.ac.kr">nuc5</maintainer>
+  <maintainer email="shineejoon@unist.ac.kr">HMCL</maintainer>
   <license>MIT</license>
 
   <exec_depend>ros2launch</exec_depend>

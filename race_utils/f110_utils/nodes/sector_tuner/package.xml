@@ -4,7 +4,7 @@
   <name>sector_tuner</name>
   <version>0.0.0</version>
   <description>Sector velocity scaler and sector slicing GUI for F1TENTH racing</description>
-  <maintainer email="shineejoon@unist.ac.kr">nuc5</maintainer>
+  <maintainer email="shineejoon@unist.ac.kr">HMCL</maintainer>
   <license>MIT</license>
 
   <exec_depend>ros2launch</exec_depend>

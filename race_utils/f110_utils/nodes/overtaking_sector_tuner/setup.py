@@ -19,7 +19,7 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='nuc5',
+    maintainer='HMCL',
     maintainer_email='shineejoon@unist.ac.kr',
     description='Overtaking sector tuner: trajectory interpolation and OT sector slicing GUI',
     license='MIT',

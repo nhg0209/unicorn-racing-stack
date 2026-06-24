@@ -31,7 +31,7 @@ class SectorTuner(Node):
     """
 
     def __init__(self):
-        super().__init__('sector_tuner',
+        super().__init__('speed_sector_tuner',
                          allow_undeclared_parameters=True,
                          automatically_declare_parameters_from_overrides=True)
 
@@ -49,6 +49,11 @@ class SectorTuner(Node):
         # get initial scaling
         self.sectors_params = self.parameters_to_dict()
         self.n_sectors = self.sectors_params['n_sectors']
+        # apply the same clip the dyn callback does, so the yaml is in effect at
+        # startup (otherwise scaling stays raw until the first param change).
+        for i in range(self.n_sectors):
+            self.sectors_params[f"Sector{i}"]['scaling'] = np.clip(
+                self.sectors_params[f"Sector{i}"]['scaling'], 0, self.sectors_params['global_limit'])
 
         # unicorn-specific: path to the yaml that can be written back to disk
         # (the map's speed_scaling.yaml). Empty -> save-back disabled.
@@ -112,7 +117,7 @@ class SectorTuner(Node):
 
     def dyn_param_cb(self, parameter_event):
         """Notices the change in the parameters and scales the global waypoints."""
-        if (parameter_event.node != '/sector_tuner'):
+        if (parameter_event.node != '/speed_sector_tuner'):
             return
         self.sectors_params = self.parameters_to_dict()
 
@@ -136,6 +141,7 @@ class SectorTuner(Node):
             return
         try:
             yaml_data = {
+                'save_params': False,
                 'global_limit': float(self.sectors_params['global_limit']),
                 'n_sectors': int(self.n_sectors),
             }
@@ -148,7 +154,7 @@ class SectorTuner(Node):
                     'only_FTG': bool(sec.get('only_FTG', False)),
                     'no_FTG': bool(sec.get('no_FTG', False)),
                 }
-            wrapped = {'sector_tuner': {'ros__parameters': yaml_data}}
+            wrapped = {'speed_sector_tuner': {'ros__parameters': yaml_data}}
             os.makedirs(os.path.dirname(self.yaml_file_path), exist_ok=True)
             with open(self.yaml_file_path, "w") as yaml_file:
                 yaml.dump(wrapped, yaml_file, default_flow_style=False, sort_keys=False)

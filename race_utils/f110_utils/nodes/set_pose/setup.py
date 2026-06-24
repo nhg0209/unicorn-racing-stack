@@ -17,7 +17,7 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='nuc5',
+    maintainer='HMCL',
     maintainer_email='shineejoon@unist.ac.kr',
     description='Set cartographer initial pose and save cartographer maps via RViz interactions',
     license='MIT',

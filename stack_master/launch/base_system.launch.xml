@@ -63,13 +63,17 @@
   <!-- speed_scaling.yaml -> /global_waypoints_scaled + /sector_markers.
        sector_tuner (not velocity_scaler) also draws the RViz markers.
        Node name must match the yaml's top-level key. -->
-  <node pkg="sector_tuner" exec="sector_tuner" name="sector_tuner" output="screen">
+  <node pkg="sector_tuner" exec="sector_tuner" name="speed_sector_tuner" output="screen">
     <param from="$(var maps_dir)/$(var map)/speed_scaling.yaml"/>
+    <!-- save_params writes back to the SAME yaml it loaded; the install copy is a
+         colcon symlink-install symlink to the source tree, so tuned values persist. -->
+    <param name="save_yaml_path" value="$(var maps_dir)/$(var map)/speed_scaling.yaml"/>
   </node>
 
   <!-- Overtaking lines: ot_sectors.yaml -> /global_waypoints/overtaking -->
-  <node pkg="overtaking_sector_tuner" exec="ot_interpolator" name="ot_interpolator" output="screen">
+  <node pkg="overtaking_sector_tuner" exec="ot_interpolator" name="ot_sector_tuner" output="screen">
     <param from="$(var maps_dir)/$(var map)/ot_sectors.yaml"/>
+    <param name="save_yaml_path" value="$(var maps_dir)/$(var map)/ot_sectors.yaml"/>
   </node>
 
   <!-- ===== Frenet odometry =====
