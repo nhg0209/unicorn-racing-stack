@@ -2,7 +2,9 @@
 <launch>
   <!-- Arguments -->
   <arg name="sim"            default="false"      description="Use simulator (true) or real hardware (false)"/>
-  <arg name="vehicle_config" default="$(find-pkg-share stack_master)/config/vehicle_config.yaml"/>
+  <let name="config_dir" value="$(find-pkg-share stack_master)/config/SIM" if="$(var sim)"/>
+  <let name="config_dir" value="$(find-pkg-share stack_master)/config/CAR" unless="$(var sim)"/>
+  <arg name="vehicle_config" default="$(var config_dir)/vehicle_config.yaml"/>
   <arg name="use_estop"      default="false"               description="Use emergency stop (true) or not (false)"/>
 
   <!-- ========== REAL HARDWARE SENSORS ========== -->

@@ -1,0 +1,87 @@
+<!-- -*- mode: XML -*- -->
+<!--
+  ROS 2 port of the ros1 stack_master/launch/mapping.launch.
+
+  Builds the global plan (and, optionally, the map) for a track, then slices the
+  speed/overtaking sectors. Mirrors the ros1 three-mode behaviour driven by
+  (create_map, create_global_path) inside gb_optimizer/global_planner_node:
+    create_map=T, create_global_path=T  -> map_editor=F, mapping=F  (drive + map + plan)
+    create_map=T, create_global_path=F  -> map_editor=T, mapping=T  (save map only)
+    create_map=F                        -> map_editor=T, mapping=F  (plan from existing map)
+
+  Examples:
+    # plan a global path from an existing map (no SLAM), then slice sectors
+    ros2 launch stack_master mapping.launch.xml map:=map_test create_map:=false
+
+    # drive the car, build the map with cartographer, then plan + slice
+    ros2 launch stack_master mapping.launch.xml map:=YOURMAP sim:=false
+-->
+<launch>
+  <arg name="map"                                  description="Map name (folder in stack_master/maps/)"/>
+  <arg name="sim"                default="false"   description="Use simulator (true) or real hardware (false)"/>
+  <arg name="gb_conf_path"       default="$(find-pkg-share stack_master)/config/global_planner_params.yaml"
+       description="ROS params YAML for the global planner node"/>
+  <arg name="reverse"            default="false"   description="Reverse raceline direction"/>
+  <arg name="create_map"         default="true"    description="Build a new map with SLAM (true) or use an existing one (false)"/>
+  <arg name="create_global_path" default="true"    description="Compute the global path + slice sectors (true) or save map only (false)"/>
+  <arg name="show_plots"         default="false"   description="Show optimization result plots"/>
+
+  <!-- sim -> SIM config folder, real hardware -> CAR config folder. The folder
+       name doubles as racecar_version (holds racecar_f110.ini + veh_dyn_info/). -->
+  <let name="racecar_version" value="SIM" if="$(var sim)"/>
+  <let name="racecar_version" value="CAR" unless="$(var sim)"/>
+  <let name="config_dir" value="$(find-pkg-share stack_master)/config/$(var racecar_version)"/>
+  <arg name="vehicle_config" default="$(var config_dir)/vehicle_config.yaml"/>
+
+  <let name="maps_dir" value="$(find-pkg-share stack_master)/maps"/>
+
+  <!-- ===== global planner (gb_optimizer) ===== -->
+  <!-- emulate_tty: line-buffer the node's stdout so the optimizer's plain
+       print()s (IQP iterations etc.) stream live instead of dumping at exit. -->
+  <node pkg="gb_optimizer" exec="global_planner_node" name="global_planner" output="screen" emulate_tty="true">
+    <param from="$(var gb_conf_path)"/>
+    <param name="racecar_version"    value="$(var racecar_version)"/>
+    <param name="create_map"         value="$(var create_map)"/>
+    <param name="create_global_path" value="$(var create_global_path)"/>
+    <param name="map"                value="$(var map)"/>
+    <param name="map_dir"            value="$(var maps_dir)/$(var map)/"/>
+    <param name="reverse_mapping"    value="$(var reverse)"/>
+    <param name="show_plots"         value="$(var show_plots)"/>
+  </node>
+
+  <!-- ===== map source ===== -->
+  <!-- create_map=true: drive + cartographer SLAM via middle_level (mapping mode) -->
+  <group if="$(var create_map)">
+    <include file="$(find-pkg-share stack_master)/launch/middle_level.launch.xml">
+      <arg name="sim"            value="$(var sim)"/>
+      <arg name="map"            value="$(var map)"/>
+      <arg name="mapping"        value="true"/>
+      <arg name="vehicle_config" value="$(var vehicle_config)"/>
+    </include>
+  </group>
+
+  <!-- create_map=false: serve the already-saved map so the planner can read it -->
+  <group unless="$(var create_map)">
+    <node pkg="nav2_map_server" exec="map_server" name="map_server" output="screen">
+      <param name="yaml_filename" value="$(var maps_dir)/$(var map)/$(var map).yaml"/>
+    </node>
+    <node pkg="nav2_lifecycle_manager" exec="lifecycle_manager" name="lifecycle_manager" output="screen">
+      <param name="autostart"  value="true"/>
+      <param name="node_names" value="[map_server]"/>
+    </node>
+  </group>
+
+  <!-- ===== sector slicing (was sector_slicing.launch) ===== -->
+  <!-- Inlined: the ros1 sector_slicing.launch only wrapped these two nodes.
+       Each subscribes to /global_waypoints (+ /trackbounds, /shortest_path) from
+       the global planner above and writes speed_scaling.yaml / ot_sectors.yaml. -->
+  <group if="$(var create_global_path)">
+    <node pkg="sector_tuner" exec="sector_slicer" name="sector_node" output="screen">
+      <param name="save_dir" value="$(var maps_dir)/$(var map)"/>
+    </node>
+    <node pkg="overtaking_sector_tuner" exec="ot_sector_slicer" name="ot_sector_node" output="screen">
+      <param name="save_dir" value="$(var maps_dir)/$(var map)"/>
+    </node>
+  </group>
+
+</launch>

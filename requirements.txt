@@ -18,6 +18,7 @@ numba>=0.65
 gymnasium==0.29.1
 casadi==3.7.2
 trajectory_planning_helpers==0.79
+tqdm
 
 # scipy is pinned here because the verified env had a pip scipy shadowing the
 # conda one. If you prefer the conda build, move this to environment.yml instead.
@@ -26,6 +27,6 @@ scipy==1.17.1
 # --- Listed in INSTALL.md A5 but ABSENT from the verified-working env ---
 # The build succeeded without them, so they are commented out. Uncomment if a
 # module that imports them ends up on your build/run path.
-# scikit-learn
-# scikit-image
+scikit-learn
+scikit-image
 # shapely
