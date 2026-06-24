@@ -17,6 +17,7 @@ from skimage.segmentation import watershed
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 from ament_index_python.packages import get_package_share_directory
 
 # Make the vendored `global_racetrajectory_optimization` subtree importable as a
@@ -94,7 +95,7 @@ class GlobalPlanner(Node):
             self.map_editor_mapping = False
 
         self.map_name = self.get_parameter('map').value
-        self.map_dir = self.get_parameter('map_dir').value
+        self.map_dir = self._resolve_source_map_dir(self.get_parameter('map_dir').value)
         self.reverse_mapping = self.get_parameter('reverse_mapping').value
         self.watershed = True  # use watershed algorithm
 
@@ -136,7 +137,11 @@ class GlobalPlanner(Node):
         self.cent_length_done = False
 
         # all required subscribers
-        self.create_subscription(OccupancyGrid, '/map', self.map_cb, 10)
+        # nav2 map_server latches /map (TRANSIENT_LOCAL); match it or we never
+        # receive the one-shot map and _wait_for_map() blocks forever.
+        map_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                             history=HistoryPolicy.KEEP_LAST)
+        self.create_subscription(OccupancyGrid, '/map', self.map_cb, map_qos)
         # self.create_subscription(PoseStamped, '/car_state/pose', self.pose_cb, 10)
         self.create_subscription(
             PoseWithCovarianceStamped, '/base_link_pose_with_cov', self.pose_cb, 10)
@@ -159,6 +164,27 @@ class GlobalPlanner(Node):
         self.map_ready_pub = self.create_publisher(Bool, 'map_ready', 10)
         # for l1_param_optimizer
         self.est_lap_time_pub = self.create_publisher(Float32, 'estimated_lap_time', 10)
+
+    def _resolve_source_map_dir(self, map_dir):
+        """Make outputs land in the SOURCE maps/<map>/ folder, not the install copy.
+
+        Launch passes the installed share path (find-pkg-share). With colcon
+        --symlink-install the files inside it (e.g. <map>.yaml) are symlinks back
+        to src, so following one to its real location yields the source folder -
+        independent of the repo/workspace name. Falls back to the given path if
+        nothing resolvable is found (e.g. a non-symlink install).
+        """
+        if not map_dir:
+            return map_dir
+        for probe in (self.map_name + '.yaml', self.map_name + '.png', self.map_name + '.pgm'):
+            p = os.path.join(map_dir, probe)
+            if os.path.islink(p) or os.path.exists(p):
+                real_dir = os.path.dirname(os.path.realpath(p))
+                if real_dir != os.path.realpath(map_dir):
+                    self.get_logger().info(
+                        f'[GB Planner]: resolved source map dir -> {real_dir}')
+                return real_dir
+        return map_dir
 
     def map_cb(self, data):
         """
@@ -212,7 +238,10 @@ class GlobalPlanner(Node):
 
         # If in map_editor mode while not mapping (i.e. no need for .pbstream) we only compute the gb from the img and exit
         if self.map_editor and not self.map_editor_mapping:
-            self._wait_for_map()
+            # create_map=false: the plan is built from the saved .png + .yaml
+            # (resolution/origin below), NOT from a live /map occupancy grid -
+            # map_cb only fills map_occupancy_grid when create_map is true, so
+            # waiting on it here would block forever.
             with open(os.path.join(self.map_dir, self.map_name + '.yaml')) as f:
                 data = yaml.safe_load(f)
                 # only need resolution and origin for waypoints
@@ -422,9 +451,11 @@ class GlobalPlanner(Node):
         skeleton = skeletonize(opening, method='lee')
 
         # ! For debugging
+        # origin='lower' flips the display about the x-axis so the map shows
+        # right-side-up (viz only; the underlying arrays / waypoints are unchanged).
         f, (ax0, ax1) = plt.subplots(2, 1)
-        ax0.imshow(opening, cmap='gray')
-        ax1.imshow(skeleton, cmap='gray')
+        ax0.imshow(opening, cmap='gray', origin='lower')
+        ax1.imshow(skeleton, cmap='gray', origin='lower')
         plt.show()
 
         ################################################################################################################
@@ -490,7 +521,9 @@ class GlobalPlanner(Node):
             plt.show()
 
         # flip centerline if directions don't match
-        if not self.compare_direction(cent_direction, self.initial_position[2]):
+        # cent_direction is np.angle([...]) -> a length-1 array; pass the scalar
+        # element (newer numpy won't coerce a 1-elem array in math.fabs).
+        if not self.compare_direction(cent_direction[0], self.initial_position[2]):
             centerline_smooth = np.flip(centerline_smooth, axis=0)
             centerline_meter_int = np.flip(centerline_meter_int, axis=0)
 
@@ -610,10 +643,16 @@ class GlobalPlanner(Node):
 
         _, new_centerline_markers = self.write_centerline(new_cent_with_dist, sp_bool=True)
 
-        # to use iqp as new centerline, set trackname='map_centerline_2', otherwise use track_name='map_centerline'
-        # is a bit faster but cuts corner a bit more
+        # Use the TRUE centerline (map_centerline) as the shortest-path reference,
+        # not the IQP line (map_centerline_2). The IQP line already hugs the inside
+        # of corners, so measuring d_right/d_left from it gives a lopsided width:
+        # the outer-bound distance is large, which lets the shortest-path QP shift
+        # the path up to ~0.8 m past the outer wall (~15% of points went outside on
+        # the f map). The centerline has balanced left/right widths, keeping the
+        # solution inside the track. (map_centerline_2 is "a bit faster but cuts
+        # corners more" per the original note -- at the cost of leaving the track.)
         global_trajectory_sp, bound_r_sp, bound_l_sp, est_t_sp = trajectory_optimizer(input_path=self.input_path,
-                                                                                      track_name='map_centerline_2',
+                                                                                      track_name='map_centerline',
                                                                                       curv_opt_type='shortest_path',
                                                                                       safety_width=self.safety_width_sp,
                                                                                       plot=(self.show_plots and not self.map_editor))
@@ -695,6 +734,10 @@ class GlobalPlanner(Node):
             {self.test_on_car} is True)
         """
         # get contours from skeleton
+        # skimage.skeletonize returns a bool array; OpenCV >=4.6 rejects bool in
+        # findContours, so cast to the uint8 (0/255) image it expects.
+        if skeleton.dtype == bool:
+            skeleton = skeleton.astype(np.uint8) * 255
         contours, hierarchy = cv2.findContours(skeleton, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
 
         # save all closed contours
@@ -1099,7 +1142,11 @@ class GlobalPlanner(Node):
         centerline_markers = MarkerArray()
         centerline_wpnts = WpntArray()
 
-        cent_str = 'map_centerline.csv' if not sp_bool else 'map_centerline_2.csv'
+        # Intermediate track file consumed by trajectory_optimizer (track_name +
+        # '.csv'). Written to /tmp so it doesn't litter the launch cwd; the
+        # optimizer resolves the same /tmp path from track_name.
+        cent_name = 'map_centerline' if not sp_bool else 'map_centerline_2'
+        cent_str = os.path.join('/tmp', cent_name + '.csv')
         with open(cent_str, 'w', newline='') as file:
             writer = csv.writer(file)
             id_cnt = 0  # for marker id
@@ -1291,6 +1338,10 @@ class GlobalPlanner(Node):
         bool
             True if alpha and beta point in the same direction
         """
+        # callers sometimes pass np.angle([...]) results (length-1 arrays);
+        # coerce to scalars so math.fabs works under newer numpy.
+        alpha = float(np.asarray(alpha).reshape(-1)[0])
+        beta = float(np.asarray(beta).reshape(-1)[0])
         delta_theta = math.fabs(alpha - beta)
 
         if delta_theta > math.pi:

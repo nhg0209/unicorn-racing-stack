@@ -17,7 +17,11 @@
   <arg name="map"          description="Map name (folder in stack_master/maps/)"/>
   <arg name="sim"          default="false" description="Use simulator (true) or real hardware (false)"/>
   <arg name="localization" default="gt"    description="gt (sim) | cartographer | pf (real)"/>
-  <arg name="vehicle_config" default="$(find-pkg-share stack_master)/config/vehicle_config.yaml"/>
+
+  <!-- sim -> SIM config folder, real hardware -> CAR config folder -->
+  <let name="config_dir" value="$(find-pkg-share stack_master)/config/SIM" if="$(var sim)"/>
+  <let name="config_dir" value="$(find-pkg-share stack_master)/config/CAR" unless="$(var sim)"/>
+  <arg name="vehicle_config" default="$(var config_dir)/vehicle_config.yaml"/>
 
   <!-- ===== Sensors / Simulator (+ opponent) + Localization ===== -->
   <!-- SIM: low_level brings up gym_bridge (gt localization) + virtual opponent + mux. -->
@@ -38,12 +42,34 @@
     </include>
   </group>
 
-  <!-- ===== Global raceline =====
-       Publishes /global_waypoints (+ /global_waypoints_scaled and
-       /global_waypoints/overtaking, consumed by the state machine & planners)
-       and /centerline_waypoints from stack_master/maps/<map>/. -->
-  <node pkg="planner" exec="waypoint_publisher" name="waypoint_publisher" output="screen">
-    <param name="map_name" value="$(var map)"/>
+  <!-- ===== Global raceline (gb_optimizer JSON pipeline) =====
+       ROS2 port of the ros1 base_system global-waypoint chain. Replaces the CSV
+       waypoint_publisher: the republisher reads stack_master/maps/<map>/
+       global_waypoints.json (produced by mapping.launch.xml) and publishes
+       /global_waypoints, /global_waypoints/shortest_path, /centerline_waypoints,
+       /trackbounds/markers, etc.
+
+       The ros1 dynamic_reconfigure sector servers (sector_server / ot_sector_server)
+       are NOT ported; vel_scaler and ot_interpolator load their sector config
+       straight from the map's yaml instead (autodeclare_from_overrides=True), so
+       they run standalone and produce /global_waypoints_scaled and
+       /global_waypoints/overtaking for the state machine & local planners. -->
+  <let name="maps_dir" value="$(find-pkg-share stack_master)/maps"/>
+
+  <node pkg="gb_optimizer" exec="global_trajectory_publisher" name="global_republisher" output="screen">
+    <param name="map" value="$(var map)"/>
+  </node>
+
+  <!-- speed_scaling.yaml -> /global_waypoints_scaled + /sector_markers.
+       sector_tuner (not velocity_scaler) also draws the RViz markers.
+       Node name must match the yaml's top-level key. -->
+  <node pkg="sector_tuner" exec="sector_tuner" name="sector_tuner" output="screen">
+    <param from="$(var maps_dir)/$(var map)/speed_scaling.yaml"/>
+  </node>
+
+  <!-- Overtaking lines: ot_sectors.yaml -> /global_waypoints/overtaking -->
+  <node pkg="overtaking_sector_tuner" exec="ot_interpolator" name="ot_interpolator" output="screen">
+    <param from="$(var maps_dir)/$(var map)/ot_sectors.yaml"/>
   </node>
 
   <!-- ===== Frenet odometry =====

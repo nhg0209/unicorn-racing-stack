@@ -109,8 +109,13 @@ def trajectory_optimizer(input_path: str,
     # get current path
     file_paths["module"] = os.path.dirname(os.path.abspath(__file__))
 
-    # assemble track import path
-    file_paths["track_file"] = os.path.join(file_paths["track_name"] + ".csv")
+    # assemble track import path. The global planner writes its intermediate
+    # map_centerline[_2].csv to /tmp (see global_planner_node.write_centerline),
+    # so read it back from there; other track names keep the legacy behaviour.
+    if file_paths["track_name"] in ("map_centerline", "map_centerline_2"):
+        file_paths["track_file"] = os.path.join("/tmp", file_paths["track_name"] + ".csv")
+    else:
+        file_paths["track_file"] = os.path.join(file_paths["track_name"] + ".csv")
 
     # assemble friction map import paths
     file_paths["tpamap"] = os.path.join(file_paths["inputs"], "frictionmaps",
@@ -269,10 +274,25 @@ def trajectory_optimizer(input_path: str,
                                                   plot_debug=False)[0]
 
     elif curv_opt_type == 'mincurv_iqp':
-        alpha_opt, reftrack_interp, normvec_normalized_interp = tph.iqp_handler.\
+        # tph >=0.78 moved spline_len/psi/kappa/dkappa out of iqp_handler and
+        # expects the caller to pass them. Compute from the interpolated spline
+        # coeffs (same calls iqp_handler used internally on older tph).
+        spline_len_interp = tph.calc_spline_lengths.calc_spline_lengths(
+            coeffs_x=coeffs_x_interp, coeffs_y=coeffs_y_interp)
+        psi_interp, kappa_interp, dkappa_interp = tph.calc_head_curv_an.calc_head_curv_an(
+            coeffs_x=coeffs_x_interp,
+            coeffs_y=coeffs_y_interp,
+            ind_spls=np.arange(reftrack_interp.shape[0]),
+            t_spls=np.zeros(reftrack_interp.shape[0]),
+            calc_dcurv=True)
+        alpha_opt, reftrack_interp, normvec_normalized_interp, *_ = tph.iqp_handler.\
             iqp_handler(reftrack=reftrack_interp,
                         normvectors=normvec_normalized_interp,
                         A=a_interp,
+                        spline_len=spline_len_interp,
+                        psi=psi_interp,
+                        kappa=kappa_interp,
+                        dkappa=dkappa_interp,
                         kappa_bound=pars["veh_params"]["curvlim"],
                         w_veh=safety_width,
                         print_debug=debug,

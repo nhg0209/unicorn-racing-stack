@@ -355,11 +355,14 @@ class OvertakingInterpolator(Node):
             curvature = (
                 np.abs(x_d * y_dd - y_d * x_dd)/pow((x_d**2 + y_d ** 2), 1.5)
             )
-            new_wpnt.kappa_radpm = curvature
+            new_wpnt.kappa_radpm = float(curvature)
             # frenet components
+            # get_frenet returns np.array([s, d]) where s, d are length-1 arrays
+            # (x/y passed as arrays); ravel before float() -- newer numpy rejects
+            # float() on a 1-element array.
             frenet_newpoint = self.converter.get_frenet(np.array([new_wpnt.x_m]), np.array([new_wpnt.y_m]))
-            new_wpnt.s_m = float(frenet_newpoint[0])
-            new_wpnt.d_m = float(frenet_newpoint[1])
+            new_wpnt.s_m = float(np.ravel(frenet_newpoint[0])[0])
+            new_wpnt.d_m = float(np.ravel(frenet_newpoint[1])[0])
 
             self.interp_wpnt.wpnts.append(copy.deepcopy(new_wpnt))
 
