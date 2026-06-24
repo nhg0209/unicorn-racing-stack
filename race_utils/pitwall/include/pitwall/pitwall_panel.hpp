@@ -49,6 +49,8 @@ private Q_SLOTS:
   void onToggleOppLidar();
   void onSelectOverlay();
   void onSelectMerge();
+  void onSelectJoy();
+  void onSelectKeyboard();
 
 private:
   void publishSpeedDelta(float delta);
@@ -63,6 +65,9 @@ private:
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr opp_lidar_pub_;
   // virtual_perception injection seam selector (overlay XOR merge)
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr inject_mode_pub_;
+  // ego human-drive input source selector (joy XOR keyboard) -> simple_mux.
+  // Bool: false = joy (existing path), true = keyboard (/joy_keyboard).
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr ego_control_pub_;
   // current state machine state -> colour banner (survives removing /state_marker)
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr state_sub_;
   // pitwall important-events feed -> telemetry box
@@ -71,6 +76,8 @@ private:
   QPushButton * opp_lidar_btn_ {nullptr};
   QPushButton * scan_overlay_btn_ {nullptr};
   QPushButton * tracking_merge_btn_ {nullptr};
+  QPushButton * joy_src_btn_ {nullptr};
+  QPushButton * keyboard_src_btn_ {nullptr};
 
   QLabel * state_banner_ {nullptr};          // top: current state, coloured per state
   QPlainTextEdit * telemetry_log_ {nullptr}; // terminal-like live telemetry feed
