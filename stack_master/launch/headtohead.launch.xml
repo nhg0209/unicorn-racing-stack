@@ -7,7 +7,7 @@
     perception   : detect (C++) + tracking (Python)  (/scan -> /detect/raw_obstacles -> /tracking/obstacles_raw)
     state machine: state_machine                     (/tracking/obstacles + raceline -> /local_waypoints, /behavior_strategy, /state_machine)
     planning     : spliner_node                      (avoidance spline -> /planner/avoidance/otwpnts)
-    control      : pp_node                           (follows /local_waypoints -> /vesc/high_level/ackermann_cmd)
+    control      : controller_manager               (L1/Pure-Pursuit; /behavior_strategy -> high_level/ackermann_cmd)
 
   The virtual opponent and its obstacle injection (/tracking/obstacles with
   Frenet fields) come from base_system -> low_level -> virtual_perception pkg
@@ -21,7 +21,7 @@
 <launch>
   <arg name="map"        description="Map name (folder in stack_master/maps/)"/>
   <arg name="sim"        default="false" description="Use simulator (true) or real hardware (false)"/>
-  <arg name="ot_planner" default="spliner" description="overtake planner the state machine listens to"/>
+  <arg name="ot_planner" default="predictive_spliner" description="overtake planner the state machine listens to (ROS1 default = predictive_spliner: listens to BOTH /planner/avoidance/otwpnts (dynamic) AND /planner/avoidance/static_otwpnts (static))"/>
   <arg name="control_topic" default="/local_waypoints"
        description="WpntArray the controller follows: /local_waypoints (state-machine output w/ avoidance) or /global_waypoints (robust raceline)"/>
   <!-- virtual_perception injection seam is chosen at RUNTIME from the Sim Control
@@ -59,22 +59,28 @@
     <param name="ot_planner"      value="$(var ot_planner)"/>
   </node>
 
-  <!-- ===== Planning: spliner avoidance (publishes /planner/avoidance/otwpnts) ===== -->
-  <node pkg="spliner" exec="spliner_node" name="spliner_node" output="screen"/>
+  <!-- Recovery planner -> /planner/recovery/wpnts -->
+  <node pkg="recovery_spliner" exec="recovery_spliner_node" name="recovery_spliner_node" output="screen"/>
 
-  <!-- ===== Control: Pure Pursuit following the state machine's local waypoints ===== -->
-  <group if="$(var sim)">
-    <node pkg="controller" exec="pp_node" name="pp" output="screen">
-      <param from="$(find-pkg-share stack_master)/config/ppc.yaml"/>
-      <param name="waypoint_topic" value="$(var control_topic)"/>
-      <param name="odom_topic"     value="/vesc/odom"/>
-    </node>
-  </group>
-  <group unless="$(var sim)">
-    <node pkg="controller" exec="pp_node" name="pp" output="screen">
-      <param from="$(find-pkg-share stack_master)/config/ppc.yaml"/>
-      <param name="waypoint_topic" value="$(var control_topic)"/>
-      <param name="odom_topic"     value="/car_state/odom"/>
-    </node>
-  </group>
+  <!-- Start planner -> /planner/start_wpnts -->
+  <node pkg="spliner" exec="start_spline_node_v2" name="start_planner" output="screen"/>
+
+  <!-- Static avoidance -> /planner/avoidance/static_otwpnts -->
+  <node pkg="spliner" exec="static_avoidance_node" name="planner_spline" output="screen">
+    <remap from="/planner/avoidance/otwpnts" to="/planner/avoidance/static_otwpnts"/>
+  </node>
+
+  <!-- Dynamic avoidance (ROS1 Change mode) -> /planner/avoidance/otwpnts + /planner/avoidance/merger -->
+  <node pkg="lane_change_planner" exec="change_avoidance_node" name="planner_change" output="screen"/>
+  <node pkg="lane_change_planner" exec="update_waypoints" name="waypoint_updater" output="screen"/>
+
+  <!-- ===== Control: L1 / Pure-Pursuit controller (ROS2 port of the ROS1 controller_manager) =====
+       Subscribes /behavior_strategy + car state, publishes high_level/ackermann_cmd
+       (-> simple_mux -> vehicle). Common controller.yaml; save_params writes back
+       to the same file. -->
+  <node pkg="controller" exec="controller_manager" name="controller_manager" output="screen">
+    <param from="$(find-pkg-share stack_master)/config/controller.yaml"/>
+    <param name="save_yaml_path" value="$(find-pkg-share stack_master)/config/controller.yaml"/>
+    <param name="sim" value="$(var sim)"/>
+  </node>
 </launch>

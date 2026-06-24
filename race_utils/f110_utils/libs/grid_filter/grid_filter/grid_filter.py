@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from nav_msgs.msg import OccupancyGrid
+from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 
 
 class GridFilter:
@@ -30,8 +31,13 @@ class GridFilter:
 
     def subscribe_to_map(self, map_topic):
         self._log(f"Subscribing to map topic: {map_topic}")
+        # nav2 map_server / gym_bridge latch /map (TRANSIENT_LOCAL); a default
+        # VOLATILE subscriber never receives the one-shot latched map, so
+        # eroded_image stays None and is_point_inside() is always False.
+        map_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                             history=HistoryPolicy.KEEP_LAST)
         self._sub = self.node.create_subscription(
-            OccupancyGrid, map_topic, self.map_callback, 10)
+            OccupancyGrid, map_topic, self.map_callback, map_qos)
 
     def map_callback(self, msg):
         if self.image is None:

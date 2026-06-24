@@ -30,3 +30,7 @@ COLCON_IGNORE
 .docker/colcon_build.log
 # old docker/ dir superseded by .docker/ (kept on disk only while a build runs)
 /docker/
+
+# rosbag recordings (local debugging only; keep the folder, ignore contents)
+/bags/*
+!/bags/.gitkeep

@@ -1,8 +1,0 @@
-pp:
-  ros__parameters:
-    control_rate_hz:  50.0
-    estop_min_dist:   0.5    # [m]
-    estop_angle_deg: 30.0    # [deg]
-    pp_lookahead:     1.0    # [m]
-    pp_wheelbase:     0.33   # [m]
-    pp_max_steer:     0.4    # [rad]
