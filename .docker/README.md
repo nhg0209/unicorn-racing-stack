@@ -1,6 +1,10 @@
 # `.docker/` — container build / smoke / sim (RoboStack conda, ROS 2 Jazzy)
 
-Everything here runs the **INSTALL.md Path A** flow (Miniforge → `conda env create`
+> **Status: experimental / not yet officially supported.** The conda
+> ("Get started") path in the top-level README is the only supported install;
+> Docker support is planned. The harness here works but is not a stability promise.
+
+Everything here runs the **README "Get started"** flow (Miniforge → `conda env create`
 → range_libc → quadprog → `colcon build`) in a clean container, so a green build
 == the stack builds from scratch on that base. Cross-platform (x86_64 + aarch64).
 
@@ -8,9 +12,10 @@ Everything here runs the **INSTALL.md Path A** flow (Miniforge → `conda env cr
 |------|------|
 | `Dockerfile` | build-test image (the build *is* the test) |
 | `docker-compose.yml` | `buildtest` / `smoke` / `sim` services |
+| `docker-compose.dev.yml` | interactive `dev` container (host net + X11 + workspace mount) |
 | `smoke_test.sh` | bring up `low_level` + `headtohead` headless, check core topics/nodes |
 | `run_platform_test.sh` | build a base + run smoke + append `results.txt` (per-platform matrix driver) |
-| `results.txt` | recorded verdicts (see also `../BUILD.md`) |
+| `results.txt` | recorded verdicts |
 
 ## Quick start (run from the repo root, the dir that holds `.docker/`)
 
@@ -33,5 +38,5 @@ docker run --privileged --rm tonistiigi/binfmt --install arm64   # one-time, x86
 .docker/run_platform_test.sh ubuntu:24.04 24.04-arm linux/arm64  # qemu (slow)
 ```
 
-See `../BUILD.md` for the platform matrix and the build fixes this surfaced
-(ROS_VERSION/`SHELL bash`, quadprog A1c, raycaster path).
+Verdicts are appended to `results.txt`; per-run logs are `build_<label>.log` /
+`smoke_<label>.log`.

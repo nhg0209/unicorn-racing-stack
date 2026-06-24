@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # unicorn.sh — enter the unicorn-racing-stack dev environment in one step.
 #
-# SOURCE it (do not execute). Add an alias to your ~/.bashrc:
+# SOURCE it (do not execute). Works in bash AND zsh. setup_conda_onCar.sh adds the alias
+# to your ~/.bashrc and ~/.zshrc:
 #     alias unicorn='source /path/to/unicorn-racing-stack/unicorn.sh'
 # then just run:  unicorn
 #
@@ -9,7 +10,16 @@
 # (3) sources the colcon workspace, and (4) defines ros2kill / cbuild helpers.
 
 # --- locate this repo and the colcon workspace root (<ws>/src/<repo>) ---
-_URS_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve this script's own path under whichever shell sourced it (bash sets
+# BASH_SOURCE; zsh uses ${(%):-%x}).
+if [ -n "${BASH_SOURCE:-}" ]; then
+    _URS_SRC="${BASH_SOURCE[0]}"
+elif [ -n "${ZSH_VERSION:-}" ]; then
+    _URS_SRC="${(%):-%x}"
+else
+    _URS_SRC="$0"
+fi
+_URS_REPO="$(cd "$(dirname "$_URS_SRC")" && pwd)"
 _URS_WS="$(cd "$_URS_REPO/../.." && pwd)"
 
 # --- 1) conda env: RoboStack ROS 2 Jazzy ('unicorn') ---
@@ -33,20 +43,25 @@ export PYTHONNOUSERSITE=1
 # apt-style ROS python dirs (.../lib/pythonX/dist-packages — conda/colcon use
 # site-packages, so dist-packages is exclusively system ROS). This is what
 # shadowed rosidl_generator_c on the Orin ("generate_c() takes 1 arg but 2 given").
-_urs_clean_paths() {
-    local var p new parts
-    for var in PYTHONPATH LD_LIBRARY_PATH PATH; do
-        IFS=: read -ra parts <<< "${!var-}"
-        new=""
-        for p in "${parts[@]}"; do
-            [[ "$p" == /opt/ros/* ]] && continue
-            [[ "$p" == */lib/python*/dist-packages ]] && continue
-            new="${new:+$new:}$p"
-        done
-        export "$var=$new"
+# Portable (bash + zsh): filter one colon-list, echo the survivors.
+_urs_filter_path() {
+    local old="$1" new="" p rest="$1"
+    while [ -n "$rest" ]; do
+        case "$rest" in
+            *:*) p="${rest%%:*}"; rest="${rest#*:}" ;;
+            *)   p="$rest";       rest="" ;;
+        esac
+        case "$p" in
+            /opt/ros/*) continue ;;
+            */lib/python*/dist-packages) continue ;;
+        esac
+        new="${new:+$new:}$p"
     done
+    printf '%s' "$new"
 }
-_urs_clean_paths
+[ -n "${PYTHONPATH:-}" ]     && export PYTHONPATH="$(_urs_filter_path "$PYTHONPATH")"
+[ -n "${LD_LIBRARY_PATH:-}" ] && export LD_LIBRARY_PATH="$(_urs_filter_path "$LD_LIBRARY_PATH")"
+export PATH="$(_urs_filter_path "$PATH")"
 
 # --- 2) middleware + ROS domain ---
 # CycloneDDS is far lighter than the default FastDDS on this many-node single-host
@@ -59,16 +74,10 @@ export CYCLONEDDS_URI="file://$_URS_REPO/cyclonedds.xml"
 
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-1}"
 
-# CycloneDDS config file: cyclonedds.xml targets the CAR network (192.168.60.x,
-# explicit peers, no multicast). A dev laptop wants CycloneDDS DEFAULTS (auto
-# interface + multicast), so only point CYCLONEDDS_URI at the file when that
-# subnet is actually present.
-if command -v ip >/dev/null 2>&1 && ip -o addr show 2>/dev/null | grep -q '192\.168\.80\.'; then
-    export CYCLONEDDS_URI="file://$_URS_REPO/cyclonedds.xml"
-fi
-
 # --- 3) colcon workspace overlay + gym raycaster dir ---
-[ -f "$_URS_WS/install/setup.bash" ] && source "$_URS_WS/install/setup.bash"
+# colcon generates setup.{bash,zsh,sh}; source the one matching the live shell.
+if [ -n "${ZSH_VERSION:-}" ]; then _urs_setup=setup.zsh; else _urs_setup=setup.bash; fi
+[ -f "$_URS_WS/install/$_urs_setup" ] && source "$_URS_WS/install/$_urs_setup"
 export RAYCASTER_DIR="$_URS_REPO/race_utils/raycaster"
 
 # --- 4) helpers ---
@@ -82,13 +91,17 @@ ros2kill() {
     echo "[ros2kill] killed all ROS 2 nodes"
 }
 
+# Open the pitwall RViz (Sim Control + telemetry panel). More tools may join
+# this launch later. Pass-through args go to ros2 launch.
+alias pitwall='ros2 launch pitwall pitwall.launch.py'
+
 # colcon build (Release) + re-source. No args = whole workspace; args = packages.
 cbuild() {
     local sel=()
     [ $# -gt 0 ] && sel=(--packages-select "$@")
     ( cd "$_URS_WS" && colcon build "${sel[@]}" --symlink-install \
           --cmake-args -DCMAKE_BUILD_TYPE=Release ) \
-        && source "$_URS_WS/install/setup.bash"
+        && source "$_URS_WS/install/$_urs_setup"
 }
 
 echo "[unicorn] env ready  |  RMW=$RMW_IMPLEMENTATION  ROS_DOMAIN_ID=$ROS_DOMAIN_ID  |  helpers: cbuild, ros2kill"

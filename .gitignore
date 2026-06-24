@@ -18,6 +18,11 @@ dist/
 .idea/
 .claude/
 
+# colcon profile markers — generated per build profile by
+# setup_conda_on{Laptop,Car}.sh (laptop touches them, car removes them).
+# Purely local artifacts; never tracked.
+COLCON_IGNORE
+
 # container platform-test transient logs (keep .docker/results.txt + scripts)
 .docker/build_*.log
 .docker/smoke_*.log

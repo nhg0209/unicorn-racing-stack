@@ -1,9 +1,12 @@
+# Interactive dev container (host networking + X11 + workspace mount).
+# Run from the repo root (the dir that holds .docker/):
+#   docker compose -f .docker/docker-compose.dev.yml up -d dev
+#   docker compose -f .docker/docker-compose.dev.yml exec dev bash
 services:
   dev:
-    # Run `docker compose` from this meta-repo dir (<workspace>/src/unicorn-racing-stack).
-    # Build context is the meta-repo; the runtime mount is the whole workspace.
+    # Build context is the repo root; the runtime mount is the whole workspace.
     build:
-      context: .
+      context: ..
       dockerfile: .devcontainer/Dockerfile
       args:
         - USERNAME=${USER}
@@ -20,7 +23,7 @@ services:
       - ROS_DOMAIN_ID=1
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
     volumes:
-      # Mount the workspace root (two levels up from this meta-repo) at /ws so
+      # Mount the workspace root (two levels up from this repo) at /ws so
       # sibling component repos under src/ are visible to colcon.
       - ${PWD}/../..:/ws
       - ${HOME}/.Xauthority:/tmp/.Xauthority

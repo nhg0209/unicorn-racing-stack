@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # First-start setup for the dev container: build the RoboStack `unicorn` env and
-# the colcon workspace against the MOUNTED source (INSTALL.md Path A). Runs once;
+# the colcon workspace against the MOUNTED source (README "Get started"). Runs once;
 # the env + install/ persist in the container for subsequent opens.
 set -e
 REPO=/ws/src/unicorn-racing-stack
@@ -12,10 +12,10 @@ if ! conda env list | grep -q '/envs/unicorn'; then
 fi
 conda activate unicorn
 
-# range_libc (header-only pybind11, no PyPI fetch) — INSTALL.md A1b
+# range_libc (header-only pybind11, no PyPI fetch) — README "Get started" step 3
 pip install --no-build-isolation -e "$REPO/race_utils/raycaster/range_libc/pywrapper" || true
 
-# quadprog: replace the broken PyPI wheel with conda-forge — INSTALL.md A1c
+# quadprog: replace the broken PyPI wheel with conda-forge — README "Get started" step 4
 python -c 'import quadprog' 2>/dev/null || \
   { pip uninstall -y quadprog; conda install -y -c conda-forge quadprog=0.1.13; }
 

@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+#
+# setup_conda_onCar.sh — set up unicorn-racing-stack in ONE shot (FULL build,
+# including the sensor drivers + SLAM). Run after you've cloned it.
+#
+#   conda activate base      # (or have conda/mamba on PATH — see README "Get started")
+#   ./setup_conda_onCar.sh   # creates the 'unicorn' env, installs deps, builds everything
+#
+# For a laptop / sim-only build (skips urg_node, vesc, cartographer{,_ros},
+# particle_filter) use setup_conda_onLaptop.sh, which adds COLCON_IGNORE files
+# and then runs THIS script.
+#
+# Cross-platform: works from bash OR zsh (it always re-execs under bash), and it
+# registers the 'unicorn' alias into BOTH ~/.bashrc and ~/.zshrc.
+#
+# What it does, in order (see the README "Get started" section for the why):
+#   1) conda env create -f environment.yml          -> env 'unicorn' (ROS 2 Jazzy)
+#   2) register `alias unicorn='source .../unicorn.sh'` in ~/.bashrc + ~/.zshrc
+#   3) pip layer under the env (requirements, gym core, range_libc)
+#   4) swap the broken quadprog PyPI wheel for the conda-forge build
+#   5) raise OS socket buffers for CycloneDDS (idempotent, sudo, non-fatal)
+#   6) colcon build (Release)
+
+# No `-u` (nounset): conda re-runs the env's activate.d hooks after every
+# `conda activate`/`conda install`, and RoboStack's hooks reference unbound vars
+# (e.g. CONDA_BUILD), which would abort the script. We still get -e and pipefail.
+set -eo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"   # .../src/unicorn-racing-stack
+WS="$(cd "$REPO/../.." && pwd)"                            # colcon workspace root
+ENV_NAME="unicorn"
+
+# Hardware-only packages the laptop build excludes via COLCON_IGNORE. On a DIRECT
+# car run (no marker from setup_conda_onLaptop.sh), clear any leftover ignores so
+# this really builds everything — otherwise a prior laptop run would silently skip
+# them. KEEP THIS LIST IN SYNC with the CAR_ONLY list in setup_conda_onLaptop.sh.
+CAR_ONLY=(sensor/urg_node \
+          sensor/vesc/vesc_driver sensor/vesc/vesc_ackermann sensor/vesc/vesc \
+          state_estimation/particle_filter)
+if [ -z "${URS_KEEP_COLCON_IGNORE:-}" ]; then
+  for p in "${CAR_ONLY[@]}"; do rm -f "$REPO/$p/COLCON_IGNORE"; done
+fi
+
+say() { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
+
+# --- 0. sanity ---------------------------------------------------------------
+command -v conda >/dev/null 2>&1 || {
+  echo "ERROR: conda/mamba not found on PATH." >&2
+  echo "       Install Miniforge first — see the README 'Get started' section." >&2
+  exit 1
+}
+source "$(conda info --base)/etc/profile.d/conda.sh"
+
+# --- 1. conda env (ROS 2 Jazzy + toolchain + pinned libs) --------------------
+if conda env list | awk '{print $1}' | grep -qxF "$ENV_NAME"; then
+  say "conda env '$ENV_NAME' already exists — skipping create (run 'conda env update -f environment.yml' to refresh)"
+else
+  say "creating conda env '$ENV_NAME' from environment.yml (ROS 2 Jazzy + deps)…"
+  conda env create -f "$REPO/environment.yml"
+fi
+
+# --- 2. register the 'unicorn' alias in bash AND zsh -------------------------
+ALIAS_LINE="alias unicorn='source $REPO/unicorn.sh'"
+for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+  # Only touch a zshrc if zsh is actually installed; always do bash.
+  if [ "$rc" = "$HOME/.zshrc" ] && ! command -v zsh >/dev/null 2>&1; then
+    continue
+  fi
+  touch "$rc"
+  if grep -qF "source $REPO/unicorn.sh" "$rc"; then
+    say "alias already in $(basename "$rc") — leaving it"
+  else
+    printf '\n# unicorn-racing-stack: enter the dev env with `unicorn`\n%s\n' "$ALIAS_LINE" >> "$rc"
+    say "added 'unicorn' alias to $(basename "$rc")"
+  fi
+done
+
+# --- 3. enter the env (with PYTHONNOUSERSITE so ~/.local can't shadow it) -----
+conda activate "$ENV_NAME"
+export PYTHONNOUSERSITE=1
+
+# --- 4. pip layer ------------------------------------------------------------
+say "pip: requirements + editable gym core + range_libc…"
+cd "$REPO"
+pip install -r requirements.txt
+pip install -e ./race_utils/unicorn_gym/f1tenth_gym                             # gym core -> f110_gym
+pip install --no-build-isolation -e ./race_utils/raycaster/range_libc/pywrapper # range_libc
+
+# --- 5. quadprog — swap the broken PyPI wheel (MUST be after step 4) ---------
+# trajectory_planning_helpers re-pulls quadprog==0.1.7, whose wheel crashes the
+# state machine at import; the conda-forge build is correct + API-compatible.
+say "swapping quadprog wheel for the conda-forge build…"
+pip uninstall -y quadprog || true
+conda install -y -c conda-forge quadprog=0.1.13
+
+# --- 6. OS socket buffers (so CycloneDDS can take the 10 MB cyclonedds.xml asks
+#        for; the kernel default ~212 KB caps it otherwise). Idempotent: skips
+#        when the live value is already >= target. Needs sudo; never fatal. -----
+SOCKBUF_TARGET=26214400   # 25 MiB
+case "$(uname)" in
+  Linux)
+    cur=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+    if [ "${cur:-0}" -ge "$SOCKBUF_TARGET" ]; then
+      say "socket buffers already >= ${SOCKBUF_TARGET} (rmem_max=${cur}) — skipping"
+    else
+      say "raising net.core.r/wmem_max to ${SOCKBUF_TARGET} via /etc/sysctl.conf (sudo)…"
+      { printf 'net.core.rmem_max=%s\nnet.core.wmem_max=%s\n' "$SOCKBUF_TARGET" "$SOCKBUF_TARGET" \
+          | sudo tee -a /etc/sysctl.conf >/dev/null && sudo sysctl -p >/dev/null; } \
+        || echo "  (skipped: no sudo / sysctl failed — DDS still works, just smaller buffers)"
+    fi
+    ;;
+  Darwin)
+    cur=$(sysctl -n kern.ipc.maxsockbuf 2>/dev/null || echo 0)
+    if [ "${cur:-0}" -ge "$SOCKBUF_TARGET" ]; then
+      say "macOS kern.ipc.maxsockbuf already >= ${SOCKBUF_TARGET} (${cur}) — skipping"
+    else
+      say "raising kern.ipc.maxsockbuf to ${SOCKBUF_TARGET} (sudo, this session only)…"
+      sudo sysctl -w kern.ipc.maxsockbuf=$SOCKBUF_TARGET >/dev/null \
+        || echo "  (skipped: no sudo — DDS still works, just smaller buffers)"
+      echo "  note: macOS resets this on reboot; add a launchd plist to persist."
+    fi
+    ;;
+esac
+
+# --- 7. build ----------------------------------------------------------------
+say "colcon build (Release)…"
+( cd "$WS" && colcon build --symlink-install \
+    --base-paths "src/$(basename "$REPO")" \
+    --cmake-args -DCMAKE_BUILD_TYPE=Release )
+
+say "done. Open a NEW shell (or 'source ~/.bashrc') then run:  unicorn"
+echo "    ros2 launch stack_master headtohead.launch.xml sim:=true map:=f"

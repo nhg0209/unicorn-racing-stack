@@ -56,7 +56,11 @@ dependencies:
   # The packages below are cartographer's BUILD dependencies that the conda
   # cartographer-ros package used to pull in transitively. They must be listed
   # explicitly now, or `colcon build` of the vendored sources fails on a fresh env.
-  - ceres-solver=2.2.0
+  # CPU build (build string `h*`, not `gpu*`). The GPU variant's CeresConfig.cmake
+  # forces find_dependency(CUDAToolkit), which fails on any env without the full
+  # CUDA toolkit (nvcc) — and breaks the macOS/Orin targets too. cartographer does
+  # not need GPU ceres.
+  - ceres-solver=2.2.0=h*
   - gflags=2.2.2
   - glog=0.7.1
   - lua=5.4.8
