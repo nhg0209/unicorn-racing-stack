@@ -30,4 +30,5 @@ scipy==1.17.1
 # module that imports them ends up on your build/run path.
 scikit-learn
 scikit-image
+matplotlib    # gp_traj_predictor predictor_opponent_trajectory imports matplotlib.pyplot
 # shapely

@@ -20,12 +20,18 @@ from std_msgs.msg import Float32
 from visualization_msgs.msg import Marker, MarkerArray
 from scipy.interpolate import InterpolatedUnivariateSpline as Spline
 from scipy.interpolate import BPoly
-from scipy.signal import argrelextrema
+from scipy.signal import argrelextrema, savgol_filter
 from f110_msgs.msg import Obstacle, ObstacleArray, OTWpntArray, Wpnt, WpntArray, BehaviorStrategy
 from frenet_conversion.frenet_converter import FrenetConverter
 from transforms3d.euler import quat2euler
 from grid_filter.grid_filter import GridFilter
 import trajectory_planning_helpers as tph
+
+# --- Evasion path smoothing ---
+SMOOTH_OTWPNTS = True
+SMOOTH_OTWPNTS_WINDOW = 51       # Savitzky-Golay window (must be odd)
+SMOOTH_OTWPNTS_POLYORDER = 2
+GB_BLEND_LEN = 40                # waypoints over which to quad-ease back onto the GB line
 
 
 class ObstacleSpliner(Node):
@@ -52,8 +58,8 @@ class ObstacleSpliner(Node):
         Initialize the node, subscribe to topics, and create publishers and service proxies.
         """
         # Initialize the node
-        self.name = "obs_spliner_node"
-        super().__init__('static_avoidance_node')
+        self.name = "static_avoidance_planner"
+        super().__init__('static_avoidance_planner')
 
         # initialize the instance variable
         self.obs_in_interest = None
@@ -122,6 +128,8 @@ class ObstacleSpliner(Node):
         self.evasion_pub = self.create_publisher(OTWpntArray, "/planner/avoidance/otwpnts", 10)
         self.closest_obs_pub = self.create_publisher(Marker, "/planner/avoidance/considered_OBS", 10)
         self.pub_propagated = self.create_publisher(Marker, "/planner/avoidance/propagated_obs", 10)
+        # Debug: per-sample spline bounds-check viz (green=pass, red=fail, blue=unchecked tail)
+        self.spline_samples_pub = self.create_publisher(MarkerArray, "/planner/avoidance/spline_samples", 10)
         if self.measuring:
             self.latency_pub = self.create_publisher(Float32, "/planner/avoidance/latency", 10)
 
@@ -303,39 +311,37 @@ class ObstacleSpliner(Node):
         return converter
 
     def _more_space(self, obstacle: Obstacle, gb_wpnts: List[Any], obs_s_idx: int) -> Tuple[str, float]:
-        left_gap = abs(gb_wpnts[obs_s_idx].d_left - obstacle.d_left)
-        right_gap = abs(gb_wpnts[obs_s_idx].d_right + obstacle.d_right)
+        # Evade toward the side with more empty space. d-sign: +d toward gb_wp.d_right wall,
+        # -d toward gb_wp.d_left wall; obstacle edges = d_center +/- size/2. gap and apex use the
+        # same convention so the apex never lands on the narrow side.
+        gb_wp = gb_wpnts[obs_s_idx]
+        obs_radius = obstacle.size / 2
+
+        pos_gap = gb_wp.d_right - (obstacle.d_center + obs_radius)  # free room toward +d wall
+        neg_gap = gb_wp.d_left + (obstacle.d_center - obs_radius)   # free room toward -d wall
         min_space = self.evasion_dist + self.spline_bound_mindist
 
-        if right_gap > min_space and left_gap < min_space:
-            # Compute apex distance to the right of the opponent
-            d_apex_right = obstacle.d_right - self.evasion_dist
-            # If we overtake to the right of the opponent BUT the apex is to the left of the raceline, then we set the apex to 0
-            if d_apex_right > 0:
-                d_apex_right = 0
-            return "right", d_apex_right
-
-        elif left_gap > min_space and right_gap < min_space:
-            # Compute apex distance to the left of the opponent
-            d_apex_left = obstacle.d_left + self.evasion_dist
-            # If we overtake to the left of the opponent BUT the apex is to the right of the raceline, then we set the apex to 0
-            if d_apex_left < 0:
-                d_apex_left = 0
-            return "left", d_apex_left
+        pos_ok = pos_gap >= min_space
+        neg_ok = neg_gap >= min_space
+        if pos_ok and not neg_ok:
+            side = "right"          # +d
+        elif neg_ok and not pos_ok:
+            side = "left"           # -d
         else:
-            candidate_d_apex_left = obstacle.d_left + self.evasion_dist
-            candidate_d_apex_right = obstacle.d_right - self.evasion_dist
+            side = "right" if pos_gap >= neg_gap else "left"
 
-            if abs(candidate_d_apex_left) <= abs(candidate_d_apex_right):
-                # If we overtake to the left of the opponent BUT the apex is to the right of the raceline, then we set the apex to 0
-                if candidate_d_apex_left < 0:
-                    candidate_d_apex_left = 0
-                return "left", candidate_d_apex_left
-            else:
-                # If we overtake to the right of the opponent BUT the apex is to the left of the raceline, then we set the apex to 0
-                if candidate_d_apex_right > 0:
-                    candidate_d_apex_right = 0
-                return "right", candidate_d_apex_right
+        if side == "right":
+            d_apex = (obstacle.d_center + obs_radius) + self.evasion_dist
+            if d_apex < 0:
+                d_apex = 0.0        # never flip across the raceline to the wrong side
+            d_apex = min(d_apex, gb_wp.d_right)   # clamp to +d wall
+        else:
+            d_apex = (obstacle.d_center - obs_radius) - self.evasion_dist
+            if d_apex > 0:
+                d_apex = 0.0
+            d_apex = max(d_apex, -gb_wp.d_left)   # clamp to -d wall
+
+        return side, d_apex
 
     def do_spline(self, obs: Obstacle, gb_wpnts: WpntArray) -> Tuple[WpntArray, MarkerArray]:
         """
@@ -426,6 +432,24 @@ class ObstacleSpliner(Node):
                 poly = BPoly.from_derivatives(d, spline_result[:, i])
                 samples[:, i] = poly(s)
 
+            # Savitzky-Golay smoothing; pin + taper the endpoints so the filter edge
+            # transient doesn't kink the car pose / last apex.
+            if SMOOTH_OTWPNTS and len(samples) >= SMOOTH_OTWPNTS_WINDOW:
+                start_pt = samples[0].copy()
+                end_pt = samples[-1].copy()
+                samples[:, 0] = savgol_filter(samples[:, 0], SMOOTH_OTWPNTS_WINDOW, SMOOTH_OTWPNTS_POLYORDER)
+                samples[:, 1] = savgol_filter(samples[:, 1], SMOOTH_OTWPNTS_WINDOW, SMOOTH_OTWPNTS_POLYORDER)
+                blend_len = min(5, len(samples) - 1)
+                for bi in range(blend_len):
+                    w = bi / blend_len
+                    samples[bi] = start_pt * (1 - w) + samples[bi] * w
+                samples[0] = start_pt
+                for bi in range(blend_len):
+                    idx = len(samples) - blend_len + bi
+                    w = bi / blend_len
+                    samples[idx] = samples[idx] * (1 - w) + end_pt * w
+                samples[-1] = end_pt
+
             n_additional = 100
             xy_additional = np.array([
                 (
@@ -434,6 +458,20 @@ class ObstacleSpliner(Node):
                 )
                 for i in range(n_additional)
             ])
+
+            # Quad-ease the spline tail onto the GB line so the handoff to xy_additional is smooth.
+            if SMOOTH_OTWPNTS and len(samples) > 0:
+                blend_to_gb_len = min(GB_BLEND_LEN, len(samples) - 1)
+                for bi in range(blend_to_gb_len):
+                    idx = len(samples) - blend_to_gb_len + bi
+                    t = (bi + 1) / (blend_to_gb_len + 1)
+                    w = t * t  # quadratic easing
+                    gb_idx_for_blend = (s_idx[-1] - blend_to_gb_len + bi + 1) % self.gb_max_idx
+                    target_pt = np.array([
+                        gb_wpnts[gb_idx_for_blend].x_m,
+                        gb_wpnts[gb_idx_for_blend].y_m])
+                    samples[idx] = samples[idx] * (1 - w) + target_pt * w
+
             samples = np.vstack([samples, xy_additional])
 
             s_, d_ = self.converter.get_frenet(samples[:, 0], samples[:, 1])
@@ -446,10 +484,12 @@ class ObstacleSpliner(Node):
                 )
 
             danger_flag = False
+            bounds_check_results = []  # debug: True if sample passed is_point_inside
             for i in range(samples.shape[0]):
                 gb_wpnt_i = int((s_[i] / wpnt_dist) % self.gb_max_idx)
 
                 inside = self.map_filter.is_point_inside(samples[i, 0], samples[i, 1])
+                bounds_check_results.append(inside)
                 if not inside:
                     self.get_logger().info(
                         f"[{self.name}]: Evasion trajectory too close to TRACKBOUNDS, aborting evasion",
@@ -466,11 +506,47 @@ class ObstacleSpliner(Node):
                 )
                 mrks.markers.append(self.xyv_to_markers(x=samples[i, 0], y=samples[i, 1], v=vi, mrks=mrks))
 
+            # Debug: visualize every spline sample colored by bounds check
+            self._publish_spline_samples_markers(samples, bounds_check_results)
+
             # Fill the rest of OTWpnts
             if danger_flag:
                 wpnts.wpnts = []
                 mrks.markers = []
         return wpnts, mrks
+
+    def _publish_spline_samples_markers(self, samples: np.ndarray, bounds_check_results: List[bool]):
+        """Debug viz: each spline sample as a sphere. green=passed bounds check,
+        red=failed (the point that aborted evasion), blue=unchecked tail point."""
+        markers = MarkerArray()
+        del_mrk = Marker()
+        del_mrk.header.frame_id = "map"
+        del_mrk.action = Marker.DELETEALL
+        markers.markers.append(del_mrk)
+        for i in range(samples.shape[0]):
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.ns = "spline_samples"
+            marker.id = i
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+            marker.pose.position.x = float(samples[i, 0])
+            marker.pose.position.y = float(samples[i, 1])
+            marker.pose.position.z = 0.1
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = 0.1
+            marker.scale.y = 0.1
+            marker.scale.z = 0.1
+            if i < len(bounds_check_results):
+                if bounds_check_results[i]:
+                    marker.color.r, marker.color.g, marker.color.b, marker.color.a = 0.0, 1.0, 0.0, 0.8  # green: passed
+                else:
+                    marker.color.r, marker.color.g, marker.color.b, marker.color.a = 1.0, 0.0, 0.0, 1.0  # red: failed
+            else:
+                marker.color.r, marker.color.g, marker.color.b, marker.color.a = 0.0, 0.0, 1.0, 0.5  # blue: unchecked tail
+            markers.markers.append(marker)
+        self.spline_samples_pub.publish(markers)
 
     def _obs_filtering(self, obstacles: ObstacleArray) -> List[Obstacle]:
         # Only use obstacles that are within a threshold of the raceline, else we don't care about them

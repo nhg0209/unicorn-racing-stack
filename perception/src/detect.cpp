@@ -267,6 +267,7 @@ visualization_msgs::msg::MarkerArray Detect::clearmarkers()
 {
   visualization_msgs::msg::MarkerArray ma;
   visualization_msgs::msg::Marker marker;
+  marker.header.frame_id = "map";  // set so the DELETEALL marker isn't dropped by RViz (empty frame)
   marker.action = visualization_msgs::msg::Marker::DELETEALL;
   ma.markers.push_back(marker);
   return ma;

@@ -41,10 +41,10 @@ from f110_msgs.msg import (
 
 import trajectory_planning_helpers as tph
 
-from state_machine.vel_planner import calc_vel_profile
-from state_machine.state_types import StateType
+from vel_planner.vel_planner import calc_vel_profile
+from state_machine.states_types import StateType
 from state_machine import states
-from state_machine import transitions
+from state_machine import state_transitions
 from state_machine.state_machine_params import StateMachineParams
 
 try:
@@ -75,6 +75,8 @@ class WaypointData:
         self.closest_gap = None
         self.is_closed = is_closed
         self.vel_planner_safety_factor = 1.0
+        # Sec this cache was last selected as local_wpnts_src (None until first use).
+        self.last_used_sec = None
         self.update_param()
 
     def update_param(self):
@@ -139,12 +141,11 @@ class StateMachine(Node):
         self.waypoints_dist = 0.1  # [m]
         self.measuring = self.params.measuring
 
-        # only ftg zones / overtake zones
-        # In ROS1 these were populated from /map_params & /ot_map_params (rosparam) and
-        # live-updated by the dyn_sector_* dynamic_reconfigure callbacks served by the
-        # (not-yet-ported) sector_tuner / overtaking_sector_tuner nodes. Here we read an
-        # optional static configuration from node parameters so the SM is functional in
-        # sim; once those tuners are ported this can be replaced with their topics/services.
+        # sectors: read the map yamls at startup, live-update from the sector tuner nodes
+        # (ROS1: /map_params + /ot_map_params and the dyn_sector_* servers)
+        self.map_name = self._get_str_param("map", "")
+        self.sectors_params = {}
+        self.ot_sectors_params = {}
         self.only_ftg_zones = []
         self.ftg_counter = 0
 
@@ -160,7 +161,8 @@ class StateMachine(Node):
         self.overtake_wpnts = None
         self.overtake_zones = []
         self.ot_begin_margin = 0.5
-        # populate only_ftg_zones / overtake_zones from optional static node params
+        # read the map sector yamls, then build only_ftg_zones / overtake_zones
+        self._load_sector_yamls()
         self._load_sector_params()
         self.cur_volt = 11.69  # default value for sim
         self.static_overtaking_mode = False
@@ -213,6 +215,8 @@ class StateMachine(Node):
         self.ot_spline_y = None
         self.ot_spline_d = None
         self.recompute_ot_spline = True
+        # live sector retune from the sector tuner nodes (after recompute_ot_spline exists)
+        self._setup_sector_live_update()
 
         # obstacle avoidance variables
         self.obstacles = []
@@ -285,13 +289,13 @@ class StateMachine(Node):
             StateType.START: states.START,
         }
         self.state_transitions = {
-            StateType.GB_TRACK: transitions.GlobalTrackingTransition,
-            StateType.RECOVERY: transitions.RecoveryTransition,
-            StateType.TRAILING: transitions.TrailingTransition,
-            StateType.ATTACK: transitions.TrailingTransition,
-            StateType.OVERTAKE: transitions.OvertakingTransition,
-            StateType.FTGONLY: transitions.FTGOnlyTransition,
-            StateType.START: transitions.StartTransition,
+            StateType.GB_TRACK: state_transitions.GlobalTrackingTransition,
+            StateType.RECOVERY: state_transitions.RecoveryTransition,
+            StateType.TRAILING: state_transitions.TrailingTransition,
+            StateType.ATTACK: state_transitions.TrailingTransition,
+            StateType.OVERTAKE: state_transitions.OvertakingTransition,
+            StateType.FTGONLY: state_transitions.FTGOnlyTransition,
+            StateType.START: state_transitions.StartTransition,
         }
 
         self.opponent = ObstacleArray()
@@ -344,6 +348,11 @@ class StateMachine(Node):
         self.state_mrk = self.create_publisher(Marker, "/state_marker", 10)
         self.emergency_pub = self.create_publisher(Marker, "/emergency_marker", 5)
         self.ot_section_check_pub = self.create_publisher(Bool, "/ot_section_check", 1)
+        # ROS1 published this from dynamic_statemachine_server when the save_start_traj
+        # rqt button was pressed; re-homed here as a momentary param (see loop()).
+        self.save_start_traj_pub = self.create_publisher(Bool, "/save_start_traj", 1)
+        self._save_start_traj_requested = False
+        self._save_params_requested = False
         if self.measuring:
             self.latency_pub = self.create_publisher(Float32, "/state_machine/latency", 10)
 
@@ -391,45 +400,93 @@ class StateMachine(Node):
                 except Exception:
                     pass
 
+    def _get_str_param(self, name, default=""):
+        try:
+            if not self.has_parameter(name):
+                self.declare_parameter(name, default)
+            v = self.get_parameter(name).value
+            return v if v is not None else default
+        except Exception:
+            return default
+
+    def _load_sector_yamls(self):
+        # read the map sector yamls into sectors_params / ot_sectors_params (ROS1 /map_params, /ot_map_params)
+        import yaml
+        try:
+            maps_dir = os.path.join(get_package_share_directory("stack_master"), "maps", self.map_name)
+        except Exception:
+            self.get_logger().warn(f"[{self.name}] could not locate stack_master maps dir; no sectors loaded")
+            return
+        sp = os.path.join(maps_dir, "speed_scaling.yaml")
+        if os.path.exists(sp):
+            with open(sp, "r") as f:
+                d = yaml.safe_load(f) or {}
+            self.sectors_params = (d.get("speed_sector_tuner", {}) or {}).get("ros__parameters", {}) or {}
+        else:
+            self.get_logger().warn(f"[{self.name}] {sp} not found; no FTG-only zones")
+        op = os.path.join(maps_dir, "ot_sectors.yaml")
+        if os.path.exists(op):
+            with open(op, "r") as f:
+                d = yaml.safe_load(f) or {}
+            self.ot_sectors_params = (d.get("ot_sector_tuner", {}) or {}).get("ros__parameters", {}) or {}
+            self.ot_begin_margin = float(self.ot_sectors_params.get("ot_sector_begin", self.ot_begin_margin))
+        else:
+            self.get_logger().warn(f"[{self.name}] {op} not found; no overtake zones")
+
     def _load_sector_params(self):
-        """Build only_ftg_zones and overtake_zones from optional flat node parameters.
-
-        Expected (all optional, default -> empty/no zones):
-          map_params.n_sectors                       (int)
-          map_params.Sector<i>.start / .end / .only_FTG
-          ot_map_params.n_sectors                    (int)
-          ot_map_params.Overtaking_sector<i>.start / .end / .ot_flag
-
-        Indices are in units of waypoints (matching the ROS1 `cur_s / waypoints_dist`
-        comparison). When the sector tuners are ported these can be fed live instead.
-        """
-        def p(name, default):
-            try:
-                if not self.has_parameter(name):
-                    self.declare_parameter(name, default)
-                return self.get_parameter(name).value
-            except Exception:
-                return default
-
-        # FTG-only sectors
+        # build zones from the sector dicts (ROS1 sector_dyn_param_cb / ot_dyn_param_cb)
         self.only_ftg_zones = []
-        n_sectors = int(p("map_params.n_sectors", 0))
-        for i in range(n_sectors):
-            only_ftg = bool(p(f"map_params.Sector{i}.only_FTG", False))
-            if only_ftg:
-                start = p(f"map_params.Sector{i}.start", 0)
-                end = p(f"map_params.Sector{i}.end", 0)
-                self.only_ftg_zones.append([start, end])
+        self.n_sectors = int(self.sectors_params.get("n_sectors", 0))
+        for i in range(self.n_sectors):
+            sec = self.sectors_params.get(f"Sector{i}", {}) or {}
+            if sec.get("only_FTG", False):
+                # end+1 == next sector's start: close the 1-index gap so adjacent FTG
+                # sectors don't briefly drop to GB_TRACK (ROS1 used [start, end]).
+                self.only_ftg_zones.append([sec.get("start", 0), sec.get("end", 0) + 1])
 
-        # Overtaking sectors
         self.overtake_zones = []
-        self.n_ot_sectors = int(p("ot_map_params.n_sectors", 0))
+        self.n_ot_sectors = int(self.ot_sectors_params.get("n_sectors", 0))
         for i in range(self.n_ot_sectors):
-            ot_flag = bool(p(f"ot_map_params.Overtaking_sector{i}.ot_flag", False))
-            if ot_flag:
-                start = p(f"ot_map_params.Overtaking_sector{i}.start", 0)
-                end = p(f"ot_map_params.Overtaking_sector{i}.end", 0)
-                self.overtake_zones.append([start, end + 1])
+            sec = self.ot_sectors_params.get(f"Overtaking_sector{i}", {}) or {}
+            if sec.get("ot_flag", False):
+                self.overtake_zones.append([sec.get("start", 0), sec.get("end", 0) + 1])
+
+    def _setup_sector_live_update(self):
+        # ROS2 replacement of ROS1 /dyn_sector_speed & /dyn_sector_overtake subscriptions
+        from rclpy.parameter_event_handler import ParameterEventHandler
+        self._sector_evt_handler = ParameterEventHandler(self)
+        self._sector_evt_cb_handle = self._sector_evt_handler.add_parameter_event_callback(
+            self._sector_param_event_cb)
+
+    @staticmethod
+    def _param_msg_value(p):
+        # rcl_interfaces/Parameter -> python value (bool/int/double only needed here)
+        t = p.value.type
+        if t == 1:
+            return p.value.bool_value
+        if t == 2:
+            return p.value.integer_value
+        if t == 3:
+            return p.value.double_value
+        return None
+
+    def _sector_param_event_cb(self, event):
+        node = event.node.lstrip("/")
+        if node == "speed_sector_tuner":
+            for p in list(event.new_parameters) + list(event.changed_parameters):
+                if p.name.startswith("Sector") and p.name.endswith(".only_FTG"):
+                    key = p.name.split(".")[0]
+                    self.sectors_params.setdefault(key, {})["only_FTG"] = bool(self._param_msg_value(p))
+            self._load_sector_params()
+        elif node == "ot_sector_tuner":
+            for p in list(event.new_parameters) + list(event.changed_parameters):
+                if p.name.startswith("Overtaking_sector") and p.name.endswith(".ot_flag"):
+                    key = p.name.split(".")[0]
+                    self.ot_sectors_params.setdefault(key, {})["ot_flag"] = bool(self._param_msg_value(p))
+                elif p.name == "ot_sector_begin":
+                    self.ot_begin_margin = float(self._param_msg_value(p))
+                    self.recompute_ot_spline = True
+            self._load_sector_params()
 
     def get_planner_param(self, planner_name, key):
         """Read a planner parameter; falls back to cached yaml value."""
@@ -527,22 +584,16 @@ class StateMachine(Node):
             self.recompute_ot_spline = False
 
     def glb_wpnts_cb(self, data: WpntArray):
+        # last point's s == loop length (ROS1 read this from /global_republisher/track_length)
+        track_len = data.wpnts[-1].s_m
         data.wpnts = data.wpnts[:-1]  # exclude last point (== first)
         self.gb_wpnts = data
         self.num_glb_wpnts = len(data.wpnts)
         self.n_loc_wpnts = min(self.n_loc_wpnts, int(self.num_glb_wpnts / 2))
         self.max_s = data.wpnts[-1].s_m
-        # Derive the track length from the global raceline so s-wrapping is
-        # correct for any map (the param default is only a placeholder).
-        if self.max_s > 1.0:
-            self.track_length = self.max_s
+        if track_len > 1.0:
+            self.track_length = track_len
         self.wpnt_dist = data.wpnts[1].s_m - data.wpnts[0].s_m
-        # waypoints_dist drives all s->index math (local window start, sectors).
-        # It defaulted to the ROS1 raceline resolution (0.1 m); use the ACTUAL
-        # spacing of this map's raceline or the local window is mis-centered
-        # (was ~2.5x ahead with a 0.25 m raceline -> the car cut corners).
-        if self.wpnt_dist > 1e-3:
-            self.waypoints_dist = self.wpnt_dist
         self.gb_max_idx = data.wpnts[-1].id
         if self.ot_planner == "graph_based":
             self.gb_wpnts_arr = np.array([
@@ -631,13 +682,8 @@ class StateMachine(Node):
             return np.abs(self.cur_d) < np.deg2rad(threshold_deg)
 
     def _check_ot_sector(self) -> bool:
-        # No overtake sectors configured -> treat the whole track as overtakable
-        # (sim / tracks without an ot_sectors.yaml). Otherwise overtaking could
-        # never trigger and the car would only ever trail (and stop behind a
-        # static obstacle).
-        if len(self.overtake_zones) == 0:
-            self.ot_section_check_pub.publish(Bool(data=True))
-            return True
+        # ROS1: no overtake zone matching cur_s -> not in an OT sector (return False).
+        # (An empty overtake_zones means overtaking is suppressed, as in ROS1.)
         for sector in self.overtake_zones:
             if sector[0] <= self.cur_s / self.waypoints_dist <= sector[1]:
                 self.ot_section_check_pub.publish(Bool(data=True))
@@ -679,7 +725,10 @@ class StateMachine(Node):
             if (self.cur_state == StateType.TRAILING or self.cur_state == StateType.ATTACK) and \
                     self.cur_vs < self.ftg_speed_mps:
                 self.ftg_counter += 1
-                self.get_logger().warn(f"[{self.name}] FTG counter: {self.ftg_counter}/{threshold}")
+                self.get_logger().warn(
+                    f"[{self.name}] FTG counter: {self.ftg_counter}/{threshold}",
+                    throttle_duration_sec=0.5,
+                )
             else:
                 self.ftg_counter = 0
             return self.ftg_counter > threshold
@@ -733,7 +782,8 @@ class StateMachine(Node):
                         if free_dist < lateral_width_m * scaling_factor:
                             is_free = False
                             self.get_logger().info(
-                                "[State Machine] FREE False, obs dist to ot lane: {} m".format(free_dist)
+                                "[State Machine] FREE False, obs dist to ot lane: {} m".format(free_dist),
+                                throttle_duration_sec=1.0,
                             )
                             if closest_obs is None or min_gap > gap:
                                 closest_obs = obs
@@ -757,7 +807,8 @@ class StateMachine(Node):
                                 self.get_logger().warn(
                                     f"free_dist: {free_dist}, lateral_width_m: {lateral_width_m}, "
                                     f"scaling_factor: {scaling_factor}, obs.size: {obs.size}, "
-                                    f"wpnt_d:{wpnt_d}, obs_pred.pred_d: {obs_pred.pred_d} "
+                                    f"wpnt_d:{wpnt_d}, obs_pred.pred_d: {obs_pred.pred_d} ",
+                                    throttle_duration_sec=0.5,
                                 )
                             if free_dist < lateral_width_m * scaling_factor:
                                 is_free = False
@@ -815,13 +866,28 @@ class StateMachine(Node):
                             closest_obs = obs
                             min_gap = gap
                         self.get_logger().info(
-                            f"[{self.name}] RECOVERY_FREE False, obs dist to recovery lane: {min_dist} m"
+                            f"[{self.name}] RECOVERY_FREE False, obs dist to recovery lane: {min_dist} m",
+                            throttle_duration_sec=1.0,
                         )
         else:
             is_free = True
         wpnts_data.closest_target = closest_obs
         wpnts_data.closest_gap = min_gap
         return is_free
+
+    def _expire_unused_ot_cache(self, wpnts_data, ttl_sec):
+        # Reference = last_used_sec, else the cached stamp (time the path was received).
+        if not wpnts_data.is_init:
+            return
+        ref = wpnts_data.last_used_sec
+        if ref is None:
+            ref = time_to_float(wpnts_data.stamp) if wpnts_data.stamp is not None else None
+        if ref is None:
+            return
+        if self.now_sec() - ref > ttl_sec:
+            wpnts_data.is_init = False
+            wpnts_data.closest_target = None
+            wpnts_data.last_used_sec = None
 
     def _check_availability(self, wpnts, wpnts_data) -> bool:
         if (self.now_sec() - time_to_float(wpnts_data.stamp)) > wpnts_data.killing_timer_sec:
@@ -875,7 +941,7 @@ class StateMachine(Node):
                 return True
         else:
             if self._check_availability(self.avoidance_wpnts, self.cur_avoidance_wpnts):
-                self.get_logger().warn("AVAILABLE")
+                self.get_logger().debug("AVAILABLE")
                 if self._check_free_frenet(self.cur_avoidance_wpnts):
                     return True
         return False
@@ -887,6 +953,8 @@ class StateMachine(Node):
         if self.ggv is None or self.gb_wpnts is None:
             return  # velocity replanning unavailable (no veh dyn info / no gb wpnts yet)
         wpnts = wpnts_msg.wpnts
+        if len(wpnts) < 3:
+            return
         kappa = np.array([wp.kappa_radpm for wp in wpnts])
         el_lengths = np.array([
             np.linalg.norm([
@@ -895,6 +963,16 @@ class StateMachine(Node):
             ])
             for i in range(len(wpnts) - 1)
         ])
+        # Bail if the path is degenerate: a zero-length segment or any non-finite input makes
+        # calc_vel_profile divide by zero -> NaN velocities that propagate into the local path
+        # and eventually the base_link TF. Leaving the original vx_mps untouched is the safe path.
+        if (el_lengths <= 1e-6).any() or not np.all(np.isfinite(el_lengths)) \
+                or not np.all(np.isfinite(kappa)):
+            self.get_logger().warn(
+                f"[{self.name}] degenerate path in update_velocity; keeping planner velocities",
+                throttle_duration_sec=1.0,
+            )
+            return
 
         glb_start_idx = int(wpnts_msg.wpnts[-1].s_m / self.wpnt_dist)
         v_end = self.gb_wpnts.wpnts[glb_start_idx % len(self.gb_wpnts.wpnts)].vx_mps
@@ -951,6 +1029,19 @@ class StateMachine(Node):
             coords[i, 3] = wpnt.d_m
             coords[i, 4] = wpnt.vx_mps
         coords = coords[coords[:, 0].argsort()]
+        # Drop non-finite rows and duplicate/non-increasing s: scipy Spline requires a
+        # strictly increasing x or it raises / returns NaN. A reversed or seam-jumped
+        # overtake path would otherwise poison every downstream spline eval with NaN.
+        coords = coords[np.isfinite(coords).all(axis=1)]
+        if len(coords) >= 2:
+            keep = np.concatenate([[True], np.diff(coords[:, 0]) > 1e-6])
+            coords = coords[keep]
+        if len(coords) < 4:
+            self.get_logger().warn(
+                f"[{self.name}] overtake wpnts degenerate ({len(coords)} usable); skipping splinification",
+                throttle_duration_sec=1.0,
+            )
+            return
         self.ot_spline_x = Spline(coords[:, 0], coords[:, 1])
         self.ot_spline_y = Spline(coords[:, 0], coords[:, 2])
         self.ot_spline_d = Spline(coords[:, 0], coords[:, 3])
@@ -1017,20 +1108,21 @@ class StateMachine(Node):
                 start_wpnts.extend(extra_wpnts)
             return start_wpnts
         else:
-            self.get_logger().warn(f"[{self.name}] No valid avoidance waypoints, passing global waypoints")
+            self.get_logger().debug(f"[{self.name}] No valid avoidance waypoints, passing global waypoints")
 
     #######
     # VIZ #
     #######
     def _pub_local_wpnts(self, wpts):
-        mrks = MarkerArray()
+        # DELETEALL as the first element of the SAME array (atomic clear+draw in
+        # one message) instead of a separate publish, so RViz2 doesn't flicker.
+        # Net result matches ROS1 (clear stale markers, then draw the new ones).
+        loc_markers = MarkerArray()
         del_mrk = Marker()
         del_mrk.header.stamp = self.get_clock().now().to_msg()
         del_mrk.action = Marker.DELETEALL
-        mrks.markers.append(del_mrk)
-        self.vis_loc_wpnt_pub.publish(mrks)
+        loc_markers.markers.append(del_mrk)
 
-        loc_markers = MarkerArray()
         loc_wpnts = WpntArray()
         loc_wpnts.wpnts = wpts if wpts is not None else []
         loc_wpnts.header.stamp = self.get_clock().now().to_msg()
@@ -1045,7 +1137,7 @@ class StateMachine(Node):
             mrk.scale.z = 0.15
             mrk.color.a = 1.0
             mrk.color.g = 1.0
-            mrk.id = i
+            mrk.id = i + 1  # 0 reserved for the DELETEALL marker (avoid duplicate id in the array)
             mrk.pose.position.x = wpnt.x_m
             mrk.pose.position.y = wpnt.y_m
             mrk.pose.position.z = wpnt.vx_mps
@@ -1206,10 +1298,50 @@ class StateMachine(Node):
             if self.ot_closest_gap > self.cur_recovery_wpnts.closest_gap:
                 self.local_wpnts_src = StateType.OVERTAKE
 
+    def save_params_to_yaml(self):
+        # ROS1 dynamic_statemachine_server.save_yaml: persist the dynamic tunables to
+        # state_machine_params.yaml, preserving the other keys.
+        import yaml
+        try:
+            path = os.path.join(get_package_share_directory("stack_master"),
+                                "config", "state_machine_params.yaml")
+        except Exception:
+            self.get_logger().error(f"[{self.name}] cannot locate state_machine_params.yaml")
+            return
+        keys = ["lateral_width_gb_m", "lateral_width_ot_m", "overtaking_ttl_sec",
+                "splini_hyst_timer_sec", "splini_ttl", "pred_splini_ttl",
+                "emergency_break_horizon", "ftg_speed_mps", "ftg_timer_sec",
+                "ftg_active", "force_GBTRACK"]
+        try:
+            with open(path, "r") as f:
+                data = yaml.safe_load(f) or {}
+            block = data.setdefault("state_machine", {}).setdefault("ros__parameters", {})
+            for k in keys:
+                if self.has_parameter(k):
+                    block[k] = self.get_parameter(k).value
+            block["save_params"] = False
+            with open(path, "w") as f:
+                yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+            self.get_logger().info(f"[{self.name}] saved params to {path}")
+        except Exception as e:
+            self.get_logger().error(f"[{self.name}] failed to save params: {e}")
+
+    def _handle_momentary_params(self):
+        # Act on the rqt buttons outside the on-set callback so set_parameters() is safe.
+        if self._save_start_traj_requested:
+            self._save_start_traj_requested = False
+            self.save_start_traj_pub.publish(Bool(data=True))
+            self.set_parameters([rclpy.parameter.Parameter('save_start_traj', rclpy.Parameter.Type.BOOL, False)])
+        if self._save_params_requested:
+            self._save_params_requested = False
+            self.save_params_to_yaml()
+            self.set_parameters([rclpy.parameter.Parameter('save_params', rclpy.Parameter.Type.BOOL, False)])
+
     #############
     # MAIN LOOP #
     #############
     def loop(self):
+        self._handle_momentary_params()
         if self.measuring:
             start = time.perf_counter()
 
@@ -1223,6 +1355,11 @@ class StateMachine(Node):
         self.cur_avoidance_wpnts.closest_target = None
         self.cur_static_avoidance_wpnts.closest_target = None
         self.cur_start_wpnts.closest_target = None
+
+        # Drop an OT path (dynamic/static) not selected as local_wpnts_src for >2 s, else the
+        # stale near-raceline path keeps passing _check_on_spline and flips GB<->OVERTAKE.
+        self._expire_unused_ot_cache(self.cur_avoidance_wpnts, 2.0)
+        self._expire_unused_ot_cache(self.cur_static_avoidance_wpnts, 2.0)
 
         # safety check
         if self.cur_volt < self.volt_threshold:
@@ -1248,6 +1385,11 @@ class StateMachine(Node):
         else:
             self.behavior_strategy.trailing_targets = []
 
+        # Mark the chosen overtake cache as used so it isn't expired next frame.
+        if self.local_wpnts_src == StateType.OVERTAKE:
+            used = self.cur_static_avoidance_wpnts if self.static_overtaking_mode else self.cur_avoidance_wpnts
+            used.last_used_sec = self.now_sec()
+
         self.behavior_strategy.overtaking_targets = self.get_overtaking_target()
 
         local_wpnts = self.states[self.local_wpnts_src](self)
@@ -1272,8 +1414,8 @@ class StateMachine(Node):
             self.ftg_counter = 0
 
         overtaking_target_mrk = Marker()
+        overtaking_target_mrk.header.frame_id = "map"  # set always so the DELETEALL marker isn't dropped by RViz (empty frame)
         if len(self.behavior_strategy.overtaking_targets) != 0:
-            overtaking_target_mrk.header.frame_id = "map"
             overtaking_target_mrk.type = Marker.SPHERE
             overtaking_target_mrk.scale.x = 0.5
             overtaking_target_mrk.scale.y = 0.5
@@ -1288,8 +1430,8 @@ class StateMachine(Node):
         self.overtaking_marker_pub.publish(overtaking_target_mrk)
 
         trailing_target_mrk = Marker()
+        trailing_target_mrk.header.frame_id = "map"  # set always so the DELETEALL marker isn't dropped by RViz (empty frame)
         if len(self.behavior_strategy.trailing_targets) != 0:
-            trailing_target_mrk.header.frame_id = "map"
             trailing_target_mrk.type = Marker.SPHERE
             trailing_target_mrk.scale.x = 0.5
             trailing_target_mrk.scale.y = 0.5
