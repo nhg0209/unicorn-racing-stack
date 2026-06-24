@@ -101,6 +101,9 @@ class ControllerManager(Node):
 
         # Publishers (ROS1 topic names kept)
         self.lookahead_pub = self.create_publisher(Marker, 'lookahead_point', 10)
+        # steering-direction arrow on its own topic (was on lookahead_point with the
+        # point marker; RViz2's singular-Marker display drops one of two ids at 100Hz)
+        self.steering_pub = self.create_publisher(Marker, 'lookahead_steering', 10)
         self.future_position_pub = self.create_publisher(Marker, 'future_position', 10)
         self.trailing_pub = self.create_publisher(Marker, 'trailing_opponent_marker', 10)
         self.l1_pub = self.create_publisher(Point, 'l1_distance', 10)
@@ -390,7 +393,7 @@ class ControllerManager(Node):
         lookahead_marker.id = 50
         lookahead_marker.scale.x = 0.6
         lookahead_marker.scale.y = 0.05
-        lookahead_marker.scale.z = 0.0
+        lookahead_marker.scale.z = 0.05  # nonzero so RViz doesn't warn "scale of 0"
         lookahead_marker.color.r = 1.0
         lookahead_marker.color.g = 0.0
         lookahead_marker.color.b = 0.0
@@ -402,7 +405,7 @@ class ControllerManager(Node):
         lookahead_marker.pose.orientation.y = quaternions[1]
         lookahead_marker.pose.orientation.z = quaternions[2]
         lookahead_marker.pose.orientation.w = quaternions[3]
-        self.lookahead_pub.publish(lookahead_marker)
+        self.steering_pub.publish(lookahead_marker)
 
     def set_lookahead_marker(self, lookahead_point, id):
         lookahead_marker = Marker()
@@ -436,7 +439,7 @@ class ControllerManager(Node):
         future_position_marker.id = id
         future_position_marker.scale.x = 1.2
         future_position_marker.scale.y = 0.06
-        future_position_marker.scale.z = 0.0
+        future_position_marker.scale.z = 0.06  # nonzero so RViz doesn't warn "scale of 0"
         future_position_marker.color.r = 0.5
         future_position_marker.color.g = 0.0
         future_position_marker.color.b = 0.5

@@ -12,7 +12,7 @@ from rcl_interfaces.msg import (
 from rclpy.parameter import Parameter
 
 if TYPE_CHECKING:
-    from state_machine.state_machine import StateMachine
+    from state_machine.state_machine_node import StateMachine
 
 """
 Replaces the ROS1 `dynamic_reconfigure` server (`dyn_statemachine_tuner.cfg`) and the
@@ -221,6 +221,12 @@ class StateMachineParams:
         self._declare("use_force_trailing", False)
         self.use_force_trailing: bool = node.get_parameter("use_force_trailing").value
 
+        # Momentary rqt buttons (ROS1: served by dynamic_statemachine_server). When set
+        # true they trigger an action and reset to false (done in the node timer, not
+        # here, so set_parameters() isn't called inside the on-set callback).
+        self._declare("save_start_traj", False)
+        self._declare("save_params", False)
+
     def _declare(self, name, default, descriptor=None):
         """Declare a parameter unless it has already been auto-declared from a yaml
         override (the node is created with
@@ -262,6 +268,13 @@ class StateMachineParams:
             elif name == "ftg_active":
                 self.ftg_active = value
                 self.node.ftg_disabled = not value
+            elif name == "save_start_traj":
+                # momentary: act + reset in the node timer (not inside this on-set cb)
+                if value:
+                    self.node._save_start_traj_requested = True
+            elif name == "save_params":
+                if value:
+                    self.node._save_params_requested = True
             else:
                 # generic live update for the remaining tunables
                 setattr(self, name, value)

@@ -25,6 +25,9 @@
   <arg name="ot_planner" default="predictive_spliner" description="overtake planner the state machine listens to (ROS1 default = predictive_spliner: listens to BOTH /planner/avoidance/otwpnts (dynamic) AND /planner/avoidance/static_otwpnts (static))"/>
   <arg name="control_topic" default="/local_waypoints"
        description="WpntArray the controller follows: /local_waypoints (state-machine output w/ avoidance) or /global_waypoints (robust raceline)"/>
+  <!-- sim -> SIM config (racecar_f110.ini + veh_dyn_info); real hardware -> CAR. Folder name == racecar_version. -->
+  <let name="racecar_version" value="SIM" if="$(var sim)"/>
+  <let name="racecar_version" value="CAR" unless="$(var sim)"/>
   <!-- virtual_perception injection seam is chosen at RUNTIME from the Sim Control
        panel (/vp/inject_mode: overlay | merge; default 'overlay'). In BOTH modes
        tracking publishes /tracking/obstacles_raw and tracking_merger owns
@@ -59,10 +62,12 @@
 
   <!-- ===== State machine: the racing brain ===== -->
   <node pkg="state_machine" exec="state_machine" name="state_machine" output="screen">
-    <param from="$(find-pkg-share state_machine)/config/state_machine_params.yaml"/>
+    <param from="$(find-pkg-share stack_master)/config/state_machine_params.yaml"/>
     <param name="sim"             value="$(var sim)"/>
+    <param name="racecar_version" value="$(var racecar_version)"/>
     <param name="timetrials_only" value="false"/>
     <param name="ot_planner"      value="$(var ot_planner)"/>
+    <param name="map"             value="$(var map)"/>
   </node>
 
   <!-- Recovery planner -> /planner/recovery/wpnts -->
@@ -72,13 +77,22 @@
   <node pkg="spliner" exec="start_spline_node_v2" name="start_planner" output="screen"/>
 
   <!-- Static avoidance -> /planner/avoidance/static_otwpnts -->
-  <node pkg="spliner" exec="static_avoidance_node" name="planner_spline" output="screen">
+  <node pkg="spliner" exec="static_avoidance_node" name="static_avoidance_planner" output="screen">
     <remap from="/planner/avoidance/otwpnts" to="/planner/avoidance/static_otwpnts"/>
   </node>
 
   <!-- Dynamic avoidance (ROS1 Change mode) -> /planner/avoidance/otwpnts + /planner/avoidance/merger -->
   <node pkg="lane_change_planner" exec="change_avoidance_node" name="planner_change" output="screen"/>
   <node pkg="lane_change_planner" exec="update_waypoints" name="waypoint_updater" output="screen"/>
+
+  <!-- ===== GP opponent-trajectory predictor =====
+       Pipeline (README): opponent_trajectory (collect /proj_opponent_trajectory) ->
+       gaussian_process_opp_traj (GP fit -> /opponent_trajectory) -> opp_prediction
+       (-> /opponent_prediction/* consumed by planner_change above).
+       opp_prediction calls the frenet_conversion_server services, launched by base. -->
+  <node pkg="gp_traj_predictor" exec="opponent_trajectory"       name="OpponentHalflap"                output="screen"/>
+  <node pkg="gp_traj_predictor" exec="gaussian_process_opp_traj" name="GP_trajectory"                  output="screen" launch-prefix="taskset -c 1"/>
+  <node pkg="gp_traj_predictor" exec="opp_prediction"           name="opponent_propagation_predictor" output="screen"/>
 
   <!-- ===== Control: L1 / Pure-Pursuit controller (ROS2 port of the ROS1 controller_manager) =====
        Subscribes /behavior_strategy + car state, publishes high_level/ackermann_cmd
