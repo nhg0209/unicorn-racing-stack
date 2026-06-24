@@ -85,6 +85,7 @@ cd "$REPO"
 pip install -r requirements.txt
 pip install -e ./race_utils/unicorn_gym/f1tenth_gym                             # gym core -> f110_gym
 pip install --no-build-isolation -e ./race_utils/raycaster/range_libc/pywrapper # range_libc
+pip install "git+https://github.com/ForzaETH/CCMA.git"                          # CCMA smoothing (dynamic-avoidance planners)
 
 # --- 5. quadprog — swap the broken PyPI wheel (MUST be after step 4) ---------
 # trajectory_planning_helpers re-pulls quadprog==0.1.7, whose wheel crashes the
