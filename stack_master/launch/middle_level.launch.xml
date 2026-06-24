@@ -9,6 +9,10 @@
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/CAR" unless="$(var sim)"/>
   <arg name="vehicle_config" default="$(var config_dir)/vehicle_config.yaml"/>
   <arg name="use_estop"      default="false"               description="Use emergency stop (true) or not (false)"/>
+  <arg name="virtual"        default="$(var sim)"           description="Inject virtual opponent/obstacles (scan overlay etc.); forced off while mapping"/>
+  <!-- never inject virtual objects while building a map -->
+  <let name="virtual_eff" value="false"          if="$(var mapping)"/>
+  <let name="virtual_eff" value="$(var virtual)" unless="$(var mapping)"/>
 
   <!-- Config / path helpers -->
   <let name="maps_dir"                value="$(find-pkg-share stack_master)/maps"/>
@@ -26,7 +30,7 @@
     <arg name="vehicle_config" value="$(var vehicle_config)"/>
     <arg name="map"            value="$(var map)"/>
     <arg name="use_estop"      value="$(var use_estop)"/>
-    
+    <arg name="virtual"        value="$(var virtual_eff)"/>
   </include>
 
   <!-- ================================================================

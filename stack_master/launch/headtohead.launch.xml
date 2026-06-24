@@ -21,6 +21,7 @@
 <launch>
   <arg name="map"        description="Map name (folder in stack_master/maps/)"/>
   <arg name="sim"        default="false" description="Use simulator (true) or real hardware (false)"/>
+  <arg name="virtual"    default="$(var sim)" description="Inject a virtual opponent + static obstacles (on by default in sim, off on the real car; e.g. virtual:=true to overlay a virtual opponent onto the real LiDAR)"/>
   <arg name="ot_planner" default="spliner" description="overtake planner the state machine listens to"/>
   <arg name="control_topic" default="/local_waypoints"
        description="WpntArray the controller follows: /local_waypoints (state-machine output w/ avoidance) or /global_waypoints (robust raceline)"/>
@@ -34,8 +35,9 @@
 
   <!-- ===== Base system: sensors/sim + opponent + raceline + frenet odom ===== -->
   <include file="$(find-pkg-share stack_master)/launch/base_system.launch.xml">
-    <arg name="map" value="$(var map)"/>
-    <arg name="sim" value="$(var sim)"/>
+    <arg name="map"     value="$(var map)"/>
+    <arg name="sim"     value="$(var sim)"/>
+    <arg name="virtual" value="$(var virtual)"/>
   </include>
 
   <!-- ===== Perception: LiDAR obstacle detection (C++) + tracking (Python) =====
@@ -46,9 +48,13 @@
     <param from="$(find-pkg-share stack_master)/config/opponent_tracker_params.yaml"/>
     <param name="map" value="$(var map)"/>
   </node>
+  <!-- with virtual:=true tracking_merger owns /tracking/obstacles, so tracking feeds it
+       on /tracking/obstacles_raw; without it, tracking publishes /tracking/obstacles directly -->
+  <let name="tracking_out" value="/tracking/obstacles_raw" if="$(var virtual)"/>
+  <let name="tracking_out" value="/tracking/obstacles"     unless="$(var virtual)"/>
   <node pkg="perception" exec="tracking_node" name="tracking" output="screen">
     <param from="$(find-pkg-share stack_master)/config/opponent_tracker_params.yaml"/>
-    <remap from="/tracking/obstacles" to="/tracking/obstacles_raw"/>
+    <remap from="/tracking/obstacles" to="$(var tracking_out)"/>
   </node>
 
   <!-- ===== State machine: the racing brain ===== -->

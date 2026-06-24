@@ -17,6 +17,7 @@
   <arg name="map"          description="Map name (folder in stack_master/maps/)"/>
   <arg name="sim"          default="false" description="Use simulator (true) or real hardware (false)"/>
   <arg name="localization" default="gt"    description="gt (sim) | cartographer | pf (real)"/>
+  <arg name="virtual"      default="$(var sim)" description="Inject virtual opponent/obstacles (scan overlay etc.); on by default in sim, off on the real car"/>
 
   <!-- sim -> SIM config folder, real hardware -> CAR config folder -->
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/SIM" if="$(var sim)"/>
@@ -30,6 +31,7 @@
       <arg name="sim"            value="true"/>
       <arg name="map"            value="$(var map)"/>
       <arg name="vehicle_config" value="$(var vehicle_config)"/>
+      <arg name="virtual"        value="$(var virtual)"/>
     </include>
   </group>
   <!-- REAL: middle_level adds VESC/LiDAR + the chosen localization stack. -->
@@ -39,6 +41,7 @@
       <arg name="map"            value="$(var map)"/>
       <arg name="localization"   value="$(var localization)"/>
       <arg name="vehicle_config" value="$(var vehicle_config)"/>
+      <arg name="virtual"        value="$(var virtual)"/>
     </include>
   </group>
 
