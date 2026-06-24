@@ -6,9 +6,11 @@ Panels:
       Expanded:
         - /Global Options1
         - /Status1
+        - /Map Carto1
         - /Ego Robot1/Ego Scan1
+        - /Odometry1
       Splitter Ratio: 0.5
-    Tree Height: 290
+    Tree Height: 300
   - Class: rviz_common/Selection
     Name: Selection
   - Class: rviz_common/Tool Properties
@@ -67,7 +69,7 @@ Visualization Manager:
       Class: rviz_default_plugins/Map
       Color Scheme: map
       Draw Behind: false
-      Enabled: true
+      Enabled: false
       Name: Map
       Topic:
         Depth: 5
@@ -83,14 +85,14 @@ Visualization Manager:
         Reliability Policy: Best Effort
         Value: /map_updates
       Use Timestamp: false
-      Value: true
+      Value: false
     - Alpha: 0.699999988079071
       Binary representation: false
       Binary threshold: 100
       Class: rviz_default_plugins/Map
-      Color Scheme: costmap
+      Color Scheme: map
       Draw Behind: false
-      Enabled: false
+      Enabled: true
       Name: Map Carto
       Topic:
         Depth: 5
@@ -106,7 +108,7 @@ Visualization Manager:
         Reliability Policy: Best Effort
         Value: /map_updates
       Use Timestamp: false
-      Value: false
+      Value: true
     - Class: rviz_common/Group
       Displays:
         - Alpha: 1
@@ -124,9 +126,9 @@ Visualization Manager:
           Enabled: true
           Invert Rainbow: false
           Max Color: 255; 255; 255
-          Max Intensity: 9.92969036102295
+          Max Intensity: 1952
           Min Color: 0; 0; 0
-          Min Intensity: 0.1512855589389801
+          Min Intensity: 123
           Name: Ego Scan
           Position Transformer: XYZ
           Selectable: true
@@ -161,44 +163,6 @@ Visualization Manager:
             Expand Link Details: false
             Expand Tree: false
             Link Tree Style: Links in Alphabetic Order
-            back_left_wheel:
-              Alpha: 1
-              Show Axes: false
-              Show Trail: false
-              Value: true
-            back_right_wheel:
-              Alpha: 1
-              Show Axes: false
-              Show Trail: false
-              Value: true
-            base_link:
-              Alpha: 1
-              Show Axes: false
-              Show Trail: false
-              Value: true
-            front_left_hinge:
-              Alpha: 1
-              Show Axes: false
-              Show Trail: false
-            front_left_wheel:
-              Alpha: 1
-              Show Axes: false
-              Show Trail: false
-              Value: true
-            front_right_hinge:
-              Alpha: 1
-              Show Axes: false
-              Show Trail: false
-            front_right_wheel:
-              Alpha: 1
-              Show Axes: false
-              Show Trail: false
-              Value: true
-            laser:
-              Alpha: 1
-              Show Axes: false
-              Show Trail: false
-              Value: true
           Mass Properties:
             Inertia: false
             Mass: false
@@ -302,44 +266,6 @@ Visualization Manager:
             Expand Link Details: false
             Expand Tree: false
             Link Tree Style: Links in Alphabetic Order
-            opp_racecar/back_left_wheel:
-              Alpha: 1
-              Show Axes: false
-              Show Trail: false
-              Value: true
-            opp_racecar/back_right_wheel:
-              Alpha: 1
-              Show Axes: false
-              Show Trail: false
-              Value: true
-            opp_racecar/base_link:
-              Alpha: 1
-              Show Axes: false
-              Show Trail: false
-              Value: true
-            opp_racecar/front_left_hinge:
-              Alpha: 1
-              Show Axes: false
-              Show Trail: false
-            opp_racecar/front_left_wheel:
-              Alpha: 1
-              Show Axes: false
-              Show Trail: false
-              Value: true
-            opp_racecar/front_right_hinge:
-              Alpha: 1
-              Show Axes: false
-              Show Trail: false
-            opp_racecar/front_right_wheel:
-              Alpha: 1
-              Show Axes: false
-              Show Trail: false
-              Value: true
-            opp_racecar/laser:
-              Alpha: 1
-              Show Axes: false
-              Show Trail: false
-              Value: true
           Mass Properties:
             Inertia: false
             Mass: false
@@ -375,7 +301,7 @@ Visualization Manager:
       Enabled: true
       Name: MarkerArray
       Namespaces:
-        "": true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -400,7 +326,7 @@ Visualization Manager:
       Enabled: true
       Name: MarkerArray
       Namespaces:
-        "": true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -412,13 +338,52 @@ Visualization Manager:
       Enabled: true
       Name: Virtual objects (opp + static)
       Namespaces:
-        opp_box: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /vil/opponents_viz
+      Value: true
+    - Angle Tolerance: 0.10000000149011612
+      Class: rviz_default_plugins/Odometry
+      Covariance:
+        Orientation:
+          Alpha: 0.5
+          Color: 255; 255; 127
+          Color Style: Unique
+          Frame: Local
+          Offset: 1
+          Scale: 1
+          Value: true
+        Position:
+          Alpha: 0.30000001192092896
+          Color: 204; 51; 204
+          Scale: 1
+          Value: true
+        Value: true
+      Enabled: true
+      Keep: 1
+      Name: Odometry
+      Position Tolerance: 0.10000000149011612
+      Shape:
+        Alpha: 1
+        Axes Length: 1
+        Axes Radius: 0.10000000149011612
+        Color: 255; 25; 0
+        Head Length: 0.30000001192092896
+        Head Radius: 0.10000000149011612
+        Shaft Length: 1
+        Shaft Radius: 0.05000000074505806
+        Value: Arrow
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /car_state/odom
       Value: true
   Enabled: true
   Global Options:
@@ -442,14 +407,14 @@ Visualization Manager:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
-        Reliability Policy: Best Effort
+        Reliability Policy: Reliable
         Value: /initialpose
     - Class: rviz_default_plugins/SetGoal
       Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
-        Reliability Policy: Best Effort
+        Reliability Policy: Reliable
         Value: /goal_pose
     - Class: rviz_default_plugins/PublishPoint
       Single click: true
@@ -457,7 +422,7 @@ Visualization Manager:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
-        Reliability Policy: Best Effort
+        Reliability Policy: Reliable
         Value: /clicked_point
   Transformation:
     Current:
@@ -475,22 +440,20 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Scale: 23.38920021057129
+      Scale: 51.70607376098633
       Target Frame: <Fixed Frame>
       Value: TopDownOrtho (rviz_default_plugins)
-      X: 10.009615898132324
-      Y: 7.7870707511901855
+      X: -1.0160799026489258
+      Y: -1.207072138786316
     Saved: ~
 Window Geometry:
   Displays:
     collapsed: false
-  Height: 749
+  Height: 1002
   Hide Left Dock: false
   Hide Right Dock: false
-  QMainWindow State: 000000ff00000000fd00000004000000000000015600000293fc0200000009fb0000001200530065006c0065006300740069006f006e00000001e10000009b0000005c00fffffffb0000001e0054006f006f006c002000500072006f007000650072007400690065007302000001ed000001df00000185000000a3fb000000120056006900650077007300200054006f006f02000001df000002110000018500000122fb000000200054006f006f006c002000500072006f0070006500720074006900650073003203000002880000011d000002210000017afb000000100044006900730070006c006100790073010000003d000001e9000000c900fffffffb0000000a00560069006500770073010000022c000000a4000000a400fffffffb0000002000730065006c0065006300740069006f006e00200062007500660066006500720200000138000000aa0000023a00000294fb00000014005700690064006500530074006500720065006f02000000e6000000d2000003ee0000030bfb0000000c004b0069006e0065006300740200000186000001060000030c00000261000000010000014000000293fc0200000003fb0000001e0054006f006f006c002000500072006f00700065007200740069006500730100000041000000780000000000000000fb0000001600530069006d00200043006f006e00740072006f006c010000003d000002930000020100fffffffb0000001200530065006c0065006300740069006f006e010000025a000000b200000000000000000000000200000490000000a9fc0100000001fb0000000a00560069006500770073030000004e00000080000002e10000019700000003000004420000003efc0100000002fb0000000800540069006d00650100000000000004420000000000000000fb0000000800540069006d00650100000000000004500000000000000000000002cc0000029300000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd00000004000000000000015600000390fc0200000009fb0000001200530065006c0065006300740069006f006e00000001e10000009b0000005c00fffffffb0000001e0054006f006f006c002000500072006f007000650072007400690065007302000001ed000001df00000185000000a3fb000000120056006900650077007300200054006f006f02000001df000002110000018500000122fb000000200054006f006f006c002000500072006f0070006500720074006900650073003203000002880000011d000002210000017afb000000100044006900730070006c006100790073010000003d000001f3000000c900fffffffb0000000a00560069006500770073010000023600000197000000a400fffffffb0000002000730065006c0065006300740069006f006e00200062007500660066006500720200000138000000aa0000023a00000294fb00000014005700690064006500530074006500720065006f02000000e6000000d2000003ee0000030bfb0000000c004b0069006e0065006300740200000186000001060000030c00000261000000010000014000000390fc0200000004fb0000000e00700069007400770061006c006c010000003d000003900000021700fffffffb0000001e0054006f006f006c002000500072006f00700065007200740069006500730100000041000000780000000000000000fb0000001600530069006d00200043006f006e00740072006f006c010000003d000002930000000000000000fb0000001200530065006c0065006300740069006f006e010000025a000000b200000000000000000000000200000490000000a9fc0100000001fb0000000a00560069006500770073030000004e00000080000002e10000019700000003000004420000003efc0100000002fb0000000800540069006d00650100000000000004420000000000000000fb0000000800540069006d00650100000000000004500000000000000000000002cc0000039000000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Selection:
-    collapsed: false
-  Sim Control:
     collapsed: false
   Tool Properties:
     collapsed: false
@@ -498,4 +461,6 @@ Window Geometry:
     collapsed: false
   Width: 1390
   X: 177
-  Y: 98
+  Y: 41
+  pitwall:
+    collapsed: false

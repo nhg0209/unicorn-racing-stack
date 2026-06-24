@@ -4,7 +4,7 @@
   ================================================================================
   The always-on foundation that both time-trial and head-to-head build on:
 
-    sensors / simulator + localization      (low_level / middle_level)
+    sensors / simulator + localization      (sim: low_level / real: localization)
     + global raceline publisher             (planner/waypoint_publisher)
     + Frenet odometry republisher           (/car_state/odom_frenet)
 
@@ -17,6 +17,7 @@
   <arg name="map"          description="Map name (folder in stack_master/maps/)"/>
   <arg name="sim"          default="false" description="Use simulator (true) or real hardware (false)"/>
   <arg name="localization" default="gt"    description="gt (sim) | cartographer | pf (real)"/>
+  <arg name="virtual"      default="$(var sim)" description="Inject virtual opponent/obstacles (scan overlay etc.); on by default in sim, off on the real car"/>
 
   <!-- sim -> SIM config folder, real hardware -> CAR config folder -->
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/SIM" if="$(var sim)"/>
@@ -30,22 +31,23 @@
       <arg name="sim"            value="true"/>
       <arg name="map"            value="$(var map)"/>
       <arg name="vehicle_config" value="$(var vehicle_config)"/>
+      <arg name="virtual"        value="$(var virtual)"/>
     </include>
   </group>
-  <!-- REAL: middle_level adds VESC/LiDAR + the chosen localization stack. -->
+  <!-- REAL: localization brings up VESC/LiDAR + the chosen localization stack. -->
   <group unless="$(var sim)">
-    <include file="$(find-pkg-share stack_master)/launch/middle_level.launch.xml">
-      <arg name="sim"            value="false"/>
+    <include file="$(find-pkg-share stack_master)/launch/localization.launch.xml">
       <arg name="map"            value="$(var map)"/>
       <arg name="localization"   value="$(var localization)"/>
       <arg name="vehicle_config" value="$(var vehicle_config)"/>
+      <arg name="virtual"        value="$(var virtual)"/>
     </include>
   </group>
 
   <!-- ===== Global raceline (gb_optimizer JSON pipeline) =====
        ROS2 port of the ros1 base_system global-waypoint chain. Replaces the CSV
        waypoint_publisher: the republisher reads stack_master/maps/<map>/
-       global_waypoints.json (produced by mapping.launch.xml) and publishes
+       global_waypoints.json (produced by raceline_generator.launch.xml) and publishes
        /global_waypoints, /global_waypoints/shortest_path, /centerline_waypoints,
        /trackbounds/markers, etc.
 

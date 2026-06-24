@@ -47,6 +47,27 @@ PitwallPanel::PitwallPanel(QWidget * parent)
   status_label_->setWordWrap(true);
   layout->addWidget(status_label_);
 
+  // ===== Ego control: human-drive input source (joy XOR keyboard) =====
+  // Sits beside the telemetry; the selection is a Bool trigger consumed by
+  // simple_mux (false = joy / existing path, true = keyboard / /joy_keyboard).
+  layout->addWidget(new QLabel("Ego control (pick one):"));
+  auto * ego_row = new QHBoxLayout;
+  joy_src_btn_ = new QPushButton("Joy");
+  keyboard_src_btn_ = new QPushButton("Keyboard");
+  joy_src_btn_->setCheckable(true);
+  keyboard_src_btn_->setCheckable(true);
+  joy_src_btn_->setChecked(true);        // default = joy (matches simple_mux default)
+  keyboard_src_btn_->setChecked(false);
+  ego_row->addWidget(joy_src_btn_);
+  ego_row->addWidget(keyboard_src_btn_);
+  layout->addLayout(ego_row);
+
+  // Tiny cheat-sheet for the keyboard teleop (keyboard_joy_node) controls.
+  // ASCII only — conda's libfontconfig segfaults on exotic glyphs (arrows, dots).
+  auto * ego_hint = new QLabel("Keyboard: arrows drive | H=human | A=auto");
+  ego_hint->setStyleSheet("color:gray; font-size:10px;");
+  layout->addWidget(ego_hint);
+
   // Push the controls block to the very bottom of the panel.
   layout->addStretch();
 
@@ -65,7 +86,6 @@ PitwallPanel::PitwallPanel(QWidget * parent)
   obs_row->addWidget(clear_obs_btn);
   layout->addLayout(obs_row);
 
-  layout->addWidget(new QLabel("Opponent drive mode:"));
   auto * mode_row = new QHBoxLayout;
   auto * manual_btn = new QPushButton("Manual");
   auto * path_btn = new QPushButton("Path");
@@ -126,6 +146,8 @@ PitwallPanel::PitwallPanel(QWidget * parent)
   connect(opp_lidar_btn_, &QPushButton::clicked, this, &PitwallPanel::onToggleOppLidar);
   connect(scan_overlay_btn_, &QPushButton::clicked, this, &PitwallPanel::onSelectOverlay);
   connect(tracking_merge_btn_, &QPushButton::clicked, this, &PitwallPanel::onSelectMerge);
+  connect(joy_src_btn_, &QPushButton::clicked, this, &PitwallPanel::onSelectJoy);
+  connect(keyboard_src_btn_, &QPushButton::clicked, this, &PitwallPanel::onSelectKeyboard);
 }
 
 void PitwallPanel::onInitialize()
@@ -138,6 +160,7 @@ void PitwallPanel::onInitialize()
   ego_lidar_pub_ = node_->create_publisher<std_msgs::msg::Bool>("/sim/ego_lidar_enable", 10);
   opp_lidar_pub_ = node_->create_publisher<std_msgs::msg::Bool>("/sim/opp_lidar_enable", 10);
   inject_mode_pub_ = node_->create_publisher<std_msgs::msg::String>("/vp/inject_mode", 10);
+  ego_control_pub_ = node_->create_publisher<std_msgs::msg::Bool>("/ego/use_keyboard", 10);
 
   // State machine state (std_msgs/String) -> colour banner. Survives removing
   // the /state_marker visualization.
@@ -290,6 +313,31 @@ void PitwallPanel::onSelectMerge()
     inject_mode_pub_->publish(m);
   }
   if (status_label_) {status_label_->setText("VP inject: tracking merge");}
+}
+
+void PitwallPanel::onSelectJoy()
+{
+  // mutually exclusive: choosing joy deselects keyboard
+  joy_src_btn_->setChecked(true);
+  keyboard_src_btn_->setChecked(false);
+  if (ego_control_pub_) {
+    std_msgs::msg::Bool m;
+    m.data = false;   // false = joy (existing /joy path)
+    ego_control_pub_->publish(m);
+  }
+  if (status_label_) {status_label_->setText("Ego control: Joy");}
+}
+
+void PitwallPanel::onSelectKeyboard()
+{
+  joy_src_btn_->setChecked(false);
+  keyboard_src_btn_->setChecked(true);
+  if (ego_control_pub_) {
+    std_msgs::msg::Bool m;
+    m.data = true;    // true = keyboard (/joy_keyboard path)
+    ego_control_pub_->publish(m);
+  }
+  if (status_label_) {status_label_->setText("Ego control: Keyboard");}
 }
 
 }  // namespace pitwall

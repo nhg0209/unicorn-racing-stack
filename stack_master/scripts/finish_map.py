@@ -22,6 +22,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 import subprocess
 import sys
 import os
+import zlib
+import struct
 
 
 class FinishMapNode(Node):
@@ -195,19 +197,24 @@ class FinishMapNode(Node):
             self.get_logger().error(f'Error saving pbstream: {str(e)}')
 
     def save_occupancy_grid(self):
-        """Render the occupancy grid (PGM + YAML) from the saved pbstream.
+        """Render the occupancy grid (PNG + YAML) from the saved pbstream.
 
         We render from the pbstream rather than snapshotting the live /map_carto
         topic: right after FinishTrajectory the occupancy_grid_node may be
         mid-rebuild and publish only a partial grid, which produced truncated /
         all-unknown maps. The pbstream always holds the full optimized map.
+
+        cartographer_pbstream_to_ros_map only emits PGM, so we convert that to
+        PNG (the format the rest of the stack's maps use) and drop the PGM.
         """
         map_path = os.path.join(self.maps_dir, self.map_basename)
         pbstream_path = os.path.join(self.maps_dir, f'{self.map_basename}.pbstream')
+        pgm_path = f'{map_path}.pgm'
+        png_path = f'{map_path}.png'
 
         self.get_logger().info(
             f'Step 3/3: Rendering occupancy grid from pbstream to '
-            f'{map_path}.pgm / {map_path}.yaml...')
+            f'{png_path} / {map_path}.yaml...')
 
         try:
             # cartographer_pbstream_to_ros_map writes <map_filestem>.pgm + .yaml
@@ -221,13 +228,16 @@ class FinishMapNode(Node):
 
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 
-            if result.returncode == 0 and os.path.exists(f'{map_path}.pgm'):
+            if result.returncode == 0 and os.path.exists(pgm_path):
+                # Convert the rendered PGM -> PNG and discard the PGM.
+                self._pgm_to_png(pgm_path, png_path)
+                os.remove(pgm_path)
                 # The tool writes an absolute path into the yaml's `image:` field;
-                # rewrite it to the relative basename so the map stays portable
+                # rewrite it to the relative PNG basename so the map stays portable
                 # after colcon copies it into install/.
                 self._fix_yaml_image_path(f'{map_path}.yaml',
-                                          f'{self.map_basename}.pgm')
-                self.get_logger().info(f'Map image saved to {map_path}.pgm')
+                                          f'{self.map_basename}.png')
+                self.get_logger().info(f'Map image saved to {png_path}')
                 self.get_logger().info(f'Map YAML saved to {map_path}.yaml')
             else:
                 self.get_logger().error(
@@ -241,11 +251,74 @@ class FinishMapNode(Node):
         self.get_logger().info("\n" + "="*60)
         self.get_logger().info(f"Map saving complete!")
         self.get_logger().info(f"  - {pbstream_path}")
-        self.get_logger().info(f"  - {map_path}.pgm")
+        self.get_logger().info(f"  - {png_path}")
         self.get_logger().info(f"  - {map_path}.yaml")
         self.get_logger().info("="*60 + "\n")
 
         self.rebuild_workspace()
+
+    @staticmethod
+    def _pgm_to_png(pgm_path, png_path):
+        """Convert an 8-bit PGM to grayscale PNG using only the stdlib.
+
+        The image libraries (Pillow/OpenCV) are unreliable in the conda runtime
+        this node launches under, so we read the PGM (cartographer emits binary
+        P5; ascii P2 handled too) and hand-encode a non-interlaced 8-bit
+        grayscale PNG with zlib — no third-party deps.
+        """
+        with open(pgm_path, 'rb') as f:
+            data = f.read()
+
+        idx = 0
+
+        def next_token():
+            nonlocal idx
+            # skip whitespace and '#' comment lines between header fields
+            while idx < len(data):
+                c = data[idx:idx + 1]
+                if c.isspace():
+                    idx += 1
+                elif c == b'#':
+                    while idx < len(data) and data[idx:idx + 1] not in (b'\n', b'\r'):
+                        idx += 1
+                else:
+                    break
+            start = idx
+            while idx < len(data) and not data[idx:idx + 1].isspace():
+                idx += 1
+            return data[start:idx]
+
+        magic = next_token()
+        width = int(next_token())
+        height = int(next_token())
+        maxval = int(next_token())
+        idx += 1  # single whitespace separator precedes the pixel data
+
+        if magic == b'P5':
+            if maxval > 255:
+                raise ValueError('16-bit PGM not supported')
+            pixels = data[idx:idx + width * height]
+            if len(pixels) < width * height:
+                raise ValueError('truncated PGM pixel data')
+        elif magic == b'P2':
+            pixels = bytes(int(v) for v in data[idx:].split()[:width * height])
+        else:
+            raise ValueError(f'unsupported PGM magic {magic!r}')
+
+        def chunk(tag, payload):
+            return (struct.pack('>I', len(payload)) + tag + payload +
+                    struct.pack('>I', zlib.crc32(tag + payload) & 0xffffffff))
+
+        raw = bytearray()
+        for y in range(height):
+            raw.append(0)  # filter type 0 (None) per scanline
+            raw.extend(pixels[y * width:(y + 1) * width])
+
+        with open(png_path, 'wb') as f:
+            f.write(b'\x89PNG\r\n\x1a\n')
+            f.write(chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 0, 0, 0, 0)))
+            f.write(chunk(b'IDAT', zlib.compress(bytes(raw), 9)))
+            f.write(chunk(b'IEND', b''))
 
     def _fix_yaml_image_path(self, yaml_path, image_basename):
         """Replace the yaml `image:` value with a relative basename."""

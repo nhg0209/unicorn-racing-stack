@@ -6,13 +6,13 @@ particle_filter:
     # range data downsampling
     publis_tf: false
     angle_step: 18
-    max_particles: 4000
+    max_particles: 2000
     squash_factor: 2.2
     # visualization
     viz: 1
     max_viz_particles: 60
     # ray marching method
-    range_method: 'pcddt' # rmgpu, pcddt
+    range_method: 'rm' # rm, pcddt, glt, rmgpu(for cuda)
     theta_discretization: 112
     # range data filtering
     max_range: 10

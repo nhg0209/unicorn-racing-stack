@@ -121,7 +121,9 @@ class ParticleFiler(Node):
         self.map_info = None
         self.map_initialized = False
         self.lidar_initialized = False
-        self.odom_initialized = False
+        # velocity motion model is integrated in lidarCB, so the filter no longer
+        # requires odom to have arrived; velocities default to 0 (= no motion).
+        self.odom_initialized = True
         self.last_pose = None
         self.laser_angles = None
         self.downsampled_angles = None
@@ -155,8 +157,10 @@ class ParticleFiler(Node):
         self.precompute_sensor_model()
         self.initialize_global()
 
-        # keep track of speed from input odom
-        self.current_speed = 0.0
+        # keep track of velocity from input odom; integrated over the scan dt
+        self.current_speed   = 0.0   # twist.linear.x  (body forward velocity)
+        self.current_angular = 0.0   # twist.angular.z (yaw rate)
+        self.last_scan_time  = None  # float secs of the previous scan, for dt
 
         # Pub Subs
         # these topics are for visualization
@@ -346,38 +350,31 @@ class ParticleFiler(Node):
         # store the necessary scanner information for later processing
         self.downsampled_ranges = np.array(msg.ranges[::self.ANGLE_STEP])
         self.lidar_initialized = True
-        # self.update()
+
+        # Velocity motion model: integrate the latest odom twist over the interval
+        # since the previous scan -> body-frame delta [dx, dy(~0 on a car), dtheta].
+        # update() consumes self.odometry_data and zeroes it, so we recompute it
+        # fresh from velocity * dt on every scan.
+        scan_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        if self.last_scan_time is not None:
+            dt = scan_time - self.last_scan_time
+            if dt > 0.0:
+                self.odometry_data = np.array(
+                    [self.current_speed * dt, 0.0, self.current_angular * dt])
+        self.last_scan_time = scan_time
+        self.last_stamp = msg.header.stamp
+
+        self.update()
 
     def odomCB(self, msg):
         '''
-        Store deltas between consecutive odometry messages in the coordinate space of the car.
-
-        Odometry data is accumulated via dead reckoning, so it is very inaccurate on its own.
+        Store the latest body-frame velocity (vx) and yaw rate (wz) from the odom
+        twist. The motion is integrated over the scan interval in lidarCB, so this
+        callback no longer computes position deltas or triggers an MCL update.
         '''
-        position = np.array([
-            msg.pose.pose.position.x,
-            msg.pose.pose.position.y])
-
-        orientation = Utils.quaternion_to_angle(msg.pose.pose.orientation)
-        pose = np.array([position[0], position[1], orientation])
-        self.current_speed = msg.twist.twist.linear.x
-
-        if isinstance(self.last_pose, np.ndarray):
-            # changes in x,y,theta in local coordinate system of the car
-            rot = Utils.rotation_matrix(-self.last_pose[2])
-            delta = np.array([position - self.last_pose[0:2]]).transpose()
-            local_delta = (rot*delta).transpose()
-            
-            self.odometry_data = np.array([local_delta[0,0], local_delta[0,1], orientation - self.last_pose[2]])
-            self.last_pose = pose
-            self.last_stamp = msg.header.stamp
-            self.odom_initialized = True
-        else:
-            self.get_logger().info('...Received first Odometry message')
-            self.last_pose = pose
-
-        # this topic is slower than lidar, so update every time we receive a message
-        self.update()
+        self.current_speed   = msg.twist.twist.linear.x
+        self.current_angular = msg.twist.twist.angular.z
+        self.odom_initialized = True
 
     def clicked_pose(self, msg):
         '''

@@ -2,6 +2,6 @@
 24.04-x86     ubuntu:24.04  BUILD_OK(42/0)     SMOKE_OK   2026-06-20
 22.04-x86     ubuntu:22.04  BUILD_OK(42/0)     SMOKE_OK   2026-06-20
 24.04-arm     ubuntu:24.04  BUILD_OK(42/0)     SMOKE_NA   2026-06-20   # qemu cross-build; smoke n/a under emulation (sim too slow, scan_hz=0)
-# (BUILD_OK(finished/failed) = colcon packages; SMOKE_OK = low_level + headtohead came up headless)
+# (BUILD_OK(finished/failed) = colcon packages; SMOKE_OK = low_level + race came up headless)
 # SMOKE_NA = build verified but smoke not judgeable under qemu emulation -> run on real arm hw
 # arm64 / macOS: run .docker/run_platform_test.sh on the device (see BUILD.md)

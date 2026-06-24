@@ -6,7 +6,7 @@
 -->
 <launch>
   <arg name="rviz_config"
-       default="$(find-pkg-share stack_master)/config/SIM/pitwall.rviz"
+       default="$(find-pkg-share stack_master)/config/pitwall.rviz"
        description="RViz config to load"/>
   <node pkg="rviz2" exec="rviz2" name="rviz2" output="screen"
         args="-d $(var rviz_config)"/>

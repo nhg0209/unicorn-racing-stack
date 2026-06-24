@@ -1,87 +1,67 @@
-<!-- -*- mode: XML -*- -->
+<?xml version="1.0"?>
 <!--
-  ROS 2 port of the ros1 stack_master/launch/mapping.launch.
+  mapping.launch.xml — build a new map with cartographer SLAM (real car).
 
-  Builds the global plan (and, optionally, the map) for a track, then slices the
-  speed/overtaking sectors. Mirrors the ros1 three-mode behaviour driven by
-  (create_map, create_global_path) inside gb_optimizer/global_planner_node:
-    create_map=T, create_global_path=T  -> map_editor=F, mapping=F  (drive + map + plan)
-    create_map=T, create_global_path=F  -> map_editor=T, mapping=T  (save map only)
-    create_map=F                        -> map_editor=T, mapping=F  (plan from existing map)
+  Brings up the real-car sensors + mux (low_level, virtual injection off) and the
+  cartographer SLAM stack. Drive the car around the track, then trigger finish_map
+  (RViz "2D Goal Pose") to save <map>.{pbstream,png,yaml} under stack_master/maps/<map>/.
 
-  Examples:
-    # plan a global path from an existing map (no SLAM), then slice sectors
-    ros2 launch stack_master mapping.launch.xml map:=map_test create_map:=false
+  Sim is intentionally NOT handled here. Generate the global raceline afterwards
+  with raceline_generator.launch.xml.
 
-    # drive the car, build the map with cartographer, then plan + slice
-    ros2 launch stack_master mapping.launch.xml map:=YOURMAP sim:=false
+    ros2 launch stack_master mapping.launch.xml map:=YOURMAP
 -->
 <launch>
-  <arg name="map"                                  description="Map name (folder in stack_master/maps/)"/>
-  <arg name="sim"                default="false"   description="Use simulator (true) or real hardware (false)"/>
-  <arg name="gb_conf_path"       default="$(find-pkg-share stack_master)/config/global_planner_params.yaml"
-       description="ROS params YAML for the global planner node"/>
-  <arg name="reverse"            default="false"   description="Reverse raceline direction"/>
-  <arg name="create_map"         default="true"    description="Build a new map with SLAM (true) or use an existing one (false)"/>
-  <arg name="create_global_path" default="true"    description="Compute the global path + slice sectors (true) or save map only (false)"/>
-  <arg name="show_plots"         default="false"   description="Show optimization result plots"/>
+  <arg name="map"                            description="Map name (folder created under stack_master/maps/)"/>
+  <arg name="vehicle_config" default="$(find-pkg-share stack_master)/config/CAR/vehicle_config.yaml"/>
+  <arg name="use_estop"     default="false"  description="Use emergency stop (true) or not (false)"/>
+  <arg name="keyboard_teleop" default="false" description="Make the mux honour keyboard teleop (/joy_keyboard); run keyboard_joy_node on the operator laptop"/>
 
-  <!-- sim -> SIM config folder, real hardware -> CAR config folder. The folder
-       name doubles as racecar_version (holds racecar_f110.ini + veh_dyn_info/). -->
-  <let name="racecar_version" value="SIM" if="$(var sim)"/>
-  <let name="racecar_version" value="CAR" unless="$(var sim)"/>
-  <let name="config_dir" value="$(find-pkg-share stack_master)/config/$(var racecar_version)"/>
-  <arg name="vehicle_config" default="$(var config_dir)/vehicle_config.yaml"/>
+  <let name="cartographer_config_dir" value="$(find-pkg-share stack_master)/config"/>
+  <let name="maps_save_dir" value="$(find-pkg-prefix stack_master)/../../src/unicorn-racing-stack/stack_master/maps/$(var map)"/>
 
-  <let name="maps_dir" value="$(find-pkg-share stack_master)/maps"/>
+  <!-- ===== Sensors + mux (real hardware; no virtual injection while mapping) ===== -->
+  <include file="$(find-pkg-share stack_master)/launch/low_level.launch.xml">
+    <arg name="sim"            value="false"/>
+    <arg name="map"            value="$(var map)"/>
+    <arg name="vehicle_config" value="$(var vehicle_config)"/>
+    <arg name="use_estop"      value="$(var use_estop)"/>
+    <arg name="virtual"        value="false"/>
+    <arg name="keyboard_teleop" value="$(var keyboard_teleop)"/>
+  </include>
 
-  <!-- ===== global planner (gb_optimizer) ===== -->
-  <!-- emulate_tty: line-buffer the node's stdout so the optimizer's plain
-       print()s (IQP iterations etc.) stream live instead of dumping at exit. -->
-  <node pkg="gb_optimizer" exec="global_planner_node" name="global_planner" output="screen" emulate_tty="true">
-    <param from="$(var gb_conf_path)"/>
-    <param name="racecar_version"    value="$(var racecar_version)"/>
-    <param name="create_map"         value="$(var create_map)"/>
-    <param name="create_global_path" value="$(var create_global_path)"/>
-    <param name="map"                value="$(var map)"/>
-    <param name="map_dir"            value="$(var maps_dir)/$(var map)/"/>
-    <param name="reverse_mapping"    value="$(var reverse)"/>
-    <param name="show_plots"         value="$(var show_plots)"/>
+  <!-- ===== Cartographer SLAM (no IMU, no odometry: mapping_2d.lua) =====
+       gym_bridge does NOT publish TF, but this is real-hardware only, so
+       cartographer owns the map->base_link TF via publish_to_tf. -->
+  <node pkg="cartographer_ros" exec="cartographer_node" name="cartographer_node" output="screen"
+        args="-configuration_directory $(var cartographer_config_dir) -configuration_basename mapping_2d.lua --ros-args --log-level warn">
+    <param name="use_sim_time"  value="false"/>
+    <remap from="/imu" to="/vesc/sensors/imu/raw"/>
+    <remap from="/odom" to="/vesc/odom"/>
   </node>
 
-  <!-- ===== map source ===== -->
-  <!-- create_map=true: drive + cartographer SLAM via middle_level (mapping mode) -->
-  <group if="$(var create_map)">
-    <include file="$(find-pkg-share stack_master)/launch/middle_level.launch.xml">
-      <arg name="sim"            value="$(var sim)"/>
-      <arg name="map"            value="$(var map)"/>
-      <arg name="mapping"        value="true"/>
-      <arg name="vehicle_config" value="$(var vehicle_config)"/>
-    </include>
-  </group>
+  <node pkg="cartographer_ros" exec="cartographer_occupancy_grid_node"
+        name="cartographer_occupancy_grid_node" output="screen"
+        args="-resolution 0.05 -publish_period_sec 1.0">
+    <param name="use_sim_time" value="false"/>
+    <remap from="/map" to="/map_carto"/>
+  </node>
 
-  <!-- create_map=false: serve the already-saved map so the planner can read it -->
-  <group unless="$(var create_map)">
-    <node pkg="nav2_map_server" exec="map_server" name="map_server" output="screen">
-      <param name="yaml_filename" value="$(var maps_dir)/$(var map)/$(var map).yaml"/>
-    </node>
-    <node pkg="nav2_lifecycle_manager" exec="lifecycle_manager" name="lifecycle_manager" output="screen">
-      <param name="autostart"  value="true"/>
-      <param name="node_names" value="[map_server]"/>
-    </node>
-  </group>
+  <node pkg="stack_master" exec="pose_to_odom_node.py" name="pose_to_odom_node" output="screen">
+    <param name="use_sim_time" value="false"/>
+    <remap from="pose_in"  to="/tracked_pose"/>
+    <remap from="odom_out" to="/tracked_pose/odom"/>
+  </node>
 
-  <!-- ===== sector slicing (was sector_slicing.launch) ===== -->
-  <!-- Inlined: the ros1 sector_slicing.launch only wrapped these two nodes.
-       Each subscribes to /global_waypoints (+ /trackbounds, /shortest_path) from
-       the global planner above and writes speed_scaling.yaml / ot_sectors.yaml. -->
-  <group if="$(var create_global_path)">
-    <node pkg="sector_tuner" exec="sector_slicer" name="sector_node" output="screen">
-      <param name="save_dir" value="$(var maps_dir)/$(var map)"/>
-    </node>
-    <node pkg="overtaking_sector_tuner" exec="ot_sector_slicer" name="ot_sector_node" output="screen">
-      <param name="save_dir" value="$(var maps_dir)/$(var map)"/>
-    </node>
-  </group>
+  <node pkg="robot_localization" exec="ekf_node" name="ekf_localization" output="screen">
+    <param from="$(find-pkg-share stack_master)/config/ekf_cartographer.yaml"/>
+    <param name="use_sim_time" value="false"/>
+    <remap from="odometry/filtered" to="/car_state/odom"/>
+  </node>
 
+  <!-- Save the map: click RViz "2D Goal Pose" to finish SLAM + write the files. -->
+  <node pkg="stack_master" exec="finish_map.py" name="finish_map_node" output="screen">
+    <param name="map_name" value="$(var map)"/>
+    <param name="maps_dir" value="$(var maps_save_dir)"/>
+  </node>
 </launch>

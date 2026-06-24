@@ -130,4 +130,4 @@ say "colcon build (Release)…"
     --cmake-args -DCMAKE_BUILD_TYPE=Release )
 
 say "done. Open a NEW shell (or 'source ~/.bashrc') then run:  unicorn"
-echo "    ros2 launch stack_master headtohead.launch.xml sim:=true map:=f"
+echo "    ros2 launch stack_master race.launch.xml sim:=true map:=f"

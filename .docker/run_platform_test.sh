@@ -34,13 +34,13 @@ fail=$(grep -c 'Failed   <<<' "$BLOG"); fail=${fail:-0}
 
 smoke="SKIP"
 if [ "$build" = "BUILD_OK" ]; then
-  echo "=== [$LABEL] smoke test (low_level + headtohead, headless) ==="
+  echo "=== [$LABEL] smoke test (low_level + race, headless) ==="
   if docker run --rm "${plat[@]}" "$TAG" > "$SLOG" 2>&1; then
     smoke="SMOKE_OK"
   else
     smoke="SMOKE_FAIL"
   fi
-  grep -E 'lowlevel:|headtohead:|SMOKE:' "$SLOG" || tail -n 8 "$SLOG"
+  grep -E 'lowlevel:|race:|SMOKE:' "$SLOG" || tail -n 8 "$SLOG"
 fi
 
 line="$(date -u +%Y-%m-%dT%H:%MZ)  ${LABEL}  BASE=${BASE}  ${build}(pkgs_ok=${fin},fail=${fail})  ${smoke}"
