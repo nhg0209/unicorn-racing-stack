@@ -2,6 +2,7 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from cartographer_ros_msgs.srv import FinishTrajectory, StartTrajectory
 import time
@@ -33,12 +34,21 @@ class SetInitialPose(Node):
         self.start_trajectory_client.wait_for_service(timeout_sec=5.0)
         self.get_logger().info('Cartographer services available!')
 
-        # Subscribe to initial pose from RViz
+        # Subscribe to initial pose from RViz. RViz's "2D Pose Estimate" tool
+        # publishes /initialpose as BEST_EFFORT; a RELIABLE subscriber (the default
+        # you get by passing depth=10) is QoS-incompatible and receives NOTHING
+        # ("incompatible QoS ... No messages will be received ... RELIABILITY"), so
+        # clicking the tool never fires the callback. A BEST_EFFORT subscriber
+        # accepts a best-effort OR a reliable publisher, so it works either way.
+        initialpose_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10)
         self.subscription = self.create_subscription(
             PoseWithCovarianceStamped,
             '/initialpose',
             self.initial_pose_callback,
-            10)
+            initialpose_qos)
 
         # 0 is the one we saved during mapping, so in localization we start trajectory 1
         self.trajectory_num = 1
