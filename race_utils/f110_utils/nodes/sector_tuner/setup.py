@@ -19,7 +19,7 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='nuc5',
+    maintainer='HMCL',
     maintainer_email='shineejoon@unist.ac.kr',
     description='Sector velocity scaler and sector slicing GUI for F1TENTH racing',
     license='MIT',
@@ -27,7 +27,6 @@ setup(
         'console_scripts': [
             'sector_tuner = sector_tuner.sector_tuner:main',
             'sector_slicer = sector_tuner.sector_slicer:main',
-            'velocity_scaler = sector_tuner.vel_scaler_node:main',
         ],
     },
     scripts=["scripts/finish_sector.sh"],

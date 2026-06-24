@@ -14,12 +14,11 @@
             <ParticipantIndex>auto</ParticipantIndex>
             <Peers>
                 <Peer address="localhost"/>
-                <Peer address="192.168.60.1#"/> <!-- Insert PEER IP Address -->
             </Peers>
         </Discovery>
         <Internal>
-            <SocketReceiveBufferSize min="10MB"/>
-            <SocketSendBufferSize min="10MB"/>
+            <SocketReceiveBufferSize min="default"/>
+            <SocketSendBufferSize min="default"/>
         </Internal>
     </Domain>
 </CycloneDDS>

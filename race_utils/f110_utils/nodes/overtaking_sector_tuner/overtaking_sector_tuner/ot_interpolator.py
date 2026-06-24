@@ -31,7 +31,7 @@ class OvertakingInterpolator(Node):
     """
 
     def __init__(self):
-        super().__init__('ot_interpolator',
+        super().__init__('ot_sector_tuner',
                          allow_undeclared_parameters=True,
                          automatically_declare_parameters_from_overrides=True)
 
@@ -131,11 +131,11 @@ class OvertakingInterpolator(Node):
         self.wait_for_message_timer = self.create_timer(timer_period, self.loop_cb)
 
     def dyn_param_cb(self, parameter_event):
-        if (parameter_event.node == '/sector_tuner'):
+        if (parameter_event.node == '/speed_sector_tuner'):
             self.need_to_reinterpolate = True
             self.glb_wpnts_scaled = None
             return
-        if (parameter_event.node == '/ot_interpolator'):
+        if (parameter_event.node == '/ot_sector_tuner'):
             # update params
             self.sectors_params = self.parameters_to_dict()
             self.yeet_factor = self.sectors_params['yeet_factor']
@@ -158,6 +158,7 @@ class OvertakingInterpolator(Node):
             return
         try:
             yaml_data = {
+                'save_params': False,
                 'n_sectors': int(self.n_sectors),
                 'yeet_factor': float(self.sectors_params['yeet_factor']),
                 'spline_len': float(self.sectors_params['spline_len']),
@@ -170,7 +171,7 @@ class OvertakingInterpolator(Node):
                     'end': int(sec['end']),
                     'ot_flag': bool(sec.get('ot_flag', False)),
                 }
-            wrapped = {'ot_interpolator': {'ros__parameters': yaml_data}}
+            wrapped = {'ot_sector_tuner': {'ros__parameters': yaml_data}}
             os.makedirs(os.path.dirname(self.yaml_file_path), exist_ok=True)
             with open(self.yaml_file_path, "w") as yaml_file:
                 yaml.dump(wrapped, yaml_file, default_flow_style=False, sort_keys=False)

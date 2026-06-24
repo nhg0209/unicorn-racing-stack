@@ -4,7 +4,7 @@
   <name>overtaking_sector_tuner</name>
   <version>0.0.0</version>
   <description>Overtaking sector tuner: trajectory interpolation and OT sector slicing GUI</description>
-  <maintainer email="shineejoon@unist.ac.kr">nuc5</maintainer>
+  <maintainer email="shineejoon@unist.ac.kr">HMCL</maintainer>
   <license>MIT</license>
 
   <exec_depend>ros2launch</exec_depend>

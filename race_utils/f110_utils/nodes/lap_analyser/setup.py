@@ -17,7 +17,7 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='nuc5',
+    maintainer='HMCL',
     maintainer_email='shineejoon@unist.ac.kr',
     description='Analyses lap times, lateral error and distance to track boundary for F1TENTH racing',
     license='MIT',
