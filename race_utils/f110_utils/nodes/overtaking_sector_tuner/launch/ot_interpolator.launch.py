@@ -19,7 +19,7 @@ def generate_launch_description():
         Node(
             package='overtaking_sector_tuner',
             executable='ot_interpolator',
-            name='ot_interpolator',
+            name='ot_sector_tuner',
             output='screen',
             parameters=[LaunchConfiguration('params_file')],
         ),

@@ -78,6 +78,14 @@
     <param name="save_yaml_path" value="$(var maps_dir)/$(var map)/ot_sectors.yaml"/>
   </node>
 
+  <!-- ===== Frenet conversion service (ROS1: middle_level) =====
+       convert_glob2frenetarr_service / convert_frenet2globarr_service over
+       /global_waypoints; opp_prediction (headtohead) calls these. -->
+  <node pkg="frenet_conversion_server" exec="frenet_conversion_server_node"
+        name="frenet_conversion_server_node" output="screen">
+    <param name="PerceptionOnly" value="false"/>
+  </node>
+
   <!-- ===== Frenet odometry =====
        /car_state/odom -> /car_state/odom_frenet (s, d) for the planners + SM.
        The node publishes /car_state/frenet/odom; remap to the stack convention. -->

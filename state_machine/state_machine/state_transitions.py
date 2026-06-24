@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Tuple
 
-from state_machine.state_types import StateType
+from state_machine.states_types import StateType
 
 if TYPE_CHECKING:
-    from state_machine.state_machine import StateMachine
+    from state_machine.state_machine_node import StateMachine
 
 """
 Transitions should loosely follow the following template (basically a match-case)

@@ -1,4 +1,4 @@
-ot_interpolator:
+ot_sector_tuner:
   ros__parameters:
     n_sectors: 2
     yeet_factor: 1.25

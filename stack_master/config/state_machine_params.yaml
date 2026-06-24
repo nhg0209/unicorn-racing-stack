@@ -6,7 +6,7 @@ state_machine:
     timetrials_only: false
     sim: true
     measure: false
-    racecar_version: "NUCX"
+    racecar_version: "CAR"
     ot_planner: "predictive_spliner"
     track_length: 1.0
     # geometry / horizons

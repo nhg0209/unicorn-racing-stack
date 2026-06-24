@@ -522,92 +522,46 @@ class ChangeAvoidanceNode(Node):
         else:
             return [], [], [], [], []
 
-        points = []
-        tangents = []
+        # ---- Monotonic-s sampling (SQP-style): define an increasing raceline s up front, then
+        # ---- pull the target lane's d at each s, ease in/out around the obstacle span, and convert
+        # ---- to cartesian. s is monotonic by construction so the published path can never reverse.
+        target_wpnts = self.inner_lane_wpnts_msg.wpnts if preferred_side == "left" else self.outer_lane_wpnts_msg.wpnts
 
-        extra_points_after_lookahead = 5
-        if self.lookahead_point_x is not None and self.lookahead_point_y is not None:
-            distances = [np.hypot(wpnt.x_m - self.lookahead_point_x, wpnt.y_m - self.lookahead_point_y) for wpnt in self.local_wpnts_msg.local_wpnts]
-            closest_idx = int(np.argmin(distances))
+        # Obstacle span unwrapped relative to the car so it stays monotonic across the s=0 seam.
+        start_s = self.current_s
+        obs_start_u = obs_start = min(o.s_start for o in considered_obs)
+        obs_end_u = max(o.s_end for o in considered_obs)
+        if obs_start_u < start_s:
+            obs_start_u += self.scaled_max_s
+        while obs_end_u < obs_start_u:
+            obs_end_u += self.scaled_max_s
+        end_s = obs_end_u + self.back_to_raceline_after
 
-            cutoff_idx = min(closest_idx + extra_points_after_lookahead, len(self.local_wpnts_msg.local_wpnts))
+        n_samples = max(int((end_s - start_s) / self.scaled_delta_s), 5)
+        s_lin = np.linspace(start_s, end_s, n_samples)            # monotonic, unwrapped
 
-            for i in range(cutoff_idx):
-                wpnt = self.local_wpnts_msg.local_wpnts[i]
-                points.append([wpnt.x_m, wpnt.y_m])
-                tangents.append([np.cos(wpnt.psi_rad), np.sin(wpnt.psi_rad)])
+        # Target lane d along s (full avoidance offset); raceline d = 0.
+        lane_d = self._lane_d_at_s(target_wpnts, s_lin)
 
-        if preferred_side == "left":
-            target_wpnts = self.inner_lane_wpnts_msg.wpnts
-        elif preferred_side == "right":
-            target_wpnts = self.outer_lane_wpnts_msg.wpnts
+        # Cosine ease: 0 (raceline) before the obstacle, ramp to lane_d across the obstacle, ramp back.
+        ramp = self.back_to_raceline_before
+        d_arr = np.zeros_like(s_lin)
+        for i, s in enumerate(s_lin):
+            if s < obs_start_u - ramp or s > obs_end_u + ramp:
+                w = 0.0
+            elif s < obs_start_u:
+                w = 0.5 * (1 - np.cos(np.pi * (s - (obs_start_u - ramp)) / ramp))
+            elif s > obs_end_u:
+                w = 0.5 * (1 + np.cos(np.pi * (s - obs_end_u) / ramp))
+            else:
+                w = 1.0
+            d_arr[i] = w * lane_d[i]
 
-        for obs in considered_obs:
-            speed_scale = np.clip(self.current_vs, 0.5, 5.0)
-            temp_s_mod = (obs.s_center + speed_scale + 1.0) % self.scaled_max_s
-            temp_idx = np.argmin([abs(wpnt.s_m - temp_s_mod) for wpnt in target_wpnts])
-            temp_s = target_wpnts[temp_idx].s_m
-            temp_d = target_wpnts[temp_idx].d_m
-            temp_psi = target_wpnts[temp_idx].psi_rad
-            temp_resp = self.converter.get_cartesian(temp_s, temp_d)
-            temp_resp = temp_resp.T if temp_resp.ndim == 2 else temp_resp
-            points.append(temp_resp.tolist())
-            tangents.append([np.cos(temp_psi), np.sin(temp_psi)])
-
-        extended_indices = [(temp_idx + i) % len(target_wpnts) for i in range(1, self.num_extra_points + 1)]
-        for idx in extended_indices:
-            wp = target_wpnts[idx]
-            ext_s, ext_d = wp.s_m, wp.d_m
-            ext_psi = wp.psi_rad
-            ext_resp = self.converter.get_cartesian(ext_s, ext_d)
-            ext_resp = ext_resp.T if ext_resp.ndim == 2 else ext_resp
-            points.append(ext_resp.tolist())
-            tangents.append([np.cos(ext_psi), np.sin(ext_psi)])
-
-        speed_scale = np.clip(self.current_vs, 4.0, 6.0)
-        extend_gb_idx = np.argmin([abs(wpnt.s_m - (ext_s + speed_scale)) for wpnt in self.scaled_wpnts_msg.wpnts])
-        extended_gb_indices = [(extend_gb_idx + i) % len(self.scaled_wpnts_msg.wpnts) for i in range(1, self.num_extra_global_points + 1)]
-        for idx in extended_gb_indices:
-            wp = self.scaled_wpnts_msg.wpnts[idx]
-            ext_s, ext_d = wp.s_m, wp.d_m
-            ext_psi = wp.psi_rad
-            ext_resp = self.converter.get_cartesian(ext_s, ext_d)
-            ext_resp = ext_resp.T if ext_resp.ndim == 2 else ext_resp
-            points.append(ext_resp.tolist())
-            tangents.append([np.cos(ext_psi), np.sin(ext_psi)])
-
-        tangents = np.dot(tangents, 1.0 * np.eye(2))
-        points = np.asarray(points)
-        nPoints, dim = points.shape
-
-        # Parametrization parameter s.
-        dp = np.diff(points, axis=0)                 # difference between points
-        dp = np.linalg.norm(dp, axis=1)              # distance between points
-        d = np.cumsum(dp)                            # cumsum along the segments
-        d = np.hstack([[0], d])                      # add distance from first point
-        l = d[-1]                                    # length of point sequence
-        nSamples = int(l / self.scaled_delta_s)      # number of samples
-        s, r = np.linspace(0, l, nSamples, retstep=True)  # sample parameter and step
-
-        # Bring points and (optional) tangent information into correct format.
-        assert(len(points) == len(tangents))
-        spline_result = np.empty([nPoints, dim], dtype=object)
-        for i, ref in enumerate(points):
-            t = tangents[i]
-            # Either tangent is None or has the same
-            # number of dimensions as the point ref.
-            assert(t is None or len(t) == dim)
-            fuse = list(zip(ref, t) if t is not None else zip(ref,))
-            spline_result[i, :] = fuse
-
-        # Compute splines per dimension separately.
-        samples = np.zeros([nSamples, dim])
-        try:
-            for i in range(dim):
-                poly = BPoly.from_derivatives(d, spline_result[:, i])
-                samples[:, i] = poly(s)
-
-        except Exception as e:
+        s_wrapped = s_lin % self.scaled_max_s
+        resp = self.converter.get_cartesian(s_wrapped, d_arr)
+        resp = resp.T if resp.ndim == 2 else resp
+        samples = np.asarray(resp, dtype=float).reshape(-1, 2)
+        if samples.shape[0] < 3 or not np.all(np.isfinite(samples)):
             return [], [], [], [], []
 
         for i in range(samples.shape[0]):
@@ -625,10 +579,26 @@ class ChangeAvoidanceNode(Node):
 
         smoothed_xy_points = self.ccma.filter(samples)
         smoothed_sd_points = self.converter.get_frenet(smoothed_xy_points[:, 0], smoothed_xy_points[:, 1])
-        evasion_s, evasion_d = zip(*sorted(zip(smoothed_sd_points[0], smoothed_sd_points[1])))
-        evasion_x = smoothed_xy_points[:, 0]
-        evasion_y = smoothed_xy_points[:, 1]
+        # samples are already s-monotonic; keep x/y and s/d in that order (no sort) and wrap s.
+        evasion_x = np.asarray(smoothed_xy_points[:, 0])
+        evasion_y = np.asarray(smoothed_xy_points[:, 1])
+        evasion_s = np.asarray(smoothed_sd_points[0]) % self.scaled_max_s
+        evasion_d = np.asarray(smoothed_sd_points[1])
         evasion_coords = np.column_stack((evasion_x, evasion_y))
+
+        # Guard: drop coincident points (zero-length segments -> NaN psi/kappa/velocity).
+        if len(evasion_coords) >= 2:
+            seg = np.linalg.norm(np.diff(evasion_coords, axis=0), axis=1)
+            keep = np.concatenate([[True], seg > 1e-6])
+            if not np.all(keep):
+                evasion_x = evasion_x[keep]
+                evasion_y = evasion_y[keep]
+                evasion_s = evasion_s[keep]
+                evasion_d = evasion_d[keep]
+                evasion_coords = evasion_coords[keep]
+        if len(evasion_coords) < 3 or not np.all(np.isfinite(evasion_coords)):
+            return [], [], [], [], []
+
         evasion_psi, evasion_kappa = tph.calc_head_curv_num.calc_head_curv_num(
             path=evasion_coords,
             el_lengths=0.1 * np.ones(len(evasion_coords) - 1),
@@ -673,6 +643,17 @@ class ChangeAvoidanceNode(Node):
         y_new = np.interp(s_new, s, xy[:, 1])
         return np.stack([x_new, y_new], axis=1)
 
+    def _lane_d_at_s(self, lane_wpnts, s_query):
+        # Interpolate a lane's d over raceline s. Lane s wraps [0, scaled_max_s); duplicate one
+        # lap ahead so an UNWRAPPED s_query (can exceed scaled_max_s) still interpolates cleanly.
+        ls = np.array([w.s_m for w in lane_wpnts])
+        ld = np.array([w.d_m for w in lane_wpnts])
+        order = np.argsort(ls)
+        ls, ld = ls[order], ld[order]
+        ls_ext = np.concatenate([ls, ls + self.scaled_max_s])
+        ld_ext = np.concatenate([ld, ld])
+        return np.interp(s_query, ls_ext, ld_ext)
+
     def generate_lanes(self, center_wpnts: WpntArray):
         original_center_wpnts = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in center_wpnts.wpnts])
         original_center_psi = np.array([wpnt.psi_rad for wpnt in center_wpnts.wpnts])
@@ -690,8 +671,8 @@ class ChangeAvoidanceNode(Node):
         # inner_lane = original_center_wpnts - normals * min_center_right_gap
 
         # 2. Constant othogonal evasion
-        outer_lane = original_center_wpnts + normals * 0.25
-        inner_lane = original_center_wpnts - normals * 0.25
+        outer_lane = original_center_wpnts + normals * 0.35
+        inner_lane = original_center_wpnts - normals * 0.35
 
         outer_lane_resampled = self.resample_lane(outer_lane, resolution=0.1)
         inner_lane_resampled = self.resample_lane(inner_lane, resolution=0.1)

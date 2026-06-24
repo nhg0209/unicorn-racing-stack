@@ -6,8 +6,8 @@ controller_manager:
     q_l1: -0.2
     speed_lookahead: 0.25
     lat_err_coeff: 1.0
-    acc_scaler_for_steer: 0.9
-    dec_scaler_for_steer: 0.9
+    acc_scaler_for_steer: 1.0
+    dec_scaler_for_steer: 1.0
     start_scale_speed: 6.5
     end_scale_speed: 10.0
     downscale_factor: 0.5

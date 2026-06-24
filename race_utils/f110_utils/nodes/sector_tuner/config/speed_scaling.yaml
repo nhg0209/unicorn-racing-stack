@@ -1,4 +1,4 @@
-sector_tuner:
+speed_sector_tuner:
   ros__parameters:
     global_limit: 1.0
     n_sectors: 2

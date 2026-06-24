@@ -34,7 +34,7 @@ def _resolve_source_dir(save_dir):
 class SectorSlicer(Node):
     """
     Node for listening to gb waypoints and running a GUI to tune the sectors
-    s.t. a yaml can be exported for the sector_tuner.
+    s.t. a yaml can be exported for the speed_sector_tuner.
     """
 
     def __init__(self, future):
@@ -171,7 +171,7 @@ class SectorSlicer(Node):
             # Add only_FTG / no_FTG fields to sector
             dict_file['Sector' + str(i)].update({'only_FTG': False})
             dict_file['Sector' + str(i)].update({'no_FTG': False})
-        ros_yaml_preamble = {'sector_tuner': {'ros__parameters': dict_file}}
+        ros_yaml_preamble = {'speed_sector_tuner': {'ros__parameters': dict_file}}
 
         # Save yaml to the respective maps folder
         if not self.yaml_dir:

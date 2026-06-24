@@ -141,6 +141,9 @@ class ObstacleSpliner(Node):
             WpntArray, "/planner/recovery/wpnts", QoSProfile(depth=10))
         self.recovery_lookahead_pub = self.create_publisher(
             Marker, "/planner/recovery/lookahead_point", QoSProfile(depth=10))
+        # Debug: per-sample spline bounds-check viz (green=pass, red=fail, blue=unchecked tail)
+        self.spline_samples_pub = self.create_publisher(
+            MarkerArray, "/planner/recovery/spline_samples", QoSProfile(depth=10))
 
         if self.measuring:
             self.latency_pub = self.create_publisher(
@@ -272,16 +275,15 @@ class ObstacleSpliner(Node):
             start = time.perf_counter()
         # Sample data
         gb_scaled_wpnts = self.gb_scaled_wpnts.wpnts
-        wpnts = WpntArray()
-        mrks = MarkerArray()
 
+        wpnts, mrks = self.do_spline(gb_wpnts=gb_scaled_wpnts)
+
+        # Prepend DELETEALL so stale markers from the previous frame are cleared, then
+        # publish once (also clears them when do_spline returns no markers).
         del_mrk = Marker()
         del_mrk.header.stamp = self.get_clock().now().to_msg()
         del_mrk.action = Marker.DELETEALL
-        mrks.markers.append(del_mrk)
-        self.mrks_pub.publish(mrks)
-
-        wpnts, mrks = self.do_spline(gb_wpnts=gb_scaled_wpnts)
+        mrks.markers.insert(0, del_mrk)
 
         # Publish wpnts and markers
         if self.measuring:
@@ -480,10 +482,12 @@ class ObstacleSpliner(Node):
             )
 
         danger_flag = False
+        bounds_check_results = []  # debug: True if sample passed is_point_inside
         for i in range(samples.shape[0]):
             gb_wpnt_i = int((s_[i] / wpnt_dist) % self.gb_max_idx)
 
             inside = self.map_filter.is_point_inside(samples[i, 0], samples[i, 1])
+            bounds_check_results.append(inside)
             if not inside:
                 self.get_logger().info(
                     f"[{self.name}]: Evasion trajectory too close to TRACKBOUNDS, aborting evasion",
@@ -498,6 +502,9 @@ class ObstacleSpliner(Node):
             )
             mrks.markers.append(self.xyv_to_markers(x=samples[i, 0], y=samples[i, 1], v=vi, mrks=mrks))
 
+        # Debug: visualize every spline sample colored by bounds check
+        self._publish_spline_samples_markers(samples, bounds_check_results)
+
         # Fill the rest of OTWpnts
         wpnts.header.stamp = self.get_clock().now().to_msg()
         wpnts.header.frame_id = "map"
@@ -507,6 +514,39 @@ class ObstacleSpliner(Node):
             mrks.markers = []
 
         return wpnts, mrks
+
+    def _publish_spline_samples_markers(self, samples: np.ndarray, bounds_check_results: List[bool]):
+        """Debug viz: each spline sample as a sphere. green=passed bounds check,
+        red=failed (the point that aborted evasion), blue=unchecked tail point."""
+        markers = MarkerArray()
+        del_mrk = Marker()
+        del_mrk.header.frame_id = "map"
+        del_mrk.action = Marker.DELETEALL
+        markers.markers.append(del_mrk)
+        for i in range(samples.shape[0]):
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.ns = "spline_samples"
+            marker.id = i
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+            marker.pose.position.x = float(samples[i, 0])
+            marker.pose.position.y = float(samples[i, 1])
+            marker.pose.position.z = 0.1
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = 0.1
+            marker.scale.y = 0.1
+            marker.scale.z = 0.1
+            if i < len(bounds_check_results):
+                if bounds_check_results[i]:
+                    marker.color.r, marker.color.g, marker.color.b, marker.color.a = 0.0, 1.0, 0.0, 0.8  # green: passed
+                else:
+                    marker.color.r, marker.color.g, marker.color.b, marker.color.a = 1.0, 0.0, 0.0, 1.0  # red: failed
+            else:
+                marker.color.r, marker.color.g, marker.color.b, marker.color.a = 0.0, 0.0, 1.0, 0.5  # blue: unchecked tail
+            markers.markers.append(marker)
+        self.spline_samples_pub.publish(markers)
 
     ######################
     # VIZ + MSG WRAPPING #
