@@ -4,7 +4,7 @@
   ==============================================================================
   Full head-to-head racing autonomy on top of base_system:
 
-    perception   : detect_node + tracking_node      (/scan -> /detections -> /tracked_obstacles)
+    perception   : detect (C++) + tracking (Python)  (/scan -> /detect/raw_obstacles -> /tracking/obstacles_raw)
     state machine: state_machine                     (/tracking/obstacles + raceline -> /local_waypoints, /behavior_strategy, /state_machine)
     planning     : spliner_node                      (avoidance spline -> /planner/avoidance/otwpnts)
     control      : pp_node                           (follows /local_waypoints -> /vesc/high_level/ackermann_cmd)
@@ -38,11 +38,17 @@
     <arg name="sim" value="$(var sim)"/>
   </include>
 
-  <!-- ===== Perception: LiDAR obstacle detection + tracking ===== -->
-  <node pkg="perception" exec="detect_node" name="detect_node" output="screen"/>
-  <node pkg="perception" exec="tracking_node" name="tracking_node" output="screen">
-    <!-- ALWAYS feed the merger; tracking_merger owns /tracking/obstacles. -->
-    <param name="output_topic" value="/tracking/obstacles_raw"/>
+  <!-- ===== Perception: LiDAR obstacle detection (C++) + tracking (Python) =====
+       detect publishes /detect/raw_obstacles (Frenet filled at the source);
+       tracking reads it and publishes /tracking/obstacles_raw. tracking_merger
+       (sim virtual_perception) owns /tracking/obstacles. -->
+  <node pkg="perception" exec="detect" name="detect" output="screen">
+    <param from="$(find-pkg-share stack_master)/config/opponent_tracker_params.yaml"/>
+    <param name="map" value="$(var map)"/>
+  </node>
+  <node pkg="perception" exec="tracking_node" name="tracking" output="screen">
+    <param from="$(find-pkg-share stack_master)/config/opponent_tracker_params.yaml"/>
+    <remap from="/tracking/obstacles" to="/tracking/obstacles_raw"/>
   </node>
 
   <!-- ===== State machine: the racing brain ===== -->
@@ -52,11 +58,6 @@
     <param name="timetrials_only" value="false"/>
     <param name="ot_planner"      value="$(var ot_planner)"/>
   </node>
-
-  <!-- ===== Opponent prediction (constant-velocity along the raceline) =====
-       Feeds /opponent_prediction/obstacles(_pred) to the state machine and the
-       predictive planners. -->
-  <node pkg="perception" exec="opponent_predictor" name="opponent_predictor" output="screen"/>
 
   <!-- ===== Planning: spliner avoidance (publishes /planner/avoidance/otwpnts) ===== -->
   <node pkg="spliner" exec="spliner_node" name="spliner_node" output="screen"/>

@@ -4,7 +4,7 @@
   <name>stack_master</name>
   <version>0.0.0</version>
   <description>Master package for managing launch files and config files for VESC and LiDAR sensors</description>
-  <maintainer email="shineejoon@unist.ac.kr">nuc5</maintainer>
+  <maintainer email="shineejoon@unist.ac.kr">HMCL</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>

@@ -13,7 +13,7 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='nuc5',
+    maintainer='HMCL',
     maintainer_email='jeongsangryu@gmail.com',
     description='Lateral and longitudinal controllers for F1TENTH autonomous racing',
     license='MIT',

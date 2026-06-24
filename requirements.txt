@@ -19,6 +19,7 @@ gymnasium==0.29.1
 casadi==3.7.2
 trajectory_planning_helpers==0.79
 tqdm
+filterpy==1.4.5
 
 # scipy is pinned here because the verified env had a pip scipy shadowing the
 # conda one. If you prefer the conda build, move this to environment.yml instead.
