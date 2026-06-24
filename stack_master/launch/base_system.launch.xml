@@ -48,7 +48,7 @@
   <!-- ===== Global raceline (gb_optimizer JSON pipeline) =====
        ROS2 port of the ros1 base_system global-waypoint chain. Replaces the CSV
        waypoint_publisher: the republisher reads stack_master/maps/<map>/
-       global_waypoints.json (produced by mapping.launch.xml) and publishes
+       global_waypoints.json (produced by raceline_generator.launch.xml) and publishes
        /global_waypoints, /global_waypoints/shortest_path, /centerline_waypoints,
        /trackbounds/markers, etc.
 

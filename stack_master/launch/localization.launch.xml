@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<!--
+  localization.launch.xml — localize on an already-built map.
+
+  Thin wrapper over middle_level in localization mode (mapping:=false). Brings up
+  the map_server plus the chosen localization stack (cartographer | pf | gt).
+
+    ros2 launch stack_master localization.launch.xml map:=YOURMAP localization:=pf    # real car
+    ros2 launch stack_master localization.launch.xml map:=YOURMAP sim:=true localization:=gt
+-->
+<launch>
+  <arg name="map"                                  description="Map name (folder in stack_master/maps/)"/>
+  <arg name="sim"           default="false"        description="Use simulator (true) or real hardware (false)"/>
+  <arg name="localization"  default="cartographer" description="Localization algorithm: cartographer | pf | gt"/>
+  <let name="config_dir" value="$(find-pkg-share stack_master)/config/SIM" if="$(var sim)"/>
+  <let name="config_dir" value="$(find-pkg-share stack_master)/config/CAR" unless="$(var sim)"/>
+  <arg name="vehicle_config" default="$(var config_dir)/vehicle_config.yaml"/>
+  <arg name="use_estop"     default="false"        description="Use emergency stop (true) or not (false)"/>
+  <arg name="virtual"       default="$(var sim)"   description="Inject virtual opponent/obstacles (scan overlay etc.); on by default in sim, off on the real car"/>
+
+  <include file="$(find-pkg-share stack_master)/launch/middle_level.launch.xml">
+    <arg name="sim"            value="$(var sim)"/>
+    <arg name="map"            value="$(var map)"/>
+    <arg name="mapping"        value="false"/>
+    <arg name="localization"   value="$(var localization)"/>
+    <arg name="vehicle_config" value="$(var vehicle_config)"/>
+    <arg name="use_estop"      value="$(var use_estop)"/>
+    <arg name="virtual"        value="$(var virtual)"/>
+  </include>
+</launch>
