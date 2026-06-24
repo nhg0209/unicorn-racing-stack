@@ -2,23 +2,18 @@
 <CycloneDDS xmlns="https://cdds.io/config">
     <Domain id="any">
         <General>
-            <!-- <Interfaces>
-                <NetworkInterface name="wlp~~~" multicast="false"/>
-            </Interfaces> -->
             <Interfaces>
-                <NetworkInterface address="192.168.60.0" multicast="false"/>
+                <NetworkInterface address="127.0.0.1" multicast="true"/>
+                <NetworkInterface name="wlp87s0f0" multicast="true" presence_required="false"/>
             </Interfaces>
-            <AllowMulticast>false</AllowMulticast>
+            <AllowMulticast>true</AllowMulticast>
         </General>
         <Discovery>
             <ParticipantIndex>auto</ParticipantIndex>
-            <Peers>
-                <Peer address="localhost"/>
-            </Peers>
         </Discovery>
         <Internal>
-            <SocketReceiveBufferSize min="default"/>
-            <SocketSendBufferSize min="default"/>
+            <SocketReceiveBufferSize min="10MB"/>
+            <SocketSendBufferSize min="10MB"/>
         </Internal>
     </Domain>
 </CycloneDDS>
