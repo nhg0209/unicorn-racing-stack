@@ -12,7 +12,7 @@
   <let name="maps_dir"                value="$(find-pkg-share stack_master)/maps"/>
   <let name="map_path"                value="$(var maps_dir)/$(var map)/$(var map)"/>
   <let name="cartographer_config_dir" value="$(find-pkg-share stack_master)/config"/>
-  <let name="maps_save_dir"           value="$(find-pkg-prefix stack_master)/../../src/creating_autonomous_car/stack_master/maps/$(var map)"/>
+  <let name="maps_save_dir"           value="$(find-pkg-prefix stack_master)/../../src/unicorn-racing-stack/stack_master/maps/$(var map)"/>
   <!-- sim=true  -> mapping_2d_sim.lua (no IMU, use odometry) -->
   <!-- sim=false -> mapping_2d.lua     (no IMU, no odometry)  -->
   <let name="mapping_lua" value="mapping_2d.lua"     unless="$(var sim)"/>

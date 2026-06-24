@@ -42,9 +42,29 @@ dependencies:
   # vesc transport stack is VENDORED from source under sensor/transport_drivers/
   # and built by colcon. Only the base `asio` library (pinned below) comes from conda.
   - ros-jazzy-ackermann-msgs=2.0.2
-  # cartographer-ros pulls in ros-jazzy-cartographer (core) +
-  # ros-jazzy-cartographer-ros-msgs automatically, so they need not be listed.
-  - ros-jazzy-cartographer-ros=2.0.9003
+  # cartographer / cartographer_ros are BUILT FROM SOURCE (vendored under
+  # state_estimation/cartographer{,_ros}/), NOT installed from conda. The robostack
+  # binary `ros-jazzy-cartographer-ros=2.0.9003` ships an internally-inconsistent
+  # build: the node executable defines the gflags symbol FLAGS_collect_metrics while
+  # libcartographer_ros.so requires FLAGS_collect_metricz (one char off) -> the node
+  # dies at launch with "undefined symbol _ZN3fLB21FLAGS_collect_metriczE". Building
+  # from source links cartographer statically into libcartographer_ros.so, so the
+  # symbol mismatch cannot happen. (See abseil_compat.h in the cartographer sources:
+  # newer abseil dropped the legacy unprefixed thread-annotation macros, so a shim
+  # remaps GUARDED_BY/LOCKS_EXCLUDED -> ABSL_* for the build.)
+  #
+  # The packages below are cartographer's BUILD dependencies that the conda
+  # cartographer-ros package used to pull in transitively. They must be listed
+  # explicitly now, or `colcon build` of the vendored sources fails on a fresh env.
+  - ceres-solver=2.2.0
+  - gflags=2.2.2
+  - glog=0.7.1
+  - lua=5.4.8
+  - cairo=1.18.4
+  - libboost-devel=1.88.0
+  - libprotobuf=6.31.1
+  - pcl=1.15.1
+  - ros-jazzy-pcl-conversions=2.6.2
   - ros-jazzy-diagnostic-updater=4.2.6
   - ros-jazzy-foxglove-bridge=3.2.4
   - ros-jazzy-joint-state-publisher=2.4.1

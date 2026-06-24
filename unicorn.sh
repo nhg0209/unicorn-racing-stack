@@ -55,13 +55,15 @@ _urs_clean_paths
 # RMW_IMPLEMENTATION, so it must be (re)set AFTER activation — that is the whole
 # reason this lives in a sourced script instead of ~/.bashrc.
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export CYCLONEDDS_URI="file://$_URS_REPO/cyclonedds.xml"
+
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-1}"
 
 # CycloneDDS config file: cyclonedds.xml targets the CAR network (192.168.60.x,
 # explicit peers, no multicast). A dev laptop wants CycloneDDS DEFAULTS (auto
 # interface + multicast), so only point CYCLONEDDS_URI at the file when that
 # subnet is actually present.
-if command -v ip >/dev/null 2>&1 && ip -o addr show 2>/dev/null | grep -q '192\.168\.60\.'; then
+if command -v ip >/dev/null 2>&1 && ip -o addr show 2>/dev/null | grep -q '192\.168\.80\.'; then
     export CYCLONEDDS_URI="file://$_URS_REPO/cyclonedds.xml"
 fi
 
