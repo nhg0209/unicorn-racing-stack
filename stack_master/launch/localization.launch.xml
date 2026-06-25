@@ -106,14 +106,16 @@
   <!-- ===== KISS-ICP 2D scan-to-SDF localization ===== -->
   <!-- No EKF: the node fuses wheel-odom (translation) + gyro (rotation) itself and
        publishes the fused pose DIRECTLY on /car_state/odom + TF map->base_link.
-       Topic names are matched in kiss.yaml (no remap). The 2D scan-to-SDF map is
-       the active map's map_server yaml (>127=drivable, boundary=walls). The PF's
-       /clicked_point global-reinit is isolated here too (RViz 2D Pose Estimate
-       publishes /initialpose, which the node already consumes for re-anchoring). -->
+       Topic names are matched in kiss.yaml (no remap). Two separate maps are
+       injected from the active map folder: loc_2d_map_yaml = <map>.yaml (the
+       cartographer occupancy grid, used for scan-to-SDF localization) and
+       track_map_yaml = <map>_track.yaml (the drivable-region mask for BEV
+       detection; generated separately, only read when detect_en:true). -->
   <group if="$(eval '\'$(var localization)\' == \'kiss\'')">
     <node pkg="kiss_icp_localization" exec="localization_node" name="kiss_icp_localization" output="screen">
       <param from="$(find-pkg-share stack_master)/config/kiss.yaml"/>
       <param name="loc_2d_map_yaml" value="$(var map_path).yaml"/>
+      <param name="track_map_yaml"  value="$(var map_path)_track.yaml"/>
     </node>
   </group>
 </launch>

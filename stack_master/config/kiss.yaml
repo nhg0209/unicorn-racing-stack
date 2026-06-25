@@ -4,8 +4,14 @@
 #
 # Topic names are matched here (no remapping). The 2D-input front-end skips the
 # 3D PointCloud band-crop and feeds /scan straight into scan-to-SDF matching.
-# The scan-to-SDF map (loc_2d_map_yaml) is injected by localization.launch.xml
-# from the active map folder, so it is NOT set here.
+#
+# TWO separate maps, managed/generated independently (both injected by
+# localization.launch.xml from the active map folder, NOT hard-set here):
+#   - loc_2d_map_yaml : the 2D map for localization (scan-to-SDF) = <map>.yaml
+#                       (the existing cartographer occupancy grid).
+#   - track_map_yaml  : the track mask for BEV detection = <map>_track.yaml
+#                       (flood-filled drivable region; generated separately,
+#                       later). Only read when detect_en:true.
 kiss_icp_localization:
   ros__parameters:
     # ---- input front-end (2D LaserScan) ----
@@ -55,8 +61,25 @@ kiss_icp_localization:
     initial_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     use_initial_pose_topic: true     # /initialpose (RViz 2D Pose Estimate)
 
-    # ---- disable 3D-only extras (map_server owns /map; no BEV detection) ----
+    # ---- BEV detection (opponents / unmapped obstacles) ----
+    # Two-map setup: detection uses its OWN track mask (track_map_yaml, injected
+    # by launch as <map>_track.yaml), kept separate from the localization 2D map
+    # (loc_2d_map_yaml = <map>.yaml). detect_en stays false until that track map
+    # is generated AND the 2D-scan detection code path lands (z-band bypass);
+    # flip to true then. Params below are pre-set so enabling is a one-line change.
     detect_en: false
+    detect_track_filter: true        # reject returns off the track mask (=walls/exterior)
+    detect_track_margin: -0.2        # erode 0.2 m inside the boundary (drop wall returns)
+    detect_res: 0.05                 # BEV cell size [m]
+    detect_eps: 0.3                  # DBSCAN neighborhood radius [m]
+    detect_min_samples: 2            # 2D scan is sparse -> low core threshold
+    detect_min_cluster_cells: 2
+    detect_track_gate: 1.0           # max cluster-center step to associate [m]
+    detect_moving_speed: 0.5         # |v| above this => moving (opponent) [m/s]
+    detect_max_misses: 5
+    detect_pose_topic: "/kiss_loc/obstacle_poses"   # cluster centers (PoseArray, map)
+
+    # ---- map_server owns /map; node publishes neither grid nor band scan ----
     publish_2d_map: false
     publish_2d_scan: false
     publish_aligned_scan: true       # /kiss_loc/scan_aligned for RViz debug
