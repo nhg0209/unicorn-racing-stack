@@ -31,4 +31,12 @@ controller_manager:
     speed_diff_thres: 0.1
     start_speed: 10.0
     start_curvature_factor: 1.5
+    # FTG (FTGONLY state) - ROS1 /state_machine/* values; range_offset MUST be >0
+    # or FTG.process_lidar slices ranges[0:-0]=[] and crashes on entering FTGONLY.
+    ftg_debug: false
+    ftg_safety_radius: 40
+    ftg_max_lidar_dist: 9.0
+    ftg_max_speed: 6.0
+    ftg_range_offset: 180
+    ftg_track_width: 2.6
     save_params: false
