@@ -3,15 +3,16 @@
   localization.launch.xml — localize on an already-built map (real car).
 
   Brings up the real-car sensors + mux (low_level), the map_server, and the chosen
-  localization stack (cartographer | pf). Sim is intentionally NOT handled here
+  localization stack (cartographer | pf | kiss). Sim is intentionally NOT handled here
   (use base_system sim:=true for the simulator, which localizes via gym ground truth).
 
-    ros2 launch stack_master localization.launch.xml map:=YOURMAP                  # cartographer
+    ros2 launch stack_master localization.launch.xml map:=YOURMAP                    # cartographer
     ros2 launch stack_master localization.launch.xml map:=YOURMAP localization:=pf
+    ros2 launch stack_master localization.launch.xml map:=YOURMAP localization:=kiss  # KISS-ICP 2D scan-to-SDF
 -->
 <launch>
   <arg name="map"                                  description="Map name (folder in stack_master/maps/)"/>
-  <arg name="localization"  default="cartographer" description="Localization algorithm: cartographer | pf"/>
+  <arg name="localization"  default="cartographer" description="Localization algorithm: cartographer | pf | kiss"/>
   <arg name="vehicle_config" default="$(find-pkg-share stack_master)/config/CAR/vehicle_config.yaml"/>
   <arg name="use_estop"     default="false"        description="Use emergency stop (true) or not (false)"/>
   <arg name="virtual"       default="false"        description="Inject virtual opponent/obstacles (scan overlay etc.) onto the real LiDAR"/>
@@ -99,6 +100,20 @@
     <node pkg="robot_localization" exec="ekf_node" name="ekf_localization" output="screen">
       <param from="$(find-pkg-share stack_master)/config/ekf_pf.yaml"/>
       <remap from="odometry/filtered" to="/car_state/odom"/>
+    </node>
+  </group>
+
+  <!-- ===== KISS-ICP 2D scan-to-SDF localization ===== -->
+  <!-- No EKF: the node fuses wheel-odom (translation) + gyro (rotation) itself and
+       publishes the fused pose DIRECTLY on /car_state/odom + TF map->base_link.
+       Topic names are matched in kiss.yaml (no remap). The 2D scan-to-SDF map is
+       the active map's map_server yaml (>127=drivable, boundary=walls). The PF's
+       /clicked_point global-reinit is isolated here too (RViz 2D Pose Estimate
+       publishes /initialpose, which the node already consumes for re-anchoring). -->
+  <group if="$(eval '\'$(var localization)\' == \'kiss\'')">
+    <node pkg="kiss_icp_localization" exec="localization_node" name="kiss_icp_localization" output="screen">
+      <param from="$(find-pkg-share stack_master)/config/kiss.yaml"/>
+      <param name="loc_2d_map_yaml" value="$(var map_path).yaml"/>
     </node>
   </group>
 </launch>

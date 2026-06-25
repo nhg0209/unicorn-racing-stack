@@ -4,3 +4,6 @@
 [submodule "race_utils/unicorn_gym"]
 	path = race_utils/unicorn_gym
 	url = https://github.com/jeongsang-ryu/unicorn-gym.git
+[submodule "state_estimation/kiss_icp_localization"]
+	path = state_estimation/kiss_icp_localization
+	url = git@github.com:freshleesh/kiss_icp_localization.git
