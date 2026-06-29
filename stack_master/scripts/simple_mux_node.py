@@ -137,7 +137,7 @@ class SimpleMuxNode(Node):
         if use_human:
             drive = AckermannDriveStamped()
             drive.header.stamp = self.get_clock().now().to_msg()
-            drive.drive.steering_angle = msg.axes[3] * self.max_steer if len(msg.axes) > 3 else 0.0
+            drive.drive.steering_angle = -msg.axes[3] * self.max_steer if len(msg.axes) > 3 else 0.0  # 조이 부호: IFAC servo gain(+0.7579)에 맞춤
             drive.drive.speed          = msg.axes[1] * self.max_speed  if len(msg.axes) > 1 else 0.0
             self.human_drive   = drive
             self.current_host  = 'humandrive'
@@ -154,7 +154,10 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        # On Ctrl-C, rclpy's signal handler already shut the context down;
+        # guard so the explicit shutdown doesn't raise "rcl_shutdown already called".
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

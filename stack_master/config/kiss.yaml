@@ -14,19 +14,19 @@
 #                       later). Only read when detect_en:true.
 kiss_icp_localization:
   ros__parameters:
-    # ---- input front-end (2D LaserScan) ----
-    input_mode: "2d"                 # forces scan-to-SDF matching, skips band-crop
-    scan_topic: "/scan"              # urg_node LaserScan (frame_id: laser)
+    # ---- input front-end (3D Livox PointCloud2) ----
+    input_mode: "3d"                 # PointCloud2 voxel point-to-plane ICP (localization_2d=false)
+    lidar_topic: "/livox/lidar"      # Livox MID360 PointCloud2
+    scan_topic: "/scan"              # (unused in 3D) urg_node LaserScan
     # ---- prediction: translation from wheel odom, rotation from gyro ----
     odom_twist_topic: "/vesc/odom"   # twist.vx drives translation prediction
-    imu_topic: "/vesc/sensors/imu/raw"
+    imu_topic: "/livox/imu"          # Livox internal IMU (gyro deskew + high-rate prediction)
     imu_en: true
-    deskew_en: true                  # gyro deskew (uses LaserScan time_increment)
+    deskew_en: true                  # gyro deskew
     imu_rate_odom: true              # high-rate pose between scans (gyro rot + odom vx)
     imu_init_samples: 100            # static gyro-bias init samples
-    stamp_at_scan_end: false         # urg header stamp = scan START
-    # vesc_imu mount is a pure yaw rotation (z preserved) -> identity is fine for
-    # the 2D yaw-rate; only gyro.z is used in 2D.
+    stamp_at_scan_end: true          # livox use_system_timestamp -> header = scan END
+    # Livox MID360 internal IMU -> LiDAR rotation is identity (datasheet).
     extrinsic_R_il: [1.0, 0.0, 0.0,
                      0.0, 1.0, 0.0,
                      0.0, 0.0, 1.0]
@@ -38,9 +38,9 @@ kiss_icp_localization:
     publish_tf: true                 # map->base_link (perception looks up map->laser)
 
     # ---- scan preprocessing / range gate ----
-    scan_voxel_size: 0.1             # 2D laser is sparse; small voxel keeps geometry
-    min_range: 0.1
-    max_range: 15.0
+    scan_voxel_size: 0.35            # 3D Livox cloud is dense; 0.35 keeps ICP real-time (bag-tuned)
+    min_range: 0.3                   # drop near-body returns
+    max_range: 60.0                  # Livox MID360 range
 
     # ---- 2D scan-to-SDF registration + safety ----
     loc_2d_corr_gain: 0.3            # complementary low-pass (cuts per-scan yaw jitter)
@@ -67,7 +67,7 @@ kiss_icp_localization:
     # (loc_2d_map_yaml = <map>.yaml). detect_en stays false until that track map
     # is generated AND the 2D-scan detection code path lands (z-band bypass);
     # flip to true then. Params below are pre-set so enabling is a one-line change.
-    detect_en: false
+    detect_en: true
     detect_track_filter: true        # reject returns off the track mask (=walls/exterior)
     detect_track_margin: -0.2        # erode 0.2 m inside the boundary (drop wall returns)
     detect_res: 0.05                 # BEV cell size [m]
@@ -81,6 +81,6 @@ kiss_icp_localization:
 
     # ---- map_server owns /map; node publishes neither grid nor band scan ----
     publish_2d_map: false
-    publish_2d_scan: false
+    publish_2d_scan: true
     publish_aligned_scan: true       # /kiss_loc/scan_aligned for RViz debug
     print_stats: false

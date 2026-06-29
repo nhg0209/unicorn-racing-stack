@@ -1,0 +1,25 @@
+<launch>
+  <!--
+    mpcc_car.launch.xml — 실차 MPCC 원라이너 (mpcc.launch.xml wrapper).
+    KISS localization 실차 배선을 미리 박음:
+      odom = /kiss_loc/odometry,  drive out = mac simple_mux nav_1 입력,
+      detector = false (실차엔 2D /scan 없음).
+    사용:
+      ros2 launch nonlinear_mpc_acados mpcc_car.launch.xml                       # 기본 (GP off)
+      ros2 launch nonlinear_mpc_acados mpcc_car.launch.xml use_gp_residual:=true # GP 켜기 (~/bo_results/gp_residual.pt)
+      ros2 launch nonlinear_mpc_acados mpcc_car.launch.xml map:=<다른맵>
+    주의: use_gp_residual:=true 첫 launch 는 l4acados wrap codegen ~30s 추가.
+          PYTHONPATH=$HOME/l4acados/src 필요 (.zshrc 에 이미 추가됨).
+  -->
+  <arg name="map"             default="ifac"/>  <!-- 2026-06-24: raceline(global_waypoints/shortest_path) 는 maps/ifac 에 있음. KISS localization pcd 는 T2서 ifac_map 별도 -->
+  <arg name="use_gp_residual" default="false"/>
+  <arg name="odom_topic" default="/car_state/odom"/>  <!-- 2026-06-24: 이 KISS빌드는 글로벌 pose를 /car_state/odom 으로 발행(/kiss_loc/odometry 아님). publisher=kiss_icp_localization, frame=map 확인. -->
+  <include file="$(find-pkg-share nonlinear_mpc_acados)/launch/mpcc.launch.xml">
+    <arg name="map"             value="$(var map)"/>
+    <arg name="odom_topic"      value="$(var odom_topic)"/>
+    <arg name="cmd_topic"       value="/vesc/high_level/ackermann_cmd_mux/input/nav_1"/>
+    <arg name="detector"        value="false"/>
+    <arg name="obstacle_topic"  value="/kiss_loc/obstacle_poses"/>
+    <arg name="use_gp_residual" value="$(var use_gp_residual)"/>
+  </include>
+</launch>

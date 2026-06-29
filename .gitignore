@@ -34,3 +34,6 @@ COLCON_IGNORE
 # rosbag recordings (local debugging only; keep the folder, ignore contents)
 /bags/*
 !/bags/.gitkeep
+stack_master/maps/ifac/ifac.pcd
+cyclonedds.log
+*.bak

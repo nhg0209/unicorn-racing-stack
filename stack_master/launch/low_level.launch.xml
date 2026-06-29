@@ -7,6 +7,18 @@
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/CAR" unless="$(var sim)"/>
   <arg name="vehicle_config" default="$(var config_dir)/vehicle_config.yaml"/>
   <arg name="use_estop"      default="false"               description="Use emergency stop (true) or not (false)"/>
+  <!-- ELRS RC receiver -> /joy (same topic the mux drives the car from). Mirrors the
+       ros2_ws low_level_mac setup: elrs_joy streams /joy at 100Hz (failsafe neutral
+       when no signal). simple_mux routes /joy to the car unless keyboard teleop is
+       selected. Real car only (needs the USB receiver). -->
+  <arg name="elrs"           default="true"   description="Start elrs_joy (ELRS RC -> /joy) on the real car"/>
+  <arg name="elrs_ft232"     default="true"   description="ELRS variant: true=FT232 (CRSF 420000), false=CP2102 (/dev/ELRS)"/>
+  <!-- Livox MID-360 3D LiDAR: coexists with urg (2D /scan). Publishes /livox/lidar
+       (PointCloud2) + /livox/imu in frame_id 'livox_frame'. Real car only; needs the
+       livox network (host 192.168.1.2, see livox_ros_driver2/config/MID360_config.json).
+       The wrapper launch also fixes macOS DYLD_LIBRARY_PATH for the plugin dlopen. -->
+  <arg name="livox"                default="true" description="Start the Livox MID-360 driver on the real car"/>
+  <arg name="use_system_timestamp" default="true" description="Livox stamp source: true=ROS now() (mapping), false=device HW clock (LIO-only)"/>
   <!-- Keyboard teleop: start keyboard_joy (pynput -> /joy_keyboard) and route the
        mux to it. The pitwall panel's Joy/Keyboard buttons can still switch at runtime. -->
   <arg name="keyboard_teleop" default="true"              description="Drive the ego with the keyboard instead of a joystick"/>
@@ -52,6 +64,23 @@
     <node pkg="stack_master" exec="static_tf_publisher.py" name="static_tf_publisher" output="screen">
       <param from="$(var config_dir)/static_transforms.yaml"/>
     </node>
+
+    <!-- ELRS RC receiver -> /joy. FT232 by default; elrs_ft232:=false uses CP2102
+         (/dev/ELRS). Override the serial port with port:=/dev/tty.usbserial-XXX. -->
+    <group if="$(var elrs)">
+      <include file="$(find-pkg-share elrs_joy)/launch/elrs_joy_ft232.launch.py"
+               if="$(var elrs_ft232)"/>
+      <include file="$(find-pkg-share elrs_joy)/launch/elrs_joy.launch.py"
+               unless="$(var elrs_ft232)"/>
+    </group>
+
+    <!-- Livox MID-360 3D LiDAR (coexists with urg). Wrapper sets macOS DYLD before
+         launching livox_ros_driver2's msg_MID360 driver. -->
+    <group if="$(var livox)">
+      <include file="$(find-pkg-share stack_master)/launch/livox_lidar.launch.py">
+        <arg name="use_system_timestamp" value="$(var use_system_timestamp)"/>
+      </include>
+    </group>
 
   </group>
 

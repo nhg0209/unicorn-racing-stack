@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>nonlinear_mpc_acados</name>
+  <version>0.1.0</version>
+  <description>VPMPCC + EVO-MPCC LTM acados controller (ported from IFAC2026_SH)</description>
+  <maintainer email="dnrwls04@naver.com">hmcl</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>ackermann_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>f110_msgs</depend>
+
+  <exec_depend>osuf1_common</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>tf_transformations</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
