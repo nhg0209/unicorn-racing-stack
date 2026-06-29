@@ -30,7 +30,7 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 # workspace `source`d in ~/.bashrc, ANY distro, ANY path — is discarded, and
 # conda's activation + this workspace rebuild them. You can't pattern-match every
 # user's ~/.bashrc, so don't try; reset to a known-good baseline instead.
-unset AMENT_PREFIX_PATH AMENT_CURRENT_PREFIX CMAKE_PREFIX_PATH COLCON_PREFIX_PATH \
+unset AMENT_PREFIX_PATH AMENT_CURRENT_PREFIX AMENT_SHELL CMAKE_PREFIX_PATH COLCON_PREFIX_PATH \
       ROS_DISTRO ROS_VERSION ROS_PYTHON_VERSION ROS_PACKAGE_PATH 2>/dev/null
 
 conda activate unicorn
@@ -89,6 +89,21 @@ export RAYCASTER_DIR="$_URS_REPO/race_utils/raycaster"
 if [ "$(uname)" = "Darwin" ]; then
     export PATH="$_URS_REPO/.install_utils/macos-shims:$PATH"
     URS_QUIET_LINK=1 bash "$_URS_REPO/.install_utils/macos_link_rosidl_typesupports.sh" "$_URS_WS" 2>/dev/null || true
+fi
+
+# --- ros2 / colcon tab completion ---
+# Register argcomplete for the live shell so `ros2 <tab>` / `colcon <tab>` work.
+# NB: the shipped ros2-argcomplete.zsh hook routes ros2 through a .bash shim whose
+# extra source layer drops the zsh compdef registration (colcon registers, ros2
+# does not), so register both directly here. register-python-argcomplete
+# auto-detects bash vs zsh.
+if command -v register-python-argcomplete >/dev/null 2>&1; then
+    if [ -n "${ZSH_VERSION:-}" ]; then
+        autoload -U +X compinit 2>/dev/null && compinit -u
+        autoload -U +X bashcompinit 2>/dev/null && bashcompinit
+    fi
+    eval "$(register-python-argcomplete ros2)"
+    eval "$(register-python-argcomplete colcon)"
 fi
 
 # --- 4) helpers ---
