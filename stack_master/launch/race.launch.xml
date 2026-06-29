@@ -25,6 +25,8 @@
   <arg name="ot_planner" default="predictive_spliner" description="overtake planner the state machine listens to (ROS1 default = predictive_spliner: listens to BOTH /planner/avoidance/otwpnts (dynamic) AND /planner/avoidance/static_otwpnts (static))"/>
   <arg name="control_topic" default="/local_waypoints"
        description="WpntArray the controller follows: /local_waypoints (state-machine output w/ avoidance) or /global_waypoints (robust raceline)"/>
+  <arg name="use_pp_heading" default="false"
+       description="Run pp_heading_controller instead of controller_manager (only one runs)"/>
   <!-- sim -> SIM config (racecar_f110.ini + veh_dyn_info); real hardware -> CAR. Folder name == racecar_version. -->
   <let name="racecar_version" value="SIM" if="$(var sim)"/>
   <let name="racecar_version" value="CAR" unless="$(var sim)"/>
@@ -98,9 +100,16 @@
        Subscribes /behavior_strategy + car state, publishes high_level/ackermann_cmd
        (-> simple_mux -> vehicle). Common controller.yaml; save_params writes back
        to the same file. -->
-  <node pkg="controller" exec="controller_manager" name="controller_manager" output="screen">
+  <node pkg="controller" exec="controller_manager" name="controller_manager" output="screen"
+        unless="$(var use_pp_heading)">
     <param from="$(find-pkg-share stack_master)/config/controller.yaml"/>
     <param name="save_yaml_path" value="$(find-pkg-share stack_master)/config/controller.yaml"/>
     <param name="sim" value="$(var sim)"/>
+  </node>
+
+  <node pkg="controller" exec="pp_heading_controller" name="pp_heading_controller" output="screen"
+        if="$(var use_pp_heading)">
+    <param from="$(find-pkg-share controller)/config/pp_heading_params.yaml"/>
+    <remap from="/local_waypoints" to="$(var control_topic)"/>
   </node>
 </launch>

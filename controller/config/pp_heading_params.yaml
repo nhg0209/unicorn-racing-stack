@@ -1,0 +1,74 @@
+pp_heading_controller:
+  ros__parameters:
+
+    # ── Topic ───────────────────────────────────────────────────────────────
+    # 드라이브 명령 토픽. unicorn 컨벤션: high_level/ackermann_cmd -> simple_mux -> vehicle.
+    # (IFAC 원본은 /vesc/high_level/ackermann_cmd_mux/input/nav_1 였음)
+    drive_topic:        "/vesc/high_level/ackermann_cmd"
+
+    # ── Vehicle ─────────────────────────────────────────────────────────────
+    wheelbase_L:        0.33    # [m]
+    delta_max:          0.41    # [rad]
+    v_min:              0.5     # [m/s]
+    v_max:              8.0     # [m/s]
+    v_min_for_ik:       0.5     # [m/s]  마찰원/크로스트랙 속도 하한
+    control_rate_hz:    50.0
+
+    # ── Adaptive lookahead (속도기반 time-headway) ───────────────────────────
+    # ld = clip(t_headway·vx, ld_min, ld_max).  곡률 의존항은 제거 —
+    # 코너 동역학은 §Friction/Speed 의 마찰분배 + 코너속도캡이 담당한다.
+    # ld 짧음 → 직선 추종 강함/커팅↓, 길면 코너 부드러움.
+    ld_min:             1.2     # [m]
+    ld_max:             2.5     # [m]
+    t_headway:          0.3     # [s]      vx → ld 이득 (time headway)
+
+    # ── Friction circle ──────────────────────────────────────────────────────
+    # a_total_max = μ·g = 마찰원 반경(종방향 budget 할당에 사용).
+    # 사용가능 횡그립 a_lat_use = lat_safety·a_total_max → 조향 클램프와 코너
+    # 속도캡 둘 다에 동일 적용(둘이 따로 놀던 6.7 vs 2.0 불일치 해소).
+    a_total_max:        6.7     # [m/s²]  μ·g (실측 CCW 6.68)
+    a_long_max:         2.0     # [m/s²]  최대 가속도 (drive-wheel traction)
+    # lat_safety: 0.3 → a_lat_use≈2.0 (기존 코너 거동 보존). 그립 더 쓰려면
+    #             0.6~0.9 로 상향(코너 더 빠름, 박으면 낮춤).
+    lat_safety:         0.6     # [-]
+
+    # ── Understeer feedforward ───────────────────────────────────────────────
+    # δ_us = k_understeer · a_lat_geo  (a_lat_geo = vx²·κ_geo, 마찰 클램프 후)
+    # 코너에서 슬립 보정. 너무 키우면 안쪽으로 커팅(저속 타이트 코너도 a_lat 큼).
+    k_understeer:       0.010   # [rad/(m/s²)]  0 = off
+
+    # ── Residual heading PID (경로접선 잔차오차 보정) ────────────────────────
+    # δ_pid = Kp·e_h + Ki·∫e_h + Kd·ė(필터드),   e_h = wrap(ψ_path − yaw)
+    #   δ_geo(순수추종)가 이미 lookahead 점을 추종(크로스트랙+곡률)하므로, PID는
+    #   순수추종이 남긴 잔차(차 헤딩 vs 경로접선)만 보정 → 베어링 PID의 이중계산 제거.
+    #   Kp → 라인 수렴,  Kd → 진동 감쇠(접선오차 Kd = yaw-rate 댐핑 → δ_damp 불필요).
+    # ★ Kd가 쓸모있는 이유: ė를 d_tau로 저역통과 필터링 → raw 50Hz 노이즈 제거.
+    # 튜닝 순서:
+    #   1. Ki=Kd=0, Kp만 0.4 → 0.6 → 0.8 올려 라인 붙는 속도 확인
+    #   2. 진동/오버슈트 생기면 Kd 0.05 → 0.10 → 0.15 올려 감쇠
+    #   3. (Kd 올렸는데 굼뜨면 d_tau 낮춤 0.05→0.03 / 노이즈로 떨면 높임)
+    #   4. 코너 정상오차 남으면 Ki 0.05~0.1 소량
+    heading_kp:         0.4     # [-]
+    heading_ki:         0.0     # [1/s]
+    heading_kd:         0.05    # [s]
+    heading_i_max:      0.2     # [rad]  Ki 항 클램프
+    heading_d_tau:      0.05    # [s]    미분 저역통과 시정수
+
+    # ── Speed ────────────────────────────────────────────────────────────────
+    # a_long_budget = min(a_long_max, √(a_total_max² − (v_wp²·κ_now)²))
+    # 코너 속도캡: v_target(s) = min( raceline vx_mps, √(a_lat_use/|κ(s)|) )
+    #   ★ 고속 코너 그립의 실제 노브는 이제 lat_safety (위 Friction circle).
+    #   별도 a_lat_corner 제거 — 조향 클램프와 동일 a_lat_use 로 일관화.
+    # backward braking pass: v_ref = min_s √( v_target(s)² + 2·a_brake_max·Δs )
+    #   거리 고려 → 코너가 가까워질수록 점진 감속(과도 조기제동 제거).
+    # v_cmd = min(v_ref, vx + a_long_budget·align·t_cmd_horizon)  [가속]
+    # v_cmd = v_ref                                                [감속]
+    a_brake_max:        3.5     # [m/s²]  예측 제동 감속도 (윈도우/감속 프로파일)
+    t_cmd_horizon:      0.3     # [s]     가속 명령 horizon
+
+    # ── Heading-alignment acceleration gate ──────────────────────────────────
+    # |e_h| = |ψ_path − yaw| = 차 헤딩−경로접선.  미정렬 시 가속 억제("펴지기 전 액셀 X").
+    #   |e_h| ≤ yaw_gate_min → 가속 100% / ≥ yaw_gate_max → 0% / 사이 선형.
+    # 탈출 시 일찍 가속해 불안정 → yaw_gate_max 낮춤. 너무 안 나가면 높임.
+    yaw_gate_min:       0.05    # [rad]  ~3°  이하: 가속 풀 허용
+    yaw_gate_max:       0.40    # [rad]  ~23° 이상: 가속 차단
