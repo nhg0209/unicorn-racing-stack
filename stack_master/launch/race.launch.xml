@@ -82,9 +82,13 @@
   <!-- Start planner -> /planner/start_wpnts -->
   <node pkg="spliner" exec="start_spline_node_v2" name="start_planner" output="screen"/>
 
-  <!-- Static avoidance -> /planner/avoidance/static_otwpnts -->
+  <!-- Static avoidance (Frenet grid-sampling) -> /planner/avoidance/static_otwpnts
+       + /planner/avoidance/static_feasible (Bool; SM gates OVERTAKE entry on it). The feasible
+       topic is remapped like otwpnts so it doesn't collide with the dynamic spliner's namespace. -->
   <node pkg="spliner" exec="static_avoidance_node" name="static_avoidance_planner" output="screen">
+    <param from="$(find-pkg-share stack_master)/config/static_avoidance_params.yaml"/>
     <remap from="/planner/avoidance/otwpnts" to="/planner/avoidance/static_otwpnts"/>
+    <remap from="/planner/avoidance/feasible" to="/planner/avoidance/static_feasible"/>
   </node>
 
   <!-- Dynamic avoidance (ROS1 Change mode) -> /planner/avoidance/otwpnts + /planner/avoidance/merger -->

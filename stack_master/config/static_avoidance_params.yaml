@@ -1,0 +1,30 @@
+# Params for the Frenet grid-sampling static-avoidance planner (node: static_avoidance_planner,
+# planner/spliner/spliner/static_avoidance_node.py). Loaded in race.launch.xml via <param from=.../>.
+# All values are live-reconfigurable (ros2 param set /static_avoidance_planner <name> <val>).
+static_avoidance_planner:
+  ros__parameters:
+    measure: true          # publish /planner/avoidance/latency (loop time) for the <10 ms budget check
+    from_bag: false
+
+    # --- planning horizon ---
+    lookahead_min: 8.0      # [m]  minimum planning distance ahead of the car
+    lookahead_k: 1.5        # [s]  lookahead = max(lookahead_min, lookahead_k * cur_vs)
+    tail_m: 6.0             # [m]  path continues this far past s_end so it spans the SM horizon (~15 m)
+
+    # --- terminal-offset sampling ---
+    n_d_samples: 13         # number of lateral offsets sampled across the drivable width at s_end
+    width_car: 0.30         # [m]  car width (half is reserved as clearance to walls/obstacles)
+    safety_margin: 0.10     # [m]  extra lateral clearance beyond the half car width (tight-track tunable)
+
+    # --- feasibility limits ---
+    kappa_max: 2.0          # [1/m] reject candidates whose max curvature exceeds this (min turn radius)
+    a_lat_max: 6.0          # [m/s^2] lateral-accel cap used for v = min(v_gb, sqrt(a_lat_max/kappa))
+    use_grid_check: true    # reject candidates crossing the eroded /map (GridFilter)
+    kernel_size: 3          # [cells] GridFilter erosion (8 ate ~0.2 m and rejected the raceline on ifac)
+
+    # --- cost weights  J = w_d*Σ|d| + w_k*Σκ² + w_c*|d_end-d_end_prev| + w_obs*Σexp(-dist/σ) ---
+    w_d: 1.0                # raceline deviation
+    w_k: 0.1                # curvature (smoothness)
+    w_c: 5.0                # consistency with previous choice (anti-chatter)
+    w_obs: 2.0              # soft obstacle proximity
+    obs_sigma: 0.5          # [m]  soft-penalty length scale
