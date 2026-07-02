@@ -12,9 +12,14 @@ static_avoidance_planner:
     tail_m: 6.0             # [m]  path continues this far past s_end so it spans the SM horizon (~15 m)
 
     # --- terminal-offset sampling ---
-    n_d_samples: 13         # number of lateral offsets sampled across the drivable width at s_end
+    n_d_samples: 13         # number of lateral offsets sampled across the drivable width at the obstacle
     width_car: 0.30         # [m]  car width (half is reserved as clearance to walls/obstacles)
-    safety_margin: 0.10     # [m]  extra lateral clearance beyond the half car width (tight-track tunable)
+    safety_margin: 0.05     # [m]  extra clearance around the obstacle box (tight-track: keep small)
+    wall_margin: 0.05       # [m]  how close to the wall a candidate may reach (corridor room)
+
+    # --- maneuver timing (reach the offset BEFORE the obstacle, then hold across it) ---
+    shift_min: 1.0          # [m]  min arc length over which the lateral shift completes (no jerk)
+    shift_buffer: 0.5       # [m]  finish the shift this far before the obstacle's near edge
 
     # --- feasibility limits ---
     kappa_max: 2.0          # [1/m] reject candidates whose max curvature exceeds this (min turn radius)
