@@ -24,7 +24,11 @@ urg_node:
 
 vesc/**:
   ros__parameters:
-    port: "/dev/cu.usbmodem3041"
+    # Fallback only — low_level.launch.xml overrides this with the vesc_port arg
+    # ($(env VESC_PORT /dev/ttyACM0)). USB serial names differ per machine/OS, so set
+    # VESC_PORT in unicorn.local.sh (mac: /dev/cu.usbmodem*, Linux: /dev/ttyACM* or a
+    # stable /dev/serial/by-id/... path) instead of editing this shared file.
+    port: "/dev/ttyACM0"
     publish_tf: false
     brake_max: 200000.0
     brake_min: -20000.0

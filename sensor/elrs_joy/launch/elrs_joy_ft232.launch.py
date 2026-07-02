@@ -12,6 +12,7 @@ Watch CRC effectiveness:
     ros2 topic echo /elrs_joy_node/debug_stats
 """
 
+import glob
 import os
 
 from launch import LaunchDescription
@@ -19,26 +20,43 @@ from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
-# Probed in order when port:=auto. Add new device names here as fallbacks.
+# Probed in order when port:=auto (first existing match wins); entries may be globs.
+# The FT232 device name differs per machine/OS, so cover both: stable Linux by-id
+# paths first (survive replug), then generic Linux /dev/ttyUSB*, then macOS names.
+# To pin a port per-machine, set ELRS_PORT in unicorn.local.sh (or pass port:=...).
 PORT_CANDIDATES = [
-    "/dev/tty.usbserial-10",
-    "/dev/tty.usbserial-310",
+    "/dev/serial/by-id/*FT232*",   # Linux, stable across replug
+    "/dev/serial/by-id/*FTDI*",    # Linux, stable across replug
+    "/dev/ttyUSB0",                # Linux, generic
+    "/dev/ttyUSB1",                # Linux, generic
+    "/dev/tty.usbserial-10",       # macOS
+    "/dev/tty.usbserial-310",      # macOS
 ]
 
 
 def resolve_port(context, *args, **kwargs):
     port = LaunchConfiguration("port").perform(context)
     if port == "auto":
-        port = next((p for p in PORT_CANDIDATES if os.path.exists(p)), None)
+        port = os.environ.get("ELRS_PORT") or _probe_port()
         if port is None:
             raise RuntimeError(
                 "elrs_joy: no FT232 serial port found. Tried: "
                 + ", ".join(PORT_CANDIDATES)
-                + ". Plug in the receiver or pass port:=/dev/tty.usbserial-XXX "
-                "(check `ls /dev/tty.usbserial-*`)."
+                + ". Plug in the receiver, set ELRS_PORT in unicorn.local.sh, or pass "
+                "port:=/dev/... (Linux: `ls /dev/serial/by-id/ /dev/ttyUSB*`; "
+                "macOS: `ls /dev/tty.usbserial-*`)."
             )
         print(f"[elrs_joy] auto-selected serial port: {port}")
     return [_make_node(port)]
+
+
+def _probe_port():
+    """First existing device matching PORT_CANDIDATES (each may be a glob)."""
+    for pattern in PORT_CANDIDATES:
+        matches = sorted(glob.glob(pattern))
+        if matches:
+            return matches[0]
+    return None
 
 
 def _make_node(port):

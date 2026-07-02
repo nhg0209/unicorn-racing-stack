@@ -21,3 +21,15 @@
 
 # Extra runtime libs (e.g. a locally-built dependency in ~/.local):
 # export LD_LIBRARY_PATH="$HOME/.local/lib:${LD_LIBRARY_PATH:-}"
+
+# USB serial device paths differ per machine/OS and renumber on replug. The launch
+# files auto-detect, but you can pin them here. Prefer a stable /dev/serial/by-id/...
+# path on Linux (find with: ls -l /dev/serial/by-id/).
+#   VESC  — low_level.launch.xml reads $VESC_PORT (default /dev/ttyACM0)
+#   ELRS  — elrs_joy_ft232.launch.py reads $ELRS_PORT when port:=auto
+# Linux (nuc / dev PC):
+# export VESC_PORT=/dev/serial/by-id/usb-STMicroelectronics_ChibiOS_RT_Virtual_COM_Port-if00
+# export ELRS_PORT=/dev/ttyUSB0
+# macOS (mac mini):
+# export VESC_PORT=/dev/cu.usbmodem3041
+# export ELRS_PORT=/dev/tty.usbserial-310

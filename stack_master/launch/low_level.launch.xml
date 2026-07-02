@@ -6,6 +6,12 @@
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/SIM" if="$(var sim)"/>
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/CAR" unless="$(var sim)"/>
   <arg name="vehicle_config" default="$(var config_dir)/vehicle_config.yaml"/>
+  <!-- VESC serial port. USB serial device names differ per machine/OS (Linux
+       /dev/ttyACM*, macOS /dev/cu.usbmodem*, and they renumber on replug), so it is
+       NOT baked into the shared vehicle_config.yaml. Set VESC_PORT per-machine in
+       unicorn.local.sh (ideally a stable /dev/serial/by-id/... path), or override
+       with vesc_port:=/dev/... . Defaults to /dev/ttyACM0 when VESC_PORT is unset. -->
+  <arg name="vesc_port"      default="$(env VESC_PORT /dev/ttyACM0)" description="VESC serial port; overrides the port in vehicle_config.yaml"/>
   <arg name="use_estop"      default="false"               description="Use emergency stop (true) or not (false)"/>
   <!-- ELRS RC receiver -> /joy (same topic the mux drives the car from). Mirrors the
        ros2_ws low_level_mac setup: elrs_joy streams /joy at 100Hz (failsafe neutral
@@ -41,6 +47,7 @@
       <push_ros_namespace namespace="vesc"/>
       <node pkg="vesc_driver" exec="vesc_driver_node" name="vesc_driver_node" output="screen">
         <param from="$(var vehicle_config)"/>
+        <param name="port" value="$(var vesc_port)"/>
       </node>
       <include file="$(find-pkg-share vesc_ackermann)/launch/ackermann_to_vesc_node.launch.xml">
         <arg name="vesc_config" value="$(var vehicle_config)"/>
