@@ -1031,9 +1031,10 @@ class StateMachine(Node):
             gap_dbg = (wd.list[-1].s_m - self.cur_s) % self.track_length
             md_dbg = float(np.min(np.linalg.norm(wd.array[:, 0:2] - self.current_position[:2], axis=1)))
         self.get_logger().info(
-            f"[{self.name}] static_OT check: speed={c_speed} "
+            f"[{self.name}] static_OT check: speed={c_speed} feasible={self.static_avoidance_feasible} "
             f"latest+on_spline={c_latest}[n={n_sa},age={age:.2f}(<{wd.latest_threshold}),"
-            f"gap={gap_dbg:.2f}(>{wd.on_spline_front_horizon_thres_m}),min_dist={md_dbg:.2f}(<{wd.on_spline_min_dist_thres_m})]",
+            f"gap={gap_dbg:.2f}(>{wd.on_spline_front_horizon_thres_m}),min_dist={md_dbg:.2f}(<{wd.on_spline_min_dist_thres_m})] "
+            f"=> {c_speed and c_latest and self.static_avoidance_feasible}",
             throttle_duration_sec=0.5,
         )
         # Feasibility gate: the Frenet-sampling static planner publishes feasible=False when no
