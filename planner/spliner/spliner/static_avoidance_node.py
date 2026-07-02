@@ -99,8 +99,11 @@ class ObstacleSpliner(Node):
         self.wall_margin = 0.05      # [m] clearance to the wall the candidate may reach (corridor)
         self.shift_min = 1.0         # [m] min arc length over which the lateral maneuver completes
         self.shift_buffer = 0.5      # [m] finish the shift this far before the obstacle near-edge
+        self.ramp_len = 4.0          # [m] length of the ramp onto the offset (stay on raceline before it)
+        self.hold_after = 0.5        # [m] hold the offset this far past the obstacle far-edge
+        self.return_len = 2.5        # [m] length of the ramp back to the raceline after the obstacle
         self.width_car = 0.30        # [m]
-        self.tail_m = 6.0            # [m] raceline-ish tail after s_end so path spans the SM horizon
+        self.tail_m = 1.0            # [m] short raceline (d=0) tail after the return
         self.w_d = 1.0               # cost: raceline deviation
         self.w_k = 0.1               # cost: curvature (smoothness)
         self.w_c = 5.0               # cost: consistency with previous choice
@@ -120,8 +123,9 @@ class ObstacleSpliner(Node):
         # Sync members from loaded params (yaml/defaults), then register live-reconfigure callback.
         self.dyn_param_cb(self.get_parameters([
             'kernel_size', 'lookahead_min', 'lookahead_k', 'n_d_samples', 'kappa_max', 'a_lat_max',
-            'safety_margin', 'wall_margin', 'shift_min', 'shift_buffer', 'width_car', 'tail_m',
-            'w_d', 'w_k', 'w_c', 'w_obs', 'obs_sigma', 'use_grid_check',
+            'safety_margin', 'wall_margin', 'shift_min', 'shift_buffer', 'ramp_len', 'hold_after',
+            'return_len', 'width_car', 'tail_m', 'w_d', 'w_k', 'w_c', 'w_obs', 'obs_sigma',
+            'use_grid_check',
         ]))
         self.add_on_set_parameters_callback(self.dyn_param_cb)
 
@@ -169,8 +173,11 @@ class ObstacleSpliner(Node):
         self.declare_parameter('wall_margin', 0.05, dbl(0.0, 1.0, "clearance to wall a candidate may reach [m]"))
         self.declare_parameter('shift_min', 1.0, dbl(0.3, 10.0, "min arc length for the lateral maneuver [m]"))
         self.declare_parameter('shift_buffer', 0.5, dbl(0.0, 5.0, "finish the shift this far before the obstacle [m]"))
+        self.declare_parameter('ramp_len', 4.0, dbl(0.5, 15.0, "ramp length onto the offset [m]"))
+        self.declare_parameter('hold_after', 0.5, dbl(0.0, 5.0, "hold the offset past the obstacle far-edge [m]"))
+        self.declare_parameter('return_len', 2.5, dbl(0.5, 10.0, "ramp length back to the raceline [m]"))
         self.declare_parameter('width_car', 0.30, dbl(0.1, 1.0, "car width [m]"))
-        self.declare_parameter('tail_m', 6.0, dbl(0.0, 20.0, "raceline tail past s_end [m]"))
+        self.declare_parameter('tail_m', 1.0, dbl(0.0, 20.0, "short raceline tail after the return [m]"))
         self.declare_parameter('w_d', 1.0, dbl(0.0, 100.0, "cost weight: raceline deviation"))
         self.declare_parameter('w_k', 0.1, dbl(0.0, 100.0, "cost weight: curvature"))
         self.declare_parameter('w_c', 5.0, dbl(0.0, 100.0, "cost weight: choice consistency"))
@@ -204,6 +211,12 @@ class ObstacleSpliner(Node):
                 self.shift_min = float(p.value)
             elif n == 'shift_buffer':
                 self.shift_buffer = float(p.value)
+            elif n == 'ramp_len':
+                self.ramp_len = float(p.value)
+            elif n == 'hold_after':
+                self.hold_after = float(p.value)
+            elif n == 'return_len':
+                self.return_len = float(p.value)
             elif n == 'width_car':
                 self.width_car = float(p.value)
             elif n == 'tail_m':
@@ -344,10 +357,23 @@ class ObstacleSpliner(Node):
         g_near = (nearest.s_center - self.cur_s) % self.gb_max_s        # forward gap to nearest obs
         obs_half_s = ((nearest.s_end - nearest.s_start) % self.gb_max_s) / 2.0
 
-        # --- s-grid for the path: from the car out to lookahead + tail ---
+        # --- maneuver geometry (arc lengths from grid_start) ---
+        # Stay on the raceline until close, ramp to d_end over ramp_len ending just before the
+        # obstacle, HOLD across it, then ease back to 0 and run a short raceline tail. Returning to
+        # the raceline is essential: a held offset would violate the (narrow) corridor somewhere
+        # downstream and reject EVERY candidate -> all-red / no avoidance. Slalom is handled by
+        # per-cycle replanning (next cycle targets the next obstacle).
+        e_psi = float(self.converter.get_e_psi(self.cur_x, self.cur_y, self.cur_yaw))
+        cur_dp = float(np.tan(np.clip(e_psi, -0.5, 0.5)))
+        L_shift = float(np.clip(g_near - obs_half_s - self.shift_buffer, self.shift_min, lookahead))
+        s_ramp0 = max(0.0, L_shift - self.ramp_len)               # start easing off the raceline
+        s_hold_end = max(g_near + obs_half_s + self.hold_after, L_shift + 0.2)
+        s_ret_end = s_hold_end + self.return_len
+        span = min(s_ret_end + self.tail_m, self.gb_max_s * 0.9)
+
+        # --- s-grid for the path ---
         car_idx = int(self.cur_s / wpnt_dist) % self.gb_max_idx
         grid_start_s = gb_wpnts[car_idx].s_m
-        span = lookahead + self.tail_m
         n = max(int(span / wpnt_dist), 5)
         idxs = (car_idx + np.arange(n)) % self.gb_max_idx
         s_abs = grid_start_s + np.arange(n) * wpnt_dist
@@ -359,10 +385,7 @@ class ObstacleSpliner(Node):
         d_right_arr = np.array([gb_wpnts[j].d_right for j in idxs])   # magnitude of right half-width
         v_gb_arr = np.array([gb_wpnts[j].vx_mps for j in idxs])
 
-        # --- terminal-offset samples (raceline always included) ---
-        # Sample the corridor AT THE NEAREST OBSTACLE (where clearance actually matters), not at the
-        # far lookahead: the passable lateral window is defined by the obstacle's own s, and the
-        # corridor width there can differ from s_end.
+        # --- terminal-offset samples: corridor AT THE OBSTACLE (where clearance actually matters) ---
         obs_j = int(nearest.s_center / wpnt_dist) % self.gb_max_idx
         d_hi = gb_wpnts[obs_j].d_left - sample_margin
         d_lo = -(gb_wpnts[obs_j].d_right - sample_margin)
@@ -373,20 +396,26 @@ class ObstacleSpliner(Node):
             d_ends[int(np.argmin(np.abs(d_ends)))] = 0.0   # snap nearest sample onto the raceline
         N = len(d_ends)
 
-        # --- quintic d(s): reach d_end BEFORE the obstacle, then hold it across/past it ---
-        # L_shift is the arc length over which the lateral maneuver completes: just before the near
-        # edge of the nearest obstacle (clamped to >= shift_min so we never demand an instant jerk,
-        # and <= lookahead). Holding d_end beyond L_shift means the car is already fully offset when
-        # it reaches the obstacle -> the offset candidates actually clear the obstacle box.
-        L_shift = float(np.clip(g_near - obs_half_s - self.shift_buffer, self.shift_min, lookahead))
-        e_psi = float(self.converter.get_e_psi(self.cur_x, self.cur_y, self.cur_yaw))
-        cur_dp = float(np.tan(np.clip(e_psi, -0.5, 0.5)))
-        s_q = np.clip(s_local, 0.0, L_shift)
+        # --- d(s): flat cur_d | ramp cur_d->d_end | hold d_end across obstacle | ramp d_end->0 | tail 0 ---
+        m_ramp = (s_local > s_ramp0) & (s_local <= L_shift)
+        m_hold = (s_local > L_shift) & (s_local <= s_hold_end)
+        m_ret = (s_local > s_hold_end) & (s_local <= s_ret_end)
+        ramp_ok = L_shift > s_ramp0 + 1e-3
         d_cands = np.zeros((N, n))
         for k, d_end in enumerate(d_ends):
-            poly = BPoly.from_derivatives([0.0, L_shift], [[self.cur_d, cur_dp, 0.0], [float(d_end), 0.0, 0.0]])
-            dv = poly(s_q)
-            dv[s_local > L_shift] = d_end
+            de = float(d_end)
+            dv = np.full(n, self.cur_d)
+            if ramp_ok and m_ramp.any():
+                dp0 = cur_dp if s_ramp0 == 0.0 else 0.0   # match car heading only if ramp starts at the car
+                p_in = BPoly.from_derivatives([s_ramp0, L_shift], [[self.cur_d, dp0, 0.0], [de, 0.0, 0.0]])
+                dv[m_ramp] = p_in(s_local[m_ramp])
+            else:
+                dv[m_ramp] = de
+            dv[m_hold] = de
+            if m_ret.any():
+                p_out = BPoly.from_derivatives([s_hold_end, s_ret_end], [[de, 0.0, 0.0], [0.0, 0.0, 0.0]])
+                dv[m_ret] = p_out(s_local[m_ret])
+            dv[s_local > s_ret_end] = 0.0
             d_cands[k] = dv
 
         # --- feasibility 1: track corridor (reject, don't clip) ---

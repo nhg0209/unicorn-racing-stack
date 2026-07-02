@@ -6,10 +6,9 @@ static_avoidance_planner:
     measure: true          # publish /planner/avoidance/latency (loop time) for the <10 ms budget check
     from_bag: false
 
-    # --- planning horizon ---
+    # --- planning horizon (bounds how far ahead an obstacle is considered) ---
     lookahead_min: 8.0      # [m]  minimum planning distance ahead of the car
     lookahead_k: 1.5        # [s]  lookahead = max(lookahead_min, lookahead_k * cur_vs)
-    tail_m: 6.0             # [m]  path continues this far past s_end so it spans the SM horizon (~15 m)
 
     # --- terminal-offset sampling ---
     n_d_samples: 13         # number of lateral offsets sampled across the drivable width at the obstacle
@@ -17,9 +16,15 @@ static_avoidance_planner:
     safety_margin: 0.05     # [m]  extra clearance around the obstacle box (tight-track: keep small)
     wall_margin: 0.05       # [m]  how close to the wall a candidate may reach (corridor room)
 
-    # --- maneuver timing (reach the offset BEFORE the obstacle, then hold across it) ---
+    # --- maneuver shape: stay on raceline -> ramp to offset -> hold across obstacle -> ramp back to 0 ---
+    # The path MUST return to the raceline after the obstacle: a held offset violates the narrow
+    # corridor downstream and rejects every candidate (all-red). Slalom handled by replanning.
     shift_min: 1.0          # [m]  min arc length over which the lateral shift completes (no jerk)
     shift_buffer: 0.5       # [m]  finish the shift this far before the obstacle's near edge
+    ramp_len: 4.0           # [m]  ramp length onto the offset (stay on the raceline before it)
+    hold_after: 0.5         # [m]  hold the offset this far past the obstacle far-edge
+    return_len: 2.5         # [m]  ramp length back to the raceline after the obstacle
+    tail_m: 1.0             # [m]  short raceline (d=0) tail after the return (on_spline horizon)
 
     # --- feasibility limits ---
     kappa_max: 2.0          # [1/m] reject candidates whose max curvature exceeds this (min turn radius)
