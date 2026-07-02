@@ -281,7 +281,12 @@ class StateMachine(Node):
         self.min_dwell_sec = self.params.min_dwell_sec
         self._last_transition_time = self.now_sec()
         self._committed_src = None
-        self._SAFE_STATES = {StateType.TRAILING, StateType.FTGONLY}
+        # Targets that may be entered IMMEDIATELY (bypass min_dwell): the safe-direction states
+        # (TRAILING, FTGONLY) AND OVERTAKE. OVERTAKE must never be delayed by the dwell -- while
+        # approaching, the SM legitimately flickers GB_TRACK<->TRAILING, which keeps resetting the
+        # dwell timer; gating OVERTAKE behind it would perpetually veto the overtake commit. The
+        # dwell therefore only damps the return-to-raceline direction (->GB_TRACK/RECOVERY/...).
+        self._IMMEDIATE_STATES = {StateType.TRAILING, StateType.FTGONLY, StateType.OVERTAKE}
 
         self.save_start_traj = False
         self.cur_start_wpnts_candidate = OTWpntArray()
@@ -566,15 +571,15 @@ class StateMachine(Node):
     def _commit_state(self, proposed_state, proposed_src, force=False):
         """Apply a proposed (state, wpnts_src) with min_dwell transition hysteresis.
 
-        A switch to a NON-safe state is vetoed if it comes sooner than ``min_dwell_sec`` after the
+        A switch to a dwell-gated state is vetoed if it comes sooner than ``min_dwell_sec`` after the
         last committed switch; on veto the previous state and its behaviour source are held for this
-        cycle. Switches toward the safe states (TRAILING, FTGONLY), staying in the same state, and
-        forced overrides (force_GBTRACK / FTGONLY sector) always commit immediately.
+        cycle. Switches into an immediate state (TRAILING, FTGONLY, OVERTAKE), staying in the same
+        state, and forced overrides (force_GBTRACK / FTGONLY sector) always commit immediately.
         """
         allow = (
             force
             or proposed_state == self.cur_state
-            or proposed_state in self._SAFE_STATES
+            or proposed_state in self._IMMEDIATE_STATES
             or (self.now_sec() - self._last_transition_time) >= self.min_dwell_sec
         )
         if allow:
