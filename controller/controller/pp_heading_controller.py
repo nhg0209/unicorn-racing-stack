@@ -1,44 +1,33 @@
 """PP + Friction Circle Controller.
 
-Design intent: follow the global raceline with a speed-based adaptive lookahead;
-split the available grip (friction circle) into lateral + longitudinal shares;
-convert the lateral share back into a steering command and the longitudinal share
-into a target speed; then trim the *residual* heading error with a PID.
+Follows the global raceline (/local_waypoints) with a speed-adaptive lookahead, and uses
+a friction circle to (a) clamp the steering to the available lateral grip and (b) split
+the remaining grip into the longitudinal accel budget. A residual heading-error PID trims
+what pure-pursuit leaves on the table.
 
-Steering law (each tick):  δ_cmd = clip(δ_geo + δ_us + δ_pid, ±δ_max)
+Steering (each tick):  δ_cmd = clip(δ_geo + δ_pid, ±δ_max)
+  δ_geo — pure-pursuit to the lookahead point, friction-circle limited:
+            kappa_pp  = 2·ly / dist²              (curvature to lookahead point)
+            a_lat_use = lat_safety · a_total_max  (usable lateral grip)
+            kappa_geo = clip(kappa_pp, ±a_lat_use/vx²)
+            δ_geo     = atan(L · kappa_geo)        (valid at all speeds, incl. standstill)
+  δ_pid — PID on the path-tangent error e_h = wrap(ψ_path − yaw). δ_geo already pursues the
+            lookahead (cross-track + curvature), so the PID only corrects the residual
+            heading vs path tangent. Kd on the tangent error == yaw-rate damping; the
+            derivative is low-pass filtered (heading_d_tau).
 
-  δ_geo  — Pure-pursuit base, friction-circle limited (= lateral-accel share → δ).
-             kappa_pp  = 2·ly / dist²            (curvature to lookahead point)
-             a_lat_use = lat_safety · a_total_max (usable lateral grip)
-             kappa_max = a_lat_use / vx²          (friction-circle curvature limit)
-             kappa_geo = clip(kappa_pp, ±kappa_max)
-             δ_geo     = atan(L · kappa_geo)      (valid at ALL speeds, incl. standstill)
+Speed:
+  a_lat_used    = max(|vx²·kappa_geo|, |vx·yaw_rate|_filt)    (P1: measured-fed friction circle)
+  a_long_budget = min(a_long_max, √(a_total_max² − a_lat_used²))
+  v_ref         = raceline vx at a forward look-ahead point (L1-style, anticipatory), lifted
+                  toward √(a_lat_use/κ) by corner_push (P2), then capped by a backward
+                  braking-feasible pass for slower corners ahead.
+  v_cmd         = min(v_ref, vx + a_long_budget·t_cmd_horizon)   [accel] / v_ref [brake]
 
-  δ_us   — Understeer feedforward (tire slip in fast corners).
-             δ_us = k_understeer · a_lat_geo,  a_lat_geo = vx²·kappa_geo
+Latency comp (B): steering is computed for the pose future_constant·v ahead.
+H2H: TRAILING gap controller + FTGONLY follow-the-gap fallback + local-wpnt watchdog.
 
-  δ_pid  — Residual heading-error PID on the PATH-TANGENT error e_h = wrap(ψ_path − yaw).
-             δ_pid = Kp·e_h + Ki·∫e_h + Kd·ė_h(filtered)
-             δ_geo already pursues the lookahead point (cross-track + curvature);
-             the PID corrects what pure-pursuit leaves on the table — the car's
-             heading vs the path tangent (understeer, dynamics). Using the tangent
-             residual (not the lookahead bearing) avoids double-counting δ_geo. Kd
-             on the tangent error == yaw-rate damping, so a separate δ_damp term is
-             unnecessary. The derivative is low-pass filtered (heading_d_tau) so Kd
-             is usable — raw 50 Hz de/dt is too noisy.
-
-Speed law (longitudinal grip share + anticipatory braking):
-  a_long_budget = min(a_long_max, √(a_total_max² − (v_wp²·κ_now)²))   (raceline-based)
-  v_target(s)   = min( raceline vx_mps, √(a_lat_use/|κ(s)|) )         (per point ahead)
-  v_ref         = min_s √( v_target(s)² + 2·a_brake_max·Δs )          (backward braking pass)
-  v_cmd         = min(v_ref, vx + a_long_budget·align·t_cmd_horizon)  [accel]
-  v_cmd         = v_ref                                               [brake]
-  align         = heading-alignment gate (no power until pointed along the path).
-
-IFAC2026_SH port notes:
-  - odom      : /car_state/odom            (IFAC convention; was /vesc/odom)
-  - waypoints : /local_waypoints           (f110_msgs/WpntArray, state_machine 출력)
-  - drive     : drive_topic param, default /vesc/high_level/ackermann_cmd_mux/input/nav_1
+I/O: odom /car_state/odom, waypoints /local_waypoints, drive → drive_topic param.
 """
 
 import math
@@ -46,31 +35,40 @@ import math
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from nav_msgs.msg import Odometry
 from ackermann_msgs.msg import AckermannDriveStamped
 from std_msgs.msg import Float64MultiArray
+from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker
-from f110_msgs.msg import WpntArray
+from f110_msgs.msg import WpntArray, BehaviorStrategy
+
+from controller.ftg.ftg import FTG
 
 PARAMS = {
-    # vehicle
-    'wheelbase_L':     0.33,
-    'delta_max':       0.41,
+    # vehicle — unified with global-trajectory dynamics (stack_master/config/<ver>/)
+    'wheelbase_L':     0.33,   # vehicle_config wheelbase
+    'delta_max':       0.4189, # dynamics.yaml s_max
     'v_min':           0.5,
-    'v_max':           8.0,
+    'v_max':           15.0,   # racecar_f110.ini veh_params v_max
     'v_min_for_ik':    0.5,    # [m/s] friction-circle / cross-track speed floor
     # control rate
     'control_rate_hz': 50.0,
     # adaptive lookahead (speed-based time-headway): ld = clip(t_headway·vx, ld_min, ld_max)
-    'ld_min':          1.2,
-    'ld_max':          2.5,
-    't_headway':       0.3,    # [s]      vx → lookahead gain (time headway)
-    # friction circle
-    'a_total_max':     6.7,    # [m/s²]  μ·g  (실측 6.68) — friction-circle radius
-    'a_long_max':      2.0,    # [m/s²]  최대 가속도 (drive-wheel traction)
-    'lat_safety':      0.3,    # [-]     usable lateral fraction: a_lat_use = lat_safety·a_total_max
-    # understeer feedforward: δ_us = k_understeer · a_lat
-    'k_understeer':    0.010,  # [rad/(m/s²)]  0 = off
+    'ld_min':          1.0,
+    'ld_max':          5.0,    # longer at speed → smoother heading (A)
+    't_headway':       0.6,    # [s]      vx → lookahead gain (time headway)
+    # friction circle — unified with global-trajectory ggv (ay_max=4.5, ax_max=5.0)
+    'a_total_max':     5.0,    # [m/s²]  circle radius = ggv max(ax_max, ay_max)
+    'a_long_max':      5.0,    # [m/s²]  = ggv ax_max / ax_max_machines
+    'lat_safety':      0.9,    # [-]     a_lat_use = 0.9·5.0 = 4.5 = ggv ay_max
+    # measured lateral-accel feedback into the friction circle (P1). a_lat_used =
+    # max(commanded vx²·κ_geo, |vx·yaw_rate|_filtered): closes the loop on what the car
+    # is REALLY pulling, so the longitudinal budget reflects reality (conservative on
+    # corner entry / understeer → no combined-grip over-drive). yaw_rate from odom.
+    'use_measured_a_lat': True,
+    'a_lat_meas_tau':  0.10,   # [s]  low-pass time constant on the measured lateral accel
+    'corner_push':     0.0,    # [0..1] P2: lift corner speed from raceline toward √(a_lat_use/κ); 0=raceline
     # residual heading-error PID on the path-tangent error e_h = wrap(ψ_path − yaw).
     # δ_pid = Kp·e + Ki·∫e + Kd·ė(filtered).  Kp → line convergence, Kd → damp.
     'heading_kp':      0.4,    # [-]
@@ -79,28 +77,44 @@ PARAMS = {
     'heading_i_max':   0.2,    # [rad]  integral clamp (anti-windup)
     'heading_d_tau':   0.05,   # [s]    derivative low-pass time constant
     # speed
-    'a_brake_max':     3.5,    # [m/s²]  anticipatory braking deceleration
+    'a_brake_max':     5.0,    # [m/s²]  anticipatory braking decel = ggv b_ax_max
     't_cmd_horizon':   0.3,    # [s]     가속 명령 horizon
-    # heading-alignment acceleration gate
-    'yaw_gate_min':    0.05,   # [rad]  ≤ this: full accel
-    'yaw_gate_max':    0.40,   # [rad]  ≥ this: no accel
+    'speed_lookahead': 0.3,    # [s]     forward time to read the raceline target speed (L1-style)
+    'future_constant': 0.05,   # [s]     latency comp: steer for the pose τ seconds ahead (B)
+    # ── H2H: TRAILING gap controller (ported from L1 controller_manager) ─────
+    # In the TRAILING state, hold a fixed gap behind the opponent. The gap PID
+    # output is clipped to v_ref (this controller's friction-circle speed cap) so
+    # the trailing speed can never exceed the dynamics-feasible reference.
+    'state_machine_rate': 40.0,  # [Hz]  rate used to integrate the gap error
+    'trailing_gap':       1.55,  # [m]   base standstill gap to the opponent
+    'trailing_vel_gain':  0.25,  # [s]   speed-proportional gap term (gap_should = gain·v + gap)
+    'trailing_p_gain':    1.35,  # [-]   gap-error P gain
+    'trailing_i_gain':    0.0,   # [-]   gap-error I gain
+    'trailing_d_gain':    1.0,   # [-]   relative-velocity D gain
+    'blind_trailing_speed': 1.5, # [m/s] floor speed when opponent not visible and gap is large
+    # ── H2H: FTG fallback (FTGONLY state) — defaults mirror controller.yaml ──
+    'ftg_debug':          False,
+    'ftg_safety_radius':  40.0,  # bubble radius (LiDAR samples)
+    'ftg_max_lidar_dist': 9.0,   # [m]
+    'ftg_max_speed':      6.0,   # [m/s]
+    'ftg_range_offset':   180.0, # samples trimmed each side (MUST be >0)
+    'ftg_track_width':    2.6,   # [m]
+    # ── H2H: local-waypoint freshness watchdog ──────────────────────────────
+    'wpnt_timeout_s':     0.5,   # [s]  no fresh /local_waypoints for this long → stop
 }
 
 # /pp_debug Float64MultiArray field indices
-_D_A_LAT_PP   = 0   # [m/s²]  PP lateral demand  (vx²·κ_pp, before clip)
-_D_A_LAT_GEO  = 1   # [m/s²]  friction-circle-clipped a_lat
-_D_DELTA_GEO  = 2   # [deg]   pure-pursuit base steering
-_D_DELTA_US   = 3   # [deg]   understeer feedforward
+_D_A_LAT_PP   = 0   # [m/s²]  demanded lateral vx²·κ_pp (pre-clip; > a_lat_geo ⇒ steering clamped)
+_D_A_LAT_GEO  = 1   # [m/s²]  commanded lateral vx²·κ_geo (post friction clamp)
+_D_A_LAT_MEAS = 2   # [m/s²]  measured lateral |vx·yaw_rate| (filtered, P1)
+_D_DELTA_GEO  = 3   # [deg]   pure-pursuit base steering
 _D_DELTA_PID  = 4   # [deg]   residual heading-error PID trim
-_D_E_H        = 5   # [rad]   path-tangent heading error (PID input)
-_D_LD         = 6   # [m]     adaptive lookahead distance
-_D_V_REF      = 7   # [m/s]   velocity reference (after braking pass)
-_D_V_CMD      = 8   # [m/s]   commanded speed
-_D_DELTA_CMD  = 9   # [deg]   total commanded steering
-_D_ALIGN      = 10  # [-]     accel gate factor (0=blocked, 1=full)
-_DEBUG_LEN    = 11
-
-_N_KAPPA_AVG = 5
+_D_DELTA_CMD  = 5   # [deg]   total commanded steering
+_D_E_H        = 6   # [rad]   path-tangent heading error ψ_path−yaw (PID input)
+_D_LD         = 7   # [m]     adaptive lookahead distance
+_D_V_REF      = 8   # [m/s]   velocity reference (after braking pass)
+_D_V_CMD      = 9   # [m/s]   commanded speed
+_DEBUG_LEN    = 10
 
 
 class PPHeadingController(Node):
@@ -129,7 +143,9 @@ class PPHeadingController(Node):
         self.a_total_max   = float(p('a_total_max'))
         self.a_long_max    = float(p('a_long_max'))
         self.lat_safety    = float(p('lat_safety'))
-        self.k_understeer  = float(p('k_understeer'))
+        self.use_measured_a_lat = bool(p('use_measured_a_lat'))
+        self.a_lat_meas_tau = float(p('a_lat_meas_tau'))
+        self.corner_push = float(p('corner_push'))
         self.heading_kp    = float(p('heading_kp'))
         self.heading_ki    = float(p('heading_ki'))
         self.heading_kd    = float(p('heading_kd'))
@@ -137,8 +153,18 @@ class PPHeadingController(Node):
         self.heading_d_tau = float(p('heading_d_tau'))
         self.a_brake_max   = float(p('a_brake_max'))
         self.t_cmd_horizon = float(p('t_cmd_horizon'))
-        self.yaw_gate_min  = float(p('yaw_gate_min'))
-        self.yaw_gate_max  = float(p('yaw_gate_max'))
+        self.speed_lookahead = float(p('speed_lookahead'))
+        self.future_constant = float(p('future_constant'))
+
+        # H2H: trailing gap controller params
+        self.state_machine_rate   = float(p('state_machine_rate'))
+        self.trailing_gap         = float(p('trailing_gap'))
+        self.trailing_vel_gain    = float(p('trailing_vel_gain'))
+        self.trailing_p_gain      = float(p('trailing_p_gain'))
+        self.trailing_i_gain      = float(p('trailing_i_gain'))
+        self.trailing_d_gain      = float(p('trailing_d_gain'))
+        self.blind_trailing_speed = float(p('blind_trailing_speed'))
+        self.wpnt_timeout_s       = float(p('wpnt_timeout_s'))
 
         self.odom         = None
         self.waypoints    = []
@@ -147,6 +173,29 @@ class PPHeadingController(Node):
         self._he_int      = 0.0    # heading PID integral
         self._he_prev     = None   # previous e_h (None = first tick)
         self._he_deriv    = 0.0    # filtered derivative state
+        self._a_lat_meas  = 0.0    # filtered measured lateral accel |vx·yaw_rate| (P1)
+
+        # H2H state (filled by /behavior_strategy, /car_state/odom_frenet, /global_waypoints)
+        self.state        = ""
+        # opponent = [s_center, d_center, vs, is_static, is_visible] or None
+        self.opponent     = None
+        self.ego_s        = None
+        self.ego_vs       = 0.0
+        self.track_length = None
+        self._i_gap       = 0.0    # trailing gap-error integral
+        self._last_wp_t   = None   # ros time of last /local_waypoints (watchdog)
+        self.scan         = None
+
+        # FTG controller for the FTGONLY state (self-contained; node=self enables viz)
+        self.ftg = FTG(
+            node=self,
+            debug=bool(p('ftg_debug')),
+            safety_radius=int(p('ftg_safety_radius')),
+            max_lidar_dist=float(p('ftg_max_lidar_dist')),
+            max_speed=float(p('ftg_max_speed')),
+            range_offset=int(p('ftg_range_offset')),
+            track_width=float(p('ftg_track_width')),
+        )
 
         # cached numpy arrays — rebuilt only when waypoints change
         self._wx      = None
@@ -160,6 +209,11 @@ class PPHeadingController(Node):
 
         self.create_subscription(Odometry,  '/car_state/odom',  self._odom_cb, 10)
         self.create_subscription(WpntArray, '/local_waypoints', self._wp_cb,   10)
+        # H2H inputs
+        self.create_subscription(BehaviorStrategy, '/behavior_strategy', self._behavior_cb, 10)
+        self.create_subscription(Odometry, '/car_state/odom_frenet', self._odom_frenet_cb, 10)
+        self.create_subscription(WpntArray, '/global_waypoints', self._global_wp_cb, 10)
+        self.create_subscription(LaserScan, '/scan', self._scan_cb, qos_profile_sensor_data)
         self.drive_pub     = self.create_publisher(
             AckermannDriveStamped, drive_topic, 10)
         self.debug_pub     = self.create_publisher(Float64MultiArray, '/pp_debug', 10)
@@ -171,7 +225,6 @@ class PPHeadingController(Node):
             f't_headway={self.t_headway}  ld=[{self.ld_min},{self.ld_max}]  '
             f'a_total_max={self.a_total_max}  a_long_max={self.a_long_max}  '
             f'lat_safety={self.lat_safety} (a_lat_use={self.lat_safety*self.a_total_max:.2f})  '
-            f'k_us={self.k_understeer}  '
             f'Kp={self.heading_kp}  Ki={self.heading_ki}  Kd={self.heading_kd}  '
             f'd_tau={self.heading_d_tau}  dt={self._dt*1000:.1f} ms'
         )
@@ -192,6 +245,28 @@ class PPHeadingController(Node):
         self._he_int   = 0.0       # reset PID state on path change
         self._he_prev  = None
         self._he_deriv = 0.0
+        self._last_wp_t = self.get_clock().now()   # watchdog: fresh waypoints just arrived
+
+    # ── H2H callbacks ────────────────────────────────────────────────────────
+    def _behavior_cb(self, msg: BehaviorStrategy):
+        self.state = msg.state
+        if len(msg.trailing_targets) != 0:
+            o = msg.trailing_targets[0]
+            self.opponent = [o.s_center, o.d_center, o.vs, o.is_static, o.is_visible]
+        else:
+            self.opponent = None
+
+    def _odom_frenet_cb(self, msg: Odometry):
+        self.ego_s  = msg.pose.pose.position.x   # frenet s
+        self.ego_vs = msg.twist.twist.linear.x   # s-velocity
+
+    def _global_wp_cb(self, msg: WpntArray):
+        if len(msg.wpnts) != 0:
+            self.track_length = msg.wpnts[-1].s_m
+
+    def _scan_cb(self, msg: LaserScan):
+        self.scan = msg
+        self.ftg.set_vel(abs(self.odom.twist.twist.linear.x) if self.odom is not None else 0.0)
 
     # ── arc-length forward walk ──────────────────────────────────────────────
 
@@ -214,17 +289,47 @@ class PPHeadingController(Node):
     # ── main loop ────────────────────────────────────────────────────────────
 
     def _loop(self):
+        # ── H2H: FTGONLY fallback — bypass the PP/raceline law, drive on /scan ──
+        if self.state == "FTGONLY":
+            if self.scan is not None:
+                speed, steer = self.ftg.process_lidar(self.scan.ranges)
+                self._publish_drive(steer, speed)
+            else:
+                self._publish_drive(0.0, 0.0)
+            return
+
         if self.odom is None or self._wx is None or self._N == 0:
             return
 
-        vx      = abs(self.odom.twist.twist.linear.x)
-        p_x = self.odom.pose.pose.position.x
-        p_y = self.odom.pose.pose.position.y
-        q   = self.odom.pose.pose.orientation
-        yaw = math.atan2(
+        # ── H2H: local-waypoint freshness watchdog — stop if state machine output went stale ──
+        if self._last_wp_t is not None:
+            age = (self.get_clock().now() - self._last_wp_t).nanoseconds * 1e-9
+            if age > self.wpnt_timeout_s:
+                self.get_logger().error(
+                    f"[PP] no fresh /local_waypoints for {age:.2f}s — STOPPING",
+                    throttle_duration_sec=0.5)
+                self._publish_drive(0.0, 0.0)
+                return
+
+        vx       = abs(self.odom.twist.twist.linear.x)
+        p_x_m    = self.odom.pose.pose.position.x
+        p_y_m    = self.odom.pose.pose.position.y
+        q        = self.odom.pose.pose.orientation
+        yaw_m    = math.atan2(
             2.0 * (q.w * q.z + q.x * q.y),
             1.0 - 2.0 * (q.y * q.y + q.z * q.z),
         )
+        yaw_rate = float(self.odom.twist.twist.angular.z)
+
+        # ── Latency / future-position compensation (B) ───────────────────────
+        # Steer for where the car WILL be in future_constant seconds, not where it is
+        # now: at speed this cancels the sensing+actuation lag that otherwise turns into
+        # heading oscillation (mirrors the L1 controller's future_position). Position is
+        # advanced along the current heading; yaw is advanced by the measured yaw_rate.
+        tau = self.future_constant
+        p_x = p_x_m + vx * math.cos(yaw_m) * tau
+        p_y = p_y_m + vx * math.sin(yaw_m) * tau
+        yaw = yaw_m + yaw_rate * tau
 
         wx      = self._wx
         wy      = self._wy
@@ -233,12 +338,13 @@ class PPHeadingController(Node):
         s_total = self._s_total
 
         # ── 1. Nearest waypoint ──────────────────────────────────────────────
+        # teleport check on the MEASURED pose (prediction is continuous, won't jump)
         if self._last_pos is not None:
-            dx = p_x - self._last_pos[0]
-            dy = p_y - self._last_pos[1]
+            dx = p_x_m - self._last_pos[0]
+            dy = p_y_m - self._last_pos[1]
             if dx * dx + dy * dy > 0.25:    # teleport > 0.5 m → reset
                 self._nearest_idx = None
-        self._last_pos = (p_x, p_y)
+        self._last_pos = (p_x_m, p_y_m)
 
         if self._nearest_idx is None:
             d2      = (wx - p_x) ** 2 + (wy - p_y) ** 2
@@ -255,10 +361,6 @@ class PPHeadingController(Node):
         # ld ∝ vx (clamped). Corner dynamics are handled by the friction-circle
         # speed cap + braking pass below, so no curvature shortening is needed.
         ld = float(np.clip(self.t_headway * vx, self.ld_min, self.ld_max))
-
-        # current-point curvature (for the longitudinal grip budget in §5)
-        now_idxs  = [(nearest_idx + i) % N for i in range(_N_KAPPA_AVG)]
-        kappa_now = float(np.mean(np.abs(self._kappa[now_idxs])))
 
         # ── 3. Lookahead point ───────────────────────────────────────────────
         psi_n    = float(self.waypoints[nearest_idx].psi_rad)
@@ -299,10 +401,7 @@ class PPHeadingController(Node):
         a_lat_pp  = vx * vx * kappa_pp
         a_lat_geo = vx * vx * kappa_geo
 
-        # ── 4b. Understeer feedforward ───────────────────────────────────────
-        delta_us = self.k_understeer * a_lat_geo
-
-        # ── 4c. Residual heading-error PID (on the path-tangent error) ───────
+        # ── 4b. Residual heading-error PID (on the path-tangent error) ───────
         # e_h = wrap(ψ_path − yaw): the car heading vs the path tangent at the
         # nearest waypoint. δ_geo already pursues the lookahead point (cross-track
         # + curvature), so this is the RESIDUAL pure-pursuit leaves — corrected by
@@ -332,57 +431,119 @@ class PPHeadingController(Node):
                      + i_term
                      + self.heading_kd * self._he_deriv)
 
-        # ── 4d. Combined steering ────────────────────────────────────────────
-        delta_cmd = float(np.clip(delta_geo + delta_us + delta_pid,
-                                  -self.delta_max, self.delta_max))
+        # ── 4c. Combined steering ────────────────────────────────────────────
+        delta_cmd = float(np.clip(delta_geo + delta_pid, -self.delta_max, self.delta_max))
 
         # ── 5. Speed ─────────────────────────────────────────────────────────
-        # Longitudinal grip budget from the raceline at the current point
-        # (v_near matched to kappa_now → self-consistent, ≤ a_total_max). Uses the
-        # FULL friction circle: lateral demand a_lat_ref, remainder is longitudinal.
-        v_near        = float(self._vx_wp[nearest_idx])
-        a_lat_ref     = v_near * v_near * kappa_now
+        # Longitudinal grip budget from the friction circle, using the ACTUAL lateral
+        # accel (P1): a_lat_used = max(commanded vx²·kappa_geo, measured |vx·yaw_rate|).
+        # The larger keeps the budget conservative on corner-entry loading (measured
+        # lags) and understeer (front saturated) — never over-driving combined grip.
+        # a_lat_used ≤ a_lat_use < a_total_max, so some longitudinal grip is always left.
+        a_lat_meas_raw = abs(vx * yaw_rate)
+        a_d_lat = self._dt / (self.a_lat_meas_tau + self._dt) if self.a_lat_meas_tau > 0.0 else 1.0
+        self._a_lat_meas += a_d_lat * (a_lat_meas_raw - self._a_lat_meas)
+        a_lat_used = max(abs(a_lat_geo), self._a_lat_meas) if self.use_measured_a_lat else abs(a_lat_geo)
         a_long_budget = min(self.a_long_max,
-                            math.sqrt(max(0.0, self.a_total_max ** 2 - a_lat_ref ** 2)))
+                            math.sqrt(max(0.0, self.a_total_max ** 2 - a_lat_used ** 2)))
 
-        # Anticipatory v_ref via a backward braking-feasible pass over the window:
-        # for each point ahead, the max speed we can carry NOW and still brake to
-        # its target within Δs at a_brake_max is √(v_target² + 2·a_brake·Δs).
-        # v_target = min(raceline vx, curvature cap √(a_lat_use/|κ|)). v_ref = min.
-        s_nearest = float(s_vals[nearest_idx])
-        s_ahead   = (s_vals - s_nearest) % s_total
-        brake_hd  = vx ** 2 / (2.0 * self.a_brake_max) + self.ld_min
-        v_win     = np.where(s_ahead <= brake_hd)[0]
-        if len(v_win) > 0:
-            ds        = s_ahead[v_win]
-            kappa_win = np.abs(self._kappa[v_win])
+        # ── v_ref: L1-style anticipatory target + corner-braking safety ──────
+        # (1) Target = raceline vx at a FORWARD look-ahead point (like the L1
+        # controller's speed_lookahead). Reading ahead — instead of pinning v_ref to
+        # the current point's profile speed (a backward-pass min over the whole window,
+        # which lags the profile's own ramp) — lets the car accelerate out of corners
+        # and onto straights as early as L1 does. On the nominal line this just
+        # reproduces the (friction-optimal) global velocity profile.
+        s_ahead = (s_vals - float(s_vals[nearest_idx])) % s_total
+        la_dist = max(self.ld_min, self.speed_lookahead * vx)
+        spd_idx = self._advance(nearest_idx, la_dist, wx, wy, s_vals, s_total, N)
+        v_ref   = float(self._vx_wp[spd_idx])
+        # P2 — corner-speed release: lift the corner target from the (conservative) raceline
+        # vx toward the real friction corner limit √(a_lat_use/κ), by corner_push∈[0,1].
+        # 0 = raceline exactly (default). The SAME a_lat_use feeds the steering clamp, so the
+        # commanded corner speed stays achievable (no understeer-wide). Straights: v_curve≫,
+        # raceline≈v_max → head≈0 → unaffected. Push grip via lat_safety while watching the
+        # P1 measured a_lat (/pp_debug idx 11) approach a_total_max.
+        if self.corner_push > 0.0:
+            k_fwd       = abs(float(self._kappa[spd_idx]))
+            v_curve_fwd = math.sqrt(a_lat_use / max(k_fwd, 1e-3))
+            v_ref      += self.corner_push * max(0.0, min(v_curve_fwd, self.v_max) - v_ref)
+
+        # (2) Corner braking: never exceed the speed from which we can still brake to a
+        # SLOWER point ahead (BEYOND la_dist) at a_brake_max — √(v_target² + 2·a_brake·Δs),
+        # v_target = min(raceline vx, curvature cap √(a_lat_use/|κ|)). Points within
+        # la_dist are trusted to the raceline vx + steering clamp, so corner-EXIT accel
+        # is no longer pinned by the current low profile speed.
+        brake_hd = vx ** 2 / (2.0 * self.a_brake_max) + self.ld_min
+        mask     = (s_ahead > la_dist) & (s_ahead <= brake_hd)
+        if np.any(mask):
+            ds        = s_ahead[mask]
+            kappa_win = np.abs(self._kappa[mask])
             v_curve   = np.sqrt(a_lat_use / np.maximum(kappa_win, 1e-3))
-            v_target  = np.minimum(self._vx_wp[v_win], v_curve)
+            v_rl      = self._vx_wp[mask]
+            # P2: same corner-speed lift on the braking targets (consistent with v_ref above)
+            if self.corner_push > 0.0:
+                v_target = v_rl + self.corner_push * np.maximum(
+                    0.0, np.minimum(v_curve, self.v_max) - v_rl)
+            else:
+                v_target = v_rl
+            v_target  = np.minimum(v_target, v_curve)   # never exceed the friction corner cap
             v_allow   = np.sqrt(v_target ** 2 + 2.0 * self.a_brake_max * ds)
-            v_ref     = float(np.min(v_allow))
-        else:
-            v_ref = float(self._vx_wp[target_idx])
+            v_ref     = min(v_ref, float(np.min(v_allow)))
         v_ref = max(v_ref, self.v_min)
 
-        # Heading-alignment acceleration gate: no power until pointed along path.
-        # |e_h| = |ψ_path − yaw| is the same misalignment the PID corrects.
-        if self.yaw_gate_max > self.yaw_gate_min:
-            align = (self.yaw_gate_max - abs(e_h)) / (self.yaw_gate_max - self.yaw_gate_min)
-        else:
-            align = 1.0 if abs(e_h) <= self.yaw_gate_max else 0.0
-        align = float(np.clip(align, 0.0, 1.0))
-
+        # Accelerate toward v_ref bounded by the friction-circle longitudinal budget;
+        # braking is never budget-limited (let the car slow as needed for corners).
         if v_ref > vx:
-            v_cmd = min(v_ref, vx + a_long_budget * align * self.t_cmd_horizon)
+            v_cmd = min(v_ref, vx + a_long_budget * self.t_cmd_horizon)
         else:
-            v_cmd = v_ref                            # braking: never gated
-        v_cmd = float(np.clip(v_cmd, self.v_min, self.v_max))
+            v_cmd = v_ref
+
+        # ── H2H: TRAILING overrides the raceline speed with a gap-keeping command,
+        # clipped to v_ref so it never exceeds the friction-feasible speed. Allowed
+        # down to 0 so the car can stop behind the opponent. Steering is unchanged
+        # (still tracks /local_waypoints, incl. any avoidance path baked in upstream).
+        if (self.state == "TRAILING" and self.opponent is not None
+                and self.ego_s is not None and self.track_length):
+            v_cmd = float(np.clip(self._trailing_controller(v_ref), 0.0, self.v_max))
+        else:
+            self._i_gap = 0.0
+            v_cmd = float(np.clip(v_cmd, self.v_min, self.v_max))
 
         # ── publish ──────────────────────────────────────────────────────────
         self._publish_drive(delta_cmd, v_cmd)
         self._publish_lookahead(lx_w, ly_w, ld)
-        self._publish_debug(a_lat_pp, a_lat_geo, delta_geo, delta_us,
-                            delta_pid, e_h, ld, v_ref, v_cmd, delta_cmd, align)
+        self._publish_debug(a_lat_pp, a_lat_geo, self._a_lat_meas,
+                            delta_geo, delta_pid, delta_cmd, e_h, ld, v_ref, v_cmd)
+
+    # ── H2H: trailing gap controller ─────────────────────────────────────────
+
+    def _trailing_controller(self, v_cap: float) -> float:
+        """Hold a fixed gap behind the opponent (ported from the L1 controller_manager
+        trailing_controller). Returns a target speed clipped to [0, v_cap], where
+        v_cap is this controller's friction-circle speed reference (v_ref) so the
+        trailing command can never exceed the dynamics-feasible speed.
+
+        gap_should = trailing_vel_gain·v + trailing_gap  (speed-dependent target gap)
+        cmd        = opp_vs − P·gap_error − I·∫gap_error − D·(ego_vs − opp_vs)
+        """
+        opp_s, _opp_d, opp_vs, _opp_static, opp_visible = self.opponent
+        gap        = (opp_s - self.ego_s) % self.track_length
+        gap_should = self.trailing_vel_gain * self.ego_vs + self.trailing_gap
+        gap_error  = gap_should - gap
+        v_diff     = self.ego_vs - opp_vs
+        self._i_gap = float(np.clip(self._i_gap + gap_error / self.state_machine_rate,
+                                    -10.0, 10.0))
+
+        p_value = gap_error * self.trailing_p_gain
+        i_value = self._i_gap * self.trailing_i_gain
+        d_value = v_diff * self.trailing_d_gain
+
+        cmd = float(np.clip(opp_vs - p_value - i_value - d_value, 0.0, v_cap))
+        # opponent not visible but still farther than the target gap → keep creeping
+        if (not opp_visible) and gap > gap_should:
+            cmd = max(self.blind_trailing_speed, cmd)
+        return cmd
 
     # ── publishers ───────────────────────────────────────────────────────────
 
@@ -408,20 +569,19 @@ class PPHeadingController(Node):
         m.color.r, m.color.g, m.color.b, m.color.a = 0.0, 0.8, 1.0, 1.0
         self.lookahead_pub.publish(m)
 
-    def _publish_debug(self, a_lat_pp, a_lat_geo, delta_geo, delta_us,
-                       delta_pid, e_h, ld, v_ref, v_cmd, delta_cmd, align):
+    def _publish_debug(self, a_lat_pp, a_lat_geo, a_lat_meas,
+                       delta_geo, delta_pid, delta_cmd, e_h, ld, v_ref, v_cmd):
         d = [0.0] * _DEBUG_LEN
         d[_D_A_LAT_PP]   = a_lat_pp
         d[_D_A_LAT_GEO]  = a_lat_geo
+        d[_D_A_LAT_MEAS] = a_lat_meas
         d[_D_DELTA_GEO]  = math.degrees(delta_geo)
-        d[_D_DELTA_US]   = math.degrees(delta_us)
         d[_D_DELTA_PID]  = math.degrees(delta_pid)
+        d[_D_DELTA_CMD]  = math.degrees(delta_cmd)
         d[_D_E_H]        = e_h
         d[_D_LD]         = ld
         d[_D_V_REF]      = v_ref
         d[_D_V_CMD]      = v_cmd
-        d[_D_DELTA_CMD]  = math.degrees(delta_cmd)
-        d[_D_ALIGN]      = align
         msg = Float64MultiArray()
         msg.data = d
         self.debug_pub.publish(msg)

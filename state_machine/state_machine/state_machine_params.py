@@ -36,6 +36,9 @@ class StateMachineParams:
         "gb_horizon_m",
         "interest_horizon_m",
         "overtaking_horizon_m",
+        "static_ot_speed_mps",
+        "getting_closer_rel_vel_mps",
+        "static_ot_distance_m",
     }
 
     def __init__(self, node: "StateMachine") -> None:
@@ -220,6 +223,38 @@ class StateMachineParams:
 
         self._declare("use_force_trailing", False)
         self.use_force_trailing: bool = node.get_parameter("use_force_trailing").value
+
+        self._declare(
+            "static_ot_speed_mps", 3.0,
+            ParameterDescriptor(
+                description="Speed below which a static-obstacle overtake may be initiated [mps]",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=10.0, step=0.1)],
+            ),
+        )
+        self.static_ot_speed_mps: float = node.get_parameter("static_ot_speed_mps").value
+
+        self._declare(
+            "getting_closer_rel_vel_mps", -0.5,
+            ParameterDescriptor(
+                description="Min (ego - obstacle) s-velocity to count as 'getting closer' [mps]",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=-5.0, to_value=5.0, step=0.1)],
+            ),
+        )
+        self.getting_closer_rel_vel_mps: float = node.get_parameter("getting_closer_rel_vel_mps").value
+
+        self._declare(
+            "static_ot_distance_m", 12.0,
+            ParameterDescriptor(
+                description="Forward gap [m] within which a static obstacle triggers the "
+                            "TRAILING->OVERTAKE commit (getting_closer window for static avoidance). "
+                            "Larger = commit earlier / avoid slow-trailing a stationary obstacle.",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=1.0, to_value=25.0, step=0.5)],
+            ),
+        )
+        self.static_ot_distance_m: float = node.get_parameter("static_ot_distance_m").value
 
         # Momentary rqt buttons (ROS1: served by dynamic_statemachine_server). When set
         # true they trigger an action and reset to false (done in the node timer, not

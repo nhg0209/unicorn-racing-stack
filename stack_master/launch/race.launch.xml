@@ -27,6 +27,8 @@
        description="WpntArray the controller follows: /local_waypoints (state-machine output w/ avoidance) or /global_waypoints (robust raceline)"/>
   <arg name="use_pp_heading" default="false"
        description="Run pp_heading_controller instead of controller_manager (only one runs)"/>
+  <arg name="reopt" default="false" description="Obstacle-aware global line (IFAC static re-optimization): static_reopt_node + static_obstacle_layer instead of plain global_trajectory_publisher"/>
+  <arg name="reopt_safety_width" default="0.5" description="safety_width for the obstacle-aware re-optimizer (tight ifac map solves plain mincurv_iqp only at 0.25 or lower)"/>
   <!-- sim -> SIM config (racecar_f110.ini + veh_dyn_info); real hardware -> CAR. Folder name == racecar_version. -->
   <let name="racecar_version" value="SIM" if="$(var sim)"/>
   <let name="racecar_version" value="CAR" unless="$(var sim)"/>
@@ -43,6 +45,8 @@
     <arg name="map"     value="$(var map)"/>
     <arg name="sim"     value="$(var sim)"/>
     <arg name="virtual" value="$(var virtual)"/>
+    <arg name="reopt"   value="$(var reopt)"/>
+    <arg name="reopt_safety_width" value="$(var reopt_safety_width)"/>
   </include>
 
   <!-- ===== Perception: LiDAR obstacle detection (C++) + tracking (Python) =====

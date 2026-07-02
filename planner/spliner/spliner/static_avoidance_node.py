@@ -18,6 +18,7 @@ import numpy as np
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Float32
 from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
 from scipy.interpolate import InterpolatedUnivariateSpline as Spline
 from scipy.interpolate import BPoly
 from scipy.signal import argrelextrema, savgol_filter
@@ -29,7 +30,10 @@ import trajectory_planning_helpers as tph
 
 # --- Evasion path smoothing ---
 SMOOTH_OTWPNTS = True
-SMOOTH_OTWPNTS_WINDOW = 51       # Savitzky-Golay window (must be odd)
+# Savitzky-Golay window for the kappa profile (odd, in waypoints; 0.1 m spacing -> 11 = ~1.1 m).
+# Big enough to kill the point-to-point numeric-curvature noise, small enough to preserve the
+# real ~2 m evasion bends (a 5 m window flattened them and over-smoothed the speed profile).
+SMOOTH_OTWPNTS_WINDOW = 11
 SMOOTH_OTWPNTS_POLYORDER = 2
 GB_BLEND_LEN = 40                # waypoints over which to quad-ease back onto the GB line
 
@@ -63,6 +67,14 @@ class ObstacleSpliner(Node):
 
         # initialize the instance variable
         self.obs_in_interest = None
+        self._behavior_target = None  # obstacle from /behavior_strategy (primary while not in OVERTAKE)
+        self.obstacles = []          # latest /tracking/obstacles (fallback source, like change_avoidance_node)
+        # short obstacle memory: if /tracking/obstacles briefly drops the static obstacle (a 1-2 frame
+        # detection gap), reuse the last passable candidate set for this window so the published spline
+        # doesn't blank out and un-commit the OVERTAKE (the SM latest_threshold is only 0.1 s).
+        self.obs_memory_sec = 0.3
+        self._mem_cands_obs = []      # cached candidate Obstacle objects (absolute-s, frame-invariant)
+        self._mem_cands_time = None   # rclpy Time of the last non-empty candidate set
         self.gb_wpnts = None
         self.gb_vmax = None
         self.gb_max_idx = None
@@ -91,19 +103,30 @@ class ObstacleSpliner(Node):
 
         # dyn params defaults
         self.save_params = False
-        self.kernel_size = 8
+        self.kernel_size = 3
         self.post_sampling_dist = 5.0
         self.sampling_dist = 5.0
         self.post_min_dist = 1.5
         self.post_max_dist = 5.0
         self.spline_scale = 0.8
-        self.evasion_dist = 0.65
+        # cosine ease-in/out ramp lengths [m] for the s-monotonic avoidance profile
+        self.back_to_raceline_before = 2.0   # start easing off the raceline this far before the obstacle
+        self.back_to_raceline_after = 2.0    # ease back onto the raceline this far after it
+        # Build the evasion path while the obstacle is this far ahead [m]. Kept ABOVE the state
+        # machine's GB-track max_horizon (15 m, the overtake-intent trigger) so a fresh escape spline
+        # is always available the moment the SM decides the raceline is blocked -> immediate OVERTAKE
+        # commit instead of trailing/crawling up to the obstacle. Still capped at gb_max_s/2 to avoid
+        # the path wrapping past half the lap.
+        self.gen_horizon = 17.0
+        self.tail_m = 6.0         # raceline tail after the ease-out so the path spans the SM horizon [m]
+        self.evasion_dist = 0.35   # lateral gap [m] car near-edge <-> obstacle edge (main clearance knob)
         self.obs_traj_tresh = 0.3
         self.spline_bound_mindist = 0.2
         self.kd_obs_pred = 1.0
         self.fixed_pred_time = 0.15
         self.n_loc_wpnts = 80
         self.width_car = 0.30
+        self.safety_margin = 0.1   # lateral safety margin for the evasion apex (matches change_avoidance_node)
 
         self.map_filter = GridFilter(node=self, map_topic="/map", debug=False)
         self.map_filter.set_erosion_kernel_size(self.kernel_size)
@@ -119,6 +142,10 @@ class ObstacleSpliner(Node):
 
         # Subscribe to the topics
         self.create_subscription(BehaviorStrategy, "/behavior_strategy", self.behavior_cb, 10)
+        # Direct obstacle source (like change_avoidance_node): the previous behavior_strategy-only
+        # input starved this planner the moment the state machine entered OVERTAKE (it stops
+        # publishing overtaking_targets there), which killed the very spline the car was following.
+        self.create_subscription(ObstacleArray, "/tracking/obstacles", self.obstacles_cb, 10)
         self.create_subscription(Odometry, "/car_state/odom_frenet", self.state_frenet_cb, 10)
         self.create_subscription(Odometry, "/car_state/odom", self.state_cb, 10)
         self.create_subscription(WpntArray, "/global_waypoints", self.gb_cb, 10)
@@ -170,12 +197,12 @@ class ObstacleSpliner(Node):
         self.declare_parameter('save_params', False,
                                ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
                                                    description="Save params"))
-        self.declare_parameter('kernel_size', 8, intd(1, 20))
+        self.declare_parameter('kernel_size', 3, intd(1, 20))  # 8 eroded ~0.2m and rejected the raceline itself on the tight ifac track
         self.declare_parameter('post_sampling_dist', 5.0, dbl(0.5, 20.0))
         self.declare_parameter('post_min_dist', 1.5, dbl(0.5, 3.0))
         self.declare_parameter('post_max_dist', 5.0, dbl(3.0, 20.0))
         self.declare_parameter('spline_scale', 0.8, dbl(0.5, 2.0))
-        self.declare_parameter('evasion_dist', 0.6, dbl(0.25, 1.25))
+        self.declare_parameter('evasion_dist', 0.35, dbl(0.25, 1.25))
         self.declare_parameter('obs_traj_tresh', 1.0, dbl(0.1, 1.5))
         self.declare_parameter('spline_bound_mindist', 0.30, dbl(0.05, 1.0))
         self.declare_parameter('pre_apex_dist0', 4.0, dbl(0.5, 8.0))
@@ -229,10 +256,13 @@ class ObstacleSpliner(Node):
     # CALLBACKS #
     #############
     def behavior_cb(self, data: BehaviorStrategy):
-        if len(data.overtaking_targets) != 0:
-            self.obs_in_interest = data.overtaking_targets[0]
-        else:
-            self.obs_in_interest = None
+        # Primary target while the state machine still publishes it (GB_TRACK / TRAILING).
+        # It goes empty once the SM enters OVERTAKE; the loop then falls back to selecting the
+        # obstacle directly from /tracking/obstacles so the spline keeps regenerating.
+        self._behavior_target = data.overtaking_targets[0] if len(data.overtaking_targets) != 0 else None
+
+    def obstacles_cb(self, data: ObstacleArray):
+        self.obstacles = data.obstacles
 
     def state_frenet_cb(self, data: Odometry):
         self.cur_s = data.pose.pose.position.x
@@ -266,22 +296,9 @@ class ObstacleSpliner(Node):
     def loop(self):
         if self.measuring:
             start = time.perf_counter()
-        # Sample data
-        gb_scaled_wpnts = self.gb_scaled_wpnts.wpnts
-        wpnts = OTWpntArray()
-        mrks = MarkerArray()
+        # do_spline now reads ALL static obstacles ahead directly and chains them into one path.
+        wpnts, mrks = self.do_spline(gb_wpnts=self.gb_scaled_wpnts.wpnts)
 
-        # If obs then do splining around it
-        if self.obs_in_interest is not None:
-            wpnts, mrks = self.do_spline(obs=copy.deepcopy(self.obs_in_interest), gb_wpnts=gb_scaled_wpnts)
-        # Else delete spline markers
-        else:
-            del_mrk = Marker()
-            del_mrk.header.stamp = self.get_clock().now().to_msg()
-            del_mrk.action = Marker.DELETEALL
-            mrks.markers.append(del_mrk)
-
-        # Publish wpnts and markers
         if self.measuring:
             end = time.perf_counter()
             self.latency_pub.publish(Float32(data=float(end - start)))
@@ -310,210 +327,194 @@ class ObstacleSpliner(Node):
         self.get_logger().info(f"[{self.name}] initialized FrenetConverter object")
         return converter
 
-    def _more_space(self, obstacle: Obstacle, gb_wpnts: List[Any], obs_s_idx: int) -> Tuple[str, float]:
-        # Evade toward the side with more empty space. d-sign: +d toward gb_wp.d_right wall,
-        # -d toward gb_wp.d_left wall; obstacle edges = d_center +/- size/2. gap and apex use the
-        # same convention so the apex never lands on the narrow side.
+    def _side_and_apex(self, obs: Obstacle, gb_wpnts, wpnt_dist: float) -> Tuple[bool, float]:
+        """Per-obstacle go/no-go + apex offset. Returns (feasible, d_apex).
+        Convention: +d = LEFT (gb_wp.d_left), -d = RIGHT (gb_wp.d_right); obs.d_left/d_right are
+        the obstacle edges in the same signed frame."""
+        obs_s_idx = int(obs.s_center / wpnt_dist) % self.gb_max_idx
         gb_wp = gb_wpnts[obs_s_idx]
-        obs_radius = obstacle.size / 2
-
-        pos_gap = gb_wp.d_right - (obstacle.d_center + obs_radius)  # free room toward +d wall
-        neg_gap = gb_wp.d_left + (obstacle.d_center - obs_radius)   # free room toward -d wall
-        min_space = self.evasion_dist + self.spline_bound_mindist
-
-        pos_ok = pos_gap >= min_space
-        neg_ok = neg_gap >= min_space
-        if pos_ok and not neg_ok:
-            side = "right"          # +d
-        elif neg_ok and not pos_ok:
-            side = "left"           # -d
+        half_car = self.width_car / 2
+        clearance = self.evasion_dist            # desired car-edge <-> obstacle-edge gap (dyn param)
+        wall_margin = 0.15
+        min_gap = half_car + self.spline_bound_mindist
+        left_gap = gb_wp.d_left - obs.d_left      # obstacle left edge  -> left wall
+        right_gap = gb_wp.d_right + obs.d_right   # obstacle right edge -> right wall
+        left_feasible = left_gap >= min_gap
+        right_feasible = right_gap >= min_gap
+        if not (left_feasible or right_feasible):
+            return False, 0.0
+        d_apex_left = min(obs.d_left + half_car + clearance, gb_wp.d_left - wall_margin)      # +d
+        d_apex_right = max(obs.d_right - half_car - clearance, -(gb_wp.d_right - wall_margin))  # -d
+        # among the feasible sides take the one closest to the raceline (smaller |d_apex|)
+        if left_feasible and right_feasible:
+            d_apex = d_apex_left if abs(d_apex_left) <= abs(d_apex_right) else d_apex_right
         else:
-            side = "right" if pos_gap >= neg_gap else "left"
+            d_apex = d_apex_left if left_feasible else d_apex_right
+        return True, d_apex
 
-        if side == "right":
-            d_apex = (obstacle.d_center + obs_radius) + self.evasion_dist
-            if d_apex < 0:
-                d_apex = 0.0        # never flip across the raceline to the wrong side
-            d_apex = min(d_apex, gb_wp.d_right)   # clamp to +d wall
-        else:
-            d_apex = (obstacle.d_center - obs_radius) - self.evasion_dist
-            if d_apex > 0:
-                d_apex = 0.0
-            d_apex = max(d_apex, -gb_wp.d_left)   # clamp to -d wall
+    def _gather_cands(self, obstacles, gen_h: float) -> List[Tuple[float, Obstacle]]:
+        """Static/near-stationary obstacles ahead within [0.5, gen_h] as (gap, obs), unsorted."""
+        cands = []
+        for o in obstacles:
+            if not (o.is_static or (abs(o.vs) < 0.5 and abs(o.vd) < 0.5)):
+                continue
+            gap = (o.s_center - self.cur_s) % self.gb_max_s
+            if 0.5 <= gap <= gen_h:
+                cands.append((gap, o))
+        return cands
 
-        return side, d_apex
-
-    def do_spline(self, obs: Obstacle, gb_wpnts: WpntArray) -> Tuple[WpntArray, MarkerArray]:
+    def do_spline(self, gb_wpnts: WpntArray) -> Tuple[WpntArray, MarkerArray]:
         """
-        Creates an evasion trajectory for a static obstacle by splining between current pose and post-apex points.
+        Build ONE frame-stable evasion path that chains ALL static obstacles ahead within the
+        generation horizon — or nothing, if the nearest one has no room to pass.
 
-        Returns:
-        - wpnts (WpntArray): An array of waypoints that describe the evasion trajectory to the closest obstacle.
-        - mrks (MarkerArray): An array of markers that represent the waypoints in a visualization format.
+        Design:
+        - GO/NO-GO per obstacle lives in `_side_and_apex`; if the nearest obstacle can't be passed
+          we publish an empty path (state machine keeps TRAILING).
+        - Each passable obstacle adds a cosine bump to a single d(s) profile anchored to the
+          global-waypoint grid. Consecutive obstacles are therefore handled in ONE path (fixing
+          "avoids #1 then drives the raceline into #2"); d returns to 0 in the clear stretches.
+        - Grid-anchored s means d(s) is frame-invariant: as the car advances the window just slides,
+          so the published path doesn't morph -> no controller jitter / wobble.
         """
-        # Return wpnts and markers
         mrks = MarkerArray()
         wpnts = OTWpntArray()
         wpnts.header.stamp = self.get_clock().now().to_msg()
         wpnts.header.frame_id = "map"
-        # Get spacing between wpnts for rough approximations
         wpnt_dist = gb_wpnts[1].s_m - gb_wpnts[0].s_m
 
-        # If there are obstacles within the lookahead distance, then we need to generate an evasion trajectory considering the closest one
-        if obs.is_static == True:
-            pre_dist = (obs.s_center - self.cur_s) % self.gb_max_s
+        def _empty():
+            del_mrk = Marker()
+            del_mrk.header.frame_id = "map"
+            del_mrk.action = Marker.DELETEALL
+            mrks.markers = [del_mrk]
+            wpnts.wpnts = []
+            return wpnts, mrks
 
-            if pre_dist < 0.5 or pre_dist > self.gb_max_s / 2:
-                wpnts.wpnts = []
-                mrks.markers = []
-                return wpnts, mrks
+        if self.cur_s is None or self.gb_max_s is None:
+            return _empty()
 
-            obs_s_idx = int(obs.s_center / wpnt_dist) % self.gb_max_idx
+        # --- gather ALL near-stationary obstacles ahead within the horizon (nearest first) ---
+        gen_h = min(self.gen_horizon, self.gb_max_s / 2.0)
+        cands = self._gather_cands(self.obstacles, gen_h)
+        now = self.get_clock().now()
+        if cands:
+            # cache the raw obstacle objects (their absolute s is frame-invariant, so they stay
+            # valid to re-gather next frame with the current cur_s until the car passes them).
+            self._mem_cands_obs = [o for _, o in cands]
+            self._mem_cands_time = now
+        elif self._mem_cands_obs and self._mem_cands_time is not None and \
+                (now - self._mem_cands_time).nanoseconds * 1e-9 < self.obs_memory_sec:
+            # brief detection dropout -> reuse remembered obstacles so the spline stays put
+            cands = self._gather_cands(self._mem_cands_obs, gen_h)
+        if not cands:
+            return _empty()
+        cands.sort(key=lambda go: go[0])
+        self.obs_in_interest = cands[0][1]   # nearest, kept for viz/debug
 
-            more_space, d_apex = self._more_space(obs, gb_wpnts, obs_s_idx)
-            s_list = [obs.s_center]
-            d_list = [d_apex]
+        # --- grid anchor (frame-stable) -----------------------------------------------------
+        ramp_in = max(self.back_to_raceline_before, 1e-3)
+        ramp_out = max(self.back_to_raceline_after, 1e-3)
+        car_idx = int(self.cur_s / wpnt_dist) % self.gb_max_idx
+        grid_start_s = gb_wpnts[car_idx].s_m
 
-            post_dist = min(min(max(pre_dist, self.post_min_dist), self.post_max_dist), self.gb_max_s / 2)
+        # per-obstacle feasibility/side/apex; stop at the first obstacle we cannot pass so we never
+        # plan a path through it (the state machine keeps TRAILING that one).
+        bumps = []   # (pre, obs_half, d_apex) in grid-anchored absolute s
+        for gap, o in cands:
+            feasible, d_apex = self._side_and_apex(o, gb_wpnts, wpnt_dist)
+            if not feasible:
+                break
+            obs_half = ((o.s_end - o.s_start) % self.gb_max_s) / 2.0
+            pre = (o.s_center - grid_start_s) % self.gb_max_s
+            bumps.append((pre, obs_half, d_apex))
+        if not bumps:
+            self.get_logger().info(
+                f"[{self.name}]: nearest obstacle has no lateral gap -> no spline, TRAILING",
+                throttle_duration_sec=1.0,
+            )
+            return _empty()
 
-            num_post_ref = int((post_dist // self.sampling_dist)) + 1
+        # --- path span reaches past the LAST avoided obstacle -------------------------------
+        last_pre, last_half, _ = bumps[-1]
+        span = last_pre + last_half + ramp_out + self.tail_m
+        n = max(int(span / wpnt_dist), 5)
+        idxs = (car_idx + np.arange(n)) % self.gb_max_idx
+        s_abs = grid_start_s + np.arange(n) * wpnt_dist
 
-            for i in range(num_post_ref):
-                s_list.append(obs.s_center + post_dist * ((i + 1) / num_post_ref))
-                d_list.append((d_apex * (1 - (i + 1) / num_post_ref)))
+        # --- combined d-profile: each obstacle a cosine bump; on overlap the more-active (larger
+        #     weight) bump wins, so obstacles chain and d returns to 0 between well-separated ones.
+        d_arr = np.zeros(n)
+        win_w = np.zeros(n)
+        for pre, obs_half, d_apex in bumps:
+            obs_start_abs = grid_start_s + pre - obs_half
+            obs_end_abs = grid_start_s + pre + obs_half
+            ease_in_start = obs_start_abs - ramp_in
+            w = np.zeros(n)
+            m_in = (s_abs >= ease_in_start) & (s_abs < obs_start_abs)
+            m_hold = (s_abs >= obs_start_abs) & (s_abs <= obs_end_abs)
+            m_out = (s_abs > obs_end_abs) & (s_abs <= obs_end_abs + ramp_out)
+            w[m_in] = 0.5 * (1 - np.cos(np.pi * (s_abs[m_in] - ease_in_start) / ramp_in))
+            w[m_hold] = 1.0
+            w[m_out] = 0.5 * (1 + np.cos(np.pi * (s_abs[m_out] - obs_end_abs) / ramp_out))
+            take = w > win_w
+            d_arr[take] = (w * d_apex)[take]
+            win_w[take] = w[take]
 
-            s_array = np.array(s_list)
-            d_array = np.array(d_list)
+        # clamp every sample inside the local drivable corridor
+        wall_margin = 0.15
+        d_right_arr = np.array([gb_wpnts[j].d_right for j in idxs])
+        d_left_arr = np.array([gb_wpnts[j].d_left for j in idxs])
+        d_arr = np.clip(d_arr, -(d_right_arr - wall_margin), d_left_arr - wall_margin)
 
-            s_array = s_array % self.gb_max_s
+        s_mod = s_abs % self.gb_max_s
+        resp = self.converter.get_cartesian(s_mod, d_arr)
+        resp = resp.T if resp.ndim == 2 else resp
+        xy = np.asarray(resp, dtype=float).reshape(-1, 2)
 
-            s_idx = np.round((s_array / wpnt_dist)).astype(int) % self.gb_max_idx
+        # heading/curvature over the whole (continuous) path, then smooth kappa (the velocity
+        # profile is kappa-driven and the controller uses kappa as a steering feed-forward).
+        psi_, kappa_ = tph.calc_head_curv_num.calc_head_curv_num(
+            path=xy, el_lengths=wpnt_dist * np.ones(len(xy) - 1), is_closed=False)
+        if SMOOTH_OTWPNTS and kappa_.size > SMOOTH_OTWPNTS_POLYORDER + 2:
+            win = min(SMOOTH_OTWPNTS_WINDOW, kappa_.size)
+            if win % 2 == 0:
+                win -= 1
+            if win > SMOOTH_OTWPNTS_POLYORDER:
+                kappa_ = savgol_filter(kappa_, win, SMOOTH_OTWPNTS_POLYORDER)
 
-            # Choose the correct side and compute the distance to the apex based on left of right of the obstacle
+        for i in range(len(xy)):
+            wpnts.wpnts.append(
+                self.xyv_to_wpnts(x=xy[i, 0], y=xy[i, 1], s=s_mod[i], d=d_arr[i], v=2,
+                                  psi=psi_[i] + np.pi / 2, kappa=kappa_[i], wpnts=wpnts)
+            )
 
-            # Do frenet conversion via conversion service for spline and create markers and wpnts
-            danger_flag = False
-            resp = self.converter.get_cartesian(s_array, d_array)
-
-            points = [[self.cur_x, self.cur_y]]
-            tangents = [[np.cos(self.cur_yaw), np.sin(self.cur_yaw)]]
-
-            for i in range(len(s_idx)):
-                points.append(resp[:, i])
-                tangents.append(np.array([np.cos(gb_wpnts[s_idx[i]].psi_rad), np.sin(gb_wpnts[s_idx[i]].psi_rad)]))
-
-            tangents = np.dot(tangents, self.spline_scale * np.eye(2))
-            points = np.asarray(points)
-            nPoints, dim = points.shape
-
-            # Parametrization parameter s.
-            dp = np.diff(points, axis=0)                 # difference between points
-            dp = np.linalg.norm(dp, axis=1)              # distance between points
-            d = np.cumsum(dp)                            # cumsum along the segments
-            d = np.hstack([[0], d])                      # add distance from first point
-            l = d[-1]                                    # length of point sequence
-            nSamples = int(l / wpnt_dist)                # number of samples
-            s, r = np.linspace(0, l, nSamples, retstep=True)  # sample parameter and step
-
-            # Bring points and (optional) tangent information into correct format.
-            assert(len(points) == len(tangents))
-            spline_result = np.empty([nPoints, dim], dtype=object)
-            for i, ref in enumerate(points):
-                t = tangents[i]
-                # Either tangent is None or has the same
-                # number of dimensions as the point ref.
-                assert(t is None or len(t) == dim)
-                fuse = list(zip(ref, t) if t is not None else zip(ref,))
-                spline_result[i, :] = fuse
-
-            # Compute splines per dimension separately.
-            samples = np.zeros([nSamples, dim])
-            for i in range(dim):
-                poly = BPoly.from_derivatives(d, spline_result[:, i])
-                samples[:, i] = poly(s)
-
-            # Savitzky-Golay smoothing; pin + taper the endpoints so the filter edge
-            # transient doesn't kink the car pose / last apex.
-            if SMOOTH_OTWPNTS and len(samples) >= SMOOTH_OTWPNTS_WINDOW:
-                start_pt = samples[0].copy()
-                end_pt = samples[-1].copy()
-                samples[:, 0] = savgol_filter(samples[:, 0], SMOOTH_OTWPNTS_WINDOW, SMOOTH_OTWPNTS_POLYORDER)
-                samples[:, 1] = savgol_filter(samples[:, 1], SMOOTH_OTWPNTS_WINDOW, SMOOTH_OTWPNTS_POLYORDER)
-                blend_len = min(5, len(samples) - 1)
-                for bi in range(blend_len):
-                    w = bi / blend_len
-                    samples[bi] = start_pt * (1 - w) + samples[bi] * w
-                samples[0] = start_pt
-                for bi in range(blend_len):
-                    idx = len(samples) - blend_len + bi
-                    w = bi / blend_len
-                    samples[idx] = samples[idx] * (1 - w) + end_pt * w
-                samples[-1] = end_pt
-
-            n_additional = 100
-            xy_additional = np.array([
-                (
-                    gb_wpnts[(s_idx[-1] + i + 1) % self.gb_max_idx].x_m,
-                    gb_wpnts[(s_idx[-1] + i + 1) % self.gb_max_idx].y_m
-                )
-                for i in range(n_additional)
-            ])
-
-            # Quad-ease the spline tail onto the GB line so the handoff to xy_additional is smooth.
-            if SMOOTH_OTWPNTS and len(samples) > 0:
-                blend_to_gb_len = min(GB_BLEND_LEN, len(samples) - 1)
-                for bi in range(blend_to_gb_len):
-                    idx = len(samples) - blend_to_gb_len + bi
-                    t = (bi + 1) / (blend_to_gb_len + 1)
-                    w = t * t  # quadratic easing
-                    gb_idx_for_blend = (s_idx[-1] - blend_to_gb_len + bi + 1) % self.gb_max_idx
-                    target_pt = np.array([
-                        gb_wpnts[gb_idx_for_blend].x_m,
-                        gb_wpnts[gb_idx_for_blend].y_m])
-                    samples[idx] = samples[idx] * (1 - w) + target_pt * w
-
-            samples = np.vstack([samples, xy_additional])
-
-            s_, d_ = self.converter.get_frenet(samples[:, 0], samples[:, 1])
-
-            psi_, kappa_ = tph.calc_head_curv_num.\
-                calc_head_curv_num(
-                    path=samples,
-                    el_lengths=0.1 * np.ones(len(samples) - 1),
-                    is_closed=False
-                )
-
-            danger_flag = False
-            bounds_check_results = []  # debug: True if sample passed is_point_inside
-            for i in range(samples.shape[0]):
-                gb_wpnt_i = int((s_[i] / wpnt_dist) % self.gb_max_idx)
-
-                inside = self.map_filter.is_point_inside(samples[i, 0], samples[i, 1])
-                bounds_check_results.append(inside)
-                if not inside:
-                    self.get_logger().info(
-                        f"[{self.name}]: Evasion trajectory too close to TRACKBOUNDS, aborting evasion",
-                        throttle_duration_sec=2,
-                    )
-                    danger_flag = True
-                    break
-                outside = True
-                # Get V from gb wpnts and go slower if we are going through the inside
-                vi = gb_wpnts[gb_wpnt_i].vx_mps if outside else gb_wpnts[gb_wpnt_i].vx_mps * 0.9  # TODO make speed scaling ros param
-
-                wpnts.wpnts.append(
-                    self.xyv_to_wpnts(x=samples[i, 0], y=samples[i, 1], s=s_[i], d=d_[i], v=2, psi=psi_[i] + np.pi / 2, kappa=kappa_[i], wpnts=wpnts)
-                )
-                mrks.markers.append(self.xyv_to_markers(x=samples[i, 0], y=samples[i, 1], v=vi, mrks=mrks))
-
-            # Debug: visualize every spline sample colored by bounds check
-            self._publish_spline_samples_markers(samples, bounds_check_results)
-
-            # Fill the rest of OTWpnts
-            if danger_flag:
-                wpnts.wpnts = []
-                mrks.markers = []
+        del_mrk = Marker()
+        del_mrk.header.frame_id = "map"
+        del_mrk.action = Marker.DELETEALL
+        mrks.markers = [del_mrk, self._spline_line_marker(wpnts)]
         return wpnts, mrks
+
+    def _spline_line_marker(self, wpnts: OTWpntArray) -> Marker:
+        """Single LINE_STRIP for the whole evasion path instead of one CYLINDER per
+        sample. ~150 markers/frame at 20 Hz was the dominant RViz load; one polyline
+        renders essentially for free and needs no DELETEALL churn (fixed id overwrites)."""
+        mrk = Marker()
+        mrk.header.frame_id = "map"
+        mrk.header.stamp = self.get_clock().now().to_msg()
+        mrk.ns = "avoidance_spline"
+        mrk.id = 0
+        mrk.type = Marker.LINE_STRIP
+        mrk.action = Marker.ADD
+        mrk.scale.x = 0.08   # line width [m]
+        mrk.color.a = 1.0
+        mrk.color.b = 0.75
+        mrk.color.r = 0.75
+        if self.from_bag:
+            mrk.color.g = 0.75
+        mrk.pose.orientation.w = 1.0
+        mrk.points = [Point(x=float(w.x_m), y=float(w.y_m), z=0.0) for w in wpnts.wpnts]
+        return mrk
 
     def _publish_spline_samples_markers(self, samples: np.ndarray, bounds_check_results: List[bool]):
         """Debug viz: each spline sample as a sphere. green=passed bounds check,

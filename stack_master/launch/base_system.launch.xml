@@ -18,6 +18,8 @@
   <arg name="sim"          default="false" description="Use simulator (true) or real hardware (false)"/>
   <arg name="localization" default="cartographer"    description="gt (sim) | cartographer | pf (real)"/>
   <arg name="virtual"      default="$(var sim)" description="Inject virtual opponent/obstacles (scan overlay etc.); on by default in sim, off on the real car"/>
+  <arg name="reopt"        default="false" description="Obstacle-aware global line: run static_reopt_node + static_obstacle_layer instead of the plain global_trajectory_publisher (IFAC static-obstacle re-optimization)"/>
+  <arg name="reopt_safety_width" default="0.5" description="safety_width for the obstacle-aware re-optimizer (incl. car width). NB: the tight ifac centerline only solves plain mincurv_iqp at 0.25 or lower"/>
 
   <!-- sim -> SIM config folder, real hardware -> CAR config folder -->
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/SIM" if="$(var sim)"/>
@@ -58,9 +60,29 @@
        /global_waypoints/overtaking for the state machine & local planners. -->
   <let name="maps_dir" value="$(find-pkg-share stack_master)/maps"/>
 
-  <node pkg="gb_optimizer" exec="global_trajectory_publisher" name="global_republisher" output="screen">
+  <!-- Global-waypoint publisher. Two mutually-exclusive providers of /global_waypoints:
+       - reopt:=false (default) -> global_trajectory_publisher: plain JSON republisher.
+       - reopt:=true            -> static_reopt_node (obstacle-aware republisher; re-optimizes
+         around confirmed static obstacles) + static_obstacle_layer (maps them from tracking).
+       Only ONE runs, so there is never a duplicate /global_waypoints publisher. The offline
+       map-build pipeline (create_path.launch.py) always uses global_trajectory_publisher. -->
+  <let name="racecar_version" value="SIM" if="$(var sim)"/>
+  <let name="racecar_version" value="CAR" unless="$(var sim)"/>
+
+  <node pkg="gb_optimizer" exec="global_trajectory_publisher" name="global_republisher"
+        output="screen" unless="$(var reopt)">
     <param name="map" value="$(var map)"/>
   </node>
+
+  <group if="$(var reopt)">
+    <node pkg="gb_optimizer" exec="static_reopt_node" name="static_reopt_node" output="screen">
+      <param name="map" value="$(var map)"/>
+      <param name="racecar_version" value="$(var racecar_version)"/>
+      <param name="safety_width" value="$(var reopt_safety_width)"/>
+      <param name="safety_width_sp" value="$(var reopt_safety_width)"/>
+    </node>
+    <node pkg="gb_optimizer" exec="static_obstacle_layer" name="static_obstacle_layer" output="screen"/>
+  </group>
 
   <!-- speed_scaling.yaml -> /global_waypoints_scaled + /sector_markers.
        sector_tuner (not velocity_scaler) also draws the RViz markers.

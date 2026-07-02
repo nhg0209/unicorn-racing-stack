@@ -29,3 +29,9 @@ state_machine:
     ftg_active: false
     force_GBTRACK: false
     use_force_trailing: false
+    # overtake-decision thresholds (were hardcoded magic numbers in the node)
+    static_ot_speed_mps: 10.0
+    getting_closer_rel_vel_mps: -0.1
+    # forward gap [m] within which a STATIC obstacle triggers TRAILING->OVERTAKE.
+    # larger = commit earlier (less slow-trailing a stationary obstacle). keep <= static_avoidance max_horizon.
+    static_ot_distance_m: 12.0

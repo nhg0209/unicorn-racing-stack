@@ -51,6 +51,8 @@ setup(
             'global_planner_node = gb_optimizer.global_planner_node:main',
             'global_trajectory_publisher = gb_optimizer.global_trajectory_publisher:main',
             'global_trajectory_tuner = gb_optimizer.global_trajectory_tuner:main',
+            'static_reopt_node = gb_optimizer.static_reopt_node:main',
+            'static_obstacle_layer = gb_optimizer.static_obstacle_layer:main',
         ],
     },
 )

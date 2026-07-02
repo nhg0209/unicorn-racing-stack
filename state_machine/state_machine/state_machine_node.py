@@ -185,6 +185,9 @@ class StateMachine(Node):
         self.lateral_width_gb_m = self.params.lateral_width_gb_m
         self.gb_horizon_m = self.params.gb_horizon_m
         self.interest_horizon_m = self.params.interest_horizon_m
+        self.static_ot_speed_mps = self.params.static_ot_speed_mps
+        self.getting_closer_rel_vel_mps = self.params.getting_closer_rel_vel_mps
+        self.static_ot_distance_m = self.params.static_ot_distance_m
 
         self.last_recovery_update_time = None
         self.cur_gb_wpnts = WaypointData(self, "global_tracking", True)
@@ -618,8 +621,12 @@ class StateMachine(Node):
             for obs in data.obstacles:
                 gap = (obs.s_start - self.cur_s) % self.track_length
                 if gap < self.interest_horizon_m:
-                    obstacles_in_interest.append(obs)
-            self.obstacles_in_interest = obstacles_in_interest
+                    obstacles_in_interest.append((gap, obs))
+            # Sort by forward gap so [0] is always the nearest obstacle ahead. Several
+            # checks (_check_getting_closer) only look at index 0, which is only correct
+            # if the list is ordered (perception does not guarantee any order).
+            obstacles_in_interest.sort(key=lambda g_obs: g_obs[0])
+            self.obstacles_in_interest = [obs for _, obs in obstacles_in_interest]
 
     def ego_prediction_cb(self, data):
         self.ego_prediction = data.predictions if len(data.predictions) != 0 else []
@@ -673,13 +680,16 @@ class StateMachine(Node):
         else:
             return np.abs(self.cur_d) < threshold_m
 
-    def _check_close_to_raceline_heading(self, threshold_deg=None) -> bool:
+    def _check_close_to_raceline_heading(self, threshold_deg=20) -> bool:
+        # True when the ego heading is aligned with the closest raceline waypoint within
+        # threshold_deg. The heading error is wrapped to (-pi, pi] so the seam (psi near
+        # +/-pi) doesn't produce a spurious ~2*pi error.
+        # NOTE: the previous threshold_deg branch compared self.cur_d (lateral metres)
+        # against deg2rad(threshold_deg) (radians) -- it never checked heading at all.
         cloest_wpnt_idx = int(self.cur_s / self.waypoints_dist) % self.num_glb_wpnts
         cloest_wpnt_psi = self.cur_gb_wpnts.list[cloest_wpnt_idx].psi_rad
-        if threshold_deg is None:
-            return np.abs(self.current_position[2] - cloest_wpnt_psi) < np.deg2rad(20)
-        else:
-            return np.abs(self.cur_d) < np.deg2rad(threshold_deg)
+        heading_err = (self.current_position[2] - cloest_wpnt_psi + np.pi) % (2 * np.pi) - np.pi
+        return np.abs(heading_err) < np.deg2rad(threshold_deg)
 
     def _check_ot_sector(self) -> bool:
         # ROS1: no overtake zone matching cur_s -> not in an OT sector (return False).
@@ -692,13 +702,17 @@ class StateMachine(Node):
         return False
 
     def _check_getting_closer(self, threshold_m=3.0) -> bool:
-        if (
-            len(self.obstacles_in_interest) != 0
-            and self.cur_vs - self.obstacles_in_interest[0].vs > -0.5
-        ):
-            return True
-        else:
+        # True when the nearest obstacle ahead is within threshold_m AND we are closing on it.
+        # NOTE: threshold_m was previously declared but never used -- the distance gate was
+        # silently dropped, so this returned True for a closing obstacle anywhere on the track.
+        # Honour it now so the overtake decision commits inside a sane window (the callers pass
+        # 7-10 m, matching the overtaking horizon) instead of from across the lap.
+        if len(self.obstacles_in_interest) == 0:
             return False
+        nearest = self.obstacles_in_interest[0]
+        gap = (nearest.s_start - self.cur_s) % self.track_length
+        closing = (self.cur_vs - nearest.vs) > self.getting_closer_rel_vel_mps
+        return bool(gap < threshold_m and closing)
 
     def _check_enemy_in_front(self) -> bool:
         horizon = self.gb_horizon_m
@@ -764,7 +778,11 @@ class StateMachine(Node):
                 ttc = (gap - self.pars["veh_params"]["length"]) / clip_vs
                 tt0 = (gap + 0.3 * self.pars["veh_params"]["length"]) / clip_vs
 
-                if obs.is_static:
+                # Treat near-stationary obstacles as static regardless of the (noisy, laggy)
+                # tracking is_static flag: a static obstacle transiently classified dynamic would
+                # otherwise be checked against a bogus predicted trajectory, making the static
+                # avoidance spline read "not free" and delaying the TRAILING->OVERTAKE switch.
+                if obs.is_static or (abs(obs.vs) < 0.5 and abs(obs.vd) < 0.5):
                     if not wpnts_data.is_closed and gap > max_gap:
                         is_free = False
                         if closest_obs is None or min_gap > gap:
@@ -778,8 +796,20 @@ class StateMachine(Node):
                             ot_d = wpnts_data.list[avoid_wpnt_idx].d_m
                         min_dist = abs(ot_d - obs_d)
                         free_dist = min_dist - obs.size / 2 - self.gb_ego_width_m / 2
-                        scaling_factor = np.clip(gap / free_scaling_reference_distance_m, 0.0, 1.0)
-                        if free_dist < lateral_width_m * scaling_factor:
+                        # For a STATIC obstacle evaluated against an AVOIDANCE path the required
+                        # clearance must be DISTANCE-INDEPENDENT: the object isn't moving, so a
+                        # spline that geometrically clears it is just as valid at 8 m as at 1 m.
+                        # The original gap-scaling (meant for moving opponents: "only trust the
+                        # lateral gap once close") made a clearing spline read NOT-free while far
+                        # and only relax as the car crept to gap<~2 m -> the "trail up close, then
+                        # switch" artifact. Keep the scaling only for the raceline (GB) check,
+                        # which governs *when to leave* the line.
+                        if is_ot_wpnts and not is_gb_track_wpnts:
+                            required_margin = lateral_width_m
+                        else:
+                            required_margin = lateral_width_m * np.clip(
+                                gap / free_scaling_reference_distance_m, 0.0, 1.0)
+                        if free_dist < required_margin:
                             is_free = False
                             self.get_logger().info(
                                 "[State Machine] FREE False, obs dist to ot lane: {} m".format(free_dist),
@@ -921,12 +951,29 @@ class StateMachine(Node):
             return False
 
     def _check_static_overtaking_mode(self) -> bool:
-        if (
-            self.cur_vs < 3.0
-            and self._check_getting_closer(threshold_m=7.0)
-            and self._check_latest_wpnts(self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts)
-            and self._check_free_frenet(self.cur_static_avoidance_wpnts)
-        ):
+        # SIMPLIFIED: the static spliner now owns the go/no-go decision — it publishes an evasion
+        # path ONLY when a static obstacle has a wide-enough lateral gap to pass (and clamps it
+        # inside the track). So the state machine just commits when that path is fresh and the car
+        # is on it. The old distance gate (c_closer) and the redundant free-check (c_free) — which
+        # made the car slow-trail right up to the obstacle before switching — are gone.
+        c_speed = self.cur_vs < self.static_ot_speed_mps   # light guard, keep
+        c_latest = self._check_latest_wpnts(self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts)
+        # debug: why isn't a fresh on-spline path available?
+        sa = self.static_avoidance_wpnts
+        n_sa = len(sa.wpnts) if sa is not None else 0
+        age = (self.now_sec() - time_to_float(sa.header.stamp)) if n_sa > 0 else -1.0
+        gap_dbg = md_dbg = -1.0
+        wd = self.cur_static_avoidance_wpnts
+        if wd.is_init and wd.array is not None:
+            gap_dbg = (wd.list[-1].s_m - self.cur_s) % self.track_length
+            md_dbg = float(np.min(np.linalg.norm(wd.array[:, 0:2] - self.current_position[:2], axis=1)))
+        self.get_logger().info(
+            f"[{self.name}] static_OT check: speed={c_speed} "
+            f"latest+on_spline={c_latest}[n={n_sa},age={age:.2f}(<{wd.latest_threshold}),"
+            f"gap={gap_dbg:.2f}(>{wd.on_spline_front_horizon_thres_m}),min_dist={md_dbg:.2f}(<{wd.on_spline_min_dist_thres_m})]",
+            throttle_duration_sec=0.5,
+        )
+        if c_speed and c_latest:
             self.static_overtaking_mode = True
             return True
         else:
@@ -934,10 +981,10 @@ class StateMachine(Node):
 
     def _check_overtaking_mode_sustainability(self) -> bool:
         if self.static_overtaking_mode:
-            if (
-                self._check_availability(self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts)
-                and self._check_free_frenet(self.cur_static_avoidance_wpnts)
-            ):
+            # Stay in OVERTAKE while the (spliner-vetted) static path is still available and the
+            # car is on it. The spliner stops publishing once the gap closes / obstacle is passed,
+            # so availability naturally drops and we exit — no redundant free re-check needed.
+            if self._check_availability(self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts):
                 return True
         else:
             if self._check_availability(self.avoidance_wpnts, self.cur_avoidance_wpnts):
