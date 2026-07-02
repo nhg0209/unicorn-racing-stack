@@ -7,9 +7,17 @@
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/CAR" unless="$(var sim)"/>
   <arg name="vehicle_config" default="$(var config_dir)/vehicle_config.yaml"/>
   <arg name="use_estop"      default="false"               description="Use emergency stop (true) or not (false)"/>
+  <!-- Livox MID-360 3D LiDAR: primary LiDAR on the real car. Publishes /livox/lidar
+       (PointCloud2) + /livox/imu in frame_id 'livox_frame'. Needs the livox network
+       (host 192.168.1.2, see livox_ros_driver2/config/MID360_config.json). -->
+  <arg name="livox"                default="true"  description="Start the Livox MID-360 driver on the real car"/>
+  <arg name="use_system_timestamp" default="true"  description="Livox stamp source: true=ROS now() (mapping), false=device HW clock (LIO-only)"/>
+  <!-- Hokuyo 2D LiDAR (urg_node -> /scan). Disabled by default; set hokuyo:=true to
+       start it. The Livox MID-360 is the primary LiDAR. -->
+  <arg name="hokuyo"               default="false" description="Start the Hokuyo (urg_node) 2D LiDAR driver on the real car"/>
   <!-- Keyboard teleop: start keyboard_joy (pynput -> /joy_keyboard) and route the
        mux to it. The pitwall panel's Joy/Keyboard buttons can still switch at runtime. -->
-  <arg name="keyboard_teleop" default="true"              description="Drive the ego with the keyboard instead of a joystick"/>
+  <arg name="keyboard_teleop" default="false"             description="Drive the ego with the keyboard instead of a joystick"/>
   <!-- virtual_perception (scan_overlay + virtual opponent + static obstacles).
        Defaults ON in sim (preserves prior behavior), OFF on the real car; toggle
        with virtual:=true (e.g. to overlay a virtual opponent onto the real LiDAR). -->
@@ -40,10 +48,20 @@
          identity remap leaves it on /scan. -->
     <let name="lidar_scan_out" value="/scan_raw" if="$(var virtual)"/>
     <let name="lidar_scan_out" value="/scan"     unless="$(var virtual)"/>
-    <node pkg="urg_node" exec="urg_node_driver" name="urg_node" output="screen">
-      <param from="$(var vehicle_config)"/>
-      <remap from="/scan" to="$(var lidar_scan_out)"/>
-    </node>
+    <group if="$(var hokuyo)">
+      <node pkg="urg_node" exec="urg_node_driver" name="urg_node" output="screen">
+        <param from="$(var vehicle_config)"/>
+        <remap from="/scan" to="$(var lidar_scan_out)"/>
+      </node>
+    </group>
+
+    <!-- Livox MID-360 3D LiDAR (primary). Wrapper includes livox_ros_driver2's
+         msg_MID360 driver; publishes /livox/lidar + /livox/imu. -->
+    <group if="$(var livox)">
+      <include file="$(find-pkg-share stack_master)/launch/livox_lidar.launch.py">
+        <arg name="use_system_timestamp" value="$(var use_system_timestamp)"/>
+      </include>
+    </group>
 
     <!-- Static TFs (base_link->laser, IMU frames) now come from per-vehicle config
          so they can differ by SIM/CAR — edit config/CAR/static_transforms.yaml,
