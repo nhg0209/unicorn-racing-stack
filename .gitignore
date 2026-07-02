@@ -34,3 +34,6 @@ COLCON_IGNORE
 # rosbag recordings (local debugging only; keep the folder, ignore contents)
 /bags/*
 !/bags/.gitkeep
+
+# Large point-cloud map assets — distribute out-of-band, not via git
+stack_master/maps/**/*.pcd
