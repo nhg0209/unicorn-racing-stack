@@ -24,8 +24,8 @@ NOTE 2: notice that, when implementing new states, if an attribute/condition in 
 
 NOTE 3: transitions must not have side effects on the state machine!
     i.e. any attribute of the state machine should not be modified in the transitions.
-    (The UNICORN implementation does mutate overtaking_ttl_count / cur_start_wpnts here;
-     behaviour preserved as-is from the ROS1 stack.)
+    (overtaking_ttl_count is now updated by the node in _update_overtake_ttl, not here.
+     StartTransition still flips cur_start_wpnts.is_init - a remaining ROS1 carry-over.)
 """
 
 
@@ -65,16 +65,16 @@ def TrailingTransition(state_machine: "StateMachine") -> Tuple[StateType, StateT
 
 
 def OvertakingTransition(state_machine: "StateMachine") -> Tuple[StateType, StateType]:
-    """Transitions for being in `StateType.OVERTAKE`"""
+    """Transitions for being in `StateType.OVERTAKE` (pure: the ttl counter is updated by the node
+    in `_update_overtake_ttl`, not here)."""
     ot_sustainability = state_machine._check_overtaking_mode_sustainability()
     enemy_in_front = state_machine._check_enemy_in_front()
-    if ot_sustainability and enemy_in_front:
-        state_machine.overtaking_ttl_count = 0
+    # Stay in OVERTAKE while the path is still sustainable AND either an enemy is directly ahead or
+    # the ttl latch still has budget (keeps overtaking briefly after the enemy clears -> anti-chatter).
+    if ot_sustainability and (
+        enemy_in_front or state_machine.overtaking_ttl_count < state_machine.overtaking_ttl_count_threshold
+    ):
         return StateType.OVERTAKE, StateType.OVERTAKE
-    if ot_sustainability and state_machine.overtaking_ttl_count < state_machine.overtaking_ttl_count_threshold:
-        state_machine.overtaking_ttl_count += 1
-        return StateType.OVERTAKE, StateType.OVERTAKE
-    state_machine.overtaking_ttl_count = 0
     close_to_raceline = state_machine._check_close_to_raceline(0.05) * state_machine._check_close_to_raceline_heading(20)
     return GlobalTrackingTransition(state_machine, close_to_raceline)
 

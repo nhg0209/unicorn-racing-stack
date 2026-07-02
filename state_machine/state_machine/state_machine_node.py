@@ -270,6 +270,19 @@ class StateMachine(Node):
         self.overtaking_ttl_count = 0
         self.overtaking_ttl_count_threshold = int(self.overtaking_ttl_sec * self.rate_hz)
 
+        # Feasibility signal from the static avoidance planner (True until told otherwise, so the
+        # absence of the topic never silently blocks overtaking; the planner publishes False only
+        # when it finds no passable candidate).
+        self.static_avoidance_feasible = True
+
+        # Transition hysteresis (anti-chatter): a state must be held >= min_dwell_sec before it may
+        # switch to a NON-safe state. Switches toward the safe states bypass this. The counter/timer
+        # live on the node (not in the pure transition functions).
+        self.min_dwell_sec = self.params.min_dwell_sec
+        self._last_transition_time = self.now_sec()
+        self._committed_src = None
+        self._SAFE_STATES = {StateType.TRAILING, StateType.FTGONLY}
+
         self.save_start_traj = False
         self.cur_start_wpnts_candidate = OTWpntArray()
         self.need_start_traj = False
@@ -329,6 +342,11 @@ class StateMachine(Node):
             if self.ot_planner == "predictive_spliner":
                 self.create_subscription(
                     OTWpntArray, "/planner/avoidance/static_otwpnts", self.static_avoidance_cb, qos
+                )
+                # Feasibility gate from the static (Frenet-sampling) avoidance planner: False means
+                # it found no passable candidate -> the SM must not commit to a static OVERTAKE.
+                self.create_subscription(
+                    Bool, "/planner/avoidance/static_feasible", self.static_feasible_cb, qos
                 )
         if self.ot_planner == "predictive_spliner":
             self.create_subscription(Float32MultiArray, "/planner/avoidance/merger", self.merger_cb, qos)
@@ -545,6 +563,43 @@ class StateMachine(Node):
     def now_sec(self) -> float:
         return time_to_float(self.get_clock().now().to_msg())
 
+    def _commit_state(self, proposed_state, proposed_src, force=False):
+        """Apply a proposed (state, wpnts_src) with min_dwell transition hysteresis.
+
+        A switch to a NON-safe state is vetoed if it comes sooner than ``min_dwell_sec`` after the
+        last committed switch; on veto the previous state and its behaviour source are held for this
+        cycle. Switches toward the safe states (TRAILING, FTGONLY), staying in the same state, and
+        forced overrides (force_GBTRACK / FTGONLY sector) always commit immediately.
+        """
+        allow = (
+            force
+            or proposed_state == self.cur_state
+            or proposed_state in self._SAFE_STATES
+            or (self.now_sec() - self._last_transition_time) >= self.min_dwell_sec
+        )
+        if allow:
+            if proposed_state != self.cur_state:
+                self._last_transition_time = self.now_sec()
+            self.cur_state = proposed_state
+            self.local_wpnts_src = proposed_src
+            self._committed_src = proposed_src
+        else:
+            # hold the current state; reuse the last committed behaviour source for consistency
+            self.local_wpnts_src = self._committed_src if self._committed_src is not None else proposed_src
+
+    def _update_overtake_ttl(self, prev_state, proposed_state):
+        """Node-owned replacement for the counter mutation that used to live in
+        OvertakingTransition (which violated the 'transitions have no side effects' rule). Mirrors
+        the old latch: while staying in OVERTAKE, count up as long as the OT path is sustainable but
+        no enemy is directly ahead; reset on enemy / loss of sustainability / leaving OVERTAKE."""
+        if prev_state == StateType.OVERTAKE and proposed_state == StateType.OVERTAKE:
+            if self._check_enemy_in_front():
+                self.overtaking_ttl_count = 0
+            else:
+                self.overtaking_ttl_count += 1
+        else:
+            self.overtaking_ttl_count = 0
+
     #############
     # CALLBACKS #
     #############
@@ -661,6 +716,9 @@ class StateMachine(Node):
 
     def fail_trailing_cb(self, data):
         self.fail_trailing = data.data
+
+    def static_feasible_cb(self, data):
+        self.static_avoidance_feasible = data.data
 
     ######################################
     # ATTRIBUTES/CONDITIONS CALCULATIONS #
@@ -973,7 +1031,9 @@ class StateMachine(Node):
             f"gap={gap_dbg:.2f}(>{wd.on_spline_front_horizon_thres_m}),min_dist={md_dbg:.2f}(<{wd.on_spline_min_dist_thres_m})]",
             throttle_duration_sec=0.5,
         )
-        if c_speed and c_latest:
+        # Feasibility gate: the Frenet-sampling static planner publishes feasible=False when no
+        # passable candidate exists. Block the OVERTAKE commit and keep TRAILING in that case.
+        if c_speed and c_latest and self.static_avoidance_feasible:
             self.static_overtaking_mode = True
             return True
         else:
@@ -1416,14 +1476,17 @@ class StateMachine(Node):
             self.publish_not_ready_marker()
 
         if self.force_gbtrack_state:
-            self.cur_state = StateType.GB_TRACK
-            self.local_wpnts_src = StateType.GB_TRACK
+            self._commit_state(StateType.GB_TRACK, StateType.GB_TRACK, force=True)
         elif self._check_only_ftg_zone():
-            self.cur_state = StateType.FTGONLY
-            self.local_wpnts_src = StateType.FTGONLY
+            self._commit_state(StateType.FTGONLY, StateType.FTGONLY, force=True)
             self.get_logger().warn(f"[{self.name}] FTGONLY sector !!!")
         else:
-            self.cur_state, self.local_wpnts_src = self.state_transitions[self.cur_state](self)
+            prev_state = self.cur_state
+            proposed_state, proposed_src = self.state_transitions[self.cur_state](self)
+            # Own the overtaking-ttl side-effect that used to live in OvertakingTransition (keeps
+            # the transition functions pure) and apply the min_dwell transition hysteresis.
+            self._update_overtake_ttl(prev_state, proposed_state)
+            self._commit_state(proposed_state, proposed_src)
 
         if self.cur_state == StateType.TRAILING:
             self.check_ot_cloest_target()

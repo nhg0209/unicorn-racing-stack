@@ -39,6 +39,7 @@ class StateMachineParams:
         "static_ot_speed_mps",
         "getting_closer_rel_vel_mps",
         "static_ot_distance_m",
+        "min_dwell_sec",
     }
 
     def __init__(self, node: "StateMachine") -> None:
@@ -255,6 +256,18 @@ class StateMachineParams:
             ),
         )
         self.static_ot_distance_m: float = node.get_parameter("static_ot_distance_m").value
+
+        self._declare(
+            "min_dwell_sec", 0.2,
+            ParameterDescriptor(
+                description="Minimum time [s] a state must be held before switching to a non-safe "
+                            "state (transition hysteresis / anti-chatter). Switches TOWARD the safe "
+                            "states (TRAILING, FTGONLY) bypass this and are allowed immediately.",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=2.0, step=0.05)],
+            ),
+        )
+        self.min_dwell_sec: float = node.get_parameter("min_dwell_sec").value
 
         # Momentary rqt buttons (ROS1: served by dynamic_statemachine_server). When set
         # true they trigger an action and reset to false (done in the node timer, not
