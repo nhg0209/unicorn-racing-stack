@@ -37,3 +37,8 @@ COLCON_IGNORE
 stack_master/maps/ifac/ifac.pcd
 cyclonedds.log
 *.bak
+
+# per-machine local overrides (see unicorn.sh §5 and the CYCLONEDDS_URI block).
+# Base configs stay tracked; anything host-specific goes in these, never committed.
+unicorn.local.sh
+cyclonedds.local.xml

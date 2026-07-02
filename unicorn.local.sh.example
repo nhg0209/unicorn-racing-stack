@@ -1,0 +1,23 @@
+# unicorn.local.sh — per-machine overrides (NOT tracked; copy this file).
+#
+#   cp unicorn.local.sh.example unicorn.local.sh
+#
+# unicorn.sh sources this LAST (after conda + colcon + DDS setup), so anything here
+# overrides the tracked defaults. Use it for host-specific bits that must never be
+# committed: a different ROS_DOMAIN_ID, extra PATH/LD_LIBRARY_PATH, sensor enables,
+# hardware device paths, etc. Runs under bash AND zsh — keep it POSIX-ish.
+#
+# The repo root and workspace are available as $_URS_REPO and $_URS_WS.
+
+# --- examples (uncomment/edit as needed) ---
+
+# Put this host on its own DDS domain:
+# export ROS_DOMAIN_ID=7
+
+# Pin CycloneDDS to a specific interface on a multi-homed box (otherwise the tracked
+# cyclonedds.xml, which lists all known interfaces with presence_required="false",
+# is used). Alternatively drop a cyclonedds.local.xml next to unicorn.sh.
+# export CYCLONEDDS_URI="file://$_URS_REPO/cyclonedds.local.xml"
+
+# Extra runtime libs (e.g. a locally-built dependency in ~/.local):
+# export LD_LIBRARY_PATH="$HOME/.local/lib:${LD_LIBRARY_PATH:-}"

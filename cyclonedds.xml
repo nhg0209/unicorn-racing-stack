@@ -5,6 +5,8 @@
             <Interfaces>
                 <NetworkInterface address="127.0.0.1" multicast="true"/>
                 <NetworkInterface name="en1" multicast="true" presence_required="false"/>
+                <NetworkInterface name="wlp3s0" multicast="true" presence_required="false"/>
+                <NetworkInterface name="wlp9s0" multicast="true" presence_required="false"/>
             </Interfaces>
             <AllowMulticast>true</AllowMulticast>
         </General>

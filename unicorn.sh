@@ -70,7 +70,16 @@ export PATH="$(_urs_filter_path "$PATH")"
 # RMW_IMPLEMENTATION, so it must be (re)set AFTER activation — that is the whole
 # reason this lives in a sourced script instead of ~/.bashrc.
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-export CYCLONEDDS_URI="file://$_URS_REPO/cyclonedds.xml"
+# cyclonedds.xml (tracked) lists the known interfaces across machines (mac en1,
+# Linux wlp*/en*) with presence_required="false", so each host binds only the ones
+# it actually has. A machine that needs a different or pinned interface — e.g. a
+# multi-homed box where a tether NIC would otherwise be picked — drops a gitignored
+# cyclonedds.local.xml next to this script and it wins.
+if [ -f "$_URS_REPO/cyclonedds.local.xml" ]; then
+    export CYCLONEDDS_URI="file://$_URS_REPO/cyclonedds.local.xml"
+else
+    export CYCLONEDDS_URI="file://$_URS_REPO/cyclonedds.xml"
+fi
 
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-1}"
 
@@ -78,6 +87,20 @@ export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-1}"
 # colcon generates setup.{bash,zsh,sh}; source the one matching the live shell.
 if [ -n "${ZSH_VERSION:-}" ]; then _urs_setup=setup.zsh; else _urs_setup=setup.bash; fi
 [ -f "$_URS_WS/install/$_urs_setup" ] && source "$_URS_WS/install/$_urs_setup"
+
+# colcon's install/setup.bash re-injects the workspace's build-time parent prefix
+# (/opt/ros, recorded in the prefix chain) back into AMENT_PREFIX_PATH/PYTHONPATH/
+# CMAKE_PREFIX_PATH. That system rosidl then shadows conda's and nodes die at
+# startup ("Could not import rosidl_typesupport_c for package 'nav_msgs'" ->
+# gym_bridge + half the stack 'process has died'). The _urs_filter_path pass above
+# ran BEFORE this source, so re-strip the ROS leakage now (and after each cbuild).
+_urs_strip_leak() {
+    [ -n "${AMENT_PREFIX_PATH:-}" ] && export AMENT_PREFIX_PATH="$(_urs_filter_path "$AMENT_PREFIX_PATH")"
+    [ -n "${CMAKE_PREFIX_PATH:-}" ] && export CMAKE_PREFIX_PATH="$(_urs_filter_path "$CMAKE_PREFIX_PATH")"
+    [ -n "${PYTHONPATH:-}" ]        && export PYTHONPATH="$(_urs_filter_path "$PYTHONPATH")"
+    [ -n "${LD_LIBRARY_PATH:-}" ]   && export LD_LIBRARY_PATH="$(_urs_filter_path "$LD_LIBRARY_PATH")"
+}
+_urs_strip_leak
 export RAYCASTER_DIR="$_URS_REPO/race_utils/raycaster"
 
 # --- macOS portability (no-op on Linux) ---
@@ -128,7 +151,14 @@ cbuild() {
     ( cd "$_URS_WS" && colcon build "${sel[@]}" --symlink-install \
           --cmake-args -DCMAKE_BUILD_TYPE=Release ) \
         && source "$_URS_WS/install/$_urs_setup" \
-        && bash "$_URS_REPO/.install_utils/macos_link_rosidl_typesupports.sh" "$_URS_WS"
+        && bash "$_URS_REPO/.install_utils/macos_link_rosidl_typesupports.sh" "$_URS_WS" \
+        && _urs_strip_leak
 }
+
+# --- 5) per-machine overrides (gitignored) ---
+# Host-specific bits that must not live in the tracked script: extra PATH entries,
+# a different ROS_DOMAIN_ID, sensor enables, hardware paths, etc. Sourced LAST so it
+# overrides anything above. Copy unicorn.local.sh.example to unicorn.local.sh to use.
+[ -f "$_URS_REPO/unicorn.local.sh" ] && source "$_URS_REPO/unicorn.local.sh"
 
 echo "[unicorn] env ready  |  RMW=$RMW_IMPLEMENTATION  ROS_DOMAIN_ID=$ROS_DOMAIN_ID  |  helpers: cbuild, ros2kill"
