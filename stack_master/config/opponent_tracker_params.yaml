@@ -47,5 +47,10 @@ tracking:
     # raised from 3 so brief detection gaps don't drop the obstacle and stall the OVERTAKE commit.
     ttl_static: 15
     vs_reset: 0.1
+    # position-persistence demotion guard: a CONFIRMED static obstacle reverts to dynamic only when
+    # the measured position stays > demote_disp_m from its mean for demote_time_s (so single-frame
+    # velocity/position noise can't flip a genuinely static box).
+    demote_disp_m: 0.5
+    demote_time_s: 0.5
     measure: false
     from_bag: false

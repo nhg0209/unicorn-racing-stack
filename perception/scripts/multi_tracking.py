@@ -193,6 +193,11 @@ class ObstacleSD:
     ttl = None
     min_std = None
     max_std = None
+    # demotion guard: once confirmed static, only revert to dynamic when the measured position
+    # stays > demote_disp [m] from the established mean for demote_min_count consecutive updates
+    # (so a single-frame velocity/position spike can't flip a genuinely static obstacle).
+    demote_disp = None
+    demote_min_count = None
 
     def __init__(self, id, s_meas, d_meas, lap, size, isVisible):
         """
@@ -205,6 +210,7 @@ class ObstacleSD:
         self.mean = [s_meas, d_meas]  # [mean_s. mean_d]
         self.static_count = 0
         self.total_count = 0
+        self.demote_count = 0
         self.nb_meas = 0
         self.ttl = ObstacleSD.ttl
         self.isInFront = True
@@ -255,6 +261,25 @@ class ObstacleSD:
     def isStatic(self, track_length):
         # --- get a representative data set for the obstacle ---
         if self.nb_meas > ObstacleSD.min_nb_meas:
+            # --- already confirmed static: don't demote on single-frame noise ---
+            # Only revert to dynamic once the latest measurement stays > demote_disp from the mean
+            # for demote_min_count consecutive updates (sustained displacement = it really moved).
+            if self.staticFlag is True and ObstacleSD.demote_disp is not None:
+                disp = math.hypot(
+                    normalize_s(self.measurments_s[-1] - self.mean[0], track_length),
+                    self.measurments_d[-1] - self.mean[1],
+                )
+                if disp > ObstacleSD.demote_disp:
+                    self.demote_count += 1
+                else:
+                    self.demote_count = 0
+                if self.demote_count >= ObstacleSD.demote_min_count:
+                    self.staticFlag = False
+                    self.static_count = 0
+                    self.total_count = 0
+                    self.demote_count = 0
+                return
+
             std_s = self.std_s(track_length)
             std_d = self.std_d()
             # --- create a voting system so that the outliers don't affect much the result ---
@@ -360,6 +385,9 @@ class StaticDynamic(Node):
         self.ttl_dynamic = self._get_param("ttl_dynamic")
         self.ttl_static = self._get_param("ttl_static")
         self.vs_reset = self._get_param("vs_reset")
+        # position-persistence demotion guard (static -> dynamic only on sustained displacement)
+        self.demote_disp_m = self._get_param("demote_disp_m", 0.5)
+        self.demote_time_s = self._get_param("demote_time_s", 0.5)
 
         # dyn params sub
         Opponent_state.ttl = self.ttl_dynamic
@@ -368,6 +396,8 @@ class StaticDynamic(Node):
         ObstacleSD.min_nb_meas = self.min_nb_meas
         ObstacleSD.min_std = self.min_std
         ObstacleSD.max_std = self.max_std
+        ObstacleSD.demote_disp = self.demote_disp_m
+        ObstacleSD.demote_min_count = max(1, int(self.demote_time_s * self.rate))
         self.vs_reset = self.vs_reset
 
         # save-back path (ROS1 dynamic_tracker_server wrote both detect + tracking
@@ -427,10 +457,15 @@ class StaticDynamic(Node):
         Opponent_state.ttl = self.ttl_dynamic
         Opponent_state.ratio_to_glob_path = self.ratio_to_glob_path
 
+        self.demote_disp_m = self._get_param("demote_disp_m", 0.5)
+        self.demote_time_s = self._get_param("demote_time_s", 0.5)
+
         ObstacleSD.ttl = self.ttl_static
         ObstacleSD.min_nb_meas = self.min_nb_meas
         ObstacleSD.min_std = self.min_std
         ObstacleSD.max_std = self.max_std
+        ObstacleSD.demote_disp = self.demote_disp_m
+        ObstacleSD.demote_min_count = max(1, int(self.demote_time_s * self.rate))
 
         obstacle_params = [ObstacleSD.ttl, ObstacleSD.min_nb_meas, ObstacleSD.min_std, ObstacleSD.max_std]
         print(f'[Tracking] Dynamic reconf triggered new tracking params: Tracking TTL: {Opponent_state.ttl}, Ratio to glob path: {Opponent_state.ratio_to_glob_path}\n'
@@ -476,6 +511,8 @@ class StaticDynamic(Node):
                 'ttl_dynamic': int(self.ttl_dynamic),
                 'ttl_static': int(self.ttl_static),
                 'vs_reset': float(self.vs_reset),
+                'demote_disp_m': float(self.demote_disp_m),
+                'demote_time_s': float(self.demote_time_s),
                 'save_params': False,
             }
             data.setdefault('tracking', {})['ros__parameters'] = tracking_params
@@ -875,6 +912,9 @@ class StaticDynamic(Node):
             elif obs.staticFlag:
                 obs_msg.s_center = obs.mean[0]
                 obs_msg.d_center = obs.mean[1]
+                # expose the position-persistence variance (was only set on the dynamic KF branch)
+                obs_msg.s_var = float(obs.std_s(self.track_length) ** 2)
+                obs_msg.d_var = float(obs.std_d() ** 2)
             else:
                 if obs.dynamic_state.isInitialised:
                     if obs.dynamic_state.dynamic_kf.P[0][0] < self.var_pub:
