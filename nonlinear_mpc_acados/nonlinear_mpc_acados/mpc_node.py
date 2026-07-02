@@ -2137,6 +2137,10 @@ class MPCNode(Node):
                 kappa_signed = float(self.mpc.signed_kappa_lut(current_s % L))
             except Exception:
                 pass
+        _now_s = self.get_clock().now().nanoseconds * 1e-9
+        if getattr(self, "_dbg_t0", None) is None:
+            self._dbg_t0 = _now_s
+        t_ctrl = _now_s - self._dbg_t0
         dbg = Float32MultiArray()
         dbg.data = [
             float(con_first[0]),       # 0  a_x cmd (unified u[0]; was v_cmd pre-2026-06-10)
@@ -2163,6 +2167,10 @@ class MPCNode(Node):
             float(getattr(self.mpc, 'q_v_scale_live', 1.0)),      # 20
             float(getattr(self.mpc, 'q_drate_scale_live', 1.0)),  # 21
             float(getattr(self.mpc, 'v_max', 0.0)),                # 22 v_max_cost
+            float(t_ctrl),                                         # 23 t_ctrl (node clock; sim-time aware)
+            1.0 if opti_value < 1e8 else 0.0,                      # 24 feasible (== /mpc/is_feasible)
+            float(x0[4]),                                          # 25 vy  (EKF body lateral vel, x0[4])
+            float(x0[5]),                                          # 26 r   (EKF yaw rate, x0[5])
         ]
         self.mpc_debug_pub.publish(dbg)
 

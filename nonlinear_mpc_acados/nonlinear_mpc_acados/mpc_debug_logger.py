@@ -47,7 +47,24 @@ DBG_FIELDS = [
     "kappa_abs", "kappa_signed",
     "q_cte_scale", "q_lag_scale", "q_v_scale", "q_drate_scale",
     "v_max_cost",  # mpc.v_max (cost target). auto_step 이 동적 변경.
+    # 2026-06-29 atomic 추가 — /mpc_debug 인덱스 23,24 (mpc_node 와 동기 필수):
+    "t_ctrl",       # 23 control-loop 시각 (node clock, sim-time aware)
+    "feasible_msg", # 24 solver feasible (opti_value < 1e8)
+    # 2026-06-29 (2단계) atomic EKF 속도상태 — /mpc_debug 인덱스 25,26:
+    "vy_ekf",       # 25 x0[4] EKF body lateral velocity
+    "r_ekf",        # 26 x0[5] EKF yaw rate
 ]
+
+def csv_header() -> list:
+    """메인 CSV / 이벤트 dump 공통 헤더. GP(extract_residuals)가 이름으로 읽음."""
+    return ["t", "lap"] + DBG_FIELDS + [
+        "feasible", "min_lateral_margin",
+        "pred_dx_n0", "pred_dy_n0",
+        "pred_x_end", "pred_y_end",
+        "mpcc_active", "switch_count",
+        "vx_odom", "vy_odom", "r_odom",
+    ]
+
 
 LAP_JUMP_THRESHOLD = 5.0  # current_s big-to-small drop triggers lap +1
 
@@ -93,14 +110,7 @@ class MPCDebugLogger(Node):
         self.csv_path = os.path.join(log_dir, f"mpc_{ts}.csv")
         self.csv_file = open(self.csv_path, "w", newline="")
         self.csv = csv.writer(self.csv_file)
-        header = ["t", "lap"] + DBG_FIELDS + [
-            "feasible", "min_lateral_margin",
-            "pred_dx_n0", "pred_dy_n0",
-            "pred_x_end", "pred_y_end",
-            "mpcc_active", "switch_count",
-            "vx_odom", "vy_odom", "r_odom",
-        ]
-        self.csv.writerow(header)
+        self.csv.writerow(csv_header())
         self.csv_file.flush()
         self.get_logger().info(f"[mpc_debug_logger] CSV → {self.csv_path}")
 
@@ -133,10 +143,20 @@ class MPCDebugLogger(Node):
 
     # ── callbacks ─────────────────────────────────────────────────
     def cb_dbg(self, msg: Float32MultiArray):
-        if len(msg.data) < len(DBG_FIELDS):
-            return
+        if len(msg.data) != len(DBG_FIELDS):
+            if not getattr(self, "_warned_len", False):
+                self.get_logger().warn(
+                    f"[mpc_debug_logger] /mpc_debug 길이 {len(msg.data)} != "
+                    f"기대 {len(DBG_FIELDS)} — mpc_node/logger DBG_FIELDS 동기 확인. "
+                    "가능한 만큼만 기록.")
+                self._warned_len = True
+            if len(msg.data) < len(DBG_FIELDS):
+                return
         d = dict(zip(DBG_FIELDS, msg.data))
         self.last_dbg = d
+        # atomic feasible: 같은 사이클·같은 메시지값으로 갱신 (토픽 skew 제거).
+        if "feasible_msg" in d:
+            self.last_feasible = bool(d["feasible_msg"])
 
         s = float(d.get("current_s", 0.0))
         if self.last_s is not None and (self.last_s - s) > LAP_JUMP_THRESHOLD:
@@ -171,7 +191,7 @@ class MPCDebugLogger(Node):
             pe = self.last_pred_path.poses[-1].pose.position
             pred_dx0, pred_dy0 = p1.x - p0.x, p1.y - p0.y
             pred_xe, pred_ye = pe.x, pe.y
-        row = [time.time() - self.start_time, self.lap] + \
+        row = [d.get("t_ctrl", time.time() - self.start_time), self.lap] + \
               [d.get(k, 0.0) for k in DBG_FIELDS] + \
               [int(self.last_feasible),
                margin if margin is not None else float("nan"),
@@ -268,14 +288,9 @@ class MPCDebugLogger(Node):
                             f"event_{ts}_{reason}_{self.event_count:03d}.csv")
         f = open(path, "w", newline="")
         w = csv.writer(f)
-        header = ["t", "lap"] + DBG_FIELDS + [
-            "feasible", "min_lateral_margin",
-            "pred_dx_n0", "pred_dy_n0", "pred_x_end", "pred_y_end",
-            "trigger",
-        ]
-        w.writerow(header)
+        w.writerow(csv_header())
         for r in self.ring_before:
-            w.writerow(list(r) + [""])
+            w.writerow(list(r))
         self.active_event = {
             'file': f, 'writer': w,
             'remaining': self.event_capture_after,

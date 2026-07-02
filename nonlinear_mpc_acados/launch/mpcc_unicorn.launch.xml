@@ -34,6 +34,8 @@
 
   <!-- acados 런타임 libs: unicorn.sh 가 DYLD 를 필터링하므로 launch 에서 직접 주입.
        => run_mpcc.sh 없이 'ros2 launch' 만으로 동작 (IFAC2026 방식). -->
+  <arg name="enable_logger" default="true" description="mpc_debug_logger CSV 기록 노드 on/off"/>
+
   <set_env name="DYLD_LIBRARY_PATH" value="$(env HOME)/acados/lib:$(env DYLD_LIBRARY_PATH '')"/>
   <set_env name="LD_LIBRARY_PATH" value="$(env HOME)/acados/lib:$(env LD_LIBRARY_PATH '')"/>
 
@@ -56,5 +58,9 @@
     <remap from="/vesc/odom" to="/car_state/odom"/>
     <remap from="/external_obstacles" to="$(var obstacle_topic)"/>
   </node>
+
+  <!-- 디버그 CSV 로거 (관측 전용; enable_logger 로 on/off) -->
+  <node pkg="nonlinear_mpc_acados" exec="mpc_debug_logger" name="mpc_debug_logger" output="screen"
+        if="$(var enable_logger)"/>
 
 </launch>

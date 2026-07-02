@@ -30,6 +30,7 @@ setup(
             'ftg_fallback_node = nonlinear_mpc_acados.ftg_fallback_node:main',
             'pp_fallback_node = nonlinear_mpc_acados.pp_fallback_node:main',
             'scan_obstacle_detector = nonlinear_mpc_acados.scan_obstacle_detector:main',
+            'speed_monitor = nonlinear_mpc_acados.speed_monitor_node:main',
         ],
     },
 )

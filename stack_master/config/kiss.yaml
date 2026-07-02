@@ -41,6 +41,10 @@ kiss_icp_localization:
     scan_voxel_size: 0.35            # 3D Livox cloud is dense; 0.35 keeps ICP real-time (bag-tuned)
     min_range: 0.3                   # drop near-body returns
     max_range: 60.0                  # Livox MID360 range
+    # Lift the map ground to z=0 so base_link/odom lands on the 2D /map grid (which
+    # is drawn at z=0) instead of sinking below it. Set to |base_link z| you read
+    # from `tf2_echo map base_link` (GLIM refs map z=0 to sensor height). 0 = off.
+    map_z_offset: 0.158             # measured |base_link z| (tf2_echo) -> ground to z=0
 
     # ---- 2D scan-to-SDF registration + safety ----
     loc_2d_corr_gain: 0.3            # complementary low-pass (cuts per-scan yaw jitter)

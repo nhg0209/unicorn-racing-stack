@@ -51,9 +51,8 @@ setup(
             'global_planner_node = gb_optimizer.global_planner_node:main',
             'global_trajectory_publisher = gb_optimizer.global_trajectory_publisher:main',
             'global_trajectory_tuner = gb_optimizer.global_trajectory_tuner:main',
-            # IFAC2026-ported 2-stage IQP->SP generator (with [map]_modi.png guidance)
-            'centerline_extractor = gb_optimizer.centerline_extractor:main',
-            'trajectory_optimizer = gb_optimizer.trajectory_optimizer:main',
+            'static_reopt_node = gb_optimizer.static_reopt_node:main',
+            'static_obstacle_layer = gb_optimizer.static_obstacle_layer:main',
         ],
     },
 )
