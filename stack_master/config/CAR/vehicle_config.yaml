@@ -38,8 +38,8 @@ vesc/**:
     servo_min: 0.0
     speed_max: 23250.0
     speed_min: -23250.0
-    speed_to_erpm_gain: 4614.0
+    speed_to_erpm_gain: 4014.0
     speed_to_erpm_offset: 0.0
-    steering_angle_to_servo_gain: -1.2135
-    steering_angle_to_servo_offset: 0.5304
+    steering_angle_to_servo_gain: 0.5
+    steering_angle_to_servo_offset: 0.57
     use_servo_cmd_to_calc_angular_velocity: true
