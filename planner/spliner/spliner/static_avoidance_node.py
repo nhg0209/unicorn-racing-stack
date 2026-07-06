@@ -452,7 +452,7 @@ class ObstacleSpliner(Node):
                 n_obs += 1
                 continue
             xy = xy_all[k]
-            if self.use_grid_check and self._path_hits_grid(xy):
+            if self.use_grid_check and self._path_off_track(xy):
                 n_grid += 1
                 continue
             psi_, kappa_ = tph.calc_head_curv_num.calc_head_curv_num(
@@ -514,12 +514,18 @@ class ObstacleSpliner(Node):
         self._publish_feasible(True)
         return wpnts, self._candidate_markers(xy_all, status, best_k)
 
-    def _path_hits_grid(self, xy: np.ndarray) -> bool:
-        """True if any path point lands on an occupied (eroded-map) cell. Early-exits."""
+    def _path_off_track(self, xy: np.ndarray) -> bool:
+        """True if any path point is NOT in free/drivable space (on/near a wall). Early-exits.
+
+        NOTE: GridFilter.is_point_inside() returns True when the point is INSIDE the free
+        (eroded) drivable area and False on/near a wall -- so a candidate is rejected when a
+        point is NOT inside. The map-not-loaded guard is essential: without it every point
+        reads 'not inside' and all candidates would be rejected.
+        """
         if getattr(self.map_filter, "eroded_image", None) is None:
-            return False
+            return False   # no map yet -> rely on the waypoint corridor bounds only
         for x, y in xy:
-            if self.map_filter.is_point_inside(float(x), float(y)):
+            if not self.map_filter.is_point_inside(float(x), float(y)):
                 return True
         return False
 
