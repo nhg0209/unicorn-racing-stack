@@ -1,15 +1,15 @@
 detect:
   ros__parameters:
     rate_detect: 40
-    min_size_n: 4
+    min_size_n: 5
     min_size_m: 0.29999999999999999
     max_size_m: 0.59999999999999998
     lambda_deg: 10
     sigma: 0.029999999999999999
     min_2_points_dist: 0.01
     new_cluster_threshold_m: 0.40000000000000002
-    max_viewing_distance: 15
-    boundaries_inflation: 0.10000000000000001
+    max_viewing_distance: 10   # 15->10: 40 m track, 15 m saw obstacles half a lap away (too early).
+    boundaries_inflation: 0.15  # 0.10->0.15: reject wall points nearer the track bound as false obstacles.
     filter_kernel_size: 7
     measure: false
     from_bag: false
@@ -31,14 +31,14 @@ tracking:
     var_pub: 1.0
     aggro_multi: 2.0
     dist_deletion: 7.0
-    dist_infront: 14.0
+    dist_infront: 11.0   # 14->11: forward interest distance; tightens how far ahead a track counts as "in front".
     max_std: 0.2
     min_std: 0.16
-    min_nb_meas: 5
+    min_nb_meas: 6
     # false = keep a tracked STATIC obstacle alive across missed detection frames (memory on).
     # With true + low ttl_static the obstacle was dropped after 3 missed frames, so /tracking/obstacles
     # flickered empty and the spline/OVERTAKE commit flickered -> the car crawled up before avoiding.
-    noMemoryMode: false
+    noMemoryMode: true
     debug_mode: false
     publish_static: true
     ratio_to_glob_path: 0.6

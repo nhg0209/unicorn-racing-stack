@@ -21,6 +21,8 @@
 <launch>
   <arg name="map"        description="Map name (folder in stack_master/maps/)"/>
   <arg name="sim"        default="false" description="Use simulator (true) or real hardware (false)"/>
+  <arg name="localization" default="kiss" description="Real-car localization: cartographer | pf | kiss (ignored in sim, which uses gym ground truth)"/>
+  <arg name="detection_source" default="kiss" description="Obstacle detection front-end: kiss (Livox 3D BevDetector -> kiss_obstacle_bridge) | scan (2D perception/detect on /scan, Hokuyo or pointcloud_to_laserscan)"/>
   <arg name="virtual"    default="$(var sim)" description="Inject a virtual opponent + static obstacles (on by default in sim, off on the real car; e.g. virtual:=true to overlay a virtual opponent onto the real LiDAR)"/>
   <arg name="ot_planner" default="predictive_spliner" description="overtake planner the state machine listens to (ROS1 default = predictive_spliner: listens to BOTH /planner/avoidance/otwpnts (dynamic) AND /planner/avoidance/static_otwpnts (static))"/>
   <arg name="control_topic" default="/local_waypoints"
@@ -42,9 +44,10 @@
 
   <!-- ===== Base system: sensors/sim + opponent + raceline + frenet odom ===== -->
   <include file="$(find-pkg-share stack_master)/launch/base_system.launch.xml">
-    <arg name="map"     value="$(var map)"/>
-    <arg name="sim"     value="$(var sim)"/>
-    <arg name="virtual" value="$(var virtual)"/>
+    <arg name="map"          value="$(var map)"/>
+    <arg name="sim"          value="$(var sim)"/>
+    <arg name="localization" value="$(var localization)"/>
+    <arg name="virtual"      value="$(var virtual)"/>
     <arg name="reopt"   value="$(var reopt)"/>
     <arg name="reopt_safety_width" value="$(var reopt_safety_width)"/>
   </include>
@@ -53,10 +56,21 @@
        detect publishes /detect/raw_obstacles (Frenet filled at the source);
        tracking reads it and publishes /tracking/obstacles_raw. tracking_merger
        (sim virtual_perception) owns /tracking/obstacles. -->
-  <node pkg="perception" exec="detect" name="detect" output="screen">
-    <param from="$(find-pkg-share stack_master)/config/opponent_tracker_params.yaml"/>
-    <param name="map" value="$(var map)"/>
-  </node>
+  <!-- detection_source=scan: 2D perception/detect on /scan (Hokuyo, or Livox via
+       pointcloud_to_laserscan). Fills /detect/raw_obstacles from the laser scan. -->
+  <group if="$(eval '\'$(var detection_source)\' == \'scan\'')">
+    <node pkg="perception" exec="detect" name="detect" output="screen">
+      <param from="$(find-pkg-share stack_master)/config/opponent_tracker_params.yaml"/>
+      <param name="map" value="$(var map)"/>
+    </node>
+  </group>
+
+  <!-- detection_source=kiss: Livox 3D native. kiss's BevDetector (detect_en:true in
+       the kiss config) publishes cluster centers on /kiss_loc/obstacle_poses; the
+       bridge converts them to /detect/raw_obstacles (Frenet-filled) for tracking. -->
+  <group if="$(eval '\'$(var detection_source)\' == \'kiss\'')">
+    <node pkg="perception" exec="kiss_obstacle_bridge" name="kiss_obstacle_bridge" output="screen"/>
+  </group>
   <!-- with virtual:=true tracking_merger owns /tracking/obstacles, so tracking feeds it
        on /tracking/obstacles_raw; without it, tracking publishes /tracking/obstacles directly -->
   <let name="tracking_out" value="/tracking/obstacles_raw" if="$(var virtual)"/>

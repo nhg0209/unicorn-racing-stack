@@ -10,7 +10,10 @@ free_scaling_reference_distance_m: 2.0
 # a perfectly-fresh 20 Hz spline reads as 0.3-0.5 s "old". At 0.1 s the freshness gate NEVER passed
 # and the car never committed to OVERTAKE (it trailed/crawled to the obstacle). 0.6 s tolerates the
 # executor lag; a static obstacle's escape path does not go stale in 0.6 s (car moves < ~4 m).
-latest_threshold: 0.6
+# Raised 0.6 -> 1.0: the car slow-trailed a feasible-but-uncommitted obstacle all the way to a
+# collision (g_near 0.44 m) because the freshness gate intermittently exceeded 0.6 s of executor
+# lag, so the OVERTAKE commit never sustained. 1.0 s still bounds staleness (car moves < ~7 m).
+latest_threshold: 1.0
 hyst_timer_sec: 4.0
 killing_timer_sec: 10.0
 on_spline_front_horizon_thres_m: 0.5

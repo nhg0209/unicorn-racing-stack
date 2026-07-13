@@ -64,4 +64,11 @@ install(PROGRAMS
   RENAME tracking_node
 )
 
+# kiss BEV-detector -> /detect/raw_obstacles bridge (Livox 3D detection path).
+install(PROGRAMS
+  scripts/kiss_obstacle_bridge.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME kiss_obstacle_bridge
+)
+
 ament_package()

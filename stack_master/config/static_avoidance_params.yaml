@@ -11,24 +11,43 @@ static_avoidance_planner:
     lookahead_k: 1.5        # [s]  lookahead = max(lookahead_min, lookahead_k * cur_vs)
 
     # --- terminal-offset sampling ---
-    n_d_samples: 13         # number of lateral offsets sampled across the drivable width at the obstacle
+    n_d_samples: 20         # number of lateral offsets sampled across the drivable width at the obstacle
     width_car: 0.30         # [m]  car width (half is reserved as clearance to walls/obstacles)
-    safety_margin: 0.05     # [m]  extra clearance around the obstacle box (tight-track: keep small)
+    safety_margin: 0.16     # [m]  extra clearance around the obstacle box. obs_margin = half_car(0.15)+
+                            #      safety must cover the SIM ego collision radius (0.29 m = half car
+                            #      LENGTH in gym_bridge); 0.16 -> 0.31 clears it so the car no longer
+                            #      grazes-then-teleports. Lower live (ros2 param set) if a tight section
+                            #      rejects every candidate; raise if the car still clips the box.
     wall_margin: 0.05       # [m]  how close to the wall a candidate may reach (corridor room)
 
-    # --- maneuver shape: stay on raceline -> ramp to offset -> hold across obstacle -> ramp back to 0 ---
-    # The path MUST return to the raceline after the obstacle: a held offset violates the narrow
-    # corridor downstream and rejects every candidate (all-red). Slalom handled by replanning.
-    shift_min: 1.0          # [m]  min arc length over which the lateral shift completes (no jerk)
-    shift_buffer: 0.5       # [m]  finish the shift this far before the obstacle's near edge
-    ramp_len: 4.0           # [m]  ramp length onto the offset (stay on the raceline before it)
-    hold_after: 0.5         # [m]  hold the offset this far past the obstacle far-edge
-    return_len: 2.5         # [m]  ramp length back to the raceline after the obstacle
-    tail_m: 1.0             # [m]  short raceline (d=0) tail after the return (on_spline horizon)
+    # --- maneuver shape: gentle ramp OUT -> APEX (peak offset at obstacle, curvature loaded) -> gentle ramp back ---
+    # Two quintics meet at the apex; outer ends are tangent to the raceline (d''=0) so entry/exit are
+    # gentle and the sharpest bend sits right beside the obstacle. Must still return to the raceline
+    # (a held offset violates the narrow corridor downstream -> all-red). Slalom handled by replanning.
+    shift_min: 1.0          # [m]  min apex arc length (keeps the apex ahead of the car when very close)
+    shift_buffer: 1.0       # [m]  (unused in apex-loaded profile; kept for param compatibility)
+    ramp_len: 3.0           # [m]  gentle entry-ramp length (raceline -> apex)
+    hold_after: 0.5         # [m]  (unused in apex-loaded profile; kept for param compatibility)
+    return_len: 3.0         # [m]  gentle exit-ramp length (apex -> raceline)
+    apex_bulge: 0.10        # [m] extra offset at the box CENTRE beyond the clearance value: the path peaks
+                            #      here (widest, furthest from the obstacle). higher = swing WIDER around the
+                            #      obstacle; 0 = flat hold. Limited by corridor (bulge past the wall -> reject).
+    max_weave: 1            # max obstacles woven into ONE path (slalom). 1 = single-apex (old behavior).
+                            #       Weaving an apex per obstacle sets up the NEXT obstacle before the
+                            #       previous is passed, so close pairs no longer collide.
+    tail_m: 0.0             # [m]  short raceline (d=0) tail after the return (on_spline horizon)
 
     # --- feasibility limits ---
-    kappa_max: 2.0          # [1/m] reject candidates whose max curvature exceeds this (min turn radius)
+    # Curvature is checked CORNER-FAIR: bound the curvature the maneuver ADDS over the raceline
+    # (kappa_add_max) AND an absolute steering ceiling (kappa_abs_max). An absolute-only check
+    # rejected every offset in a corner (raceline curvature alone ate the budget) -> flat spline,
+    # no avoidance. kappa_max is kept only as a DEPRECATED alias of kappa_abs_max.
+    kappa_add_max: 5.0      # [1/m] max curvature the maneuver may ADD over the raceline
+    kappa_abs_max: 5.5      # [1/m] absolute curvature ceiling (physical min turn radius)
     a_lat_max: 6.0          # [m/s^2] lateral-accel cap used for v = min(v_gb, sqrt(a_lat_max/kappa))
+    a_long_max: 4.0         # [m/s^2] longitudinal DECEL; backward pass brakes EARLY into the apex (slow-in)
+    a_long_accel: 3.0       # [m/s^2] longitudinal ACCEL; forward pass ramps speed up GRADUALLY out of the
+                            #         apex (fast-out). lower = gentler/longer exit acceleration.
     use_grid_check: true    # reject candidates crossing the eroded /map (GridFilter)
     kernel_size: 3          # [cells] GridFilter erosion (8 ate ~0.2 m and rejected the raceline on ifac)
 

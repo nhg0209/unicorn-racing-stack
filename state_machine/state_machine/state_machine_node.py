@@ -679,6 +679,11 @@ class StateMachine(Node):
             self.obstacles = data.obstacles
             obstacles_in_interest = []
             for obs in data.obstacles:
+                # detection-gated: ignore a remembered (currently-unseen) STATIC obstacle so state
+                # decisions track what the car actually sees, not a stored position ("knows in
+                # advance"). Dynamic obstacles are left as-is (handled via prediction + short ttl).
+                if obs.is_static and not obs.is_visible:
+                    continue
                 gap = (obs.s_start - self.cur_s) % self.track_length
                 if gap < self.interest_horizon_m:
                     obstacles_in_interest.append((gap, obs))
@@ -1341,6 +1346,40 @@ class StateMachine(Node):
             self.cur_gb_wpnts.initialize_traj(self.gb_wpnts)
         else:
             self.cur_gb_wpnts.list = self.gb_wpnts.wpnts
+        # Refresh the FOLLOWED avoidance trajectory only when the newly published spline MEANINGFULLY
+        # differs from the cached one (a re-detected / new obstacle changed the required lateral offset).
+        # Refreshing every cycle made the controller chase the planner's per-cycle re-anchoring jitter
+        # (path oscillation); never refreshing left OVERTAKE stuck on a stale path when a new obstacle
+        # appeared. So: keep the STABLE cached path for small cycle-to-cycle wiggles (only bump its
+        # freshness stamp) and swap to the new one only on a real change. Empty/stale publishes are left
+        # cached so the availability timers still expire OVERTAKE once the obstacle is passed.
+        # Refresh the FOLLOWED path only on a genuine NEW requirement: a BIGGER offset (a closer / new
+        # obstacle needs more room) or the OPPOSITE side (a new obstacle on the other side). A smaller
+        # same-side peak is just the planner returning to the raceline as the CURRENT obstacle slides
+        # behind -- following that mid-maneuver cuts the car back while still beside the box (the "path
+        # twists" symptom), so keep the committed spline (its exit ramp already eases back AFTER the box).
+        # When we KEEP the cached path we do NOT touch its stamp: _check_on_spline already sustains
+        # OVERTAKE while the car is on it, and letting the stamp age lets the availability timers expire
+        # OVERTAKE normally once the obstacle is passed (bumping the stamp used to wedge OVERTAKE on so it
+        # never exited / re-triggered).
+        OT_REFRESH_D_THRESH = 0.15   # [m] peak-offset change that counts as a new path (not tracking jitter)
+        for src, cur in ((self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts),
+                         (self.avoidance_wpnts, self.cur_avoidance_wpnts)):
+            if src is None or len(src.wpnts) == 0:
+                continue
+            if (self.now_sec() - time_to_float(src.header.stamp)) > cur.latest_threshold:
+                continue
+            if not cur.is_init or cur.list is None or len(cur.list) == 0:
+                cur.initialize_traj(src)
+                continue
+            peak_src = max((w.d_m for w in src.wpnts), key=abs, default=0.0)
+            peak_cur = max((w.d_m for w in cur.list), key=abs, default=0.0)
+            if peak_src * peak_cur >= 0.0:            # same side (or one is ~raceline)
+                refresh = abs(peak_src) - abs(peak_cur) > OT_REFRESH_D_THRESH   # only if it needs MORE offset
+            else:                                     # opposite side -> a new obstacle the other way
+                refresh = abs(peak_src) > OT_REFRESH_D_THRESH
+            if refresh:
+                cur.initialize_traj(src)              # real new requirement -> follow the new path
         self.cur_obstacles_in_interest = self.obstacles_in_interest
         return
 

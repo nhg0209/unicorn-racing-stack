@@ -693,6 +693,11 @@ class StaticDynamic(Node):
         """
         Checks if an obstacle is in the field of view by checking the corresponding lidar beams
         """
+        # Livox 3D path: no /scan (this check is hardcoded to the Hokuyo 270deg/1080-beam
+        # geometry). kiss already track-mask filters off-track points, so treat as visible.
+        if self.scans is None:
+            return True
+
         dist_to_obs = np.linalg.norm(vec_car_to_obs)
 
         angle = self.angle_to_obs(vec_car_to_obs, car_orientation_copy)

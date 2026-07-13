@@ -33,6 +33,21 @@ SMOOTH_OTWPNTS = True
 # real ~2 m evasion bends.
 SMOOTH_OTWPNTS_WINDOW = 11
 SMOOTH_OTWPNTS_POLYORDER = 2
+# Savitzky-Golay window for the velocity profile (odd, waypoints). Smooths the raceline-speed lookup
+# (sector-boundary steps / index quantization) and the final min()-crossover corners.
+SMOOTH_VEL_WINDOW = 9
+
+
+def _savgol_safe(arr: np.ndarray, window: int) -> np.ndarray:
+    """Savitzky-Golay smoothing that no-ops on arrays too short for the window/polyorder."""
+    if arr.size <= SMOOTH_OTWPNTS_POLYORDER + 2:
+        return arr
+    win = min(window, arr.size)
+    if win % 2 == 0:
+        win -= 1
+    if win <= SMOOTH_OTWPNTS_POLYORDER:
+        return arr
+    return savgol_filter(arr, win, SMOOTH_OTWPNTS_POLYORDER)
 
 
 class ObstacleSpliner(Node):
@@ -93,15 +108,28 @@ class ObstacleSpliner(Node):
         self.lookahead_min = 8.0     # [m]
         self.lookahead_k = 1.5       # [s]  lookahead = max(lookahead_min, k * cur_vs)
         self.n_d_samples = 13        # terminal offsets sampled across the width
-        self.kappa_max = 2.0         # [1/m] curvature reject limit (min turn radius)
+        # Curvature feasibility is corner-fair: budget the curvature the MANEUVER adds over the
+        # raceline (kappa_add_max) AND keep an absolute steering ceiling (kappa_abs_max = physical
+        # min turn radius). An absolute-only check rejected every offset in a corner because the
+        # raceline curvature alone already ate the budget -> flat spline, no avoidance.
+        self.kappa_add_max = 2.0     # [1/m] max curvature the maneuver may ADD over the raceline
+        self.kappa_abs_max = 3.5     # [1/m] absolute curvature ceiling (min turn radius)
         self.a_lat_max = 6.0         # [m/s^2] lateral-accel cap for the velocity profile
-        self.safety_margin = 0.05    # [m] extra clearance around the obstacle box (beyond half car)
+        self.a_long_max = 4.0        # [m/s^2] longitudinal DECEL for the backward pass (brake into the apex)
+        self.a_long_accel = 3.0      # [m/s^2] longitudinal ACCEL for the forward pass (gentle exit ramp-up;
+                                     # lower = more gradual "fast-out" acceleration off the apex)
+        self.safety_margin = 0.16    # [m] extra clearance around the obstacle box (beyond half car).
+                                     # obs_margin = half_car(0.15)+safety must cover the sim ego collision
+                                     # radius (0.29 m = half car LENGTH); 0.16 -> 0.31 clears it (+0.02).
         self.wall_margin = 0.05      # [m] clearance to the wall the candidate may reach (corridor)
         self.shift_min = 1.0         # [m] min arc length over which the lateral maneuver completes
         self.shift_buffer = 0.5      # [m] finish the shift this far before the obstacle near-edge
-        self.ramp_len = 4.0          # [m] length of the ramp onto the offset (stay on raceline before it)
-        self.hold_after = 0.5        # [m] hold the offset this far past the obstacle far-edge
-        self.return_len = 2.5        # [m] length of the ramp back to the raceline after the obstacle
+        self.ramp_len = 4.0          # [m] gentle entry-ramp length (raceline -> apex)
+        self.hold_after = 0.5        # [m] (unused in apex-loaded profile; kept for param compatibility)
+        self.return_len = 2.5        # [m] gentle exit-ramp length (apex -> raceline)
+        self.apex_bulge = 0.10       # [m] extra offset at the box CENTRE (apex) beyond the clearance
+                                     # value: higher = car swings WIDER around the obstacle. 0 = flat hold.
+        self.max_weave = 3           # max obstacles woven into one path (slalom); 1 = single-apex only
         self.width_car = 0.30        # [m]
         self.tail_m = 1.0            # [m] short raceline (d=0) tail after the return
         self.w_d = 1.0               # cost: raceline deviation
@@ -122,9 +150,10 @@ class ObstacleSpliner(Node):
         self.declare_all_parameters()
         # Sync members from loaded params (yaml/defaults), then register live-reconfigure callback.
         self.dyn_param_cb(self.get_parameters([
-            'kernel_size', 'lookahead_min', 'lookahead_k', 'n_d_samples', 'kappa_max', 'a_lat_max',
+            'kernel_size', 'lookahead_min', 'lookahead_k', 'n_d_samples', 'kappa_max',
+            'kappa_add_max', 'kappa_abs_max', 'a_lat_max', 'a_long_max', 'a_long_accel',
             'safety_margin', 'wall_margin', 'shift_min', 'shift_buffer', 'ramp_len', 'hold_after',
-            'return_len', 'width_car', 'tail_m', 'w_d', 'w_k', 'w_c', 'w_obs', 'obs_sigma',
+            'return_len', 'apex_bulge', 'max_weave', 'width_car', 'tail_m', 'w_d', 'w_k', 'w_c', 'w_obs', 'obs_sigma',
             'use_grid_check',
         ]))
         self.add_on_set_parameters_callback(self.dyn_param_cb)
@@ -167,15 +196,21 @@ class ObstacleSpliner(Node):
         self.declare_parameter('lookahead_min', 8.0, dbl(1.0, 20.0, "min planning lookahead [m]"))
         self.declare_parameter('lookahead_k', 1.5, dbl(0.0, 5.0, "lookahead = max(min, k*cur_vs) [s]"))
         self.declare_parameter('n_d_samples', 13, intd(3, 41, "terminal lateral offsets sampled"))
-        self.declare_parameter('kappa_max', 2.0, dbl(0.1, 10.0, "curvature reject limit [1/m]"))
+        self.declare_parameter('kappa_max', 2.0, dbl(0.1, 10.0, "DEPRECATED alias -> kappa_abs_max [1/m]"))
+        self.declare_parameter('kappa_add_max', 2.0, dbl(0.1, 10.0, "max curvature the maneuver may ADD over the raceline [1/m]"))
+        self.declare_parameter('kappa_abs_max', 3.5, dbl(0.1, 10.0, "absolute curvature ceiling / min turn radius [1/m]"))
         self.declare_parameter('a_lat_max', 6.0, dbl(1.0, 20.0, "lateral-accel cap [m/s^2]"))
-        self.declare_parameter('safety_margin', 0.05, dbl(0.0, 1.0, "clearance around obstacle box [m]"))
+        self.declare_parameter('a_long_max', 4.0, dbl(0.5, 20.0, "longitudinal decel for backward speed pass [m/s^2]"))
+        self.declare_parameter('a_long_accel', 3.0, dbl(0.5, 20.0, "longitudinal accel for forward pass (gentle exit) [m/s^2]"))
+        self.declare_parameter('safety_margin', 0.16, dbl(0.0, 1.0, "clearance around obstacle box [m]"))
         self.declare_parameter('wall_margin', 0.05, dbl(0.0, 1.0, "clearance to wall a candidate may reach [m]"))
         self.declare_parameter('shift_min', 1.0, dbl(0.3, 10.0, "min arc length for the lateral maneuver [m]"))
         self.declare_parameter('shift_buffer', 0.5, dbl(0.0, 5.0, "finish the shift this far before the obstacle [m]"))
         self.declare_parameter('ramp_len', 4.0, dbl(0.5, 15.0, "ramp length onto the offset [m]"))
         self.declare_parameter('hold_after', 0.5, dbl(0.0, 5.0, "hold the offset past the obstacle far-edge [m]"))
         self.declare_parameter('return_len', 2.5, dbl(0.5, 10.0, "ramp length back to the raceline [m]"))
+        self.declare_parameter('apex_bulge', 0.10, dbl(0.0, 1.0, "extra apex offset beyond clearance: higher=wider avoidance [m]"))
+        self.declare_parameter('max_weave', 3, intd(1, 5, "max obstacles woven into one path (slalom); 1=single-apex"))
         self.declare_parameter('width_car', 0.30, dbl(0.1, 1.0, "car width [m]"))
         self.declare_parameter('tail_m', 1.0, dbl(0.0, 20.0, "short raceline tail after the return [m]"))
         self.declare_parameter('w_d', 1.0, dbl(0.0, 100.0, "cost weight: raceline deviation"))
@@ -200,9 +235,17 @@ class ObstacleSpliner(Node):
             elif n == 'n_d_samples':
                 self.n_d_samples = int(p.value)
             elif n == 'kappa_max':
-                self.kappa_max = float(p.value)
+                self.kappa_abs_max = float(p.value)   # deprecated alias -> absolute ceiling
+            elif n == 'kappa_add_max':
+                self.kappa_add_max = float(p.value)
+            elif n == 'kappa_abs_max':
+                self.kappa_abs_max = float(p.value)
             elif n == 'a_lat_max':
                 self.a_lat_max = float(p.value)
+            elif n == 'a_long_max':
+                self.a_long_max = float(p.value)
+            elif n == 'a_long_accel':
+                self.a_long_accel = float(p.value)
             elif n == 'safety_margin':
                 self.safety_margin = float(p.value)
             elif n == 'wall_margin':
@@ -217,6 +260,10 @@ class ObstacleSpliner(Node):
                 self.hold_after = float(p.value)
             elif n == 'return_len':
                 self.return_len = float(p.value)
+            elif n == 'apex_bulge':
+                self.apex_bulge = float(p.value)
+            elif n == 'max_weave':
+                self.max_weave = int(p.value)
             elif n == 'width_car':
                 self.width_car = float(p.value)
             elif n == 'tail_m':
@@ -305,6 +352,12 @@ class ObstacleSpliner(Node):
         for o in obstacles:
             if not (o.is_static or (abs(o.vs) < 0.5 and abs(o.vd) < 0.5)):
                 continue
+            # detection-gated: only avoid an obstacle we currently SEE. The tracker keeps confirmed
+            # statics in memory (is_visible=False when remembered-but-unseen) for continuity, but
+            # planning off a remembered position looks like the car "knows" the box in advance.
+            # Brief close-range dropouts are bridged by obs_memory_sec below.
+            if not o.is_visible:
+                continue
             gap = (o.s_center - self.cur_s) % self.gb_max_s
             if gap <= lookahead:
                 cands.append((gap, o))
@@ -354,22 +407,28 @@ class ObstacleSpliner(Node):
             return _empty()
         nearest = obs_ahead[0]
         self.obs_in_interest = nearest
-        g_near = (nearest.s_center - self.cur_s) % self.gb_max_s        # forward gap to nearest obs
-        obs_half_s = ((nearest.s_end - nearest.s_start) % self.gb_max_s) / 2.0
 
-        # --- maneuver geometry (arc lengths from grid_start) ---
-        # Stay on the raceline until close, ramp to d_end over ramp_len ending just before the
-        # obstacle, HOLD across it, then ease back to 0 and run a short raceline tail. Returning to
-        # the raceline is essential: a held offset would violate the (narrow) corridor somewhere
-        # downstream and reject EVERY candidate -> all-red / no avoidance. Slalom is handled by
-        # per-cycle replanning (next cycle targets the next obstacle).
+        # --- avoidance knots: ONE smooth hump per obstacle, peaking at the obstacle centre ---
+        # Single knot per obstacle at its centre: the path is one clean quintic hump -- gentle
+        # monotonic rise from the raceline, WIDEST at the apex (beside the obstacle), gentle monotonic
+        # fall back. The s-inflated obstacle box is verified by the feasibility filter (obs_ok); the
+        # sampled offset (+ apex_bulge) is chosen high enough that the hump clears it. Several obstacles
+        # -> a woven chain of humps (one apex each).
         e_psi = float(self.converter.get_e_psi(self.cur_x, self.cur_y, self.cur_yaw))
         cur_dp = float(np.tan(np.clip(e_psi, -0.5, 0.5)))
-        L_shift = float(np.clip(g_near - obs_half_s - self.shift_buffer, self.shift_min, lookahead))
-        s_ramp0 = max(0.0, L_shift - self.ramp_len)               # start easing off the raceline
-        s_hold_end = max(g_near + obs_half_s + self.hold_after, L_shift + 0.2)
-        s_ret_end = s_hold_end + self.return_len
-        span = min(s_ret_end + self.tail_m, self.gb_max_s * 0.9)
+        knots = []          # [(s_centre, obstacle, corridor_idx), ...] strictly increasing in s
+        for o in obs_ahead:
+            s_c = float(np.clip((o.s_center - self.cur_s) % self.gb_max_s, 0.3, lookahead))
+            if knots and s_c <= knots[-1][0] + 0.4:
+                continue                                   # too close in s to the previous apex -> merge
+            knots.append((s_c, o, int(o.s_center / wpnt_dist) % self.gb_max_idx))
+            if len(knots) >= self.max_weave:
+                break
+        g_near = (nearest.s_center - self.cur_s) % self.gb_max_s       # forward gap to nearest obstacle
+        obs_half_s = ((nearest.s_end - nearest.s_start) % self.gb_max_s) / 2.0
+        s_entry0 = max(0.0, knots[0][0] - self.ramp_len)              # gentle ramp OUT starts here
+        s_exit_end = knots[-1][0] + self.return_len                   # ease back to the raceline after the LAST apex
+        span = min(s_exit_end + self.tail_m, self.gb_max_s * 0.9)
 
         # --- s-grid for the path ---
         car_idx = int(self.cur_s / wpnt_dist) % self.gb_max_idx
@@ -384,6 +443,7 @@ class ObstacleSpliner(Node):
         d_left_arr = np.array([gb_wpnts[j].d_left for j in idxs])
         d_right_arr = np.array([gb_wpnts[j].d_right for j in idxs])   # magnitude of right half-width
         v_gb_arr = np.array([gb_wpnts[j].vx_mps for j in idxs])
+        kappa_ref = np.array([gb_wpnts[j].kappa_radpm for j in idxs])  # raceline curvature (corner-fair check)
 
         # --- terminal-offset samples: corridor AT THE OBSTACLE (where clearance actually matters) ---
         obs_j = int(nearest.s_center / wpnt_dist) % self.gb_max_idx
@@ -396,26 +456,47 @@ class ObstacleSpliner(Node):
             d_ends[int(np.argmin(np.abs(d_ends)))] = 0.0   # snap nearest sample onto the raceline
         N = len(d_ends)
 
-        # --- d(s): flat cur_d | ramp cur_d->d_end | hold d_end across obstacle | ramp d_end->0 | tail 0 ---
-        m_ramp = (s_local > s_ramp0) & (s_local <= L_shift)
-        m_hold = (s_local > L_shift) & (s_local <= s_hold_end)
-        m_ret = (s_local > s_hold_end) & (s_local <= s_ret_end)
-        ramp_ok = L_shift > s_ramp0 + 1e-3
+        # --- d(s): raceline -> [hold across box_1] -> ... -> [hold across box_m] -> raceline ---
+        # The nearest apex offset is SAMPLED (d_end); each LATER apex offset is auto-chosen to clear
+        # that obstacle on the side nearer the previous one (smooth weave). One knot per obstacle at its
+        # centre -> a single clean hump per obstacle (raceline -> apex -> raceline), no flat shoulders.
+        def _pass_offset(cor_idx, o, prev_d):
+            dl = gb_wpnts[cor_idx].d_left
+            dr = gb_wpnts[cor_idx].d_right
+            obox_lo = min(o.d_right, o.d_left) - obs_margin   # car-centre keep-out, right edge
+            obox_hi = max(o.d_right, o.d_left) + obs_margin   # car-centre keep-out, left edge
+            opts = []
+            if obox_hi <= (dl - sample_margin) + 1e-6:        # room to pass on the LEFT of the obstacle
+                opts.append(obox_hi)
+            if obox_lo >= -(dr - sample_margin) - 1e-6:       # room to pass on the RIGHT of the obstacle
+                opts.append(obox_lo)
+            if not opts:
+                return prev_d                                  # blocked -> keep prev (obs_ok will reject)
+            return min(opts, key=lambda d: abs(d - prev_d))   # side nearer the previous apex -> smooth
+
+        m_span = (s_local > s_entry0) & (s_local <= s_exit_end)
+        span_ok = s_exit_end > s_entry0 + 1e-3
+        dp0 = cur_dp if s_entry0 == 0.0 else 0.0              # match car heading only if the ramp starts at the car
         d_cands = np.zeros((N, n))
         for k, d_end in enumerate(d_ends):
-            de = float(d_end)
+            d_apex = [float(d_end)]
+            for i in range(1, len(knots)):
+                d_apex.append(_pass_offset(knots[i][2], knots[i][1], d_apex[-1]))
             dv = np.full(n, self.cur_d)
-            if ramp_ok and m_ramp.any():
-                dp0 = cur_dp if s_ramp0 == 0.0 else 0.0   # match car heading only if ramp starts at the car
-                p_in = BPoly.from_derivatives([s_ramp0, L_shift], [[self.cur_d, dp0, 0.0], [de, 0.0, 0.0]])
-                dv[m_ramp] = p_in(s_local[m_ramp])
-            else:
-                dv[m_ramp] = de
-            dv[m_hold] = de
-            if m_ret.any():
-                p_out = BPoly.from_derivatives([s_hold_end, s_ret_end], [[de, 0.0, 0.0], [0.0, 0.0, 0.0]])
-                dv[m_ret] = p_out(s_local[m_ret])
-            dv[s_local > s_ret_end] = 0.0
+            if span_ok and m_span.any():
+                # One knot per obstacle centre -> a single smooth quintic hump (raceline -> apex ->
+                # raceline). d'=0 at each apex makes it the peak. apex_bulge pushes the peak FURTHER
+                # from the obstacle (wider swing); the feasibility filter verifies box clearance.
+                bp_s = [s_entry0]
+                bp_d = [[self.cur_d, dp0, 0.0]]
+                for (s_c, _o, _cor), da in zip(knots, d_apex):
+                    d_peak = da + float(np.sign(da)) * self.apex_bulge
+                    bp_s.append(s_c)
+                    bp_d.append([d_peak, 0.0, 0.0])
+                bp_s.append(s_exit_end)
+                bp_d.append([0.0, 0.0, 0.0])
+                dv[m_span] = BPoly.from_derivatives(bp_s, bp_d)(s_local[m_span])
+            dv[s_local > s_exit_end] = 0.0
             d_cands[k] = dv
 
         # --- feasibility 1: track corridor (reject, don't clip) ---
@@ -457,7 +538,11 @@ class ObstacleSpliner(Node):
                 continue
             psi_, kappa_ = tph.calc_head_curv_num.calc_head_curv_num(
                 path=xy, el_lengths=wpnt_dist * np.ones(len(xy) - 1), is_closed=False)
-            if np.max(np.abs(kappa_)) > self.kappa_max:
+            # Corner-fair curvature: allow what the raceline already curves, bound only the
+            # curvature the maneuver ADDS, plus an absolute steering ceiling. (An absolute-only
+            # check rejected every offset in a corner -> flat spline, no avoidance.)
+            if (np.max(np.abs(kappa_ - kappa_ref)) > self.kappa_add_max or
+                    np.max(np.abs(kappa_)) > self.kappa_abs_max):
                 n_curv += 1
                 continue
             j_d = self.w_d * float(np.sum(np.abs(d_cands[k])))
@@ -479,7 +564,7 @@ class ObstacleSpliner(Node):
             self.get_logger().warn(
                 f"[{self.name}] NO feasible candidate ({N} sampled) -> TRAILING | "
                 f"reject bounds={n_bounds} obs_box={n_obs} grid={n_grid} curv={n_curv} | "
-                f"g_near={g_near:.2f} obs_half_s={obs_half_s:.2f} L_shift={L_shift:.2f} | "
+                f"g_near={g_near:.2f} obs_half_s={obs_half_s:.2f} n_box={len(knots)} apex_bulge={self.apex_bulge:.2f} | "
                 f"sample d_range=[{d_lo:.2f},{d_hi:.2f}] corridor@obs "
                 f"L={gb_wpnts[obs_j].d_left:.2f}/R={gb_wpnts[obs_j].d_right:.2f} | "
                 f"obs d=[{min(nearest.d_right, nearest.d_left):.2f},{max(nearest.d_right, nearest.d_left):.2f}] "
@@ -493,16 +578,25 @@ class ObstacleSpliner(Node):
         self._d_end_prev = float(d_ends[best_k])
         xy, psi_, kappa_ = best
 
-        if SMOOTH_OTWPNTS and kappa_.size > SMOOTH_OTWPNTS_POLYORDER + 2:
-            win = min(SMOOTH_OTWPNTS_WINDOW, kappa_.size)
-            if win % 2 == 0:
-                win -= 1
-            if win > SMOOTH_OTWPNTS_POLYORDER:
-                kappa_ = savgol_filter(kappa_, win, SMOOTH_OTWPNTS_POLYORDER)
+        if SMOOTH_OTWPNTS:
+            kappa_ = _savgol_safe(kappa_, SMOOTH_OTWPNTS_WINDOW)
 
-        # velocity: scaled-raceline speed clamped by the local lateral-accel limit
+        # velocity: slow-in / fast-out around the apex, jitter-free. Smooth EVERYTHING first, run the
+        # accel/decel passes LAST so the final profile is both smooth AND shape-guaranteed:
+        #   0) smooth the raceline-speed lookup (kills sector-boundary steps / index quantization),
+        #      the curvature (above), and the min()-crossover corner -> no high-frequency noise
+        #   1) point limit  v_curv = sqrt(a_lat/|kappa|)  -> minimum sits AT the apex (max curvature)
+        #   2) backward decel pass -> brake EARLY so the car is already slow entering the apex
+        #   3) forward accel pass  -> leave the apex and accelerate out GRADUALLY (bounded a_long_accel)
+        v_gb_s = _savgol_safe(v_gb_arr, SMOOTH_VEL_WINDOW)
         v_curv = np.sqrt(self.a_lat_max / np.maximum(np.abs(kappa_), 1e-3))
-        v_arr = np.minimum(v_gb_arr, v_curv)
+        v_arr = np.clip(_savgol_safe(np.minimum(v_gb_s, v_curv), SMOOTH_VEL_WINDOW), 0.0, v_gb_s)
+        # backward: v[i]^2 <= v[i+1]^2 + 2*a_brake*ds  (ds = wpnt_dist)
+        for i in range(len(v_arr) - 2, -1, -1):
+            v_arr[i] = min(v_arr[i], float(np.sqrt(v_arr[i + 1] ** 2 + 2.0 * self.a_long_max * wpnt_dist)))
+        # forward: v[i]^2 <= v[i-1]^2 + 2*a_accel*ds  -> gentle exit ramp-up (lower a_long_accel = gentler)
+        for i in range(1, len(v_arr)):
+            v_arr[i] = min(v_arr[i], float(np.sqrt(v_arr[i - 1] ** 2 + 2.0 * self.a_long_accel * wpnt_dist)))
 
         d_sel = d_cands[best_k]
         for i in range(len(xy)):
