@@ -36,6 +36,10 @@ SMOOTH_OTWPNTS_POLYORDER = 2
 # Savitzky-Golay window for the velocity profile (odd, waypoints). Smooths the raceline-speed lookup
 # (sector-boundary steps / index quantization) and the final min()-crossover corners.
 SMOOTH_VEL_WINDOW = 9
+# Publish the (heavy) candidate MarkerArray only every Nth 20 Hz cycle. Building ~n_d_samples x ~100
+# Points every cycle and flooding RViz starves the control loop / lags RViz; the path itself is still
+# planned at 20 Hz, only the debug viz is decimated (4 -> 5 Hz).
+MARKER_DECIM = 4
 
 
 def _savgol_safe(arr: np.ndarray, window: int) -> np.ndarray:
@@ -102,6 +106,8 @@ class ObstacleSpliner(Node):
         self.waypoints = None
         self._d_end_prev = 0.0       # last selected terminal offset (chatter damping)
         self._last_feasible = False
+        self._marker_i = 0           # candidate-marker publish decimation counter
+        self._emit_markers = True    # build+publish candidate markers only on decimated cycles
 
         # --- sampling-planner param defaults (all overridable via ROS params / config yaml) ---
         self.kernel_size = 3         # GridFilter erosion (cells); 8 ate ~0.2 m and rejected the raceline
@@ -304,12 +310,21 @@ class ObstacleSpliner(Node):
         self.cur_yaw = euler[2]
 
     def gb_cb(self, data: WpntArray):
-        self.waypoints = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in data.wpnts])
+        new_wpnts = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in data.wpnts])
+        changed = (self.waypoints is None or new_wpnts.shape != self.waypoints.shape
+                   or not np.allclose(new_wpnts, self.waypoints))
+        self.waypoints = new_wpnts
         self.gb_wpnts = data
         if self.gb_vmax is None:
             self.gb_vmax = np.max(np.array([wpnt.vx_mps for wpnt in data.wpnts]))
             self.gb_max_idx = data.wpnts[-1].id
             self.gb_max_s = data.wpnts[-1].s_m
+        # The global line can CHANGE at runtime (static re-optimization swaps in an obstacle-aware
+        # line). Rebuild the FrenetConverter so avoidance splines are generated relative to the
+        # CURRENT line the car follows — not the startup (clean) one (else they are offset). Only
+        # after the initial converter exists, and only on an ACTUAL change (no per-message churn).
+        if changed and getattr(self, "converter", None) is not None:
+            self.converter = self.initialize_converter()
 
     def gb_scaled_cb(self, data: WpntArray):
         self.gb_scaled_wpnts = data
@@ -318,13 +333,17 @@ class ObstacleSpliner(Node):
     # MAIN LOOP #
     #############
     def loop(self):
+        # decimate the (heavy) candidate markers to ~5 Hz so viz load never starves the 20 Hz plan
+        self._marker_i += 1
+        self._emit_markers = (self._marker_i % MARKER_DECIM == 0)
         if self.measuring:
             start = time.perf_counter()
         wpnts, mrks = self.do_spline(gb_wpnts=self.gb_scaled_wpnts.wpnts)
         if self.measuring:
             self.latency_pub.publish(Float32(data=float(time.perf_counter() - start)))
         self.evasion_pub.publish(wpnts)
-        self.mrks_pub.publish(mrks)
+        if self._emit_markers:
+            self.mrks_pub.publish(mrks)
 
     #########
     # UTILS #
@@ -632,6 +651,8 @@ class ObstacleSpliner(Node):
     ######################
     def _candidate_markers(self, cands_xy: np.ndarray, status: List[str], sel_idx: int) -> MarkerArray:
         """One LINE_STRIP per sampled candidate: grey=feasible, red=rejected, green=selected."""
+        if not self._emit_markers:
+            return MarkerArray()   # decimated cycle: skip the ~n_d_samples x ~100 Point build entirely
         mrks = MarkerArray()
         del_mrk = Marker()
         del_mrk.header.frame_id = "map"

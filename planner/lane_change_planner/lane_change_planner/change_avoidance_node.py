@@ -271,9 +271,16 @@ class ChangeAvoidanceNode(Node):
         self.current_vx = data.twist.twist.linear.x
 
     def gb_cb(self, data: WpntArray):
-        self.global_waypoints = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in data.wpnts])
+        new_wp = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in data.wpnts])
+        changed = (self.global_waypoints is None or new_wp.shape != self.global_waypoints.shape
+                   or not np.allclose(new_wp, self.global_waypoints))
+        self.global_waypoints = new_wp
         self.gb_max_idx = data.wpnts[-1].id
         self.gb_max_s = data.wpnts[-1].s_m
+        # global line can CHANGE at runtime (static re-opt swap) -> rebuild the FrenetConverter so
+        # avoidance is relative to the CURRENT line, not the startup (clean) one. On change only.
+        if changed and self.converter is not None:
+            self.converter = self.initialize_converter()
 
     def scaled_wpnts_cb(self, data: WpntArray):
         self.scaled_wpnts = np.array([[wpnt.s_m, wpnt.d_m] for wpnt in data.wpnts])

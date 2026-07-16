@@ -11,14 +11,14 @@ static_avoidance_planner:
     lookahead_k: 1.5        # [s]  lookahead = max(lookahead_min, lookahead_k * cur_vs)
 
     # --- terminal-offset sampling ---
-    n_d_samples: 20         # number of lateral offsets sampled across the drivable width at the obstacle
+    n_d_samples: 10         # number of lateral offsets sampled across the drivable width at the obstacle
     width_car: 0.30         # [m]  car width (half is reserved as clearance to walls/obstacles)
-    safety_margin: 0.16     # [m]  extra clearance around the obstacle box. obs_margin = half_car(0.15)+
+    safety_margin: 0.15     # [m]  extra clearance around the obstacle box. obs_margin = half_car(0.15)+
                             #      safety must cover the SIM ego collision radius (0.29 m = half car
                             #      LENGTH in gym_bridge); 0.16 -> 0.31 clears it so the car no longer
                             #      grazes-then-teleports. Lower live (ros2 param set) if a tight section
                             #      rejects every candidate; raise if the car still clips the box.
-    wall_margin: 0.05       # [m]  how close to the wall a candidate may reach (corridor room)
+    wall_margin: 0.1       # [m]  how close to the wall a candidate may reach (corridor room)
 
     # --- maneuver shape: gentle ramp OUT -> APEX (peak offset at obstacle, curvature loaded) -> gentle ramp back ---
     # Two quintics meet at the apex; outer ends are tangent to the raceline (d''=0) so entry/exit are

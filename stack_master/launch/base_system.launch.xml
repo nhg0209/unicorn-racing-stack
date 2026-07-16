@@ -20,6 +20,14 @@
   <arg name="virtual"      default="$(var sim)" description="Inject virtual opponent/obstacles (scan overlay etc.); on by default in sim, off on the real car"/>
   <arg name="reopt"        default="false" description="Obstacle-aware global line: run static_reopt_node + static_obstacle_layer instead of the plain global_trajectory_publisher (IFAC static-obstacle re-optimization)"/>
   <arg name="reopt_safety_width" default="0.5" description="safety_width for the obstacle-aware re-optimizer (incl. car width). NB: the tight ifac centerline only solves plain mincurv_iqp at 0.25 or lower"/>
+  <arg name="reopt_obs_change_tol" default="0.25" description="min obstacle move [m] to re-trigger the re-opt QP (larger = detection jitter does not thrash it)"/>
+  <arg name="reopt_compute_sp" default="true" description="also re-optimize the shortest_path line (ot_interpolator consumes it); false only if the OT line is unused"/>
+  <arg name="reopt_method" default="local_window" description="obstacle-aware line optimizer: local_window (fast ONLINE windowed min-curv QP, ms/solve) | global (legacy whole-track mincurv_iqp, minutes/solve, offline-grade)"/>
+  <arg name="reopt_reach_time" default="1.2" description="[s] avoidance arc half-width ~ this * local raceline speed (bigger = gentler, faster arc reaching toward the adjacent corners)"/>
+  <arg name="reopt_reach_min" default="4.0" description="[m] MIN arc half-width (slow sections)"/>
+  <arg name="reopt_reach_max" default="10.0" description="[m] MAX arc half-width (fast sections)"/>
+  <arg name="reopt_qp_veh_width" default="0.30" description="[m] vehicle width for the windowed QP corridor + floor (obstacle clearance is obs_margin, separate)"/>
+  <arg name="reopt_wall_margin" default="0.12" description="[m] keep the re-optimized detour this far off the track walls"/>
 
   <!-- sim -> SIM config folder, real hardware -> CAR config folder -->
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/SIM" if="$(var sim)"/>
@@ -76,10 +84,23 @@
 
   <group if="$(var reopt)">
     <node pkg="gb_optimizer" exec="static_reopt_node" name="static_reopt_node" output="screen">
+      <!-- OpenBLAS spawns a big thread pool that is ~1000x slower than 1 thread on the
+           windowed QP's tiny matrices; the node also pins BLAS in-process via threadpoolctl,
+           this env is a belt-and-braces fallback. -->
+      <env name="OPENBLAS_NUM_THREADS" value="1"/>
+      <env name="OMP_NUM_THREADS" value="1"/>
       <param name="map" value="$(var map)"/>
       <param name="racecar_version" value="$(var racecar_version)"/>
       <param name="safety_width" value="$(var reopt_safety_width)"/>
       <param name="safety_width_sp" value="$(var reopt_safety_width)"/>
+      <param name="obs_change_tol" value="$(var reopt_obs_change_tol)"/>
+      <param name="compute_sp" value="$(var reopt_compute_sp)"/>
+      <param name="reopt_method" value="$(var reopt_method)"/>
+      <param name="reach_time" value="$(var reopt_reach_time)"/>
+      <param name="reach_min" value="$(var reopt_reach_min)"/>
+      <param name="reach_max" value="$(var reopt_reach_max)"/>
+      <param name="qp_veh_width" value="$(var reopt_qp_veh_width)"/>
+      <param name="wall_margin" value="$(var reopt_wall_margin)"/>
     </node>
     <node pkg="gb_optimizer" exec="static_obstacle_layer" name="static_obstacle_layer" output="screen"/>
   </group>

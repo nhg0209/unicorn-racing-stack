@@ -27,7 +27,15 @@ continuity; a timeout forces the swap if no frenet odom is seen (bench testing).
 
 import copy
 import os
-import threading
+
+# Pin BLAS/OpenMP to ONE thread BEFORE numpy loads. OpenBLAS otherwise spawns a large pool
+# that, on the tiny windowed-QP matrices, pegs every core for ~1s per solve and starves the
+# sim + control loop (whole-system stutter whenever an obstacle triggers a re-opt). setdefault
+# so an explicit launch <env> still wins; this covers `ros2 run` / missing-env launches too.
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
+import numpy as np
 from contextlib import redirect_stdout
 from typing import List, Optional
 
@@ -36,7 +44,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 
 from ament_index_python.packages import get_package_share_directory
-from std_msgs.msg import String, Float32
+from std_msgs.msg import String, Float32, Bool
 from nav_msgs.msg import Odometry
 from visualization_msgs.msg import MarkerArray
 from f110_msgs.msg import WpntArray
@@ -81,13 +89,30 @@ class StaticReoptNode(Node):
         # AVOIDANCE (design A) — must exceed gb_ego_width_m/2 - safety_width/2 so the
         # reactive planner does not re-avoid obstacles already handled by the global line.
         # Co-tune with the (currently untuned) reactive static avoidance.
-        self.declare_parameter("obs_margin", 0.15)
+        self.declare_parameter("obs_margin", 0.20)
         self.declare_parameter("default_obs_radius", 0.15)
         self.declare_parameter("republish_period", 1.0)     # [s] keep-alive republish
         self.declare_parameter("swap_at_startfinish", True)
         self.declare_parameter("swap_timeout_s", 4.0)        # force swap if no s-wrap seen
         self.declare_parameter("obs_change_tol", 0.10)       # [m] min move to count as a change
         self.declare_parameter("compute_sp", True)
+        # re-optimization method:
+        #   "local_window" (default) — fast ONLINE windowed min-curvature QP stitched into the
+        #                    clean raceline (ms/solve); the intended lap-2+ obstacle-aware line.
+        #   "global"       — legacy whole-track mincurv_iqp (minutes/solve; offline only).
+        self.declare_parameter("reopt_method", "local_window")
+        # The avoidance is a smooth WIDE arc: a smootherstep bump peaking at the required clearance
+        # over a half-width R = clip(reach_time * local_speed, reach_min, reach_max). Bigger R =
+        # gentler, faster arc that reaches toward the adjacent corners (carries speed, steers less).
+        self.declare_parameter("reach_time", 1.2)            # [s] arc half-width ~ this * local speed
+        self.declare_parameter("reach_min", 4.0)             # [m] MIN arc half-width (slow sections)
+        self.declare_parameter("reach_max", 10.0)            # [m] MAX arc half-width (fast sections)
+        self.declare_parameter("qp_veh_width", 0.30)         # [m] vehicle width for the corridor/
+                                                             # clearance floor (obstacle clearance
+                                                             # is obs_margin, separate)
+        self.declare_parameter("wall_margin", 0.12)          # [m] keep the arc this far off the
+                                                             # track walls (larger = safer, but tight
+                                                             # sections may go infeasible)
 
         self.map_name = self.get_parameter("map").value
         self.racecar_version = self.get_parameter("racecar_version").value
@@ -100,6 +125,12 @@ class StaticReoptNode(Node):
         self.swap_timeout_s = float(self.get_parameter("swap_timeout_s").value)
         self.obs_change_tol = float(self.get_parameter("obs_change_tol").value)
         self.compute_sp = bool(self.get_parameter("compute_sp").value)
+        self.reopt_method = str(self.get_parameter("reopt_method").value)
+        self.reach_time = float(self.get_parameter("reach_time").value)
+        self.reach_min = float(self.get_parameter("reach_min").value)
+        self.reach_max = float(self.get_parameter("reach_max").value)
+        self.qp_veh_width = float(self.get_parameter("qp_veh_width").value)
+        self.wall_margin = float(self.get_parameter("wall_margin").value)
 
         self.input_path = os.path.join(
             get_package_share_directory("stack_master"), "config", self.racecar_version)
@@ -111,23 +142,39 @@ class StaticReoptNode(Node):
         self.reftrack = core.load_reftrack(
             os.path.join(get_package_share_directory("stack_master"), "maps",
                          self.map_name, "centerline.csv"))
+        # clean raceline as arrays for the windowed QP (x,y + dist-to-bounds + speed)
+        gw = self.clean_bundle.glb_wpnts.wpnts
+        self._clean_xy = np.array([[w.x_m, w.y_m] for w in gw], dtype=float)
+        self._clean_dr = np.array([w.d_right for w in gw], dtype=float)
+        self._clean_dl = np.array([w.d_left for w in gw], dtype=float)
+        self._clean_vx = np.array([w.vx_mps for w in gw], dtype=float)
+        self._clean_kappa = np.array([w.kappa_radpm for w in gw], dtype=float)
         self.get_logger().info(
-            f"[static_reopt] loaded clean bundle + reftrack ({self.reftrack.shape[0]} pts) for '{self.map_name}'")
+            f"[static_reopt] loaded clean bundle ({len(gw)} raceline pts) + reftrack "
+            f"({self.reftrack.shape[0]} pts) for '{self.map_name}'; reopt_method={self.reopt_method}")
 
         # --- state ------------------------------------------------------------------------
-        self._lock = threading.Lock()          # guards active/target/obstacle_bundle
-        self.active = self.clean_bundle         # what the timer publishes (always valid)
-        self.target = self.clean_bundle         # what we want to swap TO at start/finish
-        self.obstacle_bundle: Optional[_Bundle] = None  # last valid obstacle-aware bundle
-        self.swap_pending = False
-        self.swap_request_time = 0.0
-
-        self._obstacles: List[core.Obstacle] = []      # current requested obstacle set
-        self._reopt_running = False
-        self._reopt_dirty = False               # obstacle set changed while a re-opt ran
-        self._reopt_lock = threading.Lock()
+        # BATCH workflow: obstacles are just COLLECTED during a lap; the re-opt is solved ONCE and
+        # swapped at the start/finish crossing (over ALL confirmed obstacles). No incremental solve.
+        # single-threaded rclpy executor: obstacles_cb / frenet_cb / republish_cb never run
+        # concurrently, and the batch re-opt is synchronous, so no lock is needed.
+        self.active = self.clean_bundle         # what is published (always a valid line)
+        self._obstacles: List[core.Obstacle] = []      # currently confirmed obstacle set
+        self._obstacles_dirty = False           # set changed since the last build -> rebuild at s/f
+        # publish the bundle only when the active line CHANGES (+ a slow keep-alive), NOT on every
+        # timer tick. Topics are latched (TRANSIENT_LOCAL) so late subscribers still get the last
+        # line; a fast periodic republish makes frenet_conversion / sector_tuner re-process the
+        # raceline constantly, glitching the frenet odom (wobble). This keeps churn below 2 s.
+        self._last_published: Optional[_Bundle] = None
+        self._last_publish_t = 0.0
+        # after a swap, re-publish `update_map` for a few ticks so sector_tuner / ot_interpolator
+        # (which cache the FIRST /global_waypoints, then only rescale velocity) re-take the NEW
+        # geometry -> /global_waypoints_scaled actually follows the swapped line.
+        self._notify_scaler_ticks = 0
 
         self._last_s = None
+        self._last_frenet_t = None              # wall time of the last frenet msg (stale fallback)
+        self._dirty_since = 0.0                 # wall time the set went dirty (stale-frenet fallback)
 
         # --- pub/sub ----------------------------------------------------------------------
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -141,6 +188,9 @@ class StaticReoptNode(Node):
         self.pub_bounds = self.create_publisher(MarkerArray, "/trackbounds/markers", latched)
         self.pub_info = self.create_publisher(String, "/map_infos", latched)
         self.pub_lap = self.create_publisher(Float32, "/estimated_lap_time", latched)
+        # tells sector_tuner (and any consumer that caches the first global line) to re-take
+        # the new geometry after a swap. Relative topic "update_map" == sector_tuner's sub.
+        self.pub_update_map = self.create_publisher(Bool, "update_map", 10)
 
         self.create_subscription(MarkerArray, "/static_reopt/obstacles", self.obstacles_cb, 10)
         self.create_subscription(Odometry, "/car_state/odom_frenet", self.frenet_cb, 10)
@@ -158,28 +208,52 @@ class StaticReoptNode(Node):
     def _build_obstacle_bundle(self, obstacles: List[core.Obstacle]) -> _Bundle:
         """Run the width-modulated re-optimization and assemble a full bundle. May raise;
         the caller runs this inside a try/except so a failure never reaches the timer."""
-        res = core.reoptimize_with_obstacles(
-            self.reftrack, obstacles, self.input_path,
-            params=core.ModulationParams(obs_margin=self.obs_margin),
-            safety_width=self.safety_width, safety_width_sp=self.safety_width_sp,
-            compute_sp=self.compute_sp)
+        if self.reopt_method == "local_window":
+            # Fast ONLINE windowed min-curvature QP stitched into the clean raceline.
+            res = core.reoptimize_local_window(
+                self._clean_xy, self._clean_dr, self._clean_dl, self.reftrack,
+                obstacles, self.input_path,
+                params=core.ModulationParams(obs_margin=self.obs_margin),
+                w_veh=self.qp_veh_width, clean_vx=self._clean_vx, wall_margin=self.wall_margin,
+                reach_time=self.reach_time, reach_min=self.reach_min, reach_max=self.reach_max,
+                clean_kappa=self._clean_kappa)
+        else:
+            # Legacy whole-track mincurv_iqp (offline-grade; minutes/solve).
+            res = core.reoptimize_with_obstacles(
+                self.reftrack, obstacles, self.input_path,
+                params=core.ModulationParams(obs_margin=self.obs_margin),
+                safety_width=self.safety_width, safety_width_sp=self.safety_width_sp,
+                compute_sp=self.compute_sp)
 
         traj, br, bl, est = res["main"]
-        d_r, d_l = core.dist_to_bounds(traj, br, bl)
+        if "d_right" in res:                    # local_window returns exact widths
+            d_r, d_l = res["d_right"], res["d_left"]
+        else:
+            d_r, d_l = core.dist_to_bounds(traj[:, 1:3], br, bl)  # traj is [s,x,y,...]
         glb_w, glb_m = core.build_wpnts(traj, d_r, d_l, second_traj=False)
 
         if self.compute_sp and "sp" in res:
             sp_traj, sbr, sbl, sp_est = res["sp"]
-            sd_r, sd_l = core.dist_to_bounds(sp_traj, sbr, sbl)
+            sd_r, sd_l = core.dist_to_bounds(sp_traj[:, 1:3], sbr, sbl)
             sp_w, sp_m = core.build_wpnts(sp_traj, sd_r, sd_l, second_traj=True)
         else:
             sp_w, sp_m = copy.deepcopy(self.clean_bundle.sp_wpnts), copy.deepcopy(self.clean_bundle.sp_markers)
 
         rep = res["report"]
         info = String()
-        info.data = (f"[static_reopt] obstacle-aware (mincurv_iqp) est {est:.3f}s; "
-                     f"affected {rep.n_affected}, infeasible {rep.n_infeasible}, "
-                     f"min_halfwidth {rep.min_halfwidth_seen:.3f}m")
+        if self.reopt_method == "local_window":
+            nf = res.get("n_failed", 0)
+            info.data = (f"[static_reopt] obstacle-aware (local_window) est {est:.3f}s; "
+                         f"{res.get('n_windows', 0)} window(s) re-optimized, {nf} too tight "
+                         f"(reactive layer covers those); affected {rep.n_affected}")
+            if nf:
+                self.get_logger().warning(
+                    f"[static_reopt] {nf} obstacle window(s) too tight for the global line — "
+                    f"the reactive static-avoidance layer must handle them")
+        else:
+            info.data = (f"[static_reopt] obstacle-aware (mincurv_iqp) est {est:.3f}s; "
+                         f"affected {rep.n_affected}, infeasible {rep.n_infeasible}, "
+                         f"min_halfwidth {rep.min_halfwidth_seen:.3f}m")
         lap = Float32(); lap.data = float(est)
 
         # centerline + trackbounds are map-fixed -> reuse the clean ones
@@ -188,7 +262,7 @@ class StaticReoptNode(Node):
                        glb_w, glb_m, sp_w, sp_m, self.clean_bundle.trackbounds)
 
     # ----------------------------------------------------------------------------------
-    # obstacle input -> background re-optimization
+    # obstacle input: COLLECT only (batch re-opt happens at the start/finish crossing)
     # ----------------------------------------------------------------------------------
     def obstacles_cb(self, msg: MarkerArray):
         from visualization_msgs.msg import Marker
@@ -204,9 +278,13 @@ class StaticReoptNode(Node):
 
         if not self._obstacles_changed(obs):
             return
+        # Just RECORD the confirmed set; do NOT solve here. The batch re-opt runs once at the next
+        # start/finish crossing (frenet_cb) with ALL obstacles -> one consistent line, no mid-lap churn.
         self._obstacles = obs
-        self.get_logger().info(f"[static_reopt] obstacle set changed -> {len(obs)} obstacle(s); re-optimizing")
-        self._kick_reopt()
+        self._obstacles_dirty = True
+        self._dirty_since = self.get_clock().now().nanoseconds * 1e-9
+        self.get_logger().info(
+            f"[static_reopt] obstacle set -> {len(obs)} obstacle(s); will batch re-opt at start/finish")
 
     def _obstacles_changed(self, new: List[core.Obstacle]) -> bool:
         if len(new) != len(self._obstacles):
@@ -217,80 +295,37 @@ class StaticReoptNode(Node):
                 return True
         return False
 
-    def _kick_reopt(self):
-        """Start a background re-opt worker (or flag a rerun if one is already running)."""
-        with self._reopt_lock:
-            if self._reopt_running:
-                self._reopt_dirty = True
-                return
-            self._reopt_running = True
-        threading.Thread(target=self._reopt_worker, daemon=True).start()
-
-    def _reopt_worker(self):
-        while True:
-            with self._lock:
-                obstacles = list(self._obstacles)
-
-            if not obstacles:
-                # no obstacles -> target the clean line
-                with self._lock:
-                    self.obstacle_bundle = None
-                    self.target = self.clean_bundle
-                    self._request_swap_locked()
+    def _rebuild_and_swap(self, reason: str):
+        """Solve ONE re-opt over the whole confirmed obstacle set and swap immediately. Called at
+        the start/finish crossing (car at s≈0 where reopt==clean, so the swap is jump-free). The
+        solve is ~10 ms (BLAS-pinned) so running it here does not stall the loop."""
+        obstacles = list(self._obstacles)
+        self._obstacles_dirty = False
+        try:
+            if obstacles:
+                with open(os.devnull, "w") as devnull, redirect_stdout(devnull):
+                    bundle = self._build_obstacle_bundle(obstacles)
             else:
-                try:
-                    with open(os.devnull, "w") as devnull, redirect_stdout(devnull):
-                        bundle = self._build_obstacle_bundle(obstacles)
-                    with self._lock:
-                        self.obstacle_bundle = bundle
-                        self.target = bundle
-                        self._request_swap_locked()
-                    self.get_logger().info("[static_reopt] obstacle-aware line ready; swap pending")
-                except Exception as e:  # noqa: BLE001 — must never propagate
-                    # keep whatever valid line we already have; do NOT change active
-                    fallback = "previous obstacle line" if self.obstacle_bundle else "clean line"
-                    self.get_logger().warn(
-                        f"[static_reopt] re-opt FAILED ({type(e).__name__}: {str(e)[:80]}); "
-                        f"keeping {fallback} — reactive planner handles the gap")
-                    if self.obstacle_bundle is not None:
-                        with self._lock:
-                            self.target = self.obstacle_bundle
-                            self._request_swap_locked()
+                bundle = self.clean_bundle
+        except Exception as e:  # noqa: BLE001 — must never propagate to the executor
+            self.get_logger().warn(
+                f"[static_reopt] batch re-opt FAILED ({type(e).__name__}: {str(e)[:80]}); "
+                f"keeping the current line — reactive planner handles the gap")
+            return
+        changed = bundle is not self.active
+        self.active = bundle
+        if changed:
+            self._notify_scaler_ticks = 3        # tell caching consumers to re-take the new geometry
+        kind = "CLEAN" if bundle is self.clean_bundle else f"OBSTACLE-AWARE ({len(obstacles)} obs)"
+        self.get_logger().info(f"[static_reopt] batch re-opt -> swap to {kind} ({reason})")
+        self._publish_active(bundle)             # publish now, don't wait for the republish tick
+        if changed:
+            self.pub_update_map.publish(Bool(data=True))   # /global_waypoints already latched above
 
-            # loop again if the obstacle set changed while we were optimizing
-            with self._reopt_lock:
-                if self._reopt_dirty:
-                    self._reopt_dirty = False
-                    continue
-                self._reopt_running = False
-                return
-
-    def _request_swap_locked(self):
-        """Mark a swap pending. Caller must hold self._lock."""
-        self.swap_pending = True
-        self.swap_request_time = self.get_clock().now().nanoseconds * 1e-9
-
-    # ----------------------------------------------------------------------------------
-    # swap at start/finish (or timeout)
-    # ----------------------------------------------------------------------------------
-    def frenet_cb(self, msg: Odometry):
-        s = msg.pose.pose.position.x  # frenet s
-        with self._lock:
-            crossed_sf = (self._last_s is not None and s < self._last_s - 1.0)  # s wrapped to ~0
-            self._last_s = s
-            if self.swap_pending and self.swap_at_sf and crossed_sf:
-                self._do_swap_locked("start/finish")
-
-    def republish_cb(self):
-        with self._lock:
-            # timeout / no-frenet fallback: force the swap so we never get stuck on a stale line
-            if self.swap_pending:
-                now = self.get_clock().now().nanoseconds * 1e-9
-                if not self.swap_at_sf or (now - self.swap_request_time) > self.swap_timeout_s:
-                    self._do_swap_locked("timeout" if self.swap_at_sf else "immediate")
-            active = self.active
-
-        # publish the active (always-valid) bundle
+    def _publish_active(self, active: "_Bundle"):
+        now = self.get_clock().now().nanoseconds * 1e-9
+        self._last_published = active
+        self._last_publish_t = now
         self.pub_glb.publish(active.glb_wpnts)
         self.pub_glb_m.publish(active.glb_markers)
         self.pub_sp.publish(active.sp_wpnts)
@@ -301,13 +336,33 @@ class StaticReoptNode(Node):
         self.pub_info.publish(active.map_info)
         self.pub_lap.publish(active.est_lap_time)
 
-    def _do_swap_locked(self, reason: str):
-        """Switch the active bundle to the target. Caller must hold self._lock."""
-        if self.active is not self.target:
-            kind = "CLEAN" if self.target is self.clean_bundle else "OBSTACLE-AWARE"
-            self.get_logger().info(f"[static_reopt] swapping active line -> {kind} ({reason})")
-        self.active = self.target
-        self.swap_pending = False
+    # ----------------------------------------------------------------------------------
+    # start/finish crossing -> batch re-opt + swap
+    # ----------------------------------------------------------------------------------
+    def frenet_cb(self, msg: Odometry):
+        s = msg.pose.pose.position.x  # frenet s
+        self._last_frenet_t = self.get_clock().now().nanoseconds * 1e-9
+        crossed_sf = (self._last_s is not None and s < self._last_s - 1.0)  # s wrapped to ~0
+        self._last_s = s
+        if crossed_sf and self._obstacles_dirty:
+            self._rebuild_and_swap("start/finish")
+
+    def republish_cb(self):
+        now = self.get_clock().now().nanoseconds * 1e-9
+        # STALE-FRENET fallback: no odom -> we never see the s-wrap. Solve once so a headless /
+        # bag run still gets the obstacle line. Never fires while the car is actually driving.
+        frenet_stale = (self._last_frenet_t is None
+                        or (now - self._last_frenet_t) > self.swap_timeout_s)
+        if self._obstacles_dirty and frenet_stale and (now - self._dirty_since) > self.swap_timeout_s:
+            self._rebuild_and_swap("frenet stale fallback")
+
+        active = self.active
+        # publish ONLY when the line changed, or as a slow keep-alive (>= 5 s). No churn.
+        if (active is not self._last_published) or (now - self._last_publish_t) >= 5.0:
+            self._publish_active(active)
+        if self._notify_scaler_ticks > 0:
+            self._notify_scaler_ticks -= 1
+            self.pub_update_map.publish(Bool(data=True))
 
 
 def main(args=None):

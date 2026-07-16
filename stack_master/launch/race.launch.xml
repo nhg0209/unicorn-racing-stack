@@ -31,6 +31,18 @@
        description="Run pp_heading_controller instead of controller_manager (only one runs)"/>
   <arg name="reopt" default="false" description="Obstacle-aware global line (IFAC static re-optimization): static_reopt_node + static_obstacle_layer instead of plain global_trajectory_publisher"/>
   <arg name="reopt_safety_width" default="0.5" description="safety_width for the obstacle-aware re-optimizer (tight ifac map solves plain mincurv_iqp only at 0.25 or lower)"/>
+  <arg name="reopt_obs_change_tol" default="0.25" description="min obstacle move [m] to re-trigger the re-opt QP; larger = detection jitter does not thrash the optimizer"/>
+  <arg name="reopt_compute_sp" default="true" description="also re-optimize the shortest_path line (consumed by ot_interpolator); set false only if the OT line is unused"/>
+  <arg name="reopt_method" default="local_window" description="obstacle-aware line optimizer: local_window (fast ONLINE windowed min-curv QP) | global (legacy whole-track mincurv_iqp, offline-grade)"/>
+  <arg name="reopt_reach_time" default="1.2" description="[s] avoidance arc half-width ~ this * local raceline speed (bigger = gentler, faster arc reaching toward the adjacent corners)"/>
+  <arg name="reopt_reach_min" default="4.0" description="[m] MIN arc half-width (slow sections)"/>
+  <arg name="reopt_reach_max" default="10.0" description="[m] MAX arc half-width (fast sections)"/>
+  <arg name="reopt_qp_veh_width" default="0.30" description="[m] vehicle width for the windowed QP corridor + floor (obstacle clearance is obs_margin, separate)"/>
+  <arg name="reopt_wall_margin" default="0.12" description="[m] keep the re-optimized detour this far off the track walls"/>
+  <!-- Detection front-end used effectively: sim has no Livox, so force the 2D 'scan' path there;
+       the real car honours detection_source. -->
+  <let name="det_src" value="scan" if="$(var sim)"/>
+  <let name="det_src" value="$(var detection_source)" unless="$(var sim)"/>
   <!-- sim -> SIM config (racecar_f110.ini + veh_dyn_info); real hardware -> CAR. Folder name == racecar_version. -->
   <let name="racecar_version" value="SIM" if="$(var sim)"/>
   <let name="racecar_version" value="CAR" unless="$(var sim)"/>
@@ -50,6 +62,14 @@
     <arg name="virtual"      value="$(var virtual)"/>
     <arg name="reopt"   value="$(var reopt)"/>
     <arg name="reopt_safety_width" value="$(var reopt_safety_width)"/>
+    <arg name="reopt_obs_change_tol" value="$(var reopt_obs_change_tol)"/>
+    <arg name="reopt_compute_sp" value="$(var reopt_compute_sp)"/>
+    <arg name="reopt_method" value="$(var reopt_method)"/>
+    <arg name="reopt_reach_time" value="$(var reopt_reach_time)"/>
+    <arg name="reopt_reach_min" value="$(var reopt_reach_min)"/>
+    <arg name="reopt_reach_max" value="$(var reopt_reach_max)"/>
+    <arg name="reopt_qp_veh_width" value="$(var reopt_qp_veh_width)"/>
+    <arg name="reopt_wall_margin" value="$(var reopt_wall_margin)"/>
   </include>
 
   <!-- ===== Perception: LiDAR obstacle detection (C++) + tracking (Python) =====
@@ -58,7 +78,7 @@
        (sim virtual_perception) owns /tracking/obstacles. -->
   <!-- detection_source=scan: 2D perception/detect on /scan (Hokuyo, or Livox via
        pointcloud_to_laserscan). Fills /detect/raw_obstacles from the laser scan. -->
-  <group if="$(eval '\'$(var detection_source)\' == \'scan\'')">
+  <group if="$(eval '\'$(var det_src)\' == \'scan\'')">
     <node pkg="perception" exec="detect" name="detect" output="screen">
       <param from="$(find-pkg-share stack_master)/config/opponent_tracker_params.yaml"/>
       <param name="map" value="$(var map)"/>
@@ -68,7 +88,7 @@
   <!-- detection_source=kiss: Livox 3D native. kiss's BevDetector (detect_en:true in
        the kiss config) publishes cluster centers on /kiss_loc/obstacle_poses; the
        bridge converts them to /detect/raw_obstacles (Frenet-filled) for tracking. -->
-  <group if="$(eval '\'$(var detection_source)\' == \'kiss\'')">
+  <group if="$(eval '\'$(var det_src)\' == \'kiss\'')">
     <node pkg="perception" exec="kiss_obstacle_bridge" name="kiss_obstacle_bridge" output="screen"/>
   </group>
   <!-- with virtual:=true tracking_merger owns /tracking/obstacles, so tracking feeds it

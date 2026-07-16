@@ -160,11 +160,25 @@ class ControllerManager(Node):
 
     ############################################ LAZY INIT ############################################
     def global_wpnts_cb(self, data: WpntArray):
-        if self.controller is not None:
-            return
         if len(data.wpnts) < 2:
             return
-        self.waypoints = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in data.wpnts])
+        new_wpnts = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in data.wpnts])
+        if self.controller is not None:
+            # The global line can CHANGE at runtime (static re-optimization swaps in an
+            # obstacle-aware line). Rebuild the FrenetConverter so the lateral-error / L1
+            # lookahead logic references the CURRENT line, not the one seen at startup —
+            # otherwise the car's lateral error is measured against the stale clean line and
+            # the `lower_bound = sqrt(2)*lat_err` clamp inflates the lookahead. Only rebuild on
+            # an ACTUAL change (the line is published rarely), so there is no per-message churn.
+            if (self.waypoints is None or new_wpnts.shape != self.waypoints.shape
+                    or not np.allclose(new_wpnts, self.waypoints)):
+                self.waypoints = new_wpnts
+                self.track_length = data.wpnts[-1].s_m
+                self.converter = FrenetConverter(new_wpnts[:, 0], new_wpnts[:, 1])
+                self.controller.converter = self.converter
+                self.get_logger().info(f"[{self.name}] global line changed -> rebuilt FrenetConverter")
+            return
+        self.waypoints = new_wpnts
         # ROS1 read /global_republisher/track_length; derive from the waypoints' s_m
         self.track_length = data.wpnts[-1].s_m
         self.converter = FrenetConverter(self.waypoints[:, 0], self.waypoints[:, 1])
