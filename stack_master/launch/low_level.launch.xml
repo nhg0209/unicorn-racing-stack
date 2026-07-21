@@ -75,11 +75,17 @@
        tracking_merger run. Gated by `virtual`; when off, the sensor owns /scan
        directly and none of these nodes start. -->
   <group if="$(var virtual)">
+    <!-- The kinematic opponent_vehicle IS the opponent in BOTH sim and real:
+         gym_bridge_launch.py hardcodes use_external_opponent=true, so the gym runs
+         EGO-ONLY (no /goal_pose sub, no opp pubs/TF) and the virtual opponent owns the
+         whole /goal_pose -> /opp_* -> overlay chain. Do NOT disable it in sim, or a
+         2D Goal Pose spawns nothing. -->
     <include file="$(find-pkg-share virtual_perception)/launch/virtual_perception.launch.xml">
       <arg name="map_path"       value="$(var map_path).yaml"/>
       <arg name="ego_odom_topic" value="/car_state/odom"/>
       <arg name="scan_in"        value="/scan_raw"/>
       <arg name="scan_out"       value="/scan"/>
+      <arg name="virtual_opponent" value="true"/>
     </include>
   </group>
 

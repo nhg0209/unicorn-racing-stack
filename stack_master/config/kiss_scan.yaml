@@ -1,4 +1,7 @@
-# kiss_icp_localization — 2D scan-to-SDF localization on the real car.
+# kiss_icp_localization — ARCHIVED 2D-LaserScan variant (Hokuyo /scan front-end).
+# The LIVE config the stack loads is kiss.yaml (Livox 3D / 2.5D SDF). To run on the
+# 2D lidar instead, copy this file's contents over kiss.yaml (or point the launch at it).
+#
 # Drop-in replacement for the particle_filter: consumes the 2D LiDAR /scan and
 # publishes the localized pose DIRECTLY on /car_state/odom (no EKF) + TF map->base_link.
 #
@@ -69,7 +72,9 @@ kiss_icp_localization:
     # flip to true then. Params below are pre-set so enabling is a one-line change.
     detect_en: false
     detect_track_filter: true        # reject returns off the track mask (=walls/exterior)
-    detect_track_margin: -0.2        # erode 0.2 m inside the boundary (drop wall returns)
+    # distance-to-wall erosion (replaces the removed signed detect_track_margin): points
+    # closer than this to the nearest non-track (wall) cell are dropped. 0.2 = erode 20 cm.
+    detect_track_dist_min: 0.2
     detect_res: 0.05                 # BEV cell size [m]
     detect_eps: 0.3                  # DBSCAN neighborhood radius [m]
     detect_min_samples: 2            # 2D scan is sparse -> low core threshold
