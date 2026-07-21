@@ -73,7 +73,7 @@ class ObstacleSpliner(Node):
 
     Publishes:
         - ``/planner/avoidance/otwpnts``    (OTWpntArray)      selected evasion path (may be empty)
-        - ``/planner/avoidance/feasible``   (Bool)             False if 0 feasible candidates
+        - ``/planner/avoidance/static_feasible`` (Bool)        False if 0 feasible candidates
         - ``/planner/avoidance/markers``    (MarkerArray)      grey=all, red=rejected, green=selected
         - ``/planner/avoidance/latency``    (Float32)          loop time (only if ``measure``)
     """
@@ -144,6 +144,17 @@ class ObstacleSpliner(Node):
         self.w_obs = 2.0             # cost: soft obstacle proximity
         self.obs_sigma = 0.5         # [m] soft-penalty length scale
         self.use_grid_check = True   # reject candidates crossing the eroded map
+        # Raceline-clear gate: when the CURRENT global line (d=0 in its own frenet frame) already
+        # clears every static obstacle ahead — the obstacle-aware line swapped in by static_reopt —
+        # this planner must stay IDLE. Planning anyway re-recorded apexes on top of the swapped
+        # line (the re-opt then walked outward every lap) and made the SM commit pointless
+        # OVERTAKEs. Hysteresis: going idle needs clear_hyst_m EXTRA clearance; once idle, only a
+        # genuine keep-out violation resumes planning. Gated on |cur_d| so a maneuver in progress
+        # is never abandoned mid-hump.
+        self.clear_gate_enable = True
+        self.clear_hyst_m = 0.03     # [m] extra clearance required to ENTER the idle state
+        self.clear_max_cur_d = 0.15  # [m] gate only applies with the car ON the raceline
+        self._line_clear = False     # idle latch (hysteresis state)
 
         # Static params
         self.declare_parameters(namespace='', parameters=[('from_bag', False), ('measure', False)])
@@ -160,7 +171,7 @@ class ObstacleSpliner(Node):
             'kappa_add_max', 'kappa_abs_max', 'a_lat_max', 'a_long_max', 'a_long_accel',
             'safety_margin', 'wall_margin', 'shift_min', 'shift_buffer', 'ramp_len', 'hold_after',
             'return_len', 'apex_bulge', 'max_weave', 'width_car', 'tail_m', 'w_d', 'w_k', 'w_c', 'w_obs', 'obs_sigma',
-            'use_grid_check',
+            'use_grid_check', 'clear_gate_enable', 'clear_hyst_m', 'clear_max_cur_d',
         ]))
         self.add_on_set_parameters_callback(self.dyn_param_cb)
 
@@ -172,10 +183,11 @@ class ObstacleSpliner(Node):
         self.create_subscription(WpntArray, "/global_waypoints", self.gb_cb, 10)
         self.create_subscription(WpntArray, "/global_waypoints_scaled", self.gb_scaled_cb, 10)
 
-        # Publishers (topic names unchanged; /planner/avoidance/feasible is the only new topic)
         self.mrks_pub = self.create_publisher(MarkerArray, "/planner/avoidance/markers", 10)
         self.evasion_pub = self.create_publisher(OTWpntArray, "/planner/avoidance/otwpnts", 10)
-        self.feasible_pub = self.create_publisher(Bool, "/planner/avoidance/feasible", 10)
+        # published on the CANONICAL name the SM subscribes (no launch remap needed): a partial
+        # bring-up without the remap must not leave the SM's feasibility gate silently open
+        self.feasible_pub = self.create_publisher(Bool, "/planner/avoidance/static_feasible", 10)
         if self.measuring:
             self.latency_pub = self.create_publisher(Float32, "/planner/avoidance/latency", 10)
 
@@ -227,6 +239,11 @@ class ObstacleSpliner(Node):
         self.declare_parameter('use_grid_check', True,
                                ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
                                                    description="Reject candidates crossing eroded map"))
+        self.declare_parameter('clear_gate_enable', True,
+                               ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
+                                                   description="Stay idle when the current raceline already clears every obstacle ahead"))
+        self.declare_parameter('clear_hyst_m', 0.03, dbl(0.0, 0.5, "extra clearance to ENTER the idle state [m]"))
+        self.declare_parameter('clear_max_cur_d', 0.15, dbl(0.0, 1.0, "clear gate applies only when |cur_d| below this [m]"))
 
     def dyn_param_cb(self, params: List[Parameter]):
         for p in params:
@@ -286,6 +303,12 @@ class ObstacleSpliner(Node):
                 self.obs_sigma = float(p.value)
             elif n == 'use_grid_check':
                 self.use_grid_check = bool(p.value)
+            elif n == 'clear_gate_enable':
+                self.clear_gate_enable = bool(p.value)
+            elif n == 'clear_hyst_m':
+                self.clear_hyst_m = float(p.value)
+            elif n == 'clear_max_cur_d':
+                self.clear_max_cur_d = float(p.value)
         return SetParametersResult(successful=True)
 
     #############
@@ -369,8 +392,22 @@ class ObstacleSpliner(Node):
         """Static / near-stationary obstacles ahead within [0, lookahead], as (gap, obs), sorted."""
         cands = []
         for o in obstacles:
-            if not (o.is_static or (abs(o.vs) < 0.5 and abs(o.vd) < 0.5)):
+            # Trust the (position-persistence hardened) tracker flag. The old wide velocity
+            # fallback (|vs|<0.5) also caught MOVING opponents whenever their EKF speed dipped
+            # (slow corners / filter spin-up): this planner then splined around the moving car
+            # and the SM committed a STATIC overtake (which has NO sector gate) during the
+            # approach window BEFORE the lane-change planner engages (gap > engage_gap_m) --
+            # hijacking the head-to-head behavior with a snapshot spline. Keep only a tight
+            # near-zero band as a belt for a real box transiently demoted while its EKF
+            # re-initializes (its speed then reads ~0, a driving opponent does not).
+            near_zero = abs(o.vs) < 0.15 and abs(o.vd) < 0.15
+            if not (o.is_static or near_zero):
                 continue
+            if not o.is_static and near_zero:
+                self.get_logger().info(
+                    f"[{self.name}] treating dynamic-flagged obs id={o.id} as static "
+                    f"(near-zero speed vs={o.vs:.2f} vd={o.vd:.2f})",
+                    throttle_duration_sec=2.0)
             # detection-gated: only avoid an obstacle we currently SEE. The tracker keeps confirmed
             # statics in memory (is_visible=False when remembered-but-unseen) for continuity, but
             # planning off a remembered position looks like the car "knows" the box in advance.
@@ -423,7 +460,32 @@ class ObstacleSpliner(Node):
         obs_ahead = [o for _, o in cands_obs]
         if not obs_ahead:
             # nothing to avoid -> no avoidance path (state machine stays on the raceline)
+            self._line_clear = False
             return _empty()
+
+        # --- raceline-clear gate: the current global line may ALREADY avoid everything ahead ---
+        # (the obstacle-aware line static_reopt swapped in). Idle then: no path -> the SM stays
+        # GB_TRACK and no apex is re-recorded on top of the swapped line. Obstacle d values are in
+        # the SAME frenet frame as this planner (tracking re-projects on a line swap), so "the
+        # keep-out interval does not contain d=0" IS the clearance test of the followed line.
+        # The |cur_d| condition guards ENTERING idle only (never abandon a maneuver mid-hump);
+        # once LATCHED idle it must not bypass the gate — during the post-swap merge cur_d decays
+        # through the threshold with noise, and re-planning on every excursion above it flapped
+        # publish/empty at up to 20 Hz -> the SM alternated OVERTAKE<->GB_TRACK and the controller
+        # received two different local paths in alternation (the "duplicate path" symptom; the L1
+        # point jumped between the two lines). The latch drops only on a REAL keep-out violation.
+        if self.clear_gate_enable and (self._line_clear or abs(self.cur_d) < self.clear_max_cur_d):
+            need = obs_margin if self._line_clear else obs_margin + self.clear_hyst_m
+            clear = all(
+                (min(o.d_right, o.d_left) - need) > 0.0 or (max(o.d_right, o.d_left) + need) < 0.0
+                for o in obs_ahead)
+            if clear and not self._line_clear:
+                self.get_logger().info(
+                    f"[{self.name}] raceline clears all {len(obs_ahead)} obstacle(s) ahead "
+                    f"(margin {need:.2f} m) -> planner idle")
+            self._line_clear = clear
+            if clear:
+                return _empty()
         nearest = obs_ahead[0]
         self.obs_in_interest = nearest
 
@@ -523,12 +585,18 @@ class ObstacleSpliner(Node):
                       (d_cands < -(d_right_arr - half_car)[None, :])).any(axis=1))
 
         # --- feasibility 2: inflated obstacle boxes ---
+        # Signed centre-gap + half-span (same idiom as obs_half_s above): mod-ing s_start and
+        # s_end separately breaks whenever the box wraps the seam OR the car is already inside
+        # the box's s-interval — the old `g1 < g0: continue` skipped the check exactly then,
+        # letting candidates cut straight through an obstacle near s=0.
         obs_ok = np.ones(N, dtype=bool)
         for o in obs_ahead:
-            g0 = (o.s_start - self.cur_s) % self.gb_max_s - obs_margin
-            g1 = (o.s_end - self.cur_s) % self.gb_max_s + obs_margin
-            if g1 < g0:   # box straddles the s seam; skip this frame (handled once past the seam)
-                continue
+            o_span = (o.s_end - o.s_start) % self.gb_max_s
+            gc = (o.s_center - self.cur_s) % self.gb_max_s
+            if gc > self.gb_max_s / 2.0:
+                gc -= self.gb_max_s                     # signed: negative = behind the car
+            g0 = gc - o_span / 2.0 - obs_margin
+            g1 = gc + o_span / 2.0 + obs_margin
             d_box_lo = min(o.d_right, o.d_left) - obs_margin
             d_box_hi = max(o.d_right, o.d_left) + obs_margin
             s_in = (gap_wp >= g0) & (gap_wp <= g1)

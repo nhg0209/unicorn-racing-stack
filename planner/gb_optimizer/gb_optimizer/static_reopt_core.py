@@ -115,14 +115,114 @@ def _closed_el_lengths(pts: np.ndarray) -> np.ndarray:
 
 
 def _cyclic_smooth(a: np.ndarray, win: int = 7) -> np.ndarray:
-    """Moving-average smoothing on a closed (cyclic) 1-D signal, length preserved."""
+    """Moving-average smoothing on a closed (cyclic) 1-D signal, length preserved.
+
+    A closed raceline array carries a DUPLICATED closing point (a[-1] == a[0]); wrapping over the
+    full length would then treat that duplicate as its own station and smooth with period N instead
+    of the true N-1, leaving a seam error at s=0 (0.014 m on ifac bounds) that `alpha_dd`'s 1/h^2
+    ~= 100 gain turns into a fake curvature spike at start/finish. Detect the duplicate, smooth the
+    unique part cyclically, then restore it."""
     win = max(1, int(win))
+    a = np.asarray(a, dtype=float)
     if win == 1 or len(a) < win:
         return a.astype(float)
+    if len(a) > win + 1 and np.isclose(a[0], a[-1]):
+        inner = _cyclic_smooth(a[:-1], win)          # true period = N-1
+        return np.append(inner, inner[0])            # restore the closing duplicate
     k = np.ones(win) / win
     pad = win // 2
     ext = np.concatenate([a[-pad:], a, a[:win - pad - 1]])
     return np.convolve(ext, k, mode="valid")
+
+
+# Fraction of the lap ONE avoidance hump (entry + exit) may occupy. The re-optimized line must
+# remain a local detour that visibly rejoins the racing line; without this bound the entry ramp
+# grows until a single obstacle perturbs most of the lap.
+_HUMP_SPAN_FRAC = 0.28   # 0.20 -> 0.28: room for the entry/exit ramp stretching that shallows
+                         # the merge-zone inflections (user-visible S-kinks where the hump
+                         # rejoins the raceline); still keeps a hump under ~28% of the lap.
+# ALL-OR-NOTHING apex fit: a hump the corridor forces below this fraction of the recorded
+# reactive apex does NOT clear the obstacle (the apex |d| is the reactive-PROVEN clearance) —
+# laying the shrunken hump wastes lap time, still triggers the reactive layer every lap
+# (clear-gate never idles -> OVERTAKE<->GB_TRACK churn) and re-records apexes. Measured on
+# ifac: want -0.46 laid -0.28. Such apexes are DROPPED and reported instead.
+_APEX_KEEP_FRAC = 0.90
+
+
+def _hump_values(u_stn: np.ndarray, u_c: float, d: float, r_in: float, r_out: float,
+                 track_len: float):
+    """One C2 quintic hump (raceline -> apex -> raceline) sampled at the cut-linear stations
+    `u_stn`. Returns None if scipy is unavailable or the knots are degenerate."""
+    try:
+        from scipy.interpolate import BPoly
+    except Exception:
+        return None
+    lo, hi = u_c - r_in, u_c + r_out
+    if not (hi > lo + 1e-3):
+        return None
+    try:
+        poly = BPoly.from_derivatives(np.array([lo, u_c, hi]),
+                                      [[0.0, 0.0, 0.0], [float(d), 0.0, 0.0], [0.0, 0.0, 0.0]])
+    except Exception:
+        return None
+    v = np.zeros_like(u_stn)
+    m = (u_stn >= lo) & (u_stn <= hi)
+    if np.any(m):
+        v[m] = poly(u_stn[m])
+    return v
+
+
+def _fit_hump_to_corridor(u_stn: np.ndarray, u_c: float, d: float, r0: float, track_len: float,
+                          hi_inc: np.ndarray, lo_inc: np.ndarray, reach_floor: float):
+    """Shrink one hump until it FITS the corridor, instead of letting the final clip chop it.
+
+    Root cause this addresses: the corridor is zero-width at many scattered stations (on ifac 59/355
+    = 17% have d_right - w_veh/2 - wall_margin <= 0, because the min-curvature line hugs the inside
+    wall), while a speed-scaled ramp spans ~79 stations. Element-wise clipping of the analytic hump
+    against that comb-shaped bound turns a PERFECT single hump (1 local extremum) into a 3-5
+    extremum comb, and alpha''s 1/h^2 ~= 100 gain blows those cm-scale steps up into a curvature
+    that flips sign every station. Shrinking the hump keeps it ANALYTIC (always exactly 1 extremum,
+    C2 by construction) — a narrower hump is sharper but never wavy, and the clip then barely bites.
+
+    Returns (d_fitted, r_fitted). Amplitude is capped at the apex station first, then the reach is
+    bisected; the hump shrinks monotonically in both, so bisection is well posed."""
+    bound = hi_inc if d > 0 else lo_inc
+    # 1) cap the amplitude at the apex station (an apex the corridor cannot hold at all)
+    i_c = int(np.argmin(np.abs(u_stn - u_c)))
+    cap = bound[i_c]
+    d = min(d, cap) if d > 0 else max(d, cap)
+    if abs(d) < 0.03:
+        return 0.0, r0
+
+    def fits(r, amp):
+        v = _hump_values(u_stn, u_c, amp, r, r, track_len)
+        if v is None:
+            return False
+        return bool(np.all(v <= hi_inc + 1e-9)) and bool(np.all(v >= lo_inc - 1e-9))
+
+    if fits(r0, d):
+        return d, r0
+    # 2) bisect the REACH down. A narrower hump is sharper but stays analytic (1 extremum);
+    # widening it into a corridor that cannot hold it is what forced the clip to notch it.
+    lo_r, hi_r = reach_floor, r0
+    if fits(lo_r, d):
+        for _ in range(24):
+            mid = 0.5 * (lo_r + hi_r)
+            if fits(mid, d):
+                lo_r = mid
+            else:
+                hi_r = mid
+        return d, lo_r
+    # 3) even the narrowest hump does not fit at this amplitude -> bisect the AMPLITUDE at the
+    # floor reach. Both shrink the hump monotonically, so this always terminates on a feasible pair.
+    lo_a, hi_a = 0.0, d
+    for _ in range(24):
+        mid = 0.5 * (lo_a + hi_a)
+        if fits(reach_floor, mid):
+            lo_a = mid
+        else:
+            hi_a = mid
+    return (lo_a if abs(lo_a) >= 0.03 else 0.0), reach_floor
 
 
 def centerline_frame(reftrack: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -507,6 +607,370 @@ def _load_veh_dyn(input_path: str):
     return ggv, axm, m_veh, drag, dyn_exp, v_max
 
 
+def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: float,
+                         nvec_rl: np.ndarray, apexes: List[Tuple[float, float]],
+                         clean_vx: Optional[np.ndarray],
+                         reach_time: float, reach_min: float, reach_max: float,
+                         hi_inc: Optional[np.ndarray] = None,
+                         lo_inc: Optional[np.ndarray] = None,
+                         entry_scale: float = 1.0,
+                         exit_scale: float = 1.0
+                         ) -> Tuple[np.ndarray, int, float]:
+    """Lateral offset d(s) on the CLOSED clean loop that PRESERVES each recorded reactive apex
+    but re-grows long, gentle entry/exit ramps — the "keep the apex, press the secondary apexes"
+    reshape. `apexes` are map-frame (x, y) apex points captured from the reactive spline.
+
+    Per apex: project onto the raceline normal at the nearest station -> signed offset d*; grow a
+    speed-scaled reach R = clip(reach_time * local_speed, reach_min, reach_max) SYMMETRIC on both
+    sides. A single C2 quintic (via BPoly, zero d'/d'' at the ramp ends, d'=d''-free peak at the
+    apex) realises one wide gentle hump; apexes whose ramps overlap are woven into ONE multi-knot
+    BPoly (raceline -> apex1 -> apex2 -> raceline) so the line stays C2.
+
+    NB: the ramp deliberately is NOT shortened near corners. The offset is a FIXED-shape decay to
+    zero (it cannot re-cut a corner however far it reaches — smootherstep decays to <6% of the peak
+    by 80% of R), so a LONGER ramp through a corner adds only ~0.08 1/m of curvature, whereas a
+    shortened ramp forces a sharp S-shaped merge (curvature swing +0.6/-0.6) — the exact "unnecessary
+    undulation" at the merge. Longer is always gentler here.
+
+    Returns (d_global[N], n_apex_used, entry_kappa, dropped) — `dropped` lists the apexes the
+    corridor could not hold at >= _APEX_KEEP_FRAC of their recorded amplitude (all-or-nothing;
+    each entry {"xy": (x, y), "want": d*, "fit": best_feasible_d}), so the caller can report
+    honestly and leave those obstacles to the reactive layer. Wrap is handled by cutting the
+    profile in the largest apex-free gap so no hump straddles s=0. Never raises; degrades to
+    zeros on any failure."""
+    N = len(s_loop)
+    d_global = np.zeros(N)
+    if not apexes:
+        return d_global, 0, 0.0, []
+    try:
+        from scipy.interpolate import BPoly
+    except Exception:
+        return d_global, 0, 0.0, []
+
+    # --- project apexes -> (s*, d*, R_in, R_out, xy); drop negligible offsets ----------------
+    knots = []
+    for (xa, ya) in apexes:
+        i = int(np.argmin(np.hypot(clean_xy[:, 0] - xa, clean_xy[:, 1] - ya)))
+        d_star = float((np.array([xa, ya], float) - clean_xy[i]) @ nvec_rl[i])
+        if abs(d_star) < 0.03:
+            continue                                    # apex on the raceline -> no avoidance
+        v = float(clean_vx[i]) if clean_vx is not None else 3.0
+        R = float(np.clip(reach_time * v, reach_min, reach_max))
+        R = min(R, 0.45 * track_len)                    # never span more than ~half the loop
+        knots.append((float(s_loop[i]), d_star, R, R, xa, ya))  # symmetric ramps
+    if not knots:
+        return d_global, 0, 0.0, []
+
+    # --- cut the loop in the largest gap between apex centres (seam falls on d=0) -------------
+    knots.sort(key=lambda k: k[0])
+    centers = np.array([k[0] for k in knots])
+    if len(centers) == 1:
+        s_cut = (centers[0] + 0.5 * track_len) % track_len
+    else:
+        ext = np.concatenate([centers, [centers[0] + track_len]])
+        gaps = np.diff(ext)
+        g = int(np.argmax(gaps))
+        s_cut = (centers[g] + 0.5 * gaps[g]) % track_len
+
+    # --- BPoly breakpoints in the cut-linear coordinate u = (s - s_cut) mod L -----------------
+    # Between two apexes whose ramps OVERLAP we weave straight apex->apex (no return-to-0 knot);
+    # otherwise each hump opens from and closes back to the raceline. `zero` = [d,d',d''] all 0.
+    zero = [0.0, 0.0, 0.0]
+    kn_u = sorted(((c - s_cut) % track_len, d, ri, ro, xa, ya)
+                  for (c, d, ri, ro, xa, ya) in knots)
+    dropped: List[dict] = []
+    # --- FIT each hump to the corridor (shrink reach, NEVER the clearance) BEFORE laying it ----
+    # Without this the downstream element-wise clip does the shaping and combs the hump; see
+    # _fit_hump_to_corridor. Fitting keeps every hump analytic (exactly one extremum, C2).
+    # ALL-OR-NOTHING: an amplitude below _APEX_KEEP_FRAC of the recorded apex does not clear
+    # the obstacle -> drop the hump entirely and report it (reactive layer keeps handling it).
+    if hi_inc is not None and lo_inc is not None:
+        u_all = (s_loop - s_cut) % track_len
+        # Floor well BELOW reach_min: on a tight track (ifac is 1.39 m wide, and the min-curvature
+        # line leaves zero headroom over 59/355 stations) the corridor often admits only a ~1-2 m
+        # ramp — comparable to the reactive spliner's own return_len (2.5 m). A floor at reach_min
+        # would make the fit give up and hand an infeasible hump to the clip, i.e. the comb again.
+        floor_r = max(0.5, min(1.0, 0.05 * track_len))
+        hi_a = np.asarray(hi_inc, float)
+        lo_a = np.asarray(lo_inc, float)
+        fitted = []
+        for (u, d, ri, ro, xa, ya) in kn_u:
+            d_f, r_f = _fit_hump_to_corridor(u_all, u, d, max(ri, ro), track_len,
+                                             hi_a, lo_a, floor_r)
+            if abs(d_f) < max(0.03, _APEX_KEEP_FRAC * abs(d)):
+                dropped.append({"xy": (float(xa), float(ya)),
+                                "want": float(d), "fit": float(d_f)})
+                continue
+            # ENTRY/EXIT ramps may be stretched independently of the lap-time-optimal reach:
+            # a longer ramp cuts the merge-zone curvature (the S-shaped inflection where the
+            # hump joins the raceline — it cannot be removed, only made shallower).
+            # LOCALITY CAP. An avoidance must stay a LOCAL detour: the lap-time search alone does
+            # not bound it (stretching the entry costs <30 ms, so it always "wins"), and on ifac an
+            # 18 m entry + 6 m exit put 65% of the 35 m lap off the racing line and pushed the hump
+            # across s=0. Budget the whole hump to a fraction of the lap.
+            span_cap = max(2.0 * r_f, _HUMP_SPAN_FRAC * track_len)
+
+            def _stretch(scale, r_fixed, stretch_entry):
+                """Longest feasible stretched ramp <= scale*r_f within the span budget."""
+                if scale <= 1.0:
+                    return r_f
+                r_best = r_f
+                r_try = min(r_f * scale, max(r_f, span_cap - r_fixed))
+                for _ in range(12):
+                    ri, ro = (r_try, r_fixed) if stretch_entry else (r_fixed, r_try)
+                    v = _hump_values(u_all, u, d_f, ri, ro, track_len)
+                    if v is not None and np.all(v <= hi_a + 1e-9) and np.all(v >= lo_a - 1e-9):
+                        r_best = r_try
+                        break
+                    r_try = 0.5 * (r_try + r_f)
+                    if r_try <= r_f + 1e-3:
+                        break
+                return r_best
+
+            r_in = _stretch(entry_scale, r_f, stretch_entry=True)
+            r_out = _stretch(exit_scale, r_in, stretch_entry=False)
+            fitted.append((u, d_f, r_in, r_out))
+        kn_u = sorted(fitted)
+        if not kn_u:
+            return d_global, 0, 0.0, dropped
+    else:
+        kn_u = [(u, d, ri, ro) for (u, d, ri, ro, _xa, _ya) in kn_u]   # no corridor: keep all
+    n_ap = len(kn_u)
+    breaks = [0.0]
+    bd = [list(zero)]                                   # seam: raceline, C2
+    for idx, (u, d, ri, ro) in enumerate(kn_u):
+        at_raceline = (bd[-1] == zero)
+        entry = u - ri
+        if at_raceline and entry > breaks[-1] + 2e-3:
+            breaks.append(entry)                        # open from the raceline before this hump
+            bd.append(list(zero))
+        u_adj = max(u, breaks[-1] + 1e-3)               # keep breakpoints strictly increasing
+        breaks.append(u_adj)
+        bd.append([float(d), 0.0, 0.0])                 # apex knot (peak, slope 0)
+        # close back to the raceline UNLESS the next apex's ramp overlaps this exit (-> weave)
+        exit_ = u + ro
+        next_entry = (kn_u[idx + 1][0] - kn_u[idx + 1][2]) if idx + 1 < n_ap else float("inf")
+        if next_entry > exit_ + 2e-3:
+            e = min(exit_, track_len - 1e-3)
+            if e > breaks[-1] + 1e-3:
+                breaks.append(e)
+                bd.append(list(zero))
+    if breaks[-1] < track_len - 1e-6:
+        breaks.append(track_len)                        # seam close (raceline, C2 across s=0)
+        bd.append(list(zero))
+
+    try:
+        poly = BPoly.from_derivatives(np.asarray(breaks), bd)
+        u_stn = (s_loop - s_cut) % track_len
+        d_global = np.asarray(poly(u_stn), dtype=float)
+    except Exception:
+        return np.zeros(N), 0, 0.0, dropped
+    # RAMP curvature: max |d''| over each hump's entry AND exit ramps — the merge-zone
+    # inflections the driver feels joining/leaving the avoidance. It is the tiebreak the
+    # reach/stretch search minimises once the lap time is settled.
+    ds = np.gradient(u_stn) if N > 2 else np.ones(N)
+    ent_k = 0.0
+    for (u, d, ri, ro) in kn_u:
+        m = (u_stn >= u - ri) & (u_stn <= u + ro)
+        if int(np.count_nonzero(m)) < 3:
+            continue
+        seg = d_global[m]
+        h = float(np.median(np.abs(np.diff(u_stn[m])))) or 1.0
+        ent_k = max(ent_k, float(np.abs(np.diff(seg, 2)).max() / max(h * h, 1e-9)))
+    return d_global, len(kn_u), ent_k, dropped
+
+
+def _cap_speed_to_published_curvature(traj: np.ndarray, ggv, axm) -> None:
+    """Make the speed plan consistent with the PUBLISHED geometry (in place).
+
+    The velocity profile is solved on the ANALYTIC hump curvature (kappa_clean + alpha''),
+    but the published line is sharper after the corridor fit + uniform resample — the same vx
+    then demands more lateral acceleration than the vehicle has (measured on ifac: 6.7 m/s^2
+    implied vs ggv ay_max 4.5 on a two-hump line). The controller cannot track a plan beyond
+    the friction budget, which reads as a sharp tracking-quality collapse on the swapped line.
+
+    Cap vx by ay_max over the published |kappa| (lightly smoothed so single-station kappa
+    noise doesn't notch the plan), then re-run wrap-aware backward-decel / forward-accel
+    passes so the capped profile stays reachable. Cheap (two sweeps over ~355 points)."""
+    ay_cap, a_brake, a_accel = 4.5, 5.0, 3.0
+    try:
+        if np.ndim(ggv) > 1 and np.shape(ggv)[1] > 2:
+            ay_cap = float(np.min(ggv[:, 2]))
+            a_brake = float(np.max(ggv[:, 1]))
+        if np.ndim(axm) > 1 and np.shape(axm)[1] > 1:
+            a_accel = float(np.min(axm[:, 1]))
+    except Exception:
+        pass
+    kap = _cyclic_smooth(np.abs(traj[:, 4]), win=5)
+    vx = np.minimum(traj[:, 5], np.sqrt(ay_cap / np.maximum(kap, 1e-3)))
+    seg = np.roll(traj[:, 1:3], -1, axis=0) - traj[:, 1:3]
+    el = np.maximum(np.hypot(seg[:, 0], seg[:, 1]), 1e-6)   # el[i] = dist i -> i+1 (closed)
+    n = len(vx)
+    for i in range(2 * n - 1, -1, -1):                       # backward decel, wraps the seam
+        j, k = i % n, (i + 1) % n
+        vx[j] = min(vx[j], float(np.sqrt(vx[k] ** 2 + 2.0 * a_brake * el[j])))
+    for i in range(2 * n):                                   # forward accel, wraps the seam
+        j, k = i % n, (i - 1) % n
+        vx[j] = min(vx[j], float(np.sqrt(vx[k] ** 2 + 2.0 * a_accel * el[k])))
+    traj[:, 5] = vx
+
+
+def _resample_uniform(traj: np.ndarray, d_right: np.ndarray, d_left: np.ndarray,
+                      target_n: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Resample a CLOSED trajectory [s,x,y,psi,kappa,vx,ax] to UNIFORM arc-length spacing over
+    EXACTLY `target_n` unique points (+1 duplicated closing point). Laying the avoidance offset on
+    the raceline COMPRESSES the point spacing on the inner side of curves (the clean line's uniform
+    0.1 m becomes ~0.08-0.13 m); a downstream spline fit through unevenly spaced waypoints (frenet
+    converter, controller) can overshoot and WIGGLE between the sparse points. Uniform resampling
+    removes that — the SHAPE is preserved (points are only redistributed along the same polyline),
+    so clearance/apex are unchanged.
+
+    The COUNT is PINNED to the clean line's, NOT derived from the length. Deriving it (M = L/ds)
+    makes the detour's extra path length change the waypoint count (ifac: +0.05 m of detour already
+    turns 355 into 356), and the count is a CONTRACT the rest of the stack relies on:
+      - sector_tuner.scale_points() indexes its cached scaled array with the NEW array's length and
+        has no length guard -> IndexError -> the node dies -> /global_waypoints_scaled STOPS and
+        every consumer (state_machine, ot_interpolator) keeps the OLD line forever. That is the
+        "new line published but the car still follows the old path" failure.
+      - maps/<map>/speed_scaling.yaml and ot_sectors.yaml hard-code sector bounds as INDICES
+        (ifac: end: 355), so a changed count silently shifts every sector boundary.
+    Spacing therefore becomes L_new/target_n (~1.4% off the clean 0.0998 m for a 0.5 m detour) —
+    uniformity, which is what fixed the wiggle, is fully preserved.
+
+    x,y,kappa,vx,ax,d_right,d_left are linearly interpolated along the arc; psi + s are recomputed
+    from the resampled xy. Returns (traj_M, d_right_M, d_left_M) with a duplicated closing point."""
+    xy = traj[:, 1:3]
+    dup = np.allclose(xy[-1], xy[0])
+    xyu = xy[:-1] if dup else xy
+    n = len(xyu)
+    if n < 4 or int(target_n) < 4:
+        return traj, d_right, d_left
+    seg = np.vstack([np.diff(xyu, axis=0), xyu[0] - xyu[-1]])   # closed-loop segments
+    el = np.hypot(seg[:, 0], seg[:, 1])
+    s = np.concatenate([[0.0], np.cumsum(el)])                 # s[-1] = L (arc length)
+    L = float(s[-1])
+    M = max(int(target_n), 16)
+    new_s = np.linspace(0.0, L, M, endpoint=False)
+
+    def _interp(a):                                            # periodic linear interp onto new_s
+        au = a[:-1] if dup else a
+        return np.interp(new_s, s, np.concatenate([au, au[:1]]))
+
+    new_xy = np.column_stack([_interp(traj[:, 1]), _interp(traj[:, 2])])
+    kap = _interp(traj[:, 4]); vx = _interp(traj[:, 5]); ax = _interp(traj[:, 6])
+    dr = _interp(d_right); dl = _interp(d_left)
+    # close the loop (duplicate the start point) to match the clean-bundle convention
+    new_xy = np.vstack([new_xy, new_xy[:1]])
+    kap = np.append(kap, kap[0]); vx = np.append(vx, vx[0]); ax = np.append(ax, ax[0])
+    dr = np.append(dr, dr[0]); dl = np.append(dl, dl[0])
+    # recompute psi + s on the uniformly-spaced closed line
+    segm = np.roll(new_xy, -1, axis=0) - new_xy
+    elm = np.hypot(segm[:, 0], segm[:, 1])
+    psi_m, _ = tph.calc_head_curv_num.calc_head_curv_num(path=new_xy, el_lengths=elm, is_closed=True)
+    s_m = np.concatenate([[0.0], np.cumsum(elm)])[:len(new_xy)]
+    traj_m = np.column_stack([s_m, new_xy[:, 0], new_xy[:, 1], psi_m, kap, vx, ax])
+    return traj_m, dr, dl
+
+
+def _menger_kappa(xy_closed: np.ndarray) -> np.ndarray:
+    """Signed curvature of a CLOSED polyline from circumscribed circles (Menger). Unlike
+    calc_head_curv_num this does not differentiate a numerically-derived heading, so it does not
+    amplify the raceline's micro-noise: on the ifac clean line it reproduces the stored
+    kappa_radpm to 0.0067 1/m. Returns one value per input point (closing duplicate included)."""
+    xy = np.asarray(xy_closed, float)
+    dup = len(xy) > 2 and np.allclose(xy[-1], xy[0])
+    u = xy[:-1] if dup else xy
+    a, b, c = np.roll(u, 1, axis=0), u, np.roll(u, -1, axis=0)
+    v1, v2 = b - a, c - b
+    cross = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
+    denom = (np.hypot(*(b - a).T) * np.hypot(*(c - b).T) * np.hypot(*(c - a).T))
+    k = 2.0 * cross / np.maximum(denom, 1e-12)
+    return np.append(k, k[0]) if dup else k
+
+
+def _republish_kappa(traj: np.ndarray, clean_xy: np.ndarray, clean_kappa: Optional[np.ndarray],
+                     dev_tol: float = 0.02) -> np.ndarray:
+    """Curvature CONSISTENT with the published points.
+
+    kappa was built as kappa_clean + alpha'' on the PRE-resample stations and then edge-blended, so
+    after the uniform resample the published kappa no longer describes the published geometry —
+    measured error up to 1.56 1/m (the clean line's own peak curvature is 1.19). The controller sets
+    its L1 lookahead from mean|kappa| a few points ahead, so those spikes make the lookahead jump and
+    the car wander even though the waypoints themselves are smooth to <3 mm.
+
+    Fix: take the curvature straight from the published points, then restore the EXACT clean value
+    wherever the line has rejoined the clean raceline, so outside the avoidance the controller still
+    sees byte-identical clean curvature."""
+    k_geo = _cyclic_smooth(_menger_kappa(traj[:, 1:3]), win=5)
+    if clean_kappa is None:
+        return k_geo
+    ck = np.asarray(clean_kappa, float)
+    cx = np.asarray(clean_xy, float)
+    # nearest clean station for every published point (positions, not indices — the resample and
+    # the detour both shift arc length, so index/s matching would compare different places)
+    d2 = ((traj[:, 1][:, None] - cx[None, :, 0]) ** 2 +
+          (traj[:, 2][:, None] - cx[None, :, 1]) ** 2)
+    j = np.argmin(d2, axis=1)
+    on_clean = np.sqrt(d2[np.arange(len(j)), j]) <= dev_tol
+    out = k_geo.copy()
+    out[on_clean] = ck[j[on_clean]]
+    return out
+
+
+def _offset_lap_time(d_global: np.ndarray, clean_xy: np.ndarray, nvec_rl: np.ndarray,
+                     el_cl: np.ndarray, clean_kappa: Optional[np.ndarray],
+                     clean_vx: Optional[np.ndarray], lo_inc: np.ndarray, hi_inc: np.ndarray,
+                     veh, N: int) -> float:
+    """Estimated LAP TIME for a candidate offset profile — the objective the reach search minimises.
+
+    Mirrors the geometry/velocity math of _reopt_local_window_impl but skips psi, bounds and the
+    resample (none of which affect the time), so a whole search over ~10 candidate reaches costs
+    about as much as one full solve."""
+    if clean_vx is None:
+        return float("inf")
+    try:
+        ggv, axm, m_veh, drag, dyn_exp, v_max = veh
+        alpha = np.clip(d_global, lo_inc, hi_inc)
+        stitch = clean_xy + alpha[:, None] * nvec_rl
+        if N > 1 and np.allclose(clean_xy[-1], clean_xy[0]):
+            stitch[-1] = stitch[0]
+        sg = np.roll(stitch, -1, axis=0) - stitch
+        elc = np.hypot(sg[:, 0], sg[:, 1])
+        h2 = np.maximum((0.5 * (elc + np.roll(elc, 1))) ** 2, 1e-9)
+        add = (np.roll(alpha, -1) - 2.0 * alpha + np.roll(alpha, 1)) / h2
+        if N > 3:
+            h0 = 0.5 * (elc[0] + elc[N - 2])
+            add[0] = (alpha[1] - 2.0 * alpha[0] + alpha[N - 2]) / max(h0 ** 2, 1e-9)
+            add[N - 1] = add[0]
+        kappa_full = (np.asarray(clean_kappa, float) if clean_kappa is not None
+                      else np.zeros(N)) + add
+        dev = np.hypot(stitch[:, 0] - clean_xy[:, 0], stitch[:, 1] - clean_xy[:, 1])
+        sig = dev > 0.02
+        vx = np.asarray(clean_vx, float).copy()
+        if np.any(sig):
+            # same braking-distance margin as the full solve, so the search ranks candidates on the
+            # profile that will actually be published
+            ds_stn = float(np.sum(elc)) / max(N - 1, 1)
+            a_brake = 5.0
+            if ggv is not None and np.ndim(ggv) > 1 and np.shape(ggv)[1] > 1:
+                a_brake = float(np.max(ggv[:, 1]))
+            v_ref = float(np.max(clean_vx))
+            mg = int(np.clip(np.ceil(v_ref ** 2 / (2.0 * max(a_brake, 0.5)) / max(ds_stn, 1e-3)),
+                             10, max(10, N // 3)))
+            mask = np.zeros(N, dtype=bool)
+            for run in _wrap_run_indices(sig):
+                mask[(run[0] - mg + np.arange(len(run) + 2 * mg)) % N] = True
+            for run in _wrap_run_indices(mask):
+                vn = tph.calc_vel_profile.calc_vel_profile(
+                    ax_max_machines=axm, kappa=kappa_full[run], el_lengths=elc[run[:-1]],
+                    closed=False, drag_coeff=drag, m_veh=m_veh, ggv=ggv, dyn_model_exp=dyn_exp,
+                    v_max=v_max, v_start=float(clean_vx[run[0]]), v_end=float(clean_vx[run[-1]]))
+                vx[run] = _edge_blend(np.minimum(vn, clean_vx[run]), clean_vx[run])
+        return float(np.sum(elc / np.maximum(vx, 1e-3)))
+    except Exception:
+        return float("inf")
+
+
 def reoptimize_local_window(*args, **kwargs) -> dict:
     """Fast ONLINE obstacle-aware raceline (BLAS pinned to one thread for the QP). See
     `_reopt_local_window_impl` for the full signature and behaviour."""
@@ -519,7 +983,7 @@ def _reopt_local_window_impl(
     clean_dr: np.ndarray,
     clean_dl: np.ndarray,
     reftrack: np.ndarray,
-    obstacles: List[Obstacle],
+    apexes: List[Tuple[float, float]],
     input_path: str,
     params: Optional[ModulationParams] = None,
     w_veh: float = 0.30,
@@ -530,126 +994,161 @@ def _reopt_local_window_impl(
     reach_max: float = 10.0,
     clean_kappa: Optional[np.ndarray] = None,
 ) -> dict:
-    """Fast ONLINE obstacle-aware raceline: lay a smooth WIDE avoidance arc (raised smootherstep)
-    on the clean raceline per obstacle — gentler & faster than the reactive spline's tight bump.
+    """Fast ONLINE obstacle-aware raceline: reshape the REACTIVE avoidance spline into a global
+    line. Each `apex` (map-frame (x,y) captured from the reactive spliner on the exploration lap)
+    is PRESERVED, but its entry/exit are re-grown as long gentle ramps merging into the clean
+    raceline (the "keep the apex, press the secondary apexes" reshape — see build_offset_profile).
 
-    The clearance/side/feasibility come from `modulate_widths`; the SHAPE is analytic (not a QP):
-    a smootherstep bump peaking at the required clearance over a speed-scaled half-width R. Zero
-    1st+2nd derivative at both ends -> C2 seam + low curvature (carries speed). Curvature is taken
-    analytically as `kappa_clean + alpha''` (calc_head_curv_num inflates it ~5-8x). vx/kappa outside
-    the arc stay exactly the clean values (localized; controller lookahead/speed unchanged there).
+    The offset d(s) is a C2 quintic hump per apex (woven where they overlap); it is laid on the
+    clean raceline (stitch_xy = clean + d*nvec). Curvature is analytic (`kappa_clean + d''`, since
+    calc_head_curv_num inflates it ~5-8x); vx/kappa outside the arc stay exactly the clean values
+    (localized; controller lookahead/speed unchanged there). The reactive apex already cleared the
+    obstacle (corridor+grid+box+curvature checked), so the global line uses the SAME gap.
 
     Inputs:
       clean_xy   [N,2] clean raceline points (CLOSED loop; a duplicated closing point is handled).
       clean_dr/dl[N]   distance from each raceline point to the RIGHT/LEFT track bound.
       reftrack   [M,4] centerline `[x,y,w_tr_right,w_tr_left]` (only to reconstruct bound polylines).
-      obstacles        confirmed static obstacles (map-frame disks).
+      apexes           recorded reactive-spline apex points (map-frame (x,y)); empty -> clean line.
       input_path       config/<version> dir (veh_dyn_info + racecar_f110.ini) for the vel profile.
-      w_veh            vehicle width [m] for the corridor/clearance floor. Obstacle CLEARANCE is
-                       obs.r + obs_margin (in `params`); wall_margin keeps the arc off the walls.
-      reach_time/min/max  arc half-width R = clip(reach_time * local_speed, reach_min, reach_max).
-                       Bigger R = gentler, faster arc reaching toward the adjacent corners.
+      w_veh            vehicle width [m]; with wall_margin sets the corridor the offset is clamped to.
+      reach_time/min/max  ramp reach R = clip(reach_time * local_speed, reach_min, reach_max).
+                       Bigger R = gentler ramps (secondary apexes pressed down) reaching the corners.
 
     Returns the same dict shape as `reoptimize_with_obstacles` MINUS 'sp'
     (keys 'reftrack_mod', 'report', 'main'=(traj[N,7], bound_r, bound_l, est_lap_time), plus
-    'd_right'/'d_left', 'n_windows', 'n_failed'). No obstacles -> the clean raceline. Never raises;
-    an obstacle whose corridor is blocked keeps the clean line there (reactive layer covers it).
+    'd_right'/'d_left', 'n_windows', 'n_failed'). No apexes -> the clean raceline. Never raises.
     """
     if params is None:
         params = ModulationParams()
     clean_xy = np.asarray(clean_xy, dtype=float)[:, :2]
     N = clean_xy.shape[0]
+    clean_dr = np.asarray(clean_dr, float)
+    clean_dl = np.asarray(clean_dl, float)
+    clean_vx_arr = np.asarray(clean_vx, float) if clean_vx is not None else None
 
-    # --- corridor around the RACELINE: reference = clean line, widths = dist to bounds ----
-    rl_ref = np.column_stack([clean_xy[:, 0], clean_xy[:, 1],
-                              np.asarray(clean_dr, float), np.asarray(clean_dl, float)])
-    # recenter=False: keep the smooth clean raceline as the QP reference; the obstacle
-    # exclusion lives in the widths (a recentered reference spikes at the coarse QP grid).
-    # Floor the corridor above the QP vehicle width so tight stations keep a small usable
-    # band; the +2*wall_margin lets us shave wall_margin off EACH side below (keeping the
-    # line off the walls) while the post-shave floor stays w_veh+0.05 (still solvable).
-    corridor_floor = w_veh + 0.05 + 2.0 * wall_margin
-    rl_mod, report = modulate_widths(rl_ref, obstacles, params,
-                                     min_total_width=corridor_floor, recenter=False)
-    # dense raceline normal (toward +right); used both to lay the smooth detour on the clean
-    # line and to reconstruct the track bounds. Computed once.
+    # dense raceline normal (toward +right); lays the offset on the clean line + reconstructs bounds.
+    rl_ref = np.column_stack([clean_xy[:, 0], clean_xy[:, 1], clean_dr, clean_dl])
     _, nvec_rl, _ = centerline_frame(rl_ref)
     # The closed raceline has a DUPLICATED closing point (xy[-1]==xy[0], el=0); centerline_frame's
-    # normal there is a 0/0 garbage vector -> if an obstacle arc reaches start/finish, that one
-    # station scatters far off the line (and its d_right/d_left/bounds go garbage). It is the SAME
-    # physical point as idx 0, so copy the good normal.
+    # normal there is a 0/0 garbage vector. It is the SAME physical point as idx 0, so copy it.
     if N > 1 and np.allclose(clean_xy[-1], clean_xy[0]):
         nvec_rl[-1] = nvec_rl[0]
 
-    # --- DEVIATION as a smooth WIDE arc (analytic), NOT a min-curv QP bump -----------------
-    # The windowed min-curv QP concentrates the deviation into a ~2-3 m bump right at the obstacle
-    # (as sharp as the reactive spline) and leaves curvature ripple + a seam spike -> it neither
-    # steers gently nor carries speed. Instead lay the deviation directly as a raised SMOOTHERSTEP
-    # bump per obstacle: peak = the clearance the corridor requires, spread over a speed-scaled
-    # half-width R that reaches toward the adjacent corners. smootherstep(t)=6t^5-15t^4+10t^3 has
-    # ZERO 1st AND 2nd derivative at both ends -> C2 seam (no curvature spike) + a gentle low-curv
-    # arc (v_curv stays high -> no braking). It only ever deviates to CLEAR the obstacle, so it
-    # never re-cuts real corners (no undulation) — corner reshaping stays option 2.
+    # arc length of the closed clean loop
     seg = np.roll(clean_xy, -1, axis=0) - clean_xy
     el_cl = np.hypot(seg[:, 0], seg[:, 1])
     s_loop = np.concatenate([[0.0], np.cumsum(el_cl)])[:N]
     track_len = float(np.sum(el_cl))
 
-    # per-station feasible offset band [lo_off, hi_off] for the car (w_veh) + wall_margin, and the
-    # REQUIRED signed offset to clear the obstacles (0 where the clean line already clears).
-    hi_off = rl_mod[:, 2] - 0.5 * w_veh - wall_margin
-    lo_off = -rl_mod[:, 3] + 0.5 * w_veh + wall_margin
-    req = np.where(lo_off > 0.0, lo_off, np.where(hi_off < 0.0, hi_off, 0.0))
-    feasible_stn = hi_off >= lo_off
+    # --- feasible lateral corridor per station (0 always included so a zero-offset station is
+    # never pushed off the clean line at a narrow spot). SMOOTH the bounds first: the optimizer
+    # corridor widths are bumpy at the 0.1 m scale near tight corners, and forcing a decaying ramp
+    # to track a ±cm-jittery wall makes the merge zigzag. The wall_margin buffer keeps it safe.
+    hi_off = _cyclic_smooth(clean_dr - 0.5 * w_veh - wall_margin, win=7)
+    lo_off = _cyclic_smooth(-(clean_dl - 0.5 * w_veh - wall_margin), win=7)
+    lo_inc = np.minimum(lo_off, 0.0)
+    hi_inc = np.maximum(hi_off, 0.0)
 
-    alpha_full = np.zeros(N)
-    solved_runs: List[np.ndarray] = []
-    n_solved = 0
-    n_failed = 0
-    for obs in obstacles:
-        i_c = int(np.argmin(np.hypot(clean_xy[:, 0] - obs.x, clean_xy[:, 1] - obs.y)))
-        if not feasible_stn[i_c]:
-            n_failed += 1                                # corridor blocked -> reactive layer covers
+    ggv, axm, m_veh, drag, dyn_exp, v_max = _load_veh_dyn(input_path)
+    veh = (ggv, axm, m_veh, drag, dyn_exp, v_max)
+
+    # --- OFFSET d(s): apex-preserving reshape of the reactive spline, with the ramp REACH chosen
+    # to MINIMISE LAP TIME (the actual objective) instead of by a speed heuristic ---------------
+    # The old rule R = clip(reach_time * v, reach_min, reach_max) came from "a wider arc is gentler
+    # and carries more speed". That is false on a short tight track: on ifac (35.3 m lap) R = 10 m
+    # spreads one hump over 57% of the lap, and measured against the clean line it costs 1.3-2.4 s
+    # versus 0.10-0.31 s at the optimum — i.e. roughly TWICE the time the purely reactive line
+    # loses. The optimum reach varies 1.5-4 m per apex and cannot be predicted from local speed, so
+    # search it. Asymmetric entry/exit reaches were measured to add only 0-0.03 s, not worth 8x the
+    # evaluations. reach_min/reach_max are now the SEARCH BOUNDS.
+    # Candidate reaches, additionally bounded by the locality budget: a symmetric hump of reach r
+    # spans 2r, so r must fit inside _HUMP_SPAN_FRAC of the lap however large reach_max is set.
+    r_cap = max(1.0, 0.5 * _HUMP_SPAN_FRAC * track_len)
+    # The lower bound must respect the locality cap too: with reach_min > r_cap (a long-track
+    # default like 4.0 m on the 35 m ifac loop, r_cap 3.5) the filter came back EMPTY and the
+    # fallback candidate (7.0 m) blew straight past the cap — the intended 1.5-4 m lap-time
+    # search never ran and every hump was ~2x wider than optimal.
+    r_lo = min(reach_min, r_cap)
+    cand_r = [r for r in (1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0)
+              if r_lo - 1e-9 <= r <= min(reach_max, r_cap) + 1e-9]
+    if not cand_r:
+        cand_r = [float(np.clip(0.5 * (reach_min + reach_max), r_lo, min(reach_max, r_cap)))]
+    def _try(r, e_scale, x_scale=1.0):
+        dg, nn, ek, drp = build_offset_profile(
+            clean_xy, s_loop, track_len, nvec_rl, apexes,
+            clean_vx_arr, 0.0, r, r, hi_inc=hi_inc, lo_inc=lo_inc,
+            entry_scale=e_scale, exit_scale=x_scale)
+        if nn == 0:
+            return dg, 0, float("inf"), ek, drp
+        return dg, nn, _offset_lap_time(dg, clean_xy, nvec_rl, el_cl, clean_kappa,
+                                        clean_vx_arr, lo_inc, hi_inc, veh, N), ek, drp
+
+    # STAGE 1 — symmetric reach, minimise lap time.
+    d_global, n_solved, best_est, best_ek, best_r = None, 0, float("inf"), 0.0, cand_r[0]
+    apex_dropped: List[dict] = []
+    for r_try in cand_r:
+        d_try, n_try, est_try, ek_try, drp_try = _try(r_try, 1.0)
+        if n_try == 0:
+            if d_global is None:
+                d_global, n_solved, apex_dropped = d_try, 0, drp_try
             continue
-        peak = float(req[i_c])
-        if abs(peak) < 1e-3:
-            continue                                     # clean line already clears -> no arc
-        v_obs = float(clean_vx[i_c]) if clean_vx is not None else 3.0
-        R = float(np.clip(reach_time * v_obs, reach_min, reach_max))
-        ds = np.abs(s_loop - s_loop[i_c])
-        ds = np.minimum(ds, track_len - ds)              # wrap-aware arc distance to the obstacle
-        t = np.clip(ds / max(R, 1e-3), 0.0, 1.0)
-        shape = 1.0 - (6.0 * t ** 5 - 15.0 * t ** 4 + 10.0 * t ** 3)   # 1 @obstacle -> 0 @R (C2 ends)
-        bump = peak * shape
-        # max-MAGNITUDE envelope over obstacles: same-side close obstacles merge into one wider
-        # plateau that clears both (a signed sum would over-shoot then get clamped short); opposite
-        # sides keep the dominant clearance (one line can't slalom two near-coincident blockers).
-        alpha_full = np.where(np.abs(bump) > np.abs(alpha_full), bump, alpha_full)
-        n_solved += 1
+        if est_try < best_est:
+            d_global, n_solved, best_est, best_ek, best_r = d_try, n_try, est_try, ek_try, r_try
+            apex_dropped = drp_try
+    # STAGE 2 — stretch the ENTRY ramp (gradual turn-in), then STAGE 3 — stretch the EXIT ramp
+    # too: the merge-back inflection (curvature sign flip where the hump rejoins the raceline)
+    # cannot be removed, but a longer return ramp makes it shallow instead of a visible S-kink.
+    # Each stage keeps the longest stretch that costs at most `tol` of lap time and lowers the
+    # ramp curvature tiebreak.
+    if n_solved:
+        tol = 0.03                                        # [s] lap-time budget for a softer turn-in
+        best_e = 1.0
+        for e_scale in (1.5, 2.0, 3.0):
+            d_try, n_try, est_try, ek_try, drp_try = _try(best_r, e_scale)
+            if n_try and est_try <= best_est + tol and ek_try < best_ek:
+                d_global, n_solved, best_ek, apex_dropped, best_e = d_try, n_try, ek_try, drp_try, e_scale
+        tol_exit = 0.05                                   # [s] merge smoothness is worth a bit more
+        for x_scale in (1.5, 2.0, 3.0):
+            d_try, n_try, est_try, ek_try, drp_try = _try(best_r, best_e, x_scale)
+            if n_try and est_try <= best_est + tol_exit and ek_try < best_ek:
+                d_global, n_solved, best_ek, apex_dropped = d_try, n_try, ek_try, drp_try
+    if d_global is None:
+        d_global, n_solved = np.zeros(N), 0
+    n_failed = 0                                          # apexes with no offset are simply absent
+    # The hump was already FITTED to this corridor in build_offset_profile (reach + amplitude
+    # bisection), so the clip below is a guard that should barely bite — not the shaping mechanism.
+    # Clipping as the shaping mechanism is what produced the visible undulation: it turns the
+    # analytic 1-extremum hump into a 3-5 extremum comb (see _fit_hump_to_corridor).
+    alpha_full = np.clip(d_global, lo_inc, hi_inc)
+    if n_solved and float(np.max(np.abs(alpha_full - d_global))) > 1e-6:
+        # The corridor fit could NOT make this profile feasible, so the clip had to shape it and
+        # left C0 corners -> round them. This is a FALLBACK, never the normal path: applied to an
+        # already-fitted (C2, feasible) hump the moving average would only blur the apex, and on a
+        # hump narrower than the window it rings. Measured on ifac with realistic 0.35 m apexes,
+        # fitting takes the clip-induced wobble from 38.9 mm median / 98.4 mm max down to 0.0.
+        alpha_full = np.clip(_cyclic_smooth(alpha_full, win=9), lo_inc, hi_inc)
 
-    # curvature contribution of the arc = alpha'' (2nd deriv wrt arc length) — computed from the
-    # SMOOTH (pre-clamp) smootherstep so it stays clean (the clamp below can add corridor kinks
-    # that a finite-difference would read as huge fake curvature).
+    # curvature contribution of the arc = alpha'' (2nd deriv wrt arc length), from the FINAL
+    # smoothed+clamped offset: post-smoothing this is the real laid shape (no fake clamp-kink
+    # spikes left), so the vel profile sees honest curvature through clamped wedges too.
     elm = np.roll(el_cl, 1)
     h2 = np.maximum((0.5 * (el_cl + elm)) ** 2, 1e-9)
     alpha_dd = (np.roll(alpha_full, -1) - 2.0 * alpha_full + np.roll(alpha_full, 1)) / h2
-    # The closed loop has a DUPLICATED closing point (xy[-1]==xy[0], el=0), which breaks the
-    # 2nd-difference stencil at idx 0 and N-1 (it uses the duplicate instead of the real neighbour
-    # N-2) -> a huge fake curvature spike right at start/finish. Recompute those two from the real
-    # physical neighbours so an arc that wraps past s=0 stays smooth.
+    # The DUPLICATED closing point breaks the 2nd-difference stencil at idx 0 and N-1 (it uses the
+    # duplicate instead of the real neighbour N-2) -> a fake curvature spike at start/finish.
     if N > 3:
         h0 = 0.5 * (el_cl[0] + el_cl[N - 2])
         alpha_dd[0] = (alpha_full[1] - 2.0 * alpha_full[0] + alpha_full[N - 2]) / max(h0 ** 2, 1e-9)
         alpha_dd[N - 1] = alpha_dd[0]
 
-    # clamp the arc to the drivable corridor (walls), but keep the bounds inclusive of 0 so a
-    # zero-arc station is NEVER pushed off the clean line at a narrow spot (that would deviate the
-    # line where there is no obstacle = undulation). A no-op wherever the arc already fits.
-    alpha_full = np.clip(alpha_full, np.minimum(lo_off, 0.0), np.maximum(hi_off, 0.0))
-
     stitch_xy = clean_xy + alpha_full[:, None] * nvec_rl if n_solved else clean_xy.copy()
     if N > 1 and np.allclose(clean_xy[-1], clean_xy[0]):
         stitch_xy[-1] = stitch_xy[0]                     # keep the closed-loop closing point exact
+
+    # minimal report (no width modulation now); reftrack_mod kept for the return dict shape
+    report = ModulationReport(n_stations=N, n_affected=n_solved)
+    rl_mod = rl_ref
 
     # --- recompute geometry over the stitched CLOSED loop ---------------------------------
     seg = np.roll(stitch_xy, -1, axis=0) - stitch_xy
@@ -663,8 +1162,6 @@ def _reopt_local_window_impl(
     kappa_full = kappa_clean + alpha_dd
     s_full = np.concatenate([[0.0], np.cumsum(el_cl)])[:N]
 
-    ggv, axm, m_veh, drag, dyn_exp, v_max = _load_veh_dyn(input_path)
-
     # Region to RE-SOLVE: where the line actually detours (>5 cm), extended by a margin. Both
     # vx AND the published kappa are recomputed ONLY here (blended to clean at the edges) and
     # otherwise held at the clean values — so outside the obstacle the controller sees exactly
@@ -677,7 +1174,24 @@ def _reopt_local_window_impl(
     sig = dev_full > 0.02
     vx_runs: List[np.ndarray] = []
     if np.any(sig):
-        margin = 10
+        # The margin must cover the BRAKING DISTANCE into the arc, not a token 1 m. The arc adds
+        # curvature, so the car has to be slower when it ARRIVES — braking therefore starts well
+        # upstream of any geometric deviation. With a fixed 10-station (1 m) margin that whole
+        # deceleration got crammed into 1 m and _edge_blend then forced the profile back up to the
+        # clean speed at the run edge: an impossible decel demand exactly at the junction, and up to
+        # 1.84 m/s of speed loss at stations whose GEOMETRY is already back on the clean line.
+        # Sizing the run by v^2/(2a) instead lets the re-solved profile meet the clean one on its
+        # own, so the blend at the edge becomes a no-op.
+        ds_stn = track_len / max(N - 1, 1)
+        a_brake = 5.0
+        try:
+            if ggv is not None and np.ndim(ggv) > 1 and np.shape(ggv)[1] > 1:
+                a_brake = float(np.max(ggv[:, 1]))
+        except Exception:
+            pass
+        v_ref = float(np.max(clean_vx_arr)) if clean_vx_arr is not None else 10.0
+        margin = int(np.clip(np.ceil(v_ref ** 2 / (2.0 * max(a_brake, 0.5)) / max(ds_stn, 1e-3)),
+                             10, max(10, N // 3)))
         vx_mask = np.zeros(N, dtype=bool)
         for run in _wrap_run_indices(sig):
             vx_mask[(run[0] - margin + np.arange(len(run) + 2 * margin)) % N] = True
@@ -727,9 +1241,51 @@ def _reopt_local_window_impl(
     bound_r = clean_xy + np.asarray(clean_dr, float)[:, None] * nvec_rl
     bound_l = clean_xy - np.asarray(clean_dl, float)[:, None] * nvec_rl
 
+    # UNIFORM-spacing resample: the offset compresses the point spacing on inner curves, and a
+    # downstream spline through unevenly spaced waypoints can wiggle. Only when an arc was laid
+    # (n_solved) — a clean line is already uniform. Shape is preserved; the COUNT is pinned to the
+    # clean line's (N-1 unique + 1 closing point) — see _resample_uniform: a length-derived count
+    # kills sector_tuner (IndexError -> /global_waypoints_scaled stops -> the car keeps following
+    # the OLD line) and shifts the index-based sector bounds in speed_scaling/ot_sectors.yaml.
+    if n_solved:
+        traj, d_right, d_left = _resample_uniform(traj, d_right, d_left, N - 1)
+        # Curvature must describe the points we actually publish (the controller's lookahead reads
+        # it); recompute it from the final geometry and restore the exact clean value where the
+        # line has rejoined the raceline. See _republish_kappa.
+        traj[:, 4] = _republish_kappa(traj, clean_xy, clean_kappa)
+        # FULL-LAP velocity re-solve on the PUBLISHED geometry/curvature, replacing the windowed
+        # runs + edge-blend patchwork as the final speed source: one closed-loop profile has no
+        # blend seams (the per-run profiles left small steps at run edges and between humps — a
+        # user-visible rough speed plan across the swapped line). Ceiling = the tuned clean
+        # line's top speed, so the re-solve can never overspeed the racing setup.
+        _sg = np.roll(traj[:, 1:3], -1, axis=0) - traj[:, 1:3]
+        _el = np.maximum(np.hypot(_sg[:, 0], _sg[:, 1]), 1e-6)
+        try:
+            vx_full = tph.calc_vel_profile.calc_vel_profile(
+                ax_max_machines=axm, kappa=traj[:-1, 4], el_lengths=_el[:-1], closed=True,
+                drag_coeff=drag, m_veh=m_veh, ggv=ggv, dyn_model_exp=dyn_exp, v_max=v_max)
+            ceil = float(np.max(clean_vx_arr)) if clean_vx_arr is not None else v_max
+            traj[:-1, 5] = np.minimum(vx_full, ceil)
+            traj[-1, 5] = traj[0, 5]
+        except Exception:
+            pass                                     # keep the windowed profile on any failure
+        # ... and the SPEED must stay feasible over the published curvature in every case
+        # (also re-runs the wrap-aware decel/accel sweeps) — see _cap_speed_to_published_curvature.
+        _cap_speed_to_published_curvature(traj, ggv, axm)
+        # ax likewise has to describe the PUBLISHED vx over the PUBLISHED spacing. It was computed
+        # on the pre-resample grid and then linearly interpolated, leaving it inconsistent by up to
+        # 0.85 m/s^2 (the clean line's own residual is 0.001) — a wrong feed-forward for any
+        # consumer that differentiates the speed plan.
+        _sg = np.roll(traj[:, 1:3], -1, axis=0) - traj[:, 1:3]
+        _el = np.hypot(_sg[:, 0], _sg[:, 1])
+        traj[:, 6] = (np.roll(traj[:, 5], -1) ** 2 - traj[:, 5] ** 2) / (2.0 * np.maximum(_el, 1e-6))
+        if len(traj) > 2:
+            traj[-1, 6] = traj[0, 6]                 # closing duplicate: el=0 there
+        est = float(np.sum(_el[:-1] / np.maximum(traj[:-1, 5], 1e-3)))   # est on the FINAL profile
+
     return {"reftrack_mod": rl_mod, "report": report,
             "main": (traj, bound_r, bound_l, est), "d_right": d_right, "d_left": d_left,
-            "n_windows": n_solved, "n_failed": n_failed}
+            "n_windows": n_solved, "n_failed": n_failed, "apex_dropped": apex_dropped}
 
 
 # ======================================================================================

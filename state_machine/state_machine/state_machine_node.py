@@ -183,9 +183,9 @@ class StateMachine(Node):
         # dynamic-parameter-backed attributes (aliases onto params)
         self.gb_ego_width_m = self.params.gb_ego_width_m
         self.lateral_width_gb_m = self.params.lateral_width_gb_m
+        self.lateral_width_static_gb_m = self.params.lateral_width_static_gb_m
         self.gb_horizon_m = self.params.gb_horizon_m
         self.interest_horizon_m = self.params.interest_horizon_m
-        self.static_ot_speed_mps = self.params.static_ot_speed_mps
         self.getting_closer_rel_vel_mps = self.params.getting_closer_rel_vel_mps
         self.static_ot_distance_m = self.params.static_ot_distance_m
 
@@ -270,15 +270,25 @@ class StateMachine(Node):
         self.overtaking_ttl_count = 0
         self.overtaking_ttl_count_threshold = int(self.overtaking_ttl_sec * self.rate_hz)
 
-        # Feasibility signal from the static avoidance planner (True until told otherwise, so the
-        # absence of the topic never silently blocks overtaking; the planner publishes False only
-        # when it finds no passable candidate).
-        self.static_avoidance_feasible = True
+        # Feasibility signal from the static avoidance planner. FAIL-CLOSED: the planner publishes
+        # it every cycle (20 Hz), so a stale or never-received signal means the planner is dead or
+        # miswired — the static OVERTAKE commit must then stay blocked (trailing is the safe
+        # fallback), not silently open as the old default-True did.
+        self.static_avoidance_feasible = False
+        self._static_feasible_t = None
+        self.static_feasible_stale_sec = 0.5
+        # sustain side of the same gate: last time the planner said feasible=True. A static
+        # OVERTAKE is dropped (-> TRAILING) once the planner reports infeasible for longer
+        # than this (single-cycle blips tolerated; riding the stale cached spline is not).
+        self._static_feasible_true_t = None
+        self.static_feasible_lost_sec = 0.4
 
         # Transition hysteresis (anti-chatter): a state must be held >= min_dwell_sec before it may
         # switch to a NON-safe state. Switches toward the safe states bypass this. The counter/timer
         # live on the node (not in the pure transition functions).
         self.min_dwell_sec = self.params.min_dwell_sec
+        self.splice_from_path_start = self.params.splice_from_path_start
+        self.splice_start_dist_m = self.params.splice_start_dist_m
         self._last_transition_time = self.now_sec()
         self._committed_src = None
         # Targets that may be entered IMMEDIATELY (bypass min_dwell): the safe-direction states
@@ -729,6 +739,9 @@ class StateMachine(Node):
 
     def static_feasible_cb(self, data):
         self.static_avoidance_feasible = data.data
+        self._static_feasible_t = self.now_sec()
+        if data.data:
+            self._static_feasible_true_t = self.now_sec()
 
     ######################################
     # ATTRIBUTES/CONDITIONS CALCULATIONS #
@@ -737,7 +750,7 @@ class StateMachine(Node):
         ftg_only = False
         if len(self.only_ftg_zones) != 0:
             for sector in self.only_ftg_zones:
-                if sector[0] <= self.cur_s / self.waypoints_dist <= sector[1]:
+                if sector[0] <= self.cur_s / self.wpnt_dist <= sector[1]:
                     ftg_only = True
                     break
         return ftg_only
@@ -754,7 +767,7 @@ class StateMachine(Node):
         # +/-pi) doesn't produce a spurious ~2*pi error.
         # NOTE: the previous threshold_deg branch compared self.cur_d (lateral metres)
         # against deg2rad(threshold_deg) (radians) -- it never checked heading at all.
-        cloest_wpnt_idx = int(self.cur_s / self.waypoints_dist) % self.num_glb_wpnts
+        cloest_wpnt_idx = int(self.cur_s / self.wpnt_dist) % self.num_glb_wpnts   # live spacing
         cloest_wpnt_psi = self.cur_gb_wpnts.list[cloest_wpnt_idx].psi_rad
         heading_err = (self.current_position[2] - cloest_wpnt_psi + np.pi) % (2 * np.pi) - np.pi
         return np.abs(heading_err) < np.deg2rad(threshold_deg)
@@ -763,7 +776,7 @@ class StateMachine(Node):
         # ROS1: no overtake zone matching cur_s -> not in an OT sector (return False).
         # (An empty overtake_zones means overtaking is suppressed, as in ROS1.)
         for sector in self.overtake_zones:
-            if sector[0] <= self.cur_s / self.waypoints_dist <= sector[1]:
+            if sector[0] <= self.cur_s / self.wpnt_dist <= sector[1]:
                 self.ot_section_check_pub.publish(Bool(data=True))
                 return True
         self.ot_section_check_pub.publish(Bool(data=False))
@@ -864,16 +877,22 @@ class StateMachine(Node):
                             ot_d = wpnts_data.list[avoid_wpnt_idx].d_m
                         min_dist = abs(ot_d - obs_d)
                         free_dist = min_dist - obs.size / 2 - self.gb_ego_width_m / 2
-                        # For a STATIC obstacle evaluated against an AVOIDANCE path the required
-                        # clearance must be DISTANCE-INDEPENDENT: the object isn't moving, so a
-                        # spline that geometrically clears it is just as valid at 8 m as at 1 m.
-                        # The original gap-scaling (meant for moving opponents: "only trust the
-                        # lateral gap once close") made a clearing spline read NOT-free while far
-                        # and only relax as the car crept to gap<~2 m -> the "trail up close, then
-                        # switch" artifact. Keep the scaling only for the raceline (GB) check,
-                        # which governs *when to leave* the line.
+                        # For a STATIC obstacle the required clearance must be DISTANCE-
+                        # INDEPENDENT: the object isn't moving, so a line that geometrically
+                        # clears it is just as valid at 8 m as at 1 m. The original gap-scaling
+                        # (meant for moving opponents: "only trust the lateral gap once close")
+                        # made a clearing path read NOT-free while far -> the "trail up close,
+                        # then switch" artifact.
+                        #   - avoidance path: full lateral_width_m, unscaled.
+                        #   - raceline (GB):  the SMALLER static-specific margin. The obstacle-
+                        #     aware line from static_reopt clears the box by keep-out+apex_bulge
+                        #     (~0.40 m); the scaled requirement (ego/2 + 0.3 = 0.50 m at range)
+                        #     read that line as blocked -> phantom TRAILING + pointless
+                        #     re-avoidance of an obstacle the line already avoids.
                         if is_ot_wpnts and not is_gb_track_wpnts:
                             required_margin = lateral_width_m
+                        elif is_gb_track_wpnts:
+                            required_margin = self.lateral_width_static_gb_m
                         else:
                             required_margin = lateral_width_m * np.clip(
                                 gap / free_scaling_reference_distance_m, 0.0, 1.0)
@@ -1024,7 +1043,15 @@ class StateMachine(Node):
         # inside the track). So the state machine just commits when that path is fresh and the car
         # is on it. The old distance gate (c_closer) and the redundant free-check (c_free) — which
         # made the car slow-trail right up to the obstacle before switching — are gone.
-        c_speed = self.cur_vs < self.static_ot_speed_mps   # light guard, keep
+        # Feasibility gate, FAIL-CLOSED: the planner publishes the signal every cycle, so stale
+        # (> static_feasible_stale_sec) or never-received means planner dead/miswired -> block
+        # the commit and keep TRAILING. (The old speed guard static_ot_speed_mps is gone: the
+        # live config had it disabled at 10.0, and entry speed is owned by the avoidance path's
+        # slow-in velocity profile, not the commit gate.)
+        feas_age = (self.now_sec() - self._static_feasible_t) if self._static_feasible_t is not None else -1.0
+        c_feasible = (self.static_avoidance_feasible
+                      and self._static_feasible_t is not None
+                      and feas_age <= self.static_feasible_stale_sec)
         c_latest = self._check_latest_wpnts(self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts)
         # debug: why isn't a fresh on-spline path available?
         sa = self.static_avoidance_wpnts
@@ -1036,15 +1063,14 @@ class StateMachine(Node):
             gap_dbg = (wd.list[-1].s_m - self.cur_s) % self.track_length
             md_dbg = float(np.min(np.linalg.norm(wd.array[:, 0:2] - self.current_position[:2], axis=1)))
         self.get_logger().info(
-            f"[{self.name}] static_OT check: speed={c_speed} feasible={self.static_avoidance_feasible} "
+            f"[{self.name}] static_OT check: feasible={c_feasible}"
+            f"[val={self.static_avoidance_feasible},age={feas_age:.2f}(<{self.static_feasible_stale_sec})] "
             f"latest+on_spline={c_latest}[n={n_sa},age={age:.2f}(<{wd.latest_threshold}),"
             f"gap={gap_dbg:.2f}(>{wd.on_spline_front_horizon_thres_m}),min_dist={md_dbg:.2f}(<{wd.on_spline_min_dist_thres_m})] "
-            f"=> {c_speed and c_latest and self.static_avoidance_feasible}",
+            f"=> {c_feasible and c_latest}",
             throttle_duration_sec=0.5,
         )
-        # Feasibility gate: the Frenet-sampling static planner publishes feasible=False when no
-        # passable candidate exists. Block the OVERTAKE commit and keep TRAILING in that case.
-        if c_speed and c_latest and self.static_avoidance_feasible:
+        if c_feasible and c_latest:
             self.static_overtaking_mode = True
             return True
         else:
@@ -1055,6 +1081,19 @@ class StateMachine(Node):
             # Stay in OVERTAKE while the (spliner-vetted) static path is still available and the
             # car is on it. The spliner stops publishing once the gap closes / obstacle is passed,
             # so availability naturally drops and we exit — no redundant free re-check needed.
+            # BUT: if the static planner explicitly reports NO feasible candidate (fresh
+            # feasible=False for longer than a blip), the situation has changed since the commit
+            # (obstacle moved/reclassified, gap closed). Riding the CACHED spline then is how the
+            # car lunged into a box 0.7 m ahead: the stale path aged into a raceline extension
+            # THROUGH the obstacle while availability hysteresis (hyst 4 s / kill 10 s) kept
+            # OVERTAKE alive. Fail over to TRAILING instead (gap PID brakes behind the obstacle).
+            feas_true_age = (self.now_sec() - self._static_feasible_true_t) \
+                if self._static_feasible_true_t is not None else float('inf')
+            if feas_true_age > self.static_feasible_lost_sec:
+                self.get_logger().warn(
+                    f"[{self.name}] static OVERTAKE dropped: planner reports infeasible "
+                    f"for {feas_true_age:.2f} s", throttle_duration_sec=1.0)
+                return False
             if self._check_availability(self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts):
                 return True
         else:
@@ -1186,7 +1225,15 @@ class StateMachine(Node):
             wpnts = self.cur_avoidance_wpnts
 
         diff = np.linalg.norm(wpnts.array[:, 0:2] - self.current_position[:2], axis=1)
-        min_idx = np.argmin(diff)
+        min_idx = int(np.argmin(diff))
+        # STATIC path: its entry ramp is anchored AT the car with matched heading, so while the
+        # car is still near the path's first point, splice from the start and keep that entry —
+        # the nearest-index cut throws it away and hands the controller a laterally-stepped
+        # window under SM lag. Deeper into the maneuver (damped/stale path, start left behind)
+        # the nearest-index cut remains correct.
+        if (self.static_overtaking_mode and self.splice_from_path_start
+                and diff[0] <= self.splice_start_dist_m):
+            min_idx = 0
         avoidance_wpnts = wpnts.list[min_idx:min_idx + self.n_loc_wpnts]
 
         if len(avoidance_wpnts) < self.n_loc_wpnts:

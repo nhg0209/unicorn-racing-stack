@@ -194,12 +194,19 @@ class ObstacleSD:
     min_std = None
     max_std = None
     # demotion guard: once confirmed static, only revert to dynamic when the measured position
-    # stays > demote_disp [m] from the established mean for demote_min_count consecutive updates
-    # (so a single-frame velocity/position spike can't flip a genuinely static obstacle).
+    # stays > demote_disp [m] from the established mean (or the window speed stays above
+    # demote_speed) for demote_min_count consecutive updates (so a single-frame
+    # velocity/position spike can't flip a genuinely static obstacle).
     demote_disp = None
     demote_min_count = None
+    # window-speed classification (see tracker param comments): net displacement over the
+    # measurement window / window time. A mover shows ~its true speed here even on a young
+    # window where the position std is still tiny; a static box shows only jitter/T.
+    rate = None
+    static_speed_max = None   # [m/s] above this an obstacle may NOT vote static
+    demote_speed = None       # [m/s] above this (sustained) a confirmed static demotes
 
-    def __init__(self, id, s_meas, d_meas, lap, size, isVisible):
+    def __init__(self, id, s_meas, d_meas, lap, size, isVisible, t_meas=None):
         """
         Initialize the static/dynamic obstacle
         """
@@ -207,6 +214,12 @@ class ObstacleSD:
         self.id = id
         self.measurments_s = [s_meas]
         self.measurments_d = [d_meas]
+        # wall time per measurement: the window speed must be displacement / REAL elapsed
+        # time. Deriving the window time from the SAMPLE COUNT ((n-1)/rate) breaks whenever
+        # the same detect array is processed more than once (detect slower than the tracking
+        # timer): duplicates inflate n without displacement, diluting the apparent speed of a
+        # mover below the static-vote threshold -> green "static" ghosts riding the opponent.
+        self.measurment_times = [t_meas]
         self.mean = [s_meas, d_meas]  # [mean_s. mean_d]
         self.static_count = 0
         self.total_count = 0
@@ -219,6 +232,10 @@ class ObstacleSD:
         self.size = size
         self.nb_detection = 0
         self.isVisible = isVisible
+        # set per cycle by the tracker: measurement lies within the suppression radius of an
+        # INITIALIZED dynamic track (= most likely a spare detection cluster of that car) ->
+        # such a track may not VOTE static (confirmation suppressed, demotion unaffected)
+        self.near_dynamic = False
 
         self.dynamic_state = Opponent_state()
 
@@ -258,18 +275,51 @@ class ObstacleSD:
     def std_d(self):
         return np.std(self.measurments_d)
 
+    def window_speed(self, track_length):
+        """Mean speed over the measurement window: |net (s,d) displacement| / window time.
+
+        Discriminates a MOVER from a static box far better than the position std on a
+        young window (std of uniform motion is only v*T/sqrt(12), so shortly after track
+        birth any opponent below ~3.7 m/s std-classified as static). Uses the REAL wall-time
+        span of the window when available (duplicate-processed detect frames then cannot
+        dilute the speed); falls back to sample-count/rate otherwise."""
+        n = len(self.measurments_s)
+        if n < 2:
+            return None
+        t0 = self.measurment_times[0] if self.measurment_times else None
+        t1 = self.measurment_times[-1] if self.measurment_times else None
+        if t0 is not None and t1 is not None and (t1 - t0) > 1e-3:
+            win_t = t1 - t0
+        elif ObstacleSD.rate is not None:
+            win_t = (n - 1) / ObstacleSD.rate
+        else:
+            return None
+        if win_t <= 1e-3:
+            return None
+        net = math.hypot(
+            normalize_s(self.measurments_s[-1] - self.measurments_s[0], track_length),
+            self.measurments_d[-1] - self.measurments_d[0],
+        )
+        return net / win_t
+
     def isStatic(self, track_length):
         # --- get a representative data set for the obstacle ---
         if self.nb_meas > ObstacleSD.min_nb_meas:
+            win_v = self.window_speed(track_length)
+
             # --- already confirmed static: don't demote on single-frame noise ---
-            # Only revert to dynamic once the latest measurement stays > demote_disp from the mean
-            # for demote_min_count consecutive updates (sustained displacement = it really moved).
+            # Revert to dynamic once the latest measurement stays > demote_disp from the mean
+            # OR the window speed stays above demote_speed, for demote_min_count consecutive
+            # updates (sustained displacement/speed = it really moved).
             if self.staticFlag is True and ObstacleSD.demote_disp is not None:
                 disp = math.hypot(
                     normalize_s(self.measurments_s[-1] - self.mean[0], track_length),
                     self.measurments_d[-1] - self.mean[1],
                 )
-                if disp > ObstacleSD.demote_disp:
+                moving = disp > ObstacleSD.demote_disp or \
+                    (win_v is not None and ObstacleSD.demote_speed is not None
+                     and win_v > ObstacleSD.demote_speed)
+                if moving:
                     self.demote_count += 1
                 else:
                     self.demote_count = 0
@@ -282,11 +332,19 @@ class ObstacleSD:
 
             std_s = self.std_s(track_length)
             std_d = self.std_d()
+            # net-displacement veto: a track sliding along the track may NOT vote static even
+            # while its window std is still small (young window / slow opponent). A track
+            # riding within the suppression radius of an initialized dynamic track (spare
+            # detection cluster of that car) may not vote static either.
+            speed_ok = (win_v is None or ObstacleSD.static_speed_max is None
+                        or win_v < ObstacleSD.static_speed_max) and not self.near_dynamic
             # --- create a voting system so that the outliers don't affect much the result ---
-            if (std_s < ObstacleSD.min_std and std_d < ObstacleSD.min_std):
+            if (std_s < ObstacleSD.min_std and std_d < ObstacleSD.min_std) and speed_ok:
                 self.static_count = self.static_count + 1
             # --- assert for sure that an obstacle is dynamic and not static ---
-            elif (std_s > ObstacleSD.max_std or std_d > ObstacleSD.max_std):
+            elif (std_s > ObstacleSD.max_std or std_d > ObstacleSD.max_std) or \
+                    (win_v is not None and ObstacleSD.demote_speed is not None
+                     and win_v > ObstacleSD.demote_speed):
                 self.static_count = 0
             self.total_count = self.total_count + 1
             self.staticFlag = self.static_count/self.total_count >= 0.5
@@ -385,9 +443,26 @@ class StaticDynamic(Node):
         self.ttl_dynamic = self._get_param("ttl_dynamic")
         self.ttl_static = self._get_param("ttl_static")
         self.vs_reset = self._get_param("vs_reset")
-        # position-persistence demotion guard (static -> dynamic only on sustained displacement)
-        self.demote_disp_m = self._get_param("demote_disp_m", 0.5)
-        self.demote_time_s = self._get_param("demote_time_s", 0.5)
+        # position-persistence demotion guard (static -> dynamic on sustained displacement
+        # or sustained window speed). demote_disp_m MUST stay clearly below max_dist: the
+        # association gate compares the SAME measurement-to-mean distance, so with
+        # demote_disp >= max_dist a moving obstacle loses association before the demote
+        # counter can ever fill -> a once-static obstacle could never turn dynamic again.
+        self.demote_disp_m = self._get_param("demote_disp_m", 0.3)
+        self.demote_time_s = self._get_param("demote_time_s", 0.2)
+        # window-speed classification: mean speed over the measurement window separates a
+        # MOVING car (net displacement) from a static box (jitter only). Position std alone
+        # cannot: on a young window (min_nb_meas/rate ~ 0.15 s) the std of a mover is
+        # ~v*T/sqrt(12), i.e. ANY opponent below ~3.7 m/s std-voted static at first
+        # classification -> "static" ghost boxes riding on a moving opponent.
+        self.static_speed_max_mps = self._get_param("static_speed_max_mps", 0.4)
+        self.demote_speed_mps = self._get_param("demote_speed_mps", 0.6)
+        # a track whose measurement lies within this radius of an initialized dynamic track is
+        # treated as a spare detection cluster of that car: it may not VOTE static
+        self.near_dynamic_suppress_m = self._get_param("near_dynamic_suppress_m", 0.6)
+        # Livox path (no /scan): observability is range-limited, not FOV-limited (MID-360 sees
+        # 360 deg). Used by check_in_field_of_view instead of a blanket "visible".
+        self.livox_max_view_dist = self._get_param("livox_max_view_dist", 7.0)
 
         # dyn params sub
         Opponent_state.ttl = self.ttl_dynamic
@@ -398,6 +473,9 @@ class StaticDynamic(Node):
         ObstacleSD.max_std = self.max_std
         ObstacleSD.demote_disp = self.demote_disp_m
         ObstacleSD.demote_min_count = max(1, int(self.demote_time_s * self.rate))
+        ObstacleSD.rate = self.rate
+        ObstacleSD.static_speed_max = self.static_speed_max_mps
+        ObstacleSD.demote_speed = self.demote_speed_mps
         self.vs_reset = self.vs_reset
 
         # save-back path (ROS1 dynamic_tracker_server wrote both detect + tracking
@@ -457,8 +535,12 @@ class StaticDynamic(Node):
         Opponent_state.ttl = self.ttl_dynamic
         Opponent_state.ratio_to_glob_path = self.ratio_to_glob_path
 
-        self.demote_disp_m = self._get_param("demote_disp_m", 0.5)
-        self.demote_time_s = self._get_param("demote_time_s", 0.5)
+        self.demote_disp_m = self._get_param("demote_disp_m", 0.3)
+        self.demote_time_s = self._get_param("demote_time_s", 0.2)
+        self.static_speed_max_mps = self._get_param("static_speed_max_mps", 0.4)
+        self.demote_speed_mps = self._get_param("demote_speed_mps", 0.6)
+        self.near_dynamic_suppress_m = self._get_param("near_dynamic_suppress_m", 0.6)
+        self.livox_max_view_dist = self._get_param("livox_max_view_dist", 7.0)
 
         ObstacleSD.ttl = self.ttl_static
         ObstacleSD.min_nb_meas = self.min_nb_meas
@@ -466,6 +548,9 @@ class StaticDynamic(Node):
         ObstacleSD.max_std = self.max_std
         ObstacleSD.demote_disp = self.demote_disp_m
         ObstacleSD.demote_min_count = max(1, int(self.demote_time_s * self.rate))
+        ObstacleSD.rate = self.rate
+        ObstacleSD.static_speed_max = self.static_speed_max_mps
+        ObstacleSD.demote_speed = self.demote_speed_mps
 
         obstacle_params = [ObstacleSD.ttl, ObstacleSD.min_nb_meas, ObstacleSD.min_std, ObstacleSD.max_std]
         print(f'[Tracking] Dynamic reconf triggered new tracking params: Tracking TTL: {Opponent_state.ttl}, Ratio to glob path: {Opponent_state.ratio_to_glob_path}\n'
@@ -513,6 +598,9 @@ class StaticDynamic(Node):
                 'vs_reset': float(self.vs_reset),
                 'demote_disp_m': float(self.demote_disp_m),
                 'demote_time_s': float(self.demote_time_s),
+                'static_speed_max_mps': float(self.static_speed_max_mps),
+                'demote_speed_mps': float(self.demote_speed_mps),
+                'near_dynamic_suppress_m': float(self.near_dynamic_suppress_m),
                 'save_params': False,
             }
             data.setdefault('tracking', {})['ros__parameters'] = tracking_params
@@ -529,13 +617,39 @@ class StaticDynamic(Node):
         self.current_stamp = data.header.stamp
 
     def pathCallback(self, data):
-        self.waypoints = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in data.wpnts])
+        new_waypoints = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in data.wpnts])
         if self.track_length is None:
             self.get_logger().info('[Tracking] received global path')
             self.globalpath = data.wpnts
             self.track_length = data.wpnts[-1].s_m
             Opponent_state.track_length = self.track_length
             Opponent_state.waypoints = self.globalpath
+        # The stack's frenet frame IS the global raceline, and static_reopt SWAPS that line at
+        # runtime (obstacle-aware <-> clean). The ego frenet odom re-frames on every
+        # /global_waypoints (frenet_odom_republisher), so if this node keeps the startup
+        # converter, every published obstacle (s,d) stays in the OLD frame: the avoidance
+        # planner then sees the already-cleared obstacle back on the raceline and re-avoids it
+        # every lap (and each re-avoidance re-records a further-out apex -> the re-opt line
+        # walks outward lap after lap). Rebuild + re-project the tracked states on any change.
+        if (self.converter is not None and self.waypoints is not None
+                and (new_waypoints.shape != self.waypoints.shape
+                     or not np.allclose(new_waypoints, self.waypoints))):
+            old_converter = self.converter
+            old_length = self.track_length
+            self.waypoints = new_waypoints
+            new_converter = self.initialize_converter()
+            new_length = data.wpnts[-1].s_m
+            self.reproject_tracks(old_converter, new_converter, old_length, new_length)
+            self.converter = new_converter
+            self.globalpath = data.wpnts
+            self.track_length = new_length
+            Opponent_state.track_length = new_length
+            Opponent_state.waypoints = data.wpnts
+            self.get_logger().info(
+                '[Tracking] global line changed -> rebuilt FrenetConverter and re-projected '
+                f'{len(self.tracked_obstacles)} tracked obstacle(s) into the new frame')
+        else:
+            self.waypoints = new_waypoints
         # Lazy converter init + timer start (replaces ROS1 blocking waits in
         # __init__ / main). Done once, after the first path is available.
         if self.converter is None:
@@ -543,6 +657,33 @@ class StaticDynamic(Node):
         if self.timer is None and self.converter is not None:
             self.get_logger().info('[Opponent Tracking]: Ready!')
             self.timer = self.create_timer(1.0 / self.rate, self.timer_callback)
+
+    def reproject_tracks(self, old_converter, new_converter, old_length, new_length):
+        """Carry every tracked obstacle across a raceline swap: old (s,d) -> map (x,y) via the
+        OLD converter -> new (s,d) via the NEW converter. The measurement history is shifted by
+        the same offset (not re-measured), so the position-persistence statistics (std_s/std_d
+        static voting, demotion guard) survive the swap unchanged."""
+        for t in self.tracked_obstacles:
+            try:
+                x, y = old_converter.get_cartesian(t.mean[0] % old_length, t.mean[1])
+                s_new, d_new = new_converter.get_frenet([float(x)], [float(y)])
+                s_new, d_new = float(s_new[0]) % new_length, float(d_new[0])
+            except Exception:
+                continue
+            ds = normalize_s(s_new - t.mean[0], new_length)
+            dd = d_new - t.mean[1]
+            t.mean = [s_new, d_new]
+            t.measurments_s = [(s + ds) % new_length for s in t.measurments_s]
+            t.measurments_d = [d + dd for d in t.measurments_d]
+            if t.dynamic_state.isInitialised:
+                kf = t.dynamic_state.dynamic_kf
+                try:
+                    xk, yk = old_converter.get_cartesian(kf.x[0] % old_length, kf.x[2])
+                    sk, dk = new_converter.get_frenet([float(xk)], [float(yk)])
+                    kf.x[0] = normalize_s(float(sk[0]), new_length)
+                    kf.x[2] = float(dk[0])
+                except Exception:
+                    pass
 
     def initialize_converter(self):
         """
@@ -632,13 +773,15 @@ class StaticDynamic(Node):
 
         return angle
 
-    def update_tracked_obstacle(self, tracked_obstacle: ObstacleSD, meas_obstacle):
+    def update_tracked_obstacle(self, tracked_obstacle: ObstacleSD, meas_obstacle, t_meas=None):
         tracked_obstacle.measurments_s.append(meas_obstacle.s_center)
         tracked_obstacle.measurments_d.append(meas_obstacle.d_center)
+        tracked_obstacle.measurment_times.append(t_meas)
         # handle list lenght
         if(len(tracked_obstacle.measurments_s) > 30):
             tracked_obstacle.measurments_s = tracked_obstacle.measurments_s[-20:]
             tracked_obstacle.measurments_d = tracked_obstacle.measurments_d[-20:]
+            tracked_obstacle.measurment_times = tracked_obstacle.measurment_times[-20:]
         tracked_obstacle.update_mean(self.track_length)
         tracked_obstacle.nb_meas += 1
         tracked_obstacle.isInFront = True
@@ -694,9 +837,12 @@ class StaticDynamic(Node):
         Checks if an obstacle is in the field of view by checking the corresponding lidar beams
         """
         # Livox 3D path: no /scan (this check is hardcoded to the Hokuyo 270deg/1080-beam
-        # geometry). kiss already track-mask filters off-track points, so treat as visible.
+        # geometry). The MID-360 sees 360 deg horizontally, so RANGE is the limiter: the spot
+        # counts as observable only within livox_max_view_dist. A blanket True silently
+        # degraded memory mode to no-memory (every unseen static aged out as "seen") and let
+        # far remembered obstacles pass as currently-visible.
         if self.scans is None:
-            return True
+            return bool(dist_to_obs < self.livox_max_view_dist)
 
         dist_to_obs = np.linalg.norm(vec_car_to_obs)
 
@@ -728,6 +874,17 @@ class StaticDynamic(Node):
 
     # --- update tracked obstacles, add new obstacles and remove unecessary ---
     def update(self):
+        # Freshness gate: the timer runs at the TRACKING rate; when no new detect array has
+        # arrived since the last cycle, re-processing the stored one would append duplicate
+        # measurements (zero displacement, zero dt) that bias every velocity estimate low
+        # (EKF vs measurements of 0, diluted window speed) -> movers drift toward "static".
+        stamp_key = (self.current_stamp.sec, self.current_stamp.nanosec) \
+            if self.current_stamp is not None else None
+        if stamp_key is not None and stamp_key == getattr(self, "_last_meas_stamp", None):
+            return
+        self._last_meas_stamp = stamp_key
+        now_t = self.get_clock().now().nanoseconds * 1e-9
+
         meas_obstacles_copy = self.meas_obstacles.copy()
         car_s_copy = self.car_s
         car_position_copy = np.copy(self.car_position)
@@ -735,17 +892,37 @@ class StaticDynamic(Node):
         self.lap_update(car_s_copy)
         removal_list = []
         num_dyn_obs = 0
+        # positions of the initialized dynamic tracks: a measurement inside
+        # near_dynamic_suppress_m of one of them is most likely a spare detection cluster of
+        # that same car -> its track must not confirm static (green ghost riding the opponent)
+        dyn_positions = [
+            (o.id, o.dynamic_state.dynamic_kf.x[0] % self.track_length, o.dynamic_state.dynamic_kf.x[2])
+            for o in self.tracked_obstacles
+            if o.staticFlag is False and o.dynamic_state.isInitialised
+        ]
         for tracked_obstacle in self.tracked_obstacles:
             # --- verify if the obstacle is tracked by position and update the associated obstacle ---
             isTracked, meas_obstacle = self.verify_position(tracked_obstacle, meas_obstacles_copy)
 
             if isTracked:
-                tracked_obstacle = self.update_tracked_obstacle(tracked_obstacle, meas_obstacle)
+                tracked_obstacle.near_dynamic = any(
+                    oid != tracked_obstacle.id and math.hypot(
+                        normalize_s(meas_obstacle.s_center - ps, self.track_length),
+                        meas_obstacle.d_center - pd) < self.near_dynamic_suppress_m
+                    for oid, ps, pd in dyn_positions)
+                tracked_obstacle = self.update_tracked_obstacle(tracked_obstacle, meas_obstacle, now_t)
                 # obstacle is classified as moving
                 if(tracked_obstacle.staticFlag == False):
                     if tracked_obstacle.dynamic_state.isInitialised:
                         tracked_obstacle.dynamic_state.useTargetVel = False
-                        if(tracked_obstacle.dynamic_state.avg_vs < self.vs_reset and len(tracked_obstacle.dynamic_state.vs_list) > 10 and self.publish_static):
+                        # vs_reset flip-back (dynamic -> static on a near-zero EKF speed) must
+                        # ALSO see a still position window: an EKF speed biased low (sparse or
+                        # duplicated detections) used to re-flag a demonstrably translating car
+                        # as static without any position evidence.
+                        win_v = tracked_obstacle.window_speed(self.track_length)
+                        still = (win_v is None or win_v < self.static_speed_max_mps)
+                        if(tracked_obstacle.dynamic_state.avg_vs < self.vs_reset and still
+                           and len(tracked_obstacle.dynamic_state.vs_list) > 10 and self.publish_static):
                             tracked_obstacle.dynamic_state.isInitialised = False
                             tracked_obstacle.staticFlag = True
                             tracked_obstacle.static_count = 0
@@ -779,6 +956,21 @@ class StaticDynamic(Node):
 
                     if(tracked_obstacle.staticFlag and self.noMemoryMode):
                         tracked_obstacle.ttl -= 1
+                        # Keep is_visible truthful while the short memory decays: downstream
+                        # consumers (SM interest gate, static-avoidance detection gating, the
+                        # reopt layer's unlatch streak) must not take remembered frames for
+                        # live sightings. Same observability test as the memory-mode branch.
+                        if distance_obstacle_car < self.dist_deletion:
+                            try:
+                                resp = self.converter.get_cartesian(
+                                    tracked_obstacle.mean[0], tracked_obstacle.mean[1])
+                                vec_car_to_obs = resp - car_position_copy
+                                tracked_obstacle.isVisible = self.check_in_field_of_view(
+                                    vec_car_to_obs, car_orientation_copy, distance_obstacle_car)
+                            except Exception:
+                                pass
+                        else:
+                            tracked_obstacle.isVisible = False
                     # --- if obstacle is near enough check if we can see it ---
                     elif(distance_obstacle_car < self.dist_deletion and tracked_obstacle.staticFlag):
                         try:
@@ -816,7 +1008,8 @@ class StaticDynamic(Node):
                 d_meas=meas_obstacle.d_center,
                 lap=self.current_lap,
                 size=meas_obstacle.size,
-                isVisible=True
+                isVisible=True,
+                t_meas=now_t
             ))
             self.current_id += 1
 

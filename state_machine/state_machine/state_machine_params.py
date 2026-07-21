@@ -27,6 +27,7 @@ class StateMachineParams:
     # dynamic params that the node also mirrors as a same-named attribute
     _NODE_MIRRORED_PARAMS = {
         "lateral_width_gb_m",
+        "lateral_width_static_gb_m",
         "lateral_width_ot_m",
         "splini_hyst_timer_sec",
         "emergency_break_horizon",
@@ -36,10 +37,11 @@ class StateMachineParams:
         "gb_horizon_m",
         "interest_horizon_m",
         "overtaking_horizon_m",
-        "static_ot_speed_mps",
         "getting_closer_rel_vel_mps",
         "static_ot_distance_m",
         "min_dwell_sec",
+        "splice_from_path_start",
+        "splice_start_dist_m",
     }
 
     def __init__(self, node: "StateMachine") -> None:
@@ -150,6 +152,20 @@ class StateMachineParams:
         self.lateral_width_gb_m: float = node.get_parameter("lateral_width_gb_m").value
 
         self._declare(
+            "lateral_width_static_gb_m", 0.15,
+            ParameterDescriptor(
+                description="GB_FREE margin vs STATIC obstacles, distance-independent [m]. The "
+                            "obstacle-aware line from static_reopt clears the box by keep-out + "
+                            "apex_bulge (~0.40 m); the requirement ego/2 + this must stay below "
+                            "that (checked by check_avoidance_margins.py) or the swapped line "
+                            "reads as blocked and the SM re-avoids it every lap.",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=1.0, step=0.01)],
+            ),
+        )
+        self.lateral_width_static_gb_m: float = node.get_parameter("lateral_width_static_gb_m").value
+
+        self._declare(
             "lateral_width_ot_m", 0.3,
             ParameterDescriptor(
                 description="Threshold to raceline for O_FREE in meters",
@@ -225,15 +241,10 @@ class StateMachineParams:
         self._declare("use_force_trailing", False)
         self.use_force_trailing: bool = node.get_parameter("use_force_trailing").value
 
-        self._declare(
-            "static_ot_speed_mps", 3.0,
-            ParameterDescriptor(
-                description="Speed below which a static-obstacle overtake may be initiated [mps]",
-                type=ParameterType.PARAMETER_DOUBLE,
-                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=10.0, step=0.1)],
-            ),
-        )
-        self.static_ot_speed_mps: float = node.get_parameter("static_ot_speed_mps").value
+        # static_ot_speed_mps REMOVED: the live config had it at 10.0 (= disabled), and a speed
+        # guard on the commit is conceptually wrong for a STATIC obstacle — trailing one means
+        # stopping behind it; the avoidance path's own slow-in velocity profile handles entry
+        # speed. The commit gate is: fresh on-spline static path AND (fresh) feasible signal.
 
         self._declare(
             "getting_closer_rel_vel_mps", -0.5,
@@ -268,6 +279,31 @@ class StateMachineParams:
             ),
         )
         self.min_dwell_sec: float = node.get_parameter("min_dwell_sec").value
+
+        self._declare(
+            "splice_from_path_start", True,
+            ParameterDescriptor(
+                description="Static OVERTAKE splice: when the car is still near the avoidance "
+                            "path's FIRST point, feed the controller the path from its start "
+                            "(the reactive planner anchors it at the car with matched heading) "
+                            "instead of cutting at the interior nearest index — removes the "
+                            "lateral step the nearest-index cut introduces under SM lag.",
+                type=ParameterType.PARAMETER_BOOL,
+            ),
+        )
+        self.splice_from_path_start: bool = node.get_parameter("splice_from_path_start").value
+
+        self._declare(
+            "splice_start_dist_m", 0.8,
+            ParameterDescriptor(
+                description="Max distance [m] car -> path start for the from-start splice; "
+                            "farther than this (deep in the maneuver on a damped/stale path) "
+                            "falls back to the nearest-index cut.",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=0.1, to_value=2.0, step=0.05)],
+            ),
+        )
+        self.splice_start_dist_m: float = node.get_parameter("splice_start_dist_m").value
 
         # Momentary rqt buttons (ROS1: served by dynamic_statemachine_server). When set
         # true they trigger an action and reset to false (done in the node timer, not

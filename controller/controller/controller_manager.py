@@ -34,7 +34,8 @@ L1_PARAMS = [
     'trailing_d_gain', 'blind_trailing_speed', 'curvature_factor',
     'speed_factor_for_lat_err', 'speed_factor_for_curvature', 'KP', 'KI', 'KD',
     'heading_error_thres', 'steer_gain_for_speed', 'future_constant', 'AEB_thres',
-    'speed_diff_thres', 'start_speed', 'start_curvature_factor',
+    'AEB_thres_overtake', 'speed_diff_thres', 'start_speed', 'start_curvature_factor',
+    'l1_lat_err_cap',
 ]
 
 
@@ -203,6 +204,9 @@ class ControllerManager(Node):
         )
         self.controller.speed_now = self.speed_now
         self.controller.yaw_rate = self.yaw_rate
+        # not part of the positional Controller signature; delivered like the live-tuned params
+        self.controller.AEB_thres_overtake = self.AEB_thres_overtake
+        self.controller.l1_lat_err_cap = self.l1_lat_err_cap
         self.get_logger().info(f"[{self.name}] initialized FrenetConverter + Controller. Ready!")
 
     ############################################ CALLBACKS ############################################
@@ -377,7 +381,10 @@ class ControllerManager(Node):
         if self.waypoint_safety_counter >= self.loop_rate/self.state_machine_rate * 10:
             self.get_logger().error(f"[{self.name}] Received no local wpnts. STOPPING!!", throttle_duration_sec=0.5)
             speed = 0
-            steering_angle = 0
+            # brake, but HOLD the last steering: zeroing it mid-corner straightened the car into
+            # the wall whenever the SM hiccuped for a few cycles (e.g. digesting a line swap) —
+            # braking along the current arc is strictly safer than braking straight.
+            steering_angle = float(getattr(self.controller, "curr_steering_angle", 0.0))
 
         return speed, acceleration, jerk, steering_angle
 

@@ -48,6 +48,8 @@ class KissObstacleBridge(Node):
         self.track_length = None
         self.wpnt_s = None       # cumulative s of the global path [N]
         self.wpnt_psi = None     # track heading psi_rad at each waypoint [N]
+        self._wx = None          # cached geometry for change detection (reopt swaps)
+        self._wy = None
 
         self.create_subscription(
             WpntArray, '/global_waypoints_scaled', self.path_cb, 10)
@@ -61,19 +63,25 @@ class KissObstacleBridge(Node):
             "waiting for global path...")
 
     def path_cb(self, data: WpntArray):
-        """Lazily build the FrenetConverter + heading lookup from the scaled path."""
-        if self.converter is not None:
-            return
+        """Build the FrenetConverter + heading lookup from the scaled path. The global
+        line can CHANGE at runtime (static re-optimization swaps in an obstacle-aware
+        line), so rebuild whenever the geometry actually changes — a stale converter
+        puts every detection at a wrong (s, d) relative to the line the car follows."""
         if not data.wpnts:
             return
         wx = np.array([w.x_m for w in data.wpnts])
         wy = np.array([w.y_m for w in data.wpnts])
+        if self.converter is not None and self._wx is not None \
+                and wx.shape == self._wx.shape \
+                and np.allclose(wx, self._wx) and np.allclose(wy, self._wy):
+            return                       # unchanged geometry -> keep the converter
+        self._wx, self._wy = wx, wy
         self.converter = FrenetConverter(wx, wy)
         self.wpnt_s = np.array([w.s_m for w in data.wpnts])
         self.wpnt_psi = np.array([w.psi_rad for w in data.wpnts])
         self.track_length = data.wpnts[-1].s_m
         self.get_logger().info(
-            "[kiss_obstacle_bridge] FrenetConverter ready "
+            "[kiss_obstacle_bridge] FrenetConverter (re)built "
             f"(track_length {self.track_length:.2f} m)")
 
     @staticmethod
@@ -132,6 +140,10 @@ class KissObstacleBridge(Node):
                 obs.d_left = d + half_d
                 obs.d_right = d - half_d
                 obs.size = 2.0 * max(half_s, half_d)
+                # RAW-stage placeholders, matching detect.cpp: static/dynamic classification is
+                # owned by tracking's position-std voting downstream (a single frame has no
+                # velocity), and is_visible=True is literally true here — every raw detection
+                # is a live sighting. Tracking re-derives both on /tracking/obstacles.
                 obs.is_static = False
                 obs.is_visible = True
                 out.obstacles.append(obs)

@@ -91,7 +91,7 @@ RViz에서 `/state_marker`, `/tracking/static_dynamic_marker_pub`,
 |---|---|---|
 | 장애물이 있는데 상태가 계속 GB_TRACK | `/tracking/obstacles` 비었는지 | 분류가 정적으로 빠짐 → tracking `max_std/min_std/min_nb_meas`. 또는 `interest_horizon_m`/`gb_horizon_m` 너무 짧음 |
 | 추월을 절대 안 함 | `/ot_section_check` (false?) | `ot_sectors.yaml`에 추월 허용 섹터 없음. 또는 `_check_overtaking_mode` 미충족(회피경로 비었거나 free 아님) |
-| 정적 장애물 추월만 안 됨 | `cur_vs` vs `static_ot_speed_mps` | 속도가 임계보다 높아 static OT 게이트 안 열림 → `static_ot_speed_mps`↑ |
+| 정적 장애물 추월만 안 됨 | `/planner/avoidance/static_feasible` 수신/신선도 | 플래너 죽음/미배선이면 게이트 fail-closed(0.5s stale). static_OT check 로그의 feasible/latest 항목 확인 |
 | 회피경로가 비어서 나옴(otwpnts empty) | `/planner/avoidance/markers` | danger_flag: 트랙바운드에 너무 근접 → `spline_bound_mindist`↓ 또는 `evasion_dist`↓. 또는 라인 안 타서 쪽전환 불가 |
 | 상태가 GB↔OVERTAKE 깜빡임(채터링) | `/state_machine` 빠르게 토글 | 히스테리시스 부족 → `overtaking_ttl_sec`↑, `splini_hyst_timer_sec`↑. OT 캐시 만료(2s) 확인 |
 | 추월 후 라인 복귀 안 함(RECOVERY 고착) | heading 정렬 여부 | P0 패치로 heading 게이트 활성화됨 → `recovery_planner.yaml`의 `on_spline_*`, 헤딩 정렬 20°. 8장 참고 |
@@ -128,7 +128,7 @@ RViz에서 `/state_marker`, `/tracking/static_dynamic_marker_pub`,
 ### 추월 결정 임계 (P0에서 파라미터화)
 | 파라미터 | 기본 | 의미 | 튜닝 |
 |---|---|---|---|
-| `static_ot_speed_mps` | 3.0 | 이 속도 미만일 때만 **정적** 추월 시작 | 정적 추월을 더 빨리 허용하려면 ↑ |
+| `static_ot_speed_mps` | (제거됨) | 정적 추월 속도 가드 — 라이브 설정에서 10.0으로 비활성이었고, 진입 속도는 회피 경로의 slow-in 프로파일이 담당하므로 삭제 | — |
 | `getting_closer_rel_vel_mps` | -0.5 | (ego−상대) s속도 ≥ 이 값이면 "접근중" | 더 보수적이면 ↑(0), 관대하면 ↓ |
 
 ### 히스테리시스 / 채터링 억제
@@ -187,45 +187,72 @@ RViz에서 `/state_marker`, `/tracking/static_dynamic_marker_pub`,
 | `n_loc_wpnts` | 80 | 생성 포인트 수 |
 > recovery 경로는 상태머신에서 `vel_planner_safety_factor=0.5`로 보수적 속도 재계산됨.
 
-### 5.3 동적 추월 — lane_change_planner (change_avoidance_node)
+### 5.3 동적 추월 — lane_change_planner (change_avoidance_node) **[2026-07 lane-hold 재작성]**
 
-race.launch의 **동적 추월 기본 플래너**. apex-spliner와 알고리즘이 다르다:
-- `obs_perception_cb`에서 **동적 장애물만**(`is_static==False`) 처리. 정적은 무시.
-- 부팅 시 centerline에서 **inner/outer 두 레인을 미리 생성**(`generate_lanes`, 중심선에서 normal로 ±0.35m 오프셋 → 0.1m 리샘플 → Frenet/곡률).
-- 매 20Hz `loop`: 고려 장애물의 양쪽 여유(`more_space`)를 투표해 **preferred_side**(inner=left/outer=right) 결정 → 그 레인의 d를 따라가되 장애물 구간에서만 **cosine ease-in/out**(`back_to_raceline_before/after`)으로 부드럽게 진입/복귀.
-- 단조 증가 s로 샘플링해 경로 역행 방지, `GridFilter`(`is_point_inside`)로 트랙밖이면 폐기.
-- 출력: `/planner/avoidance/otwpnts` + `/planner/avoidance/merger`(상태머신/제어가 회피→글로벌 블렌딩 구간으로 사용: `[장애물 s_end, 회피경로 마지막 s]`).
-- 곡률 한계는 **속도 적응형**: `min_radius = interp(speed, [1,6,7], [0.2,2,4])`로 빠를수록 큰 반경만 허용(급조향 방지). 코드 하드코딩.
+race.launch의 **동적 추월 기본 플래너**. 예전의 "장애물 스냅샷 구간에 cosine ramp" 방식은
+상대가 움직이면 경로가 매 사이클 재앵커링되며 차가 휘청거렸다. 현재는 **페이즈 기반
+lane-hold 추월**로 동작한다 (설정: `stack_master/config/lane_change_params.yaml`):
 
-**라이브 튜닝 파라미터** (`ros2 param set /planner_change <name> <val>`):
-| 파라미터 | 기본 | 범위 | 의미 / 방향 |
-|---|---|---|---|
-| `evasion_dist` | 0.3 | 0.0~1.25 | apex의 장애물 직교 회피거리. ↑=크게 비켜감 |
-| `obs_traj_tresh` | 1.0 | 0.1~2.0 | 레이스라인에서 이 횡거리 내 장애물만 회피 대상 |
-| `spline_bound_mindist` | 0.3 | 0.05~1.0 | 트랙바운드 최소 여유(이내면 회피 폐기) |
+- **IDLE**: 갭이 `engage_gap_m`(5.0)으로 좁혀질 때까지 플래너는 **침묵** — 접근은
+  TRAILING(컨트롤러 gap PID, `0.25·v+1.55m`에서 안정화) 또는 레이스라인 주행이 제
+  속도로 담당. 좁혀지면 추월섹터(`/ot_section_check`) 확인 후 타깃 래칭 + 사이드 1회
+  선택(진행 중 재투표 없음 → 좌우 플래핑 제거). **레인 오프셋은 상대의 실제 횡위치에서
+  역산**: 상대 중심에서 `size/2+sep_margin_m` 이상(=SM free-check 통과 보장),
+  `lane_offset_m`은 하한, 벽(회랑−차폭/2−`spline_bound_mindist`)이 상한.
+- **OPEN**: 현재 차량 위치(헤딩 e_psi 반영)에서 quintic 블렌드로 **센터라인 평행 레인**
+  (센터라인 d(s) 테이블 + 부호×오프셋)에 진입. 타깃 바로 뒤에서 engage하면 블렌드가
+  **타깃 도달 전에 끝나도록 캡**(미완성 블렌드가 free-check를 깨는 것 방지). 레인 도달 시 HOLD.
+- **HOLD**: 상대 위치와 무관하게 **레인을 계속 추종**(경로가 상대를 쫓아다니지 않음).
+  상대가 레인 쪽으로 파고들면 오프셋이 슬루(`offset_slew_mps`) 제한으로 **자동 확장**
+  (벽 캡) — 접근 중 SM free-check가 깨져 OVERTAKE→TRAILING을 반복하며 "스플라인만
+  따라가다 느려지던" 루프의 해결책. 타깃은 id+최근접 s로 연속 추적, 미검출 시 EKF
+  속도로 coast. 랩 시임을 고려한 signed Δs가 `pass_gap_m` 이상 & 상대가 다시
+  빨라지지 않음이 `pass_hyst_s` 지속되면 CLOSE.
+- **CLOSE**: `close_arm_m` 앞에서 시작하는 **래칭된 복귀 램프**로 레이스라인 복귀.
+  차가 아직 레인 위면 램프 시작점이 차 앞으로 슬라이드(상태머신이 언제 채택해도 횡 스텝 0).
+  복귀 회랑에 장애물이 있으면 시작점을 그 뒤로 미룬다. 상대가 재추월하면 HOLD로 복귀.
+- 경로는 매 사이클 차량 앵커로 재발행하지만 **레인 기하는 고정**이라 SM 캐시 스플라이싱과
+  무충돌. 경로 길이 `hold_horizon_m`(22m) > SM `interest_horizon_m`(20m) 유지 필수
+  (상대가 경로 끝을 넘으면 SM free-check가 즉시 실패하는 구조 때문).
+- 벽 처리: 레인을 트랙 회랑(`d_left/right - 차폭/2 - spline_bound_mindist`)으로 클립,
+  `GridFilter`(erosion 3)로 최종 검사. 속도는 계속 vx=0으로 발행 — SM `update_velocity`가
+  곡률 기반으로 재계산(변경 없음).
 
-**하드코딩 상수**(튜닝하려면 코드 수정 필요, `__init__`):
-| 상수 | 기본 | 의미 |
+**주요 파라미터** (라이브: `ros2 param set /planner_change <name> <val>`,
+영구: `stack_master/config/lane_change_params.yaml`):
+| 파라미터 | 기본 | 의미 / 방향 |
 |---|---|---|
-| `lookahead` | 15 | 전방 고려 거리[m] |
-| `width_car` | 0.30 | 차폭(여유 계산) |
-| `safety_margin` | 0.1 | 추가 안전 마진 |
-| `back_to_raceline_before/after` | 5 / 5 | 장애물 전/후 ease 램프 길이[m]. ↑=완만한 진입/복귀 |
-| `generate_lanes` 오프셋 | ±0.35 | inner/outer 레인의 중심선 대비 횡오프셋[m] |
-| `CCMA(w_ma=10, w_cc=5)` | — | 레인 평활화 윈도우 |
-| `min_radius` interp | [0.2,2,4]@[1,6,7] | 속도별 최소 회전반경 |
+| `engage_gap_m` | 5.0 | 이 갭까지는 TRAILING이 제 속도로 접근(플래너 침묵). 트레일링 유지거리(0.25·v+1.55≈2~3m)보다 크고 SM 커밋 게이트(10m)보다 작아야 함 |
+| `lane_offset_m` | 0.35 | 레인 오프셋의 **하한**(실제 오프셋은 상대 위치에서 역산·자동 확장) |
+| `sep_margin_m` | 0.50 | 장애물 half-size 초과 요구 이격. **SM의 0.4(ego/2+lateral_width) 미만 금지** |
+| `offset_slew_mps` | 0.6 | 오프셋 실시간 확장/축소 속도. 상대가 요동치면 ↑ |
+| `pass_gap_m` / `pass_hyst_s` | 1.2 / 0.3 | 추월 완료 판정 리드/지속시간. 복귀가 성급하면 ↑ |
+| `open/close_ramp_min_m`, `*_time_s` | 3.0 / 0.8 | 램프 길이 = max(min, t·v). 과격하면 ↑ |
+| `close_arm_m` | 1.0 | 복귀 램프가 차 앞에서 시작하는 거리 |
+| `hold_horizon_m` | 22.0 | 발행 경로 길이(20 미만으로 줄이지 말 것) |
+| `target_lost_s` | 1.0 | 타깃 coast 허용 시간(폐색 강건성) |
+| `obs_traj_tresh` | 1.0 | 래칭 시 |상대 d − ego d| 필터 |
 
 튜닝 직관:
-- **레인 변경이 너무 과격/지연** → `back_to_raceline_before/after`↑ (완만), `evasion_dist` 조정
-- **자주 회피 폐기(otwpnts 비어 나옴)** → `spline_bound_mindist`↓, generate_lanes 오프셋 확인(레인이 벽에 붙으면 항상 폐기)
-- **엉뚱한 장애물까지 회피** → `obs_traj_tresh`↓
-- **고속에서 못 비킴** → `min_radius` interp 상한↑(코드), 단 조향 한계 주의
+- **추월을 아예 시작 안 함** → ① `ot_sectors.yaml`의 `ot_flag` 확인(§6, 최다 원인)
+  ② 갭이 `engage_gap_m`까지 안 좁혀짐: 트레일링 유지거리(`trailing_gap`/`trailing_vel_gain`)가
+  engage_gap보다 크지 않은지 확인 ③ 레인 선택 실패(양쪽 벽 한계 초과): 로그에서
+  `IDLE -> OPEN`이 아예 없으면 `sep_margin_m`↓(0.42 미만 금지) 또는 트랙이 물리적으로 좁은 것
+- **접근 중 OVERTAKE↔TRAILING 반복(따라가다 느려짐)** → 오프셋 자동확장이 벽에 캡된 경우.
+  `spline_bound_mindist`↓로 벽 여유를 조금 양보하거나 그 구간 추월 포기(섹터 제외)
+- **복귀가 늦음/오래 레인에 머묾** → `pass_gap_m`↓, SM `dynamic_avoidance_planner.yaml`
+  `hyst_timer_sec`(1.5) 확인 — CLOSE 채택 지연의 상한이다
+- **진입이 과격** → `open_ramp_time_s`↑ (단 타깃 직전 engage면 갭 캡이 우선); **복귀가 과격** → `close_ramp_time_s`↑
+- **좌우 플래핑이 다시 보이면** 페이즈 로그(`[LaneChange] IDLE -> OPEN ...`) 확인:
+  래칭 후엔 사이드가 안 바뀌는 게 정상, 바뀐다면 abort→재engage 반복이므로 abort 원인
+  (`lane no longer viable`/`blocked`) 로그를 볼 것
 > 주의: 이 노드는 `merger`만 내고 `fail_trailing`은 발행하지 않는다(상태머신은 토픽을 구독하지만
 > 기본 race.launch에선 publisher 없음 → 항상 False). 정적/동적이 동시에 후보면 상태머신이
 > `_check_static_overtaking_mode`(저속) vs `_check_overtaking_mode`(동적)로 택일한다.
+> RViz 디버그: `/planner/avoidance/lanes`(두 레인), `/planner/avoidance/markers_sqp`(경로+페이즈 텍스트).
 
-동반 노드 `waypoint_updater`(`update_waypoints`)는 `/global_waypoints_updated`를 발행해
-lane_change_planner가 회피 시 갱신된 라인을 참조하게 한다.
+동반 노드 `waypoint_updater`(`update_waypoints`)는 `/global_waypoints_updated`를 발행한다
+(현 플래너는 미사용, 다른 플래너·기록용으로 유지).
 
 ---
 

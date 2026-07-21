@@ -32,9 +32,11 @@ static_avoidance_planner:
     apex_bulge: 0.10        # [m] extra offset at the box CENTRE beyond the clearance value: the path peaks
                             #      here (widest, furthest from the obstacle). higher = swing WIDER around the
                             #      obstacle; 0 = flat hold. Limited by corridor (bulge past the wall -> reject).
-    max_weave: 1            # max obstacles woven into ONE path (slalom). 1 = single-apex (old behavior).
-                            #       Weaving an apex per obstacle sets up the NEXT obstacle before the
-                            #       previous is passed, so close pairs no longer collide.
+    max_weave: 2            # max obstacles woven into ONE path (slalom). At 1 a close pair broke:
+                            #       every single-apex candidate around obstacle A ran through B and
+                            #       was rejected by the box check -> NO feasible path (TRAILING) and
+                            #       B's apex was never captured, so the re-opt only ever knew A.
+                            #       2 covers the IFAC two-obstacle format; raise to 3 for triples.
     tail_m: 0.0             # [m]  short raceline (d=0) tail after the return (on_spline horizon)
 
     # --- feasibility limits ---
@@ -50,6 +52,14 @@ static_avoidance_planner:
                             #         apex (fast-out). lower = gentler/longer exit acceleration.
     use_grid_check: true    # reject candidates crossing the eroded /map (GridFilter)
     kernel_size: 3          # [cells] GridFilter erosion (8 ate ~0.2 m and rejected the raceline on ifac)
+
+    # --- raceline-clear gate (idle when the CURRENT global line already avoids everything) ---
+    # After static_reopt swaps in the obstacle-aware line, the keep-out no longer contains d=0,
+    # so this planner goes idle: no re-avoidance of an already-cleared obstacle, no apex
+    # re-recording (which walked the re-opt line outward every lap), SM stays GB_TRACK.
+    clear_gate_enable: true
+    clear_hyst_m: 0.03      # [m] EXTRA clearance required to enter idle (leave only on a real violation)
+    clear_max_cur_d: 0.15   # [m] gate applies only with the car on the raceline (never abandons a maneuver)
 
     # --- cost weights  J = w_d*Σ|d| + w_k*Σκ² + w_c*|d_end-d_end_prev| + w_obs*Σexp(-dist/σ) ---
     w_d: 1.0                # raceline deviation

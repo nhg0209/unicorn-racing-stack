@@ -43,14 +43,40 @@ tracking:
     publish_static: true
     ratio_to_glob_path: 0.6
     ttl_dynamic: 40
-    # frames a static obstacle survives without a fresh detection (40 Hz -> 15 ~= 0.37 s).
-    # raised from 3 so brief detection gaps don't drop the obstacle and stall the OVERTAKE commit.
-    ttl_static: 15
+    # frames a static obstacle survives without a fresh detection (40 Hz -> 40 = 1.0 s).
+    # raised 3 -> 15 -> 40: close-range detect gaps on wall-adjacent boxes ran ~0.5 s+, killing
+    # the track; the re-classification delay (staticFlag None -> not on /tracking/obstacles)
+    # then blanked the planner (n=0 flicker, SM never committed OVERTAKE -> car stuck trailing)
+    # AND fed the layer's unlatch streak (spurious UNLATCH -> re-CONFIRM flap). While the track
+    # memory lives, is_visible stays truthful via the observability test, so a physically
+    # removed obstacle still unlatches ~1.5 s after removal (memory decay + clear streak).
+    ttl_static: 40
     vs_reset: 0.1
     # position-persistence demotion guard: a CONFIRMED static obstacle reverts to dynamic only when
-    # the measured position stays > demote_disp_m from its mean for demote_time_s (so single-frame
-    # velocity/position noise can't flip a genuinely static box).
-    demote_disp_m: 0.5
-    demote_time_s: 0.5
+    # the measured position stays > demote_disp_m from its mean (or the window speed stays above
+    # demote_speed_mps) for demote_time_s (so single-frame noise can't flip a genuinely static box).
+    # demote_disp_m MUST stay clearly below max_dist (0.5): association uses the SAME
+    # measurement-to-mean distance, so 0.5/0.5 was a DEADLOCK — a moving opponent lost
+    # association (spawning a fresh track) before the demote counter could ever fill,
+    # and the stale track stayed is_static=True forever.
+    demote_disp_m: 0.3
+    demote_time_s: 0.2
+    # window-speed classification: mean speed over the measurement window (net displacement/time).
+    # The position-std vote alone called ANY opponent slower than ~3.7 m/s "static" right after
+    # track birth (std of a mover over the young 0.15 s window is only v*T/sqrt(12)) -> the
+    # static planner splined around the moving car. A track may vote static only below
+    # static_speed_max_mps; above demote_speed_mps the static vote hard-resets / a confirmed
+    # static demotes (sustained for demote_time_s).
+    static_speed_max_mps: 0.4
+    demote_speed_mps: 0.6
+    # a track whose measurement lies within this radius of an initialized DYNAMIC track is a
+    # spare detection cluster of that car (the box detector splits the opponent into 2 clusters
+    # at times): it may not VOTE static -> no confirmed-static ghost riding the opponent.
+    # Demotion of already-confirmed statics is unaffected, so a real box the opponent passes
+    # close to keeps its static flag.
+    near_dynamic_suppress_m: 0.6
+    # Livox path (no /scan): a spot counts as observable within this range (the MID-360 sees
+    # 360 deg, so range is the limiter). Replaces the old unconditional "visible".
+    livox_max_view_dist: 7.0
     measure: false
     from_bag: false

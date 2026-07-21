@@ -6,7 +6,8 @@
 
     perception   : detect (C++) + tracking (Python)  (/scan -> /detect/raw_obstacles -> /tracking/obstacles_raw)
     state machine: state_machine                     (/tracking/obstacles + raceline -> /local_waypoints, /behavior_strategy, /state_machine)
-    planning     : spliner_node                      (avoidance spline -> /planner/avoidance/otwpnts)
+    planning     : change_avoidance_node (dynamic lane-hold) + static_avoidance_node (static)
+                   (-> /planner/avoidance/otwpnts, /planner/avoidance/static_otwpnts)
     control      : controller_manager               (L1/Pure-Pursuit; /behavior_strategy -> high_level/ackermann_cmd)
 
   The virtual opponent and its obstacle injection (/tracking/obstacles with
@@ -34,9 +35,9 @@
   <arg name="reopt_obs_change_tol" default="0.25" description="min obstacle move [m] to re-trigger the re-opt QP; larger = detection jitter does not thrash the optimizer"/>
   <arg name="reopt_compute_sp" default="true" description="also re-optimize the shortest_path line (consumed by ot_interpolator); set false only if the OT line is unused"/>
   <arg name="reopt_method" default="local_window" description="obstacle-aware line optimizer: local_window (fast ONLINE windowed min-curv QP) | global (legacy whole-track mincurv_iqp, offline-grade)"/>
-  <arg name="reopt_reach_time" default="1.2" description="[s] avoidance arc half-width ~ this * local raceline speed (bigger = gentler, faster arc reaching toward the adjacent corners)"/>
-  <arg name="reopt_reach_min" default="4.0" description="[m] MIN arc half-width (slow sections)"/>
-  <arg name="reopt_reach_max" default="10.0" description="[m] MAX arc half-width (fast sections)"/>
+  <arg name="reopt_reach_time" default="0.0" description="[s] DEPRECATED seed for the old speed-scaled reach; the reach is now chosen by a lap-time search over [reach_min, reach_max]. Ignored."/>
+  <arg name="reopt_reach_min" default="1.0" description="[m] MIN arc half-width searched. The reach is picked to MINIMISE estimated lap time, not by local speed."/>
+  <arg name="reopt_reach_max" default="6.0" description="[m] MAX arc half-width searched. On a short tight track a wide arc is SLOW (ifac: R=10 m costs ~2x the time a reactive line loses); raise only on long open tracks."/>
   <arg name="reopt_qp_veh_width" default="0.30" description="[m] vehicle width for the windowed QP corridor + floor (obstacle clearance is obs_margin, separate)"/>
   <arg name="reopt_wall_margin" default="0.12" description="[m] keep the re-optimized detour this far off the track walls"/>
   <!-- Detection front-end used effectively: sim has no Livox, so force the 2D 'scan' path there;
@@ -117,16 +118,19 @@
   <node pkg="spliner" exec="start_spline_node_v2" name="start_planner" output="screen"/>
 
   <!-- Static avoidance (Frenet grid-sampling) -> /planner/avoidance/static_otwpnts
-       + /planner/avoidance/static_feasible (Bool; SM gates OVERTAKE entry on it). The feasible
-       topic is remapped like otwpnts so it doesn't collide with the dynamic spliner's namespace. -->
+       + /planner/avoidance/static_feasible (Bool; SM gates OVERTAKE entry on it, treating a
+       stale/absent signal as INFEASIBLE). The feasible topic is published on the canonical name
+       by the node itself; only otwpnts still needs the namespace remap. -->
   <node pkg="spliner" exec="static_avoidance_node" name="static_avoidance_planner" output="screen">
     <param from="$(find-pkg-share stack_master)/config/static_avoidance_params.yaml"/>
     <remap from="/planner/avoidance/otwpnts" to="/planner/avoidance/static_otwpnts"/>
-    <remap from="/planner/avoidance/feasible" to="/planner/avoidance/static_feasible"/>
   </node>
 
-  <!-- Dynamic avoidance (ROS1 Change mode) -> /planner/avoidance/otwpnts + /planner/avoidance/merger -->
-  <node pkg="lane_change_planner" exec="change_avoidance_node" name="planner_change" output="screen"/>
+  <!-- Dynamic avoidance (lane-hold overtake: OPEN -> HOLD parallel lane -> CLOSE when the
+       opponent is passed) -> /planner/avoidance/otwpnts + /planner/avoidance/merger -->
+  <node pkg="lane_change_planner" exec="change_avoidance_node" name="planner_change" output="screen">
+    <param from="$(find-pkg-share stack_master)/config/lane_change_params.yaml"/>
+  </node>
   <node pkg="lane_change_planner" exec="update_waypoints" name="waypoint_updater" output="screen"/>
 
   <!-- ===== GP opponent-trajectory predictor =====

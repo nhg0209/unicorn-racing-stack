@@ -23,11 +23,12 @@
   <arg name="reopt_obs_change_tol" default="0.25" description="min obstacle move [m] to re-trigger the re-opt QP (larger = detection jitter does not thrash it)"/>
   <arg name="reopt_compute_sp" default="true" description="also re-optimize the shortest_path line (ot_interpolator consumes it); false only if the OT line is unused"/>
   <arg name="reopt_method" default="local_window" description="obstacle-aware line optimizer: local_window (fast ONLINE windowed min-curv QP, ms/solve) | global (legacy whole-track mincurv_iqp, minutes/solve, offline-grade)"/>
-  <arg name="reopt_reach_time" default="1.2" description="[s] avoidance arc half-width ~ this * local raceline speed (bigger = gentler, faster arc reaching toward the adjacent corners)"/>
-  <arg name="reopt_reach_min" default="4.0" description="[m] MIN arc half-width (slow sections)"/>
-  <arg name="reopt_reach_max" default="10.0" description="[m] MAX arc half-width (fast sections)"/>
+  <arg name="reopt_reach_time" default="0.0" description="[s] DEPRECATED seed for the old speed-scaled reach; the reach is now chosen by a lap-time search over [reach_min, reach_max]. Ignored."/>
+  <arg name="reopt_reach_min" default="1.0" description="[m] MIN arc half-width searched. The reach is picked to MINIMISE estimated lap time, not by local speed."/>
+  <arg name="reopt_reach_max" default="6.0" description="[m] MAX arc half-width searched. On a short tight track a wide arc is SLOW (ifac: R=10 m costs ~2x the time a reactive line loses); raise only on long open tracks."/>
   <arg name="reopt_qp_veh_width" default="0.30" description="[m] vehicle width for the windowed QP corridor + floor (obstacle clearance is obs_margin, separate)"/>
-  <arg name="reopt_wall_margin" default="0.12" description="[m] keep the re-optimized detour this far off the track walls"/>
+  <arg name="reopt_wall_margin" default="0.05" description="[m] wall reserve of the re-optimized detour. Aligned with the reactive spliner's wall reserve — the recorded apex was DRIVEN at that reserve; a larger value here shrinks the hump below the proven clearance and the all-or-nothing fit rejects it (obstacle stays reactive-only)."/>
+  <arg name="reopt_obs_margin" default="0.35" description="[m] clearance of the re-optimized line off each obstacle's edge. MUST be >= the reactive keep-out (width_car/2 + safety_margin in static_avoidance_params.yaml, currently 0.30) or the re-opt line sits inside the reactive planner's own keep-out and gets re-avoided every lap. Run stack_master/scripts/check_avoidance_margins.py after tuning either side."/>
 
   <!-- sim -> SIM config folder, real hardware -> CAR config folder -->
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/SIM" if="$(var sim)"/>
@@ -101,6 +102,7 @@
       <param name="reach_max" value="$(var reopt_reach_max)"/>
       <param name="qp_veh_width" value="$(var reopt_qp_veh_width)"/>
       <param name="wall_margin" value="$(var reopt_wall_margin)"/>
+      <param name="obs_margin" value="$(var reopt_obs_margin)"/>
     </node>
     <node pkg="gb_optimizer" exec="static_obstacle_layer" name="static_obstacle_layer" output="screen"/>
   </group>

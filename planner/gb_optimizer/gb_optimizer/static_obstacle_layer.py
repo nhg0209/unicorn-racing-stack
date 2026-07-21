@@ -31,6 +31,7 @@ import rclpy
 from rclpy.node import Node
 
 from nav_msgs.msg import Odometry
+from std_msgs.msg import Empty
 from visualization_msgs.msg import Marker, MarkerArray
 from f110_msgs.msg import ObstacleArray, WpntArray
 
@@ -47,6 +48,7 @@ class _Track:
     opportunity_this_lap: bool = False
     miss_laps: int = 0
     marker_id: int = 0
+    clear_streak: int = 0    # consecutive tracking msgs with a clear in-window view and no sighting
 
 
 class StaticObstacleLayer(Node):
@@ -54,15 +56,39 @@ class StaticObstacleLayer(Node):
         super().__init__("static_obstacle_layer")
 
         self.declare_parameter("static_vel_thresh", 0.3)     # [m/s] |vs|,|vd| below -> static-like
-        self.declare_parameter("require_is_static", False)   # also require perception's is_static
+        # also require perception's is_static: ON by default now that the tracker flag is
+        # position-persistence + window-speed hardened. Velocity alone (|vs|<thresh) also
+        # latched a MOVING opponent whenever its EKF speed dipped (slow corner / spin-up),
+        # letting a head-to-head opponent corrupt the obstacle-aware re-optimized line.
+        self.declare_parameter("require_is_static", True)
         self.declare_parameter("match_radius", 0.5)          # [m] associate detection to a track
         self.declare_parameter("confirm_hits", 5)            # sightings to confirm a static obstacle
         self.declare_parameter("min_radius", 0.10)           # [m] floor on obstacle radius
         self.declare_parameter("obs_horizon_m", 6.0)         # [m] range within which the ego can see
         self.declare_parameter("removal_enable", True)
-        self.declare_parameter("removal_miss_laps", 2)       # consecutive missed laps -> removed
+        # One genuinely-missed full lap is strong evidence now that lap counting is guarded by
+        # the forward-progress odometer (a spurious seam crossing can no longer charge a miss).
+        self.declare_parameter("removal_miss_laps", 1)       # consecutive missed laps -> removed
         self.declare_parameter("removal_min_lap", 0)         # fixed-schedule prior: no removal before
         self.declare_parameter("publish_period", 0.5)        # [s] republish confirmed set
+        # Sighting-based fast unlatch: while a confirmed track sits inside a HIGH-CONFIDENCE view
+        # window ahead of the ego (tighter than obs_horizon_m), every tracking message that shows
+        # NO visible detection there grows a streak; at unlatch_clear_msgs the track is dropped on
+        # the spot — no waiting for the lap accounting. A premature unlatch is survivable (the
+        # reactive layer still avoids whatever perception reports, and the layer re-confirms), so
+        # this can be aggressive. The streak must complete within one approach (reset outside the
+        # window) and is SUSPENDED while a dynamic obstacle (the opponent) sits between the ego
+        # and the spot — the main occlusion-driven false-unlatch vector in head-to-head.
+        self.declare_parameter("unlatch_enable", True)
+        self.declare_parameter("unlatch_gap_min", 1.0)       # [m] window near edge
+        self.declare_parameter("unlatch_gap_max", 5.0)       # [m] window far edge (< obs_horizon_m,
+                                                             # sized so a fast pass still fits the streak)
+        self.declare_parameter("unlatch_clear_msgs", 20)     # consecutive clear msgs -> unlatch (~0.5 s @40 Hz)
+        # Streak is also SUSPENDED while the ego is OFF the raceline (|d| above this): mid-avoidance
+        # the sensor geometry on the very obstacle being avoided is skewed (wall-adjacent boxes
+        # flicker under detect's boundary inflation at those angles) — observed: a live obstacle
+        # was unlatched DURING its own avoidance, then re-confirmed 0.2 s later (set flap 1->0->1).
+        self.declare_parameter("unlatch_max_ego_d", 0.20)    # [m] suspend streak when |ego d| exceeds
 
         self.static_vel_thresh = float(self.get_parameter("static_vel_thresh").value)
         self.require_is_static = bool(self.get_parameter("require_is_static").value)
@@ -74,18 +100,28 @@ class StaticObstacleLayer(Node):
         self.removal_miss_laps = int(self.get_parameter("removal_miss_laps").value)
         self.removal_min_lap = int(self.get_parameter("removal_min_lap").value)
         self.publish_period = float(self.get_parameter("publish_period").value)
+        self.unlatch_enable = bool(self.get_parameter("unlatch_enable").value)
+        self.unlatch_gap_min = float(self.get_parameter("unlatch_gap_min").value)
+        self.unlatch_gap_max = float(self.get_parameter("unlatch_gap_max").value)
+        self.unlatch_clear_msgs = int(self.get_parameter("unlatch_clear_msgs").value)
+        self.unlatch_max_ego_d = float(self.get_parameter("unlatch_max_ego_d").value)
 
+        self._ego_d: Optional[float] = None
         self._tracks: List[_Track] = []
         self._next_marker_id = 0
         self._ego_s: Optional[float] = None
         self._last_ego_s: Optional[float] = None
         self._lap = 0
+        self._s_progressed = 0.0
         self._track_length: Optional[float] = None
 
         self.pub = self.create_publisher(MarkerArray, "/static_reopt/obstacles", 10)
         self.create_subscription(ObstacleArray, "/tracking/obstacles", self.obstacles_cb, 10)
         self.create_subscription(Odometry, "/car_state/odom_frenet", self.frenet_cb, 10)
         self.create_subscription(WpntArray, "/global_waypoints", self.glb_cb, 10)
+        # Pit/bench reset: `ros2 topic pub --once /static_reopt/clear_obstacles std_msgs/msg/Empty`
+        # drops every track at once (e.g. the obstacles were physically removed mid-race).
+        self.create_subscription(Empty, "/static_reopt/clear_obstacles", self.clear_cb, 1)
         self.create_timer(self.publish_period, self.publish_cb)
 
         self.get_logger().info("[static_obs_layer] up — mapping static obstacles from /tracking/obstacles")
@@ -98,10 +134,27 @@ class StaticObstacleLayer(Node):
     def frenet_cb(self, msg: Odometry):
         s = msg.pose.pose.position.x
         self._ego_s = s
-        # lap wrap detection (s resets to ~0)
-        if self._last_ego_s is not None and s < self._last_ego_s - 1.0:
-            self._on_lap_complete()
-            self._lap += 1
+        self._ego_d = msg.pose.pose.position.y   # unlatch streak suspends while off-line
+        # Lap boundary needs the previous sample near the end of the lap AND a full lap of
+        # accumulated forward travel (mirrors static_reopt_node's gate): a parked car whose s
+        # flickers across the seam, a reversing car, or a localization jump must never count a
+        # lap — each spurious lap can charge a miss against every unseen obstacle. Without the
+        # track length no laps are counted, which just keeps removal disabled (safe).
+        L = self._track_length
+        if L:
+            if self._last_ego_s is not None:
+                ds = s - self._last_ego_s
+                if ds < -1.0:
+                    ds += L                   # a genuine wrap is one lap of forward travel
+                if 0.0 <= ds < 1.0:           # ignore backward/teleport frames in the odometer
+                    self._s_progressed += ds
+            if (self._last_ego_s is not None
+                    and s < self._last_ego_s - 1.0
+                    and self._last_ego_s > 0.85 * L
+                    and self._s_progressed > 0.9 * L):
+                self._on_lap_complete()
+                self._lap += 1
+                self._s_progressed = 0.0
         self._last_ego_s = s
 
         # mark observation opportunities: obstacle is within sensor range ahead of the ego
@@ -112,13 +165,19 @@ class StaticObstacleLayer(Node):
                     t.opportunity_this_lap = True
 
     def obstacles_cb(self, msg: ObstacleArray):
+        seen_now = set()      # tracks matched to a VISIBLE detection in this message
         for obs in msg.obstacles:
             if getattr(obs, "is_actually_a_gap", False):
                 continue
             if not self._is_static_like(obs):
                 continue
             r = max(obs.size / 2.0, self.min_radius)
-            self._associate(obs.x_m, obs.y_m, r, obs.s_center)
+            t = self._associate(obs.x_m, obs.y_m, r, obs.s_center)
+            # a remembered-but-unseen obstacle (is_visible=False) is tracker memory, not an
+            # observation — it must not defeat the clear-view streak below
+            if t is not None and getattr(obs, "is_visible", True):
+                seen_now.add(id(t))
+        self._update_unlatch_streaks(msg, seen_now)
 
     def _is_static_like(self, obs) -> bool:
         slow = abs(obs.vs) < self.static_vel_thresh and abs(obs.vd) < self.static_vel_thresh
@@ -126,7 +185,7 @@ class StaticObstacleLayer(Node):
             return slow and bool(obs.is_static)
         return slow
 
-    def _associate(self, x: float, y: float, r: float, s: float):
+    def _associate(self, x: float, y: float, r: float, s: float) -> _Track:
         best = None
         best_d = self.match_radius
         for t in self._tracks:
@@ -138,7 +197,7 @@ class StaticObstacleLayer(Node):
             t = _Track(x=x, y=y, r=r, s=s, hits=1, marker_id=self._next_marker_id)
             self._next_marker_id += 1
             self._tracks.append(t)
-            return
+            return t
         # EMA update of position/size; count the sighting
         a = 0.3
         best.x = (1 - a) * best.x + a * x
@@ -152,6 +211,51 @@ class StaticObstacleLayer(Node):
             best.confirmed = True
             self.get_logger().info(
                 f"[static_obs_layer] CONFIRMED static obstacle @({best.x:.2f},{best.y:.2f}) r={best.r:.2f}")
+        return best
+
+    def _update_unlatch_streaks(self, msg: ObstacleArray, seen_now):
+        """Sighting-based fast unlatch (see the unlatch_* parameter block)."""
+        if not self.unlatch_enable or self._ego_s is None or not self._track_length:
+            return
+        L = self._track_length
+        # forward gaps of dynamic obstacles (the opponent) — occlusion guard input
+        dyn_gaps = [(o.s_center - self._ego_s) % L
+                    for o in msg.obstacles
+                    if not getattr(o, "is_actually_a_gap", False) and not self._is_static_like(o)]
+        survivors: List[_Track] = []
+        for t in self._tracks:
+            if not t.confirmed:
+                survivors.append(t)
+                continue
+            gap = (t.s - self._ego_s) % L
+            if not (self.unlatch_gap_min <= gap <= self.unlatch_gap_max):
+                t.clear_streak = 0            # the streak must complete within ONE approach
+                survivors.append(t)
+                continue
+            if id(t) in seen_now:
+                t.clear_streak = 0
+                survivors.append(t)
+                continue
+            if self._ego_d is not None and abs(self._ego_d) > self.unlatch_max_ego_d:
+                survivors.append(t)           # ego mid-avoidance (off-line): geometry unreliable,
+                continue                      # suspend the streak, don't count a miss
+            if any(g < gap for g in dyn_gaps):
+                survivors.append(t)           # opponent between ego and the spot: suspend, don't count
+                continue
+            t.clear_streak += 1
+            if t.clear_streak >= self.unlatch_clear_msgs:
+                self.get_logger().info(
+                    f"[static_obs_layer] UNLATCHED static obstacle @({t.x:.2f},{t.y:.2f}) — "
+                    f"{t.clear_streak} consecutive clear views of its spot, no detection")
+                continue                      # drop it now; no waiting for the lap accounting
+            survivors.append(t)
+        self._tracks = survivors
+
+    def clear_cb(self, _msg: Empty):
+        n = len(self._tracks)
+        self._tracks = []
+        self.get_logger().info(f"[static_obs_layer] CLEARED {n} track(s) by external request")
+        self.publish_cb()  # push the empty set immediately, don't wait for the timer
 
     def _on_lap_complete(self):
         """At each lap boundary: update misses/removal for confirmed obstacles, reset flags."""
