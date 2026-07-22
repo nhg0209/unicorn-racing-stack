@@ -61,6 +61,19 @@ static_avoidance_planner:
     clear_hyst_m: 0.03      # [m] EXTRA clearance required to enter idle (leave only on a real violation)
     clear_max_cur_d: 0.15   # [m] gate applies only with the car on the raceline (never abandons a maneuver)
 
+    # --- path commitment (temporal consistency: plan once, reuse) ---
+    # The planner re-solved from the car's instantaneous pose every 20 Hz cycle. Once the obstacle
+    # came within ramp_len the entry ramp re-anchored to the moving/erroring car and the chosen
+    # candidate shifted as the gap shrank, so the car re-avoided the SAME box weirdly on approach.
+    # With commitment the chosen path is frozen in the world frame and just re-sliced/re-published;
+    # a fresh plan is taken only on a real trigger (car off the path, box moved, slice no longer
+    # clears a live box, or maneuver done). Safety is NOT frozen: the committed slice is re-checked
+    # against live obstacles every cycle and publishes feasible=False the instant it stops clearing.
+    commit_enable: true
+    commit_dev_max: 0.35    # [m] drop the commit if the car deviates this far from the committed path
+    commit_obs_ds: 0.75     # [m] drop the commit if the triggering box's s drifts this far (re-plan apex)
+    commit_obs_dd: 0.40     # [m] ... or its d drifts this far
+
     # --- cost weights  J = w_d*Σ|d| + w_k*Σκ² + w_c*|d_end-d_end_prev| + w_obs*Σexp(-dist/σ) ---
     w_d: 1.0                # raceline deviation
     w_k: 0.1                # curvature (smoothness)
