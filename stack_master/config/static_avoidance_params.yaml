@@ -12,6 +12,12 @@ static_avoidance_planner:
 
     # --- terminal-offset sampling ---
     n_d_samples: 10         # number of lateral offsets sampled across the drivable width at the obstacle
+    sample_gaps: true       # sample the two DRIVABLE GAPS beside the obstacle (box-edge -> wall on each
+                            #   side) instead of a uniform sweep of the whole corridor. On a wide, lopsided
+                            #   corridor (map f's wall-hugging raceline) the uniform sweep put ~all samples
+                            #   on the roomy side and gave the narrow free gap ZERO candidates -> avoidance
+                            #   flipped to the wrong side. Gap-anchored sampling always covers both sides
+                            #   that have room. false = legacy uniform sweep (n_d_samples across corridor).
     width_car: 0.30         # [m]  car width (half is reserved as clearance to walls/obstacles)
     safety_margin: 0.15     # [m]  extra clearance around the obstacle box. obs_margin = half_car(0.15)+
                             #      safety must cover the SIM ego collision radius (0.29 m = half car

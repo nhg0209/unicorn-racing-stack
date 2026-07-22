@@ -114,6 +114,8 @@ class ObstacleSpliner(Node):
         self.lookahead_min = 8.0     # [m]
         self.lookahead_k = 1.5       # [s]  lookahead = max(lookahead_min, k * cur_vs)
         self.n_d_samples = 13        # terminal offsets sampled across the width
+        self.sample_gaps = True      # sample the drivable gaps beside the obstacle (vs a uniform
+                                     # corridor sweep that skips the narrow gap on a lopsided corridor)
         # Curvature feasibility is corner-fair: budget the curvature the MANEUVER adds over the
         # raceline (kappa_add_max) AND keep an absolute steering ceiling (kappa_abs_max = physical
         # min turn radius). An absolute-only check rejected every offset in a corner because the
@@ -189,7 +191,7 @@ class ObstacleSpliner(Node):
         self.declare_all_parameters()
         # Sync members from loaded params (yaml/defaults), then register live-reconfigure callback.
         self.dyn_param_cb(self.get_parameters([
-            'kernel_size', 'lookahead_min', 'lookahead_k', 'n_d_samples', 'kappa_max',
+            'kernel_size', 'lookahead_min', 'lookahead_k', 'n_d_samples', 'sample_gaps', 'kappa_max',
             'kappa_add_max', 'kappa_abs_max', 'a_lat_max', 'a_long_max', 'a_long_accel',
             'safety_margin', 'wall_margin', 'shift_min', 'shift_buffer', 'ramp_len', 'hold_after',
             'return_len', 'apex_bulge', 'max_weave', 'width_car', 'tail_m', 'w_d', 'w_k', 'w_c', 'w_obs', 'obs_sigma',
@@ -237,6 +239,9 @@ class ObstacleSpliner(Node):
         self.declare_parameter('lookahead_min', 8.0, dbl(1.0, 20.0, "min planning lookahead [m]"))
         self.declare_parameter('lookahead_k', 1.5, dbl(0.0, 5.0, "lookahead = max(min, k*cur_vs) [s]"))
         self.declare_parameter('n_d_samples', 13, intd(3, 41, "terminal lateral offsets sampled"))
+        self.declare_parameter('sample_gaps', True,
+                               ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
+                                                   description="Sample the drivable gaps beside the obstacle (vs a uniform corridor sweep)"))
         self.declare_parameter('kappa_max', 2.0, dbl(0.1, 10.0, "DEPRECATED alias -> kappa_abs_max [1/m]"))
         self.declare_parameter('kappa_add_max', 2.0, dbl(0.1, 10.0, "max curvature the maneuver may ADD over the raceline [1/m]"))
         self.declare_parameter('kappa_abs_max', 3.5, dbl(0.1, 10.0, "absolute curvature ceiling / min turn radius [1/m]"))
@@ -286,6 +291,8 @@ class ObstacleSpliner(Node):
                 self.lookahead_k = float(p.value)
             elif n == 'n_d_samples':
                 self.n_d_samples = int(p.value)
+            elif n == 'sample_gaps':
+                self.sample_gaps = bool(p.value)
             elif n == 'kappa_max':
                 self.kappa_abs_max = float(p.value)   # deprecated alias -> absolute ceiling
             elif n == 'kappa_add_max':
@@ -580,15 +587,39 @@ class ObstacleSpliner(Node):
         v_gb_arr = np.array([gb_wpnts[j].vx_mps for j in idxs])
         kappa_ref = np.array([gb_wpnts[j].kappa_radpm for j in idxs])  # raceline curvature (corner-fair check)
 
-        # --- terminal-offset samples: corridor AT THE OBSTACLE (where clearance actually matters) ---
+        # --- terminal-offset samples: the DRIVABLE GAPS beside the obstacle ---
+        # Sample each free gap (obstacle's left edge -> left wall, and right edge -> right wall)
+        # rather than a blind UNIFORM sweep of the whole corridor. On a wide, LOPSIDED corridor
+        # (map f's wall-hugging min-curvature raceline: |d_left-d_right|>1 m over ~2/3 of the lap)
+        # a uniform n_d_samples sweep lands ~all samples on the roomy side and can give the narrow
+        # side ZERO box-clearing candidates -> if the free gap is the narrow side the planner never
+        # populates it and avoidance flips to the open-but-wrong side ("candidates on the opposite
+        # side of the gap"). ifac's near-symmetric corridor hides this. Gap-anchored sampling
+        # always populates BOTH sides that have room, so the correct side is never missed.
         obs_j = int(nearest.s_center / wpnt_dist) % self.gb_max_idx
-        d_hi = gb_wpnts[obs_j].d_left - sample_margin
-        d_lo = -(gb_wpnts[obs_j].d_right - sample_margin)
+        d_hi = gb_wpnts[obs_j].d_left - sample_margin          # left corridor limit (car centre)
+        d_lo = -(gb_wpnts[obs_j].d_right - sample_margin)      # right corridor limit (car centre)
+        obox_lo = min(nearest.d_right, nearest.d_left) - obs_margin   # car-centre keep-out, right edge
+        obox_hi = max(nearest.d_right, nearest.d_left) + obs_margin   # car-centre keep-out, left edge
+        n_left = n_right = 0
         if d_hi <= d_lo:
             d_ends = np.array([0.0])
+        elif self.sample_gaps:
+            n_side = max(2, self.n_d_samples // 2)
+            d_list = [0.0]                                     # always try the raceline
+            lo_left = max(obox_hi, d_lo)                       # LEFT gap: car centre in [lo_left, d_hi]
+            if lo_left <= d_hi + 1e-6:
+                left = np.linspace(lo_left, d_hi, n_side); n_left = int(left.size)
+                d_list += list(left)
+            hi_right = min(obox_lo, d_hi)                      # RIGHT gap: car centre in [d_lo, hi_right]
+            if hi_right >= d_lo - 1e-6:
+                right = np.linspace(d_lo, hi_right, n_side); n_right = int(right.size)
+                d_list += list(right)
+            d_ends = np.unique(np.round(np.asarray(d_list, dtype=float), 4))
+            d_ends[int(np.argmin(np.abs(d_ends)))] = 0.0       # snap nearest sample onto the raceline
         else:
-            d_ends = np.linspace(d_lo, d_hi, self.n_d_samples)
-            d_ends[int(np.argmin(np.abs(d_ends)))] = 0.0   # snap nearest sample onto the raceline
+            d_ends = np.linspace(d_lo, d_hi, self.n_d_samples)  # legacy uniform corridor sweep
+            d_ends[int(np.argmin(np.abs(d_ends)))] = 0.0
         N = len(d_ends)
 
         # --- d(s): raceline -> [hold across box_1] -> ... -> [hold across box_m] -> raceline ---
@@ -666,6 +697,7 @@ class ObstacleSpliner(Node):
         best_k, best_J, best = -1, np.inf, None
         status = ["reject"] * N
         n_bounds = n_obs = n_grid = n_curv = 0   # per-stage reject counters (diagnostics)
+        n_feas_left = n_feas_right = 0            # feasible candidates per side (which side has room)
         for k in range(N):
             if not bound_ok[k]:
                 n_bounds += 1
@@ -696,6 +728,10 @@ class ObstacleSpliner(Node):
                 j_o = 0.0
             J = j_d + j_k + j_c + j_o
             status[k] = "feasible"
+            if d_ends[k] > 1e-6:
+                n_feas_left += 1
+            elif d_ends[k] < -1e-6:
+                n_feas_right += 1
             if J < best_J:
                 best_J, best_k, best = J, k, (xy, psi_, kappa_)
 
@@ -719,6 +755,18 @@ class ObstacleSpliner(Node):
         status[best_k] = "selected"
         self._d_end_prev = float(d_ends[best_k])
         xy, psi_, kappa_ = best
+
+        # Diagnostic (throttled): which side did we take, how many feasible candidates were on each
+        # side, how were the samples split, and what killed the rejects. On map f this exposes a
+        # "wrong side" pick as either 0 feasible on the free side (sampling) or that side being eaten
+        # by grid/curv/bounds. sel_d>0 = LEFT of the raceline, <0 = RIGHT.
+        sel_d = float(d_ends[best_k])
+        sel_side = "LEFT" if sel_d > 1e-6 else ("RIGHT" if sel_d < -1e-6 else "RACELINE")
+        self.get_logger().info(
+            f"[{self.name}] avoid {sel_side} d_end={sel_d:+.2f} | feasible L={n_feas_left} R={n_feas_right} | "
+            f"sampled {n_left}L+{n_right}R of {N} | reject bounds={n_bounds} obs={n_obs} grid={n_grid} curv={n_curv} | "
+            f"corridor d=[{d_lo:.2f},{d_hi:.2f}] obs keep-out d=[{obox_lo:.2f},{obox_hi:.2f}]",
+            throttle_duration_sec=2.0)
 
         if SMOOTH_OTWPNTS:
             kappa_ = _savgol_safe(kappa_, SMOOTH_OTWPNTS_WINDOW)
