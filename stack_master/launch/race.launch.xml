@@ -6,7 +6,8 @@
 
     perception   : detect (C++) + tracking (Python)  (/scan -> /detect/raw_obstacles -> /tracking/obstacles_raw)
     state machine: state_machine                     (/tracking/obstacles + raceline -> /local_waypoints, /behavior_strategy, /state_machine)
-    planning     : spliner_node                      (avoidance spline -> /planner/avoidance/otwpnts)
+    planning     : change_avoidance_node (dynamic lane-hold) + static_avoidance_node (static)
+                   (-> /planner/avoidance/otwpnts, /planner/avoidance/static_otwpnts)
     control      : controller_manager               (L1/Pure-Pursuit; /behavior_strategy -> high_level/ackermann_cmd)
 
   The virtual opponent and its obstacle injection (/tracking/obstacles with
@@ -21,12 +22,31 @@
 <launch>
   <arg name="map"        description="Map name (folder in stack_master/maps/)"/>
   <arg name="sim"        default="false" description="Use simulator (true) or real hardware (false)"/>
+  <arg name="localization" default="kiss" description="Real-car localization: cartographer | pf | kiss (ignored in sim, which uses gym ground truth)"/>
+  <arg name="detection_source" default="kiss" description="Obstacle detection front-end: kiss (Livox 3D BevDetector -> kiss_obstacle_bridge) | scan (2D perception/detect on /scan, Hokuyo or pointcloud_to_laserscan)"/>
   <arg name="virtual"    default="$(var sim)" description="Inject a virtual opponent + static obstacles (on by default in sim, off on the real car; e.g. virtual:=true to overlay a virtual opponent onto the real LiDAR)"/>
   <arg name="ot_planner" default="predictive_spliner" description="overtake planner the state machine listens to (ROS1 default = predictive_spliner: listens to BOTH /planner/avoidance/otwpnts (dynamic) AND /planner/avoidance/static_otwpnts (static))"/>
   <arg name="control_topic" default="/local_waypoints"
        description="WpntArray the controller follows: /local_waypoints (state-machine output w/ avoidance) or /global_waypoints (robust raceline)"/>
   <arg name="use_pp_heading" default="false"
        description="Run pp_heading_controller instead of controller_manager (only one runs)"/>
+  <arg name="use_hokuyo" default="false" description="(real) start the Hokuyo urg_node (/scan). OFF by default: the car runs the Livox MID-360; without /scan the FTG fallback + estop are inert"/>
+  <arg name="use_livox"  default="true"  description="(real) start the Livox MID-360 driver (/livox/lidar + /livox/imu for kiss 3D localization + detection)"/>
+  <arg name="rviz"       default="false" description="(real) also start RViz with the pitwall config (2D Pose Estimate seeds kiss via /initialpose)"/>
+  <arg name="reopt" default="false" description="Obstacle-aware global line (IFAC static re-optimization): static_reopt_node + static_obstacle_layer instead of plain global_trajectory_publisher"/>
+  <arg name="reopt_safety_width" default="0.5" description="safety_width for the obstacle-aware re-optimizer (tight ifac map solves plain mincurv_iqp only at 0.25 or lower)"/>
+  <arg name="reopt_obs_change_tol" default="0.25" description="min obstacle move [m] to re-trigger the re-opt QP; larger = detection jitter does not thrash the optimizer"/>
+  <arg name="reopt_compute_sp" default="true" description="also re-optimize the shortest_path line (consumed by ot_interpolator); set false only if the OT line is unused"/>
+  <arg name="reopt_method" default="local_window" description="obstacle-aware line optimizer: local_window (fast ONLINE windowed min-curv QP) | global (legacy whole-track mincurv_iqp, offline-grade)"/>
+  <arg name="reopt_reach_time" default="0.0" description="[s] DEPRECATED seed for the old speed-scaled reach; the reach is now chosen by a lap-time search over [reach_min, reach_max]. Ignored."/>
+  <arg name="reopt_reach_min" default="1.0" description="[m] MIN arc half-width searched. The reach is picked to MINIMISE estimated lap time, not by local speed."/>
+  <arg name="reopt_reach_max" default="6.0" description="[m] MAX arc half-width searched. On a short tight track a wide arc is SLOW (ifac: R=10 m costs ~2x the time a reactive line loses); raise only on long open tracks."/>
+  <arg name="reopt_qp_veh_width" default="0.30" description="[m] vehicle width for the windowed QP corridor + floor (obstacle clearance is obs_margin, separate)"/>
+  <arg name="reopt_wall_margin" default="0.12" description="[m] keep the re-optimized detour this far off the track walls"/>
+  <!-- Detection front-end used effectively: sim has no Livox, so force the 2D 'scan' path there;
+       the real car honours detection_source. -->
+  <let name="det_src" value="scan" if="$(var sim)"/>
+  <let name="det_src" value="$(var detection_source)" unless="$(var sim)"/>
   <!-- sim -> SIM config (racecar_f110.ini + veh_dyn_info); real hardware -> CAR. Folder name == racecar_version. -->
   <let name="racecar_version" value="SIM" if="$(var sim)"/>
   <let name="racecar_version" value="CAR" unless="$(var sim)"/>
@@ -40,19 +60,54 @@
 
   <!-- ===== Base system: sensors/sim + opponent + raceline + frenet odom ===== -->
   <include file="$(find-pkg-share stack_master)/launch/base_system.launch.xml">
-    <arg name="map"     value="$(var map)"/>
-    <arg name="sim"     value="$(var sim)"/>
-    <arg name="virtual" value="$(var virtual)"/>
+    <arg name="map"          value="$(var map)"/>
+    <arg name="sim"          value="$(var sim)"/>
+    <arg name="localization" value="$(var localization)"/>
+    <arg name="virtual"      value="$(var virtual)"/>
+    <arg name="reopt"   value="$(var reopt)"/>
+    <arg name="reopt_safety_width" value="$(var reopt_safety_width)"/>
+    <arg name="reopt_obs_change_tol" value="$(var reopt_obs_change_tol)"/>
+    <arg name="reopt_compute_sp" value="$(var reopt_compute_sp)"/>
+    <arg name="reopt_method" value="$(var reopt_method)"/>
+    <arg name="reopt_reach_time" value="$(var reopt_reach_time)"/>
+    <arg name="reopt_reach_min" value="$(var reopt_reach_min)"/>
+    <arg name="reopt_reach_max" value="$(var reopt_reach_max)"/>
+    <arg name="reopt_qp_veh_width" value="$(var reopt_qp_veh_width)"/>
+    <arg name="reopt_wall_margin" value="$(var reopt_wall_margin)"/>
+    <arg name="use_hokuyo" value="$(var use_hokuyo)"/>
+    <arg name="use_livox"  value="$(var use_livox)"/>
   </include>
+
+  <!-- Optional on-car RViz (sim already gets one from gym_bridge_launch). 2D Pose
+       Estimate publishes /initialpose, which seeds the kiss localization. -->
+  <group unless="$(var sim)">
+    <node pkg="rviz2" exec="rviz2" name="rviz" output="log" if="$(var rviz)"
+          args="-d $(find-pkg-share stack_master)/config/pitwall.rviz"/>
+  </group>
 
   <!-- ===== Perception: LiDAR obstacle detection (C++) + tracking (Python) =====
        detect publishes /detect/raw_obstacles (Frenet filled at the source);
        tracking reads it and publishes /tracking/obstacles_raw. tracking_merger
        (sim virtual_perception) owns /tracking/obstacles. -->
-  <node pkg="perception" exec="detect" name="detect" output="screen">
-    <param from="$(find-pkg-share stack_master)/config/opponent_tracker_params.yaml"/>
-    <param name="map" value="$(var map)"/>
-  </node>
+  <!-- detection_source=scan: 2D perception/detect on /scan (Hokuyo, or Livox via
+       pointcloud_to_laserscan). Fills /detect/raw_obstacles from the laser scan. -->
+  <group if="$(eval '\'$(var det_src)\' == \'scan\'')">
+    <node pkg="perception" exec="detect" name="detect" output="screen">
+      <param from="$(find-pkg-share stack_master)/config/opponent_tracker_params.yaml"/>
+      <param name="map" value="$(var map)"/>
+    </node>
+  </group>
+
+  <!-- detection_source=kiss: kiss_icp_localization's BevDetector (detect_en:true in
+       kiss.yaml; works on the 2D-scan input too). It publishes CUBE bbox markers on
+       /kiss_loc/detections (map frame); the bridge converts them to
+       /detect/raw_obstacles (Frenet-filled) for tracking. Requires the kiss
+       localization node to be running (localization:=kiss) and the map folder to
+       contain <map>_track.yaml + <map>_ground_lidar.yaml (the node fails fast at
+       startup without them). -->
+  <group if="$(eval '\'$(var det_src)\' == \'kiss\'')">
+    <node pkg="perception" exec="kiss_obstacle_bridge" name="kiss_obstacle_bridge" output="screen"/>
+  </group>
   <!-- with virtual:=true tracking_merger owns /tracking/obstacles, so tracking feeds it
        on /tracking/obstacles_raw; without it, tracking publishes /tracking/obstacles directly -->
   <let name="tracking_out" value="/tracking/obstacles_raw" if="$(var virtual)"/>
@@ -78,13 +133,20 @@
   <!-- Start planner -> /planner/start_wpnts -->
   <node pkg="spliner" exec="start_spline_node_v2" name="start_planner" output="screen"/>
 
-  <!-- Static avoidance -> /planner/avoidance/static_otwpnts -->
+  <!-- Static avoidance (Frenet grid-sampling) -> /planner/avoidance/static_otwpnts
+       + /planner/avoidance/static_feasible (Bool; SM gates OVERTAKE entry on it, treating a
+       stale/absent signal as INFEASIBLE). The feasible topic is published on the canonical name
+       by the node itself; only otwpnts still needs the namespace remap. -->
   <node pkg="spliner" exec="static_avoidance_node" name="static_avoidance_planner" output="screen">
+    <param from="$(find-pkg-share stack_master)/config/static_avoidance_params.yaml"/>
     <remap from="/planner/avoidance/otwpnts" to="/planner/avoidance/static_otwpnts"/>
   </node>
 
-  <!-- Dynamic avoidance (ROS1 Change mode) -> /planner/avoidance/otwpnts + /planner/avoidance/merger -->
-  <node pkg="lane_change_planner" exec="change_avoidance_node" name="planner_change" output="screen"/>
+  <!-- Dynamic avoidance (lane-hold overtake: OPEN -> HOLD parallel lane -> CLOSE when the
+       opponent is passed) -> /planner/avoidance/otwpnts + /planner/avoidance/merger -->
+  <node pkg="lane_change_planner" exec="change_avoidance_node" name="planner_change" output="screen">
+    <param from="$(find-pkg-share stack_master)/config/lane_change_params.yaml"/>
+  </node>
   <node pkg="lane_change_planner" exec="update_waypoints" name="waypoint_updater" output="screen"/>
 
   <!-- ===== GP opponent-trajectory predictor =====

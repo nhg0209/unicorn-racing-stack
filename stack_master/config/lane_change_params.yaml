@@ -1,0 +1,53 @@
+# Lane-hold dynamic overtaking planner (lane_change_planner / change_avoidance_node,
+# launched as planner_change in race.launch.xml). All values live-tunable via rqt.
+#
+# Maneuver: the planner stays SILENT while TRAILING closes in at speed; once the gap
+# is below engage_gap_m it latches a side, sizes the lane offset from the opponent's
+# actual lateral position (never below the SM free-check requirement), blends onto the
+# centerline-parallel lane (OPEN), keeps following it while watching the wrapped
+# s-gap (HOLD, offset auto-grows if the opponent drifts toward the lane), and ramps
+# back to the raceline once the opponent is passed (CLOSE).
+planner_change:
+  ros__parameters:
+    # gate: only ENGAGE inside overtaking sectors (/ot_section_check fresh + true).
+    # A maneuver already in progress is never aborted by sector state.
+    require_ot_section: true
+
+    # --- engagement ---
+    engage_gap_m: 5.0          # trail (at speed) until the s-gap to the target is below
+                               # this, then start the lane change. Must be ABOVE the
+                               # trailing hold distance (controller: 0.25*v + 1.55 m,
+                               # ~2-3 m) or the gap never closes enough to engage,
+                               # and BELOW the SM commit gate (10 m).
+    obs_traj_tresh: 1.0        # engage only if |obs d - ego d| below this (they block our line)
+    sep_margin_m: 0.5          # required lateral clearance beyond the obstacle half-size.
+                               # MUST stay > SM gb_ego_width/2 + lateral_width_m (0.2+0.2=0.4)
+                               # or the SM free-check rejects the lane the planner accepted.
+
+    # --- lane geometry ---
+    lane_offset_m: 0.35        # MINIMUM lane offset from the CENTERLINE. The actual offset
+                               # is sized per engagement from the opponent's position
+                               # (>= size/2 + sep_margin away from them) and grows live if
+                               # they drift toward the lane; the walls always cap it.
+    offset_slew_mps: 0.6       # how fast the live offset may grow/shrink [m/s]
+    spline_bound_mindist: 0.25 # path may never come closer than this to the track bounds
+
+    # --- transition geometry (lengths speed-scale: max(min_m, time_s * v)) ---
+    open_ramp_min_m: 3.0
+    open_ramp_time_s: 0.8      # (the OPEN blend is additionally capped to finish BEFORE
+                               # the target when engaging close behind it)
+    blend_min_m: 1.5           # HOLD re-anchor blend from the car onto the lane
+    close_ramp_min_m: 3.0
+    close_ramp_time_s: 0.8
+    close_arm_m: 1.0           # return ramp starts this far ahead of the car (slides while
+                               # the car is still on the lane -> SM adoption is step-free)
+    tail_m: 2.0                # raceline tail after the return ramp
+
+    # --- hold / pass logic ---
+    hold_horizon_m: 22.0       # published path length. Keep > SM interest_horizon_m (20):
+                               # an opponent past the path end makes the SM free-check fail.
+    pass_gap_m: 1.2            # ego must lead the opponent by this (wrapped s) to close
+    pass_hyst_s: 0.3           # pass condition must hold this long (anti flicker)
+    target_lost_s: 1.0         # coast the target on its EKF velocity this long before
+                               # treating it as lost (occlusion robustness)
+    reengage_block_s: 1.0      # idle time after finishing/aborting a maneuver

@@ -2,7 +2,13 @@ free_scaling_reference_distance_m: 1
 is_closed: true
 lateral_width_m: 0.15
 latest_threshold: 0.1
-max_horizon: 20.0
+# Forward distance at which a STATIC obstacle on the raceline makes the GB path read "not free"
+# (= the TRAILING/OVERTAKE intent trigger). MUST be <= the spliner gen_horizon (17 m) so the
+# escape spline is already published when the SM decides the line is blocked -- otherwise the car
+# is forced into TRAILING and crawls up to the obstacle until the spline finally appears.
+# Dynamic opponents are unaffected: their overtake gate is _check_getting_closer(10 m), which is
+# tighter than this anyway.
+max_horizon: 15.0
 min_horizon: 0.0
 on_spline_front_horizon_thres_m: 0.5
 on_spline_min_dist_thres_m: 0.5

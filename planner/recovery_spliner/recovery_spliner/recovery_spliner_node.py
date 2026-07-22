@@ -192,13 +192,19 @@ class ObstacleSpliner(Node):
 
     # Callback for global waypoint topic
     def gb_cb(self, data: WpntArray):
-
-        self.waypoints = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in data.wpnts])
+        new_wp = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in data.wpnts])
+        changed = (self.waypoints is None or new_wp.shape != self.waypoints.shape
+                   or not np.allclose(new_wp, self.waypoints))
+        self.waypoints = new_wp
         self.gb_wpnts = data
         if self.gb_vmax is None:
             self.gb_vmax = np.max(np.array([wpnt.vx_mps for wpnt in data.wpnts]))
             self.gb_max_idx = data.wpnts[-1].id
             self.gb_max_s = data.wpnts[-1].s_m
+        # global line can CHANGE at runtime (static re-opt swap) -> rebuild the FrenetConverter so
+        # recovery splines are relative to the CURRENT line, not the startup (clean) one.
+        if changed and getattr(self, "converter", None) is not None:
+            self.converter = self.initialize_converter()
 
         # psi_array = np.array([wpnt.psi_rad for wpnt in data.wpnts])
         kappas = np.array([wpnt.kappa_radpm for wpnt in data.wpnts])

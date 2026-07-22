@@ -1,32 +1,32 @@
-# kiss_icp_localization — 2D scan-to-SDF localization on the real car.
-# Drop-in replacement for the particle_filter: consumes the 2D LiDAR /scan and
-# publishes the localized pose DIRECTLY on /car_state/odom (no EKF) + TF map->base_link.
+# kiss_icp_localization — 3D voxel-ICP localization on the real car (Livox MID-360).
+# Drop-in replacement for the particle_filter: consumes /livox/lidar (PointCloud2)
+# and publishes the localized pose DIRECTLY on /car_state/odom (no EKF) + TF
+# map->base_link. Topic names are matched here (no remapping).
 #
-# Topic names are matched here (no remapping). The 2D-input front-end skips the
-# 3D PointCloud band-crop and feeds /scan straight into scan-to-SDF matching.
+# Map assets, all injected by localization.launch.xml from the active map folder
+# (NOT hard-set here) — the node FAILS FAST at startup if one is missing:
+#   - map_pcd_3d      : <map>.pcd              (3D voxel map; REQUIRED in 3d mode)
+#   - loc_2d_map_yaml : <map>.yaml             (only used by 2d mode; ignored here)
+#   - track_map_yaml  : <map>_track.yaml       (BEV detection drivable mask)
+#   - ground_yaml     : <map>_ground_lidar.yaml (ground plane -> detection z-band crop)
+# These exist on the CAR's map folders (not in this repo's maps/).
 #
-# TWO separate maps, managed/generated independently (both injected by
-# localization.launch.xml from the active map folder, NOT hard-set here):
-#   - loc_2d_map_yaml : the 2D map for localization (scan-to-SDF) = <map>.yaml
-#                       (the existing cartographer occupancy grid).
-#   - track_map_yaml  : the track mask for BEV detection = <map>_track.yaml
-#                       (flood-filled drivable region; generated separately,
-#                       later). Only read when detect_en:true.
+# 2D scan-to-SDF fallback (previous tuning, kept for rollback): input_mode "2d",
+# scan_topic /scan, odom_twist_topic /vesc/odom, imu /vesc/sensors/imu,
+# stamp_at_scan_end false, scan_voxel 0.1, min/max_range 0.1/15, adaptive_range 15.
 kiss_icp_localization:
   ros__parameters:
-    # ---- input front-end (2D LaserScan) ----
-    input_mode: "2d"                 # forces scan-to-SDF matching, skips band-crop
-    scan_topic: "/scan"              # urg_node LaserScan (frame_id: laser)
-    # ---- prediction: translation from wheel odom, rotation from gyro ----
-    odom_twist_topic: "/vesc/odom"   # twist.vx drives translation prediction
-    imu_topic: "/vesc/sensors/imu/raw"
+    # ---- input front-end (Livox 3D PointCloud2) ----
+    input_mode: "3d"                 # full-cloud voxel ICP against <map>.pcd
+    lidar_topic: "/livox/lidar"      # sensor_msgs/PointCloud2 (livox_ros_driver2)
+    # ---- prediction: IMU rotation + ICP; wheel twist unused in 3d (reference tuning) ----
+    odom_twist_topic: ""             # 2d mode used /vesc/odom; leave empty in 3d
+    imu_topic: "/livox/imu"          # lidar-internal IMU (extrinsic = identity)
     imu_en: true
-    deskew_en: true                  # gyro deskew (uses LaserScan time_increment)
-    imu_rate_odom: true              # high-rate pose between scans (gyro rot + odom vx)
-    imu_init_samples: 100            # static gyro-bias init samples
-    stamp_at_scan_end: false         # urg header stamp = scan START
-    # vesc_imu mount is a pure yaw rotation (z preserved) -> identity is fine for
-    # the 2D yaw-rate; only gyro.z is used in 2D.
+    deskew_en: true                  # gyro deskew within each 100 ms frame
+    imu_rate_odom: true              # high-rate pose between lidar frames
+    imu_init_samples: 100            # static gyro-bias init samples (200 Hz -> 0.5 s)
+    stamp_at_scan_end: true          # livox driver stamps at frame END
     extrinsic_R_il: [1.0, 0.0, 0.0,
                      0.0, 1.0, 0.0,
                      0.0, 0.0, 1.0]
@@ -37,19 +37,23 @@ kiss_icp_localization:
     base_frame: "base_link"          # static base_link->laser completes map->laser
     publish_tf: true                 # map->base_link (perception looks up map->laser)
 
-    # ---- scan preprocessing / range gate ----
-    scan_voxel_size: 0.1             # 2D laser is sparse; small voxel keeps geometry
-    min_range: 0.1
-    max_range: 15.0
+    # ---- map / scan preprocessing (bag-tuned reference values, mid360_localization.yaml) ----
+    map_voxel_size: 0.5              # voxel hash cell [m] (also correspondence radius scale)
+    map_max_points_per_voxel: 30
+    use_normals: true                # point-to-plane ICP
+    scan_voxel_size: 0.35            # registration downsample [m]
+    min_range: 0.3                   # drop ego-body reflections
+    max_range: 60.0
+    point_filter_num: 1
 
-    # ---- 2D scan-to-SDF registration + safety ----
-    loc_2d_corr_gain: 0.3            # complementary low-pass (cuts per-scan yaw jitter)
+    # ---- registration + safety ----
+    loc_2d_corr_gain: 0.3            # 2d-mode only; ignored in 3d
     max_iterations: 50
     convergence_eps: 2.0e-3
     initial_threshold: 1.0
     min_threshold: 0.1
     min_motion: 0.05
-    adaptive_range: 15.0             # indoor track scale (km-scale margin not needed)
+    adaptive_range: 60.0             # 3d reference value (2d used 15.0)
     vel_smoothing: 0.3
     reject_trans: 2.0
     reject_rot_deg: 30.0
@@ -64,12 +68,20 @@ kiss_icp_localization:
     # ---- BEV detection (opponents / unmapped obstacles) ----
     # Two-map setup: detection uses its OWN track mask (track_map_yaml, injected
     # by launch as <map>_track.yaml), kept separate from the localization 2D map
-    # (loc_2d_map_yaml = <map>.yaml). detect_en stays false until that track map
-    # is generated AND the 2D-scan detection code path lands (z-band bypass);
-    # flip to true then. Params below are pre-set so enabling is a one-line change.
-    detect_en: false
+    # (loc_2d_map_yaml = <map>.yaml). The updated node runs detection from the
+    # 2D-scan input directly (runDetection fed from the scan pipeline).
+    # ENABLED: detection markers go out on /kiss_loc/detections (CUBE, map frame)
+    # -> kiss_obstacle_bridge -> /detect/raw_obstacles -> tracking.
+    # STARTUP REQUIREMENTS (node FAILS FAST at launch if missing from the map dir):
+    #   <map>_track.yaml        (drivable mask; needed by detect_track_filter)
+    #   <map>_ground_lidar.yaml (ground plane; the node requires it whenever
+    #                            detect_en is on, and ALWAYS when launch injects
+    #                            the explicit path — keep the file with the map)
+    detect_en: true
     detect_track_filter: true        # reject returns off the track mask (=walls/exterior)
-    detect_track_margin: -0.2        # erode 0.2 m inside the boundary (drop wall returns)
+    # NOTE: the updated node renamed detect_track_margin -> detect_track_dist_min
+    # (min distance INSIDE the track boundary, positive). The old key was silently ignored.
+    detect_track_dist_min: 0.2       # keep 0.2 m off the boundary (drop wall returns)
     detect_res: 0.05                 # BEV cell size [m]
     detect_eps: 0.3                  # DBSCAN neighborhood radius [m]
     detect_min_samples: 2            # 2D scan is sparse -> low core threshold

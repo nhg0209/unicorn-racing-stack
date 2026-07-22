@@ -7,10 +7,13 @@ pp_heading_controller:
     drive_topic:        "/vesc/high_level/ackermann_cmd"
 
     # ── Vehicle ─────────────────────────────────────────────────────────────
-    wheelbase_L:        0.33    # [m]
-    delta_max:          0.41    # [rad]
+    # ★ 동역학 값은 global trajectory 생성 파라미터(stack_master/config/<ver>/)와 통일:
+    #   wheelbase ← vehicle_config.yaml(0.33), delta_max ← dynamics.yaml s_max(0.4189),
+    #   v_max ← racecar_f110.ini veh_params(15.0).
+    wheelbase_L:        0.33    # [m]    = vehicle_config wheelbase (lf+lr≈0.33)
+    delta_max:          0.4189  # [rad]  = dynamics.yaml s_max
     v_min:              0.5     # [m/s]
-    v_max:              8.0     # [m/s]
+    v_max:              15.0    # [m/s]  = racecar_f110.ini veh_params v_max
     v_min_for_ik:       0.5     # [m/s]  마찰원/크로스트랙 속도 하한
     control_rate_hz:    50.0
 
@@ -18,24 +21,33 @@ pp_heading_controller:
     # ld = clip(t_headway·vx, ld_min, ld_max).  곡률 의존항은 제거 —
     # 코너 동역학은 §Friction/Speed 의 마찰분배 + 코너속도캡이 담당한다.
     # ld 짧음 → 직선 추종 강함/커팅↓, 길면 코너 부드러움.
-    ld_min:             1.2     # [m]
-    ld_max:             2.5     # [m]
-    t_headway:          0.3     # [s]      vx → ld 이득 (time headway)
+    # ★ lookahead 확장(A): 고속에서 ld가 너무 짧으면(예: 3m) 순수추종이 예민해져 헤딩 진동.
+    #   L1은 Ld를 최대 8m까지 늘림 → 고속 부드러움. ld_max/t_headway를 키워 헤딩 안정화.
+    ld_min:             0.4     # [m]
+    ld_max:             2.0     # [m]   (3.0→5.0: 고속 헤딩 안정)
+    t_headway:          0.3     # [s]   vx → ld 이득 (0.5→0.6)
 
     # ── Friction circle ──────────────────────────────────────────────────────
-    # a_total_max = μ·g = 마찰원 반경(종방향 budget 할당에 사용).
-    # 사용가능 횡그립 a_lat_use = lat_safety·a_total_max → 조향 클램프와 코너
-    # 속도캡 둘 다에 동일 적용(둘이 따로 놀던 6.7 vs 2.0 불일치 해소).
-    a_total_max:        6.7     # [m/s²]  μ·g (실측 CCW 6.68)
-    a_long_max:         2.0     # [m/s²]  최대 가속도 (drive-wheel traction)
-    # lat_safety: 0.3 → a_lat_use≈2.0 (기존 코너 거동 보존). 그립 더 쓰려면
-    #             0.6~0.9 로 상향(코너 더 빠름, 박으면 낮춤).
-    lat_safety:         0.6     # [-]
-
-    # ── Understeer feedforward ───────────────────────────────────────────────
-    # δ_us = k_understeer · a_lat_geo  (a_lat_geo = vx²·κ_geo, 마찰 클램프 후)
-    # 코너에서 슬립 보정. 너무 키우면 안쪽으로 커팅(저속 타이트 코너도 a_lat 큼).
-    k_understeer:       0.010   # [rad/(m/s²)]  0 = off
+    # ★ global trajectory(gb_optimizer)가 쓰는 ggv/ax_max 값과 통일:
+    #   ggv.csv  : ay_max=4.5 (횡그립),  ax_max=5.0 (종가속)
+    #   ax_max_machines.csv / b_ax_max_machines.csv : 5.0
+    # 매핑: a_total_max=5.0(원 반경=최대그립), lat_safety=0.9 → a_lat_use=0.9·5.0=4.5(=ay_max),
+    #       a_long_max=5.0(=ax_max). 코너속도캡 √(a_lat_use/κ)=√(4.5/κ) 가 raceline 코너속도와 일치.
+    #   (ggv는 box(ax/ay 독립), 여기선 circle 결합 → 조합영역은 더 보수적/현실적.)
+    a_total_max:        5.0     # [m/s²]  마찰원 반경 = ggv max(ax_max, ay_max) = 5.0
+    a_long_max:         5.0     # [m/s²]  = ggv ax_max / ax_max_machines
+    lat_safety:         0.9     # [-]     a_lat_use = 0.9·5.0 = 4.5 = ggv ay_max
+    # P1: 측정 횡가속도 폐루프. a_lat_used = max(명령 vx²·κ_geo, |vx·yaw_rate|_filt).
+    #   실제 끌고 있는 횡g를 반영 → 코너진입 로딩/언더스티어에서 종방향 예산을 보수적으로
+    #   잡아 합성 그립 초과 방지. /pp_debug idx 11 에 측정 a_lat 노출. false면 명령값만 사용.
+    use_measured_a_lat: true
+    a_lat_meas_tau:     0.10    # [s]  측정 횡가속도 저역통과 시정수 (yaw_rate 노이즈 제거)
+    # P2 — 코너 속도 해방: 코너 목표속도를 raceline(보수적)에서 마찰한계 √(a_lat_use/κ)까지
+    #   corner_push∈[0,1] 만큼 끌어올림. 0=raceline 그대로(기본). 같은 a_lat_use가 조향 클램프에도
+    #   쓰여 명령 코너속도가 실제 조향으로 달성 가능(언더스티어 방지). 직선은 영향 없음.
+    #   ★ 실제로 더 빨리 돌려면: corner_push를 0→0.3→0.5 올린 뒤 lat_safety를 0.9→0.95→1.0 로
+    #     단계 상향하며 /pp_debug idx 11(측정 a_lat)이 a_total_max(5.0)에 닿기 전까지 확인.
+    corner_push:        0.4     # [0..1]  (0=현행 raceline 코너속도)
 
     # ── Residual heading PID (경로접선 잔차오차 보정) ────────────────────────
     # δ_pid = Kp·e_h + Ki·∫e_h + Kd·ė(필터드),   e_h = wrap(ψ_path − yaw)
@@ -48,11 +60,11 @@ pp_heading_controller:
     #   2. 진동/오버슈트 생기면 Kd 0.05 → 0.10 → 0.15 올려 감쇠
     #   3. (Kd 올렸는데 굼뜨면 d_tau 낮춤 0.05→0.03 / 노이즈로 떨면 높임)
     #   4. 코너 정상오차 남으면 Ki 0.05~0.1 소량
-    heading_kp:         0.4     # [-]
+    heading_kp:         0.5     # [-]
     heading_ki:         0.0     # [1/s]
     heading_kd:         0.05    # [s]
     heading_i_max:      0.2     # [rad]  Ki 항 클램프
-    heading_d_tau:      0.05    # [s]    미분 저역통과 시정수
+    heading_d_tau:      0.1    # [s]    미분 저역통과 시정수
 
     # ── Speed ────────────────────────────────────────────────────────────────
     # a_long_budget = min(a_long_max, √(a_total_max² − (v_wp²·κ_now)²))
@@ -63,12 +75,42 @@ pp_heading_controller:
     #   거리 고려 → 코너가 가까워질수록 점진 감속(과도 조기제동 제거).
     # v_cmd = min(v_ref, vx + a_long_budget·align·t_cmd_horizon)  [가속]
     # v_cmd = v_ref                                                [감속]
-    a_brake_max:        3.5     # [m/s²]  예측 제동 감속도 (윈도우/감속 프로파일)
-    t_cmd_horizon:      0.3     # [s]     가속 명령 horizon
+    a_brake_max:        5.0     # [m/s²]  예측 제동 감속도 (윈도우/감속 프로파일)
+    t_cmd_horizon:      1.5     # [s]     가속 명령 horizon
+    # ── Latency / future-position 보상 (B) ───────────────────────────────────
+    # 현재 자세가 아니라 future_constant[s] 뒤의 예측 자세(위치+yaw)에서 조향 계산.
+    # 고속에서 센싱/구동 지연 → 늦게 꺾고 늦게 펴는 헤딩 진동을 상쇄(L1 future_position과 동일).
+    #   p_pred = pos + vx·[cosψ,sinψ]·τ,  yaw_pred = yaw + yaw_rate·τ.
+    # 진동이 남으면 τ↑(0.05→0.08), 과보상으로 흔들리면 ↓. 0이면 보상 off.
+    future_constant:    0.03    # [s]
+    # v_ref = 전방 lookahead raceline vx (L1식 선행 목표). 전방거리 = max(ld_min, speed_lookahead·vx).
+    #   코너 탈출/직선 진입에서 현재점 속도에 pinned 안 됨 → 직선 가속 회복.
+    #   코너 제동은 la_dist 너머 느린 점에 대해서만 적용(진입 감속 유지, 탈출 가속 안 막음).
+    speed_lookahead:    0.1     # [s]     전방 목표속도 읽는 time-headway (L1식 선행)
 
-    # ── Heading-alignment acceleration gate ──────────────────────────────────
-    # |e_h| = |ψ_path − yaw| = 차 헤딩−경로접선.  미정렬 시 가속 억제("펴지기 전 액셀 X").
-    #   |e_h| ≤ yaw_gate_min → 가속 100% / ≥ yaw_gate_max → 0% / 사이 선형.
-    # 탈출 시 일찍 가속해 불안정 → yaw_gate_max 낮춤. 너무 안 나가면 높임.
-    yaw_gate_min:       0.05    # [rad]  ~3°  이하: 가속 풀 허용
-    yaw_gate_max:       0.40    # [rad]  ~23° 이상: 가속 차단
+    # ── H2H: TRAILING gap controller (L1 controller_manager 이식) ─────────────
+    # TRAILING 상태일 때 상대 뒤 고정 gap 유지. gap PID 출력은 v_ref(마찰원 속도
+    # 캡)로 클립 → 동역학 한계 초과 불가. 0까지 허용해 상대 뒤 정지 가능. 조향은
+    # 그대로 /local_waypoints(회피 포함) 추종.
+    #   gap_should = trailing_vel_gain·v + trailing_gap
+    #   v_cmd = clip( opp_vs − P·gap_err − I·∫gap_err − D·(ego_vs−opp_vs), 0, v_ref )
+    # 튜닝: 너무 바짝 붙으면 trailing_gap↑ / 추돌위험이면 P↑. 진동이면 D↑.
+    state_machine_rate:   40.0   # [Hz]  gap 오차 적분 레이트(state_machine rate와 맞춤)
+    trailing_gap:         1.0   # [m]   정지시 기본 gap
+    trailing_vel_gain:    0.25   # [s]   속도비례 gap 항
+    trailing_p_gain:      1.35   # [-]   gap 오차 P
+    trailing_i_gain:      0.0    # [-]   gap 오차 I (windup 주의; 기본 off)
+    trailing_d_gain:      1.0    # [-]   상대속도차 D
+    blind_trailing_speed: 1.5    # [m/s] 상대 미관측 + gap 큼 → 최소 전진속도
+
+    # ── H2H: FTG 폴백 (FTGONLY 상태) — controller.yaml 기본값과 동일 ──────────
+    # range_offset 은 반드시 >0 (FTG.process_lidar 가 ranges[off:-off] 슬라이스).
+    ftg_debug:          false
+    ftg_safety_radius:  40.0    # bubble 반경(LiDAR 샘플 수). float로 선언 후 int() 캐스팅
+    ftg_max_lidar_dist: 9.0     # [m]
+    ftg_max_speed:      6.0     # [m/s]
+    ftg_range_offset:   180.0   # 양쪽에서 잘라낼 샘플 수 (>0 필수). float 선언 후 int() 캐스팅
+    ftg_track_width:    2.6     # [m]
+
+    # ── H2H: local waypoint 신선도 watchdog ──────────────────────────────────
+    wpnt_timeout_s:     0.5     # [s]  이 시간 동안 /local_waypoints 갱신 없으면 정지

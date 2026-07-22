@@ -1,10 +1,24 @@
 min_horizon: 0.0
-max_horizon: 10.0
+# Kept aligned with the GB-track max_horizon (15 m) so the static-path free-check (when used)
+# validates the obstacle over the same window the SM commits in. The static commit itself no longer
+# uses this (it gates on a fresh on-spline path), so this is just consistency/future-proofing.
+max_horizon: 15.0
 lateral_width_m: 0.1
 free_scaling_reference_distance_m: 2.0
-latest_threshold: 0.1
+# The single-threaded state_machine executor runs ~0.3-0.5 s behind on the static-spline messages
+# (it re-runs the heavy vel profiler on every 20 Hz avoidance msg), so measured against the SM clock
+# a perfectly-fresh 20 Hz spline reads as 0.3-0.5 s "old". At 0.1 s the freshness gate NEVER passed
+# and the car never committed to OVERTAKE (it trailed/crawled to the obstacle). 0.6 s tolerates the
+# executor lag; a static obstacle's escape path does not go stale in 0.6 s (car moves < ~4 m).
+# Raised 0.6 -> 1.0: the car slow-trailed a feasible-but-uncommitted obstacle all the way to a
+# collision (g_near 0.44 m) because the freshness gate intermittently exceeded 0.6 s of executor
+# lag, so the OVERTAKE commit never sustained. 1.0 s still bounds staleness (car moves < ~7 m).
+latest_threshold: 1.0
 hyst_timer_sec: 4.0
 killing_timer_sec: 10.0
 on_spline_front_horizon_thres_m: 0.5
-on_spline_min_dist_thres_m: 0.5
+# Car-to-spline distance below which we count as "on the spline". The controller tracks the raceline
+# with ~0.5 m lateral error, so at 0.5 m this gate sat right on the boundary (min_dist=0.51) and
+# rejected the commit. 0.85 m clears the tracking error while still requiring the car be near the path.
+on_spline_min_dist_thres_m: 0.85
 is_closed: False

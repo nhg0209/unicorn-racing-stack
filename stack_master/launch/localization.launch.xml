@@ -16,7 +16,8 @@
   <arg name="vehicle_config" default="$(find-pkg-share stack_master)/config/CAR/vehicle_config.yaml"/>
   <arg name="use_estop"     default="false"        description="Use emergency stop (true) or not (false)"/>
   <arg name="virtual"       default="false"        description="Inject virtual opponent/obstacles (scan overlay etc.) onto the real LiDAR"/>
-  <arg name="keyboard_teleop" default="true"      description="Make the mux honour keyboard teleop (/joy_keyboard); run keyboard_joy_node on the operator laptop"/>
+  <arg name="use_hokuyo"    default="false"        description="Start the Hokuyo urg_node (/scan); see low_level.launch"/>
+  <arg name="use_livox"     default="true"         description="Start the Livox MID-360 driver; see low_level.launch"/>
 
   <let name="maps_dir"                value="$(find-pkg-share stack_master)/maps"/>
   <let name="map_path"                value="$(var maps_dir)/$(var map)/$(var map)"/>
@@ -29,7 +30,8 @@
     <arg name="vehicle_config" value="$(var vehicle_config)"/>
     <arg name="use_estop"      value="$(var use_estop)"/>
     <arg name="virtual"        value="$(var virtual)"/>
-    <arg name="keyboard_teleop" value="$(var keyboard_teleop)"/>
+    <arg name="use_hokuyo"     value="$(var use_hokuyo)"/>
+    <arg name="use_livox"      value="$(var use_livox)"/>
   </include>
 
   <!-- Map relay: periodically republishes /map so remote subscribers (RViz) receive it.
@@ -58,9 +60,9 @@
     <let name="lua_file" value="localization_2d.lua"/>
 
     <node pkg="cartographer_ros" exec="cartographer_node" name="cartographer_node" output="screen"
-          args="-configuration_directory $(var cartographer_config_dir) -configuration_basename $(var lua_file) -load_state_filename $(var pbstream_file)">
+          args="-configuration_directory $(var cartographer_config_dir) -configuration_basename $(var lua_file) -load_state_filename $(var pbstream_file) -collect_metrics">
       <param name="use_sim_time" value="false"/>
-      <remap from="/imu" to="/vesc/sensors/imu/raw"/>
+      <remap from="/imu" to="/vesc/sensors/imu"/>
       <remap from="/odom" to="/vesc/odom"/>
     </node>
 
@@ -103,19 +105,26 @@
     </node>
   </group>
 
-  <!-- ===== KISS-ICP 2D scan-to-SDF localization ===== -->
+  <!-- ===== KISS-ICP localization (Livox 3D voxel ICP; config: kiss.yaml) ===== -->
   <!-- No EKF: the node fuses wheel-odom (translation) + gyro (rotation) itself and
        publishes the fused pose DIRECTLY on /car_state/odom + TF map->base_link.
-       Topic names are matched in kiss.yaml (no remap). Two separate maps are
-       injected from the active map folder: loc_2d_map_yaml = <map>.yaml (the
-       cartographer occupancy grid, used for scan-to-SDF localization) and
-       track_map_yaml = <map>_track.yaml (the drivable-region mask for BEV
-       detection; generated separately, only read when detect_en:true). -->
+       Topic names are matched in kiss.yaml (no remap). Map files injected from the
+       active map folder:
+         map_pcd_3d      = <map>.pcd              (ICP voxel map; REQUIRED in 3D mode —
+                           without it the node throws (localization_2d:false) or silently
+                           runs scan-to-SDF only (localization_2d:true, "voxel map skipped"))
+         loc_2d_map_yaml = <map>.yaml             (occupancy grid -> 2D-mode SDF)
+         track_map_yaml  = <map>_track.yaml       (drivable mask for BEV detection)
+         ground_yaml     = <map>_ground_lidar.yaml (GLIM ground plane; REQUIRED while
+                           detect_en or a PointCloud2-fed 2D crop is active. Explicit path
+                           fails fast if the file is missing from the map folder.) -->
   <group if="$(eval '\'$(var localization)\' == \'kiss\'')">
     <node pkg="kiss_icp_localization" exec="localization_node" name="kiss_icp_localization" output="screen">
       <param from="$(find-pkg-share stack_master)/config/kiss.yaml"/>
+      <param name="map_pcd_3d"      value="$(var map_path).pcd"/>
       <param name="loc_2d_map_yaml" value="$(var map_path).yaml"/>
       <param name="track_map_yaml"  value="$(var map_path)_track.yaml"/>
+      <param name="ground_yaml"     value="$(var map_path)_ground_lidar.yaml"/>
     </node>
   </group>
 </launch>

@@ -30,10 +30,19 @@ class FrenetOdomRepublisher(Node):
 
     def global_trajectory_callback(self, msg):
         waypoint_array = msg.wpnts
-        waypoints_x = [waypoint.x_m for waypoint in waypoint_array]
-        waypoints_y = [waypoint.y_m for waypoint in waypoint_array]
-        waypoints_psi = [waypoint.psi_rad for waypoint in waypoint_array]
-        self.converter = FrenetConverter(np.array(waypoints_x), np.array(waypoints_y), np.array(waypoints_psi))
+        waypoints_x = np.array([waypoint.x_m for waypoint in waypoint_array])
+        waypoints_y = np.array([waypoint.y_m for waypoint in waypoint_array])
+        waypoints_psi = np.array([waypoint.psi_rad for waypoint in waypoint_array])
+        # Rebuild only on an ACTUAL geometry change (the line is latched + keep-alive republished
+        # every few seconds; rebuilding the converter each time blocked the odom callback for a
+        # few ms per keep-alive for nothing).
+        if (self.has_global_trajectory
+                and getattr(self, "_wx", None) is not None
+                and waypoints_x.shape == self._wx.shape
+                and np.allclose(waypoints_x, self._wx) and np.allclose(waypoints_y, self._wy)):
+            return
+        self._wx, self._wy = waypoints_x, waypoints_y
+        self.converter = FrenetConverter(waypoints_x, waypoints_y, waypoints_psi)
         self.has_global_trajectory = True
 
     def odom_callback(self, msg):

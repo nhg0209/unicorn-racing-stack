@@ -183,8 +183,11 @@ class StateMachine(Node):
         # dynamic-parameter-backed attributes (aliases onto params)
         self.gb_ego_width_m = self.params.gb_ego_width_m
         self.lateral_width_gb_m = self.params.lateral_width_gb_m
+        self.lateral_width_static_gb_m = self.params.lateral_width_static_gb_m
         self.gb_horizon_m = self.params.gb_horizon_m
         self.interest_horizon_m = self.params.interest_horizon_m
+        self.getting_closer_rel_vel_mps = self.params.getting_closer_rel_vel_mps
+        self.static_ot_distance_m = self.params.static_ot_distance_m
 
         self.last_recovery_update_time = None
         self.cur_gb_wpnts = WaypointData(self, "global_tracking", True)
@@ -267,6 +270,34 @@ class StateMachine(Node):
         self.overtaking_ttl_count = 0
         self.overtaking_ttl_count_threshold = int(self.overtaking_ttl_sec * self.rate_hz)
 
+        # Feasibility signal from the static avoidance planner. FAIL-CLOSED: the planner publishes
+        # it every cycle (20 Hz), so a stale or never-received signal means the planner is dead or
+        # miswired — the static OVERTAKE commit must then stay blocked (trailing is the safe
+        # fallback), not silently open as the old default-True did.
+        self.static_avoidance_feasible = False
+        self._static_feasible_t = None
+        self.static_feasible_stale_sec = 0.5
+        # sustain side of the same gate: last time the planner said feasible=True. A static
+        # OVERTAKE is dropped (-> TRAILING) once the planner reports infeasible for longer
+        # than this (single-cycle blips tolerated; riding the stale cached spline is not).
+        self._static_feasible_true_t = None
+        self.static_feasible_lost_sec = 0.4
+
+        # Transition hysteresis (anti-chatter): a state must be held >= min_dwell_sec before it may
+        # switch to a NON-safe state. Switches toward the safe states bypass this. The counter/timer
+        # live on the node (not in the pure transition functions).
+        self.min_dwell_sec = self.params.min_dwell_sec
+        self.splice_from_path_start = self.params.splice_from_path_start
+        self.splice_start_dist_m = self.params.splice_start_dist_m
+        self._last_transition_time = self.now_sec()
+        self._committed_src = None
+        # Targets that may be entered IMMEDIATELY (bypass min_dwell): the safe-direction states
+        # (TRAILING, FTGONLY) AND OVERTAKE. OVERTAKE must never be delayed by the dwell -- while
+        # approaching, the SM legitimately flickers GB_TRACK<->TRAILING, which keeps resetting the
+        # dwell timer; gating OVERTAKE behind it would perpetually veto the overtake commit. The
+        # dwell therefore only damps the return-to-raceline direction (->GB_TRACK/RECOVERY/...).
+        self._IMMEDIATE_STATES = {StateType.TRAILING, StateType.FTGONLY, StateType.OVERTAKE}
+
         self.save_start_traj = False
         self.cur_start_wpnts_candidate = OTWpntArray()
         self.need_start_traj = False
@@ -326,6 +357,11 @@ class StateMachine(Node):
             if self.ot_planner == "predictive_spliner":
                 self.create_subscription(
                     OTWpntArray, "/planner/avoidance/static_otwpnts", self.static_avoidance_cb, qos
+                )
+                # Feasibility gate from the static (Frenet-sampling) avoidance planner: False means
+                # it found no passable candidate -> the SM must not commit to a static OVERTAKE.
+                self.create_subscription(
+                    Bool, "/planner/avoidance/static_feasible", self.static_feasible_cb, qos
                 )
         if self.ot_planner == "predictive_spliner":
             self.create_subscription(Float32MultiArray, "/planner/avoidance/merger", self.merger_cb, qos)
@@ -542,6 +578,43 @@ class StateMachine(Node):
     def now_sec(self) -> float:
         return time_to_float(self.get_clock().now().to_msg())
 
+    def _commit_state(self, proposed_state, proposed_src, force=False):
+        """Apply a proposed (state, wpnts_src) with min_dwell transition hysteresis.
+
+        A switch to a dwell-gated state is vetoed if it comes sooner than ``min_dwell_sec`` after the
+        last committed switch; on veto the previous state and its behaviour source are held for this
+        cycle. Switches into an immediate state (TRAILING, FTGONLY, OVERTAKE), staying in the same
+        state, and forced overrides (force_GBTRACK / FTGONLY sector) always commit immediately.
+        """
+        allow = (
+            force
+            or proposed_state == self.cur_state
+            or proposed_state in self._IMMEDIATE_STATES
+            or (self.now_sec() - self._last_transition_time) >= self.min_dwell_sec
+        )
+        if allow:
+            if proposed_state != self.cur_state:
+                self._last_transition_time = self.now_sec()
+            self.cur_state = proposed_state
+            self.local_wpnts_src = proposed_src
+            self._committed_src = proposed_src
+        else:
+            # hold the current state; reuse the last committed behaviour source for consistency
+            self.local_wpnts_src = self._committed_src if self._committed_src is not None else proposed_src
+
+    def _update_overtake_ttl(self, prev_state, proposed_state):
+        """Node-owned replacement for the counter mutation that used to live in
+        OvertakingTransition (which violated the 'transitions have no side effects' rule). Mirrors
+        the old latch: while staying in OVERTAKE, count up as long as the OT path is sustainable but
+        no enemy is directly ahead; reset on enemy / loss of sustainability / leaving OVERTAKE."""
+        if prev_state == StateType.OVERTAKE and proposed_state == StateType.OVERTAKE:
+            if self._check_enemy_in_front():
+                self.overtaking_ttl_count = 0
+            else:
+                self.overtaking_ttl_count += 1
+        else:
+            self.overtaking_ttl_count = 0
+
     #############
     # CALLBACKS #
     #############
@@ -616,10 +689,19 @@ class StateMachine(Node):
             self.obstacles = data.obstacles
             obstacles_in_interest = []
             for obs in data.obstacles:
+                # detection-gated: ignore a remembered (currently-unseen) STATIC obstacle so state
+                # decisions track what the car actually sees, not a stored position ("knows in
+                # advance"). Dynamic obstacles are left as-is (handled via prediction + short ttl).
+                if obs.is_static and not obs.is_visible:
+                    continue
                 gap = (obs.s_start - self.cur_s) % self.track_length
                 if gap < self.interest_horizon_m:
-                    obstacles_in_interest.append(obs)
-            self.obstacles_in_interest = obstacles_in_interest
+                    obstacles_in_interest.append((gap, obs))
+            # Sort by forward gap so [0] is always the nearest obstacle ahead. Several
+            # checks (_check_getting_closer) only look at index 0, which is only correct
+            # if the list is ordered (perception does not guarantee any order).
+            obstacles_in_interest.sort(key=lambda g_obs: g_obs[0])
+            self.obstacles_in_interest = [obs for _, obs in obstacles_in_interest]
 
     def ego_prediction_cb(self, data):
         self.ego_prediction = data.predictions if len(data.predictions) != 0 else []
@@ -655,6 +737,12 @@ class StateMachine(Node):
     def fail_trailing_cb(self, data):
         self.fail_trailing = data.data
 
+    def static_feasible_cb(self, data):
+        self.static_avoidance_feasible = data.data
+        self._static_feasible_t = self.now_sec()
+        if data.data:
+            self._static_feasible_true_t = self.now_sec()
+
     ######################################
     # ATTRIBUTES/CONDITIONS CALCULATIONS #
     ######################################
@@ -662,7 +750,7 @@ class StateMachine(Node):
         ftg_only = False
         if len(self.only_ftg_zones) != 0:
             for sector in self.only_ftg_zones:
-                if sector[0] <= self.cur_s / self.waypoints_dist <= sector[1]:
+                if sector[0] <= self.cur_s / self.wpnt_dist <= sector[1]:
                     ftg_only = True
                     break
         return ftg_only
@@ -673,32 +761,39 @@ class StateMachine(Node):
         else:
             return np.abs(self.cur_d) < threshold_m
 
-    def _check_close_to_raceline_heading(self, threshold_deg=None) -> bool:
-        cloest_wpnt_idx = int(self.cur_s / self.waypoints_dist) % self.num_glb_wpnts
+    def _check_close_to_raceline_heading(self, threshold_deg=20) -> bool:
+        # True when the ego heading is aligned with the closest raceline waypoint within
+        # threshold_deg. The heading error is wrapped to (-pi, pi] so the seam (psi near
+        # +/-pi) doesn't produce a spurious ~2*pi error.
+        # NOTE: the previous threshold_deg branch compared self.cur_d (lateral metres)
+        # against deg2rad(threshold_deg) (radians) -- it never checked heading at all.
+        cloest_wpnt_idx = int(self.cur_s / self.wpnt_dist) % self.num_glb_wpnts   # live spacing
         cloest_wpnt_psi = self.cur_gb_wpnts.list[cloest_wpnt_idx].psi_rad
-        if threshold_deg is None:
-            return np.abs(self.current_position[2] - cloest_wpnt_psi) < np.deg2rad(20)
-        else:
-            return np.abs(self.cur_d) < np.deg2rad(threshold_deg)
+        heading_err = (self.current_position[2] - cloest_wpnt_psi + np.pi) % (2 * np.pi) - np.pi
+        return np.abs(heading_err) < np.deg2rad(threshold_deg)
 
     def _check_ot_sector(self) -> bool:
         # ROS1: no overtake zone matching cur_s -> not in an OT sector (return False).
         # (An empty overtake_zones means overtaking is suppressed, as in ROS1.)
         for sector in self.overtake_zones:
-            if sector[0] <= self.cur_s / self.waypoints_dist <= sector[1]:
+            if sector[0] <= self.cur_s / self.wpnt_dist <= sector[1]:
                 self.ot_section_check_pub.publish(Bool(data=True))
                 return True
         self.ot_section_check_pub.publish(Bool(data=False))
         return False
 
     def _check_getting_closer(self, threshold_m=3.0) -> bool:
-        if (
-            len(self.obstacles_in_interest) != 0
-            and self.cur_vs - self.obstacles_in_interest[0].vs > -0.5
-        ):
-            return True
-        else:
+        # True when the nearest obstacle ahead is within threshold_m AND we are closing on it.
+        # NOTE: threshold_m was previously declared but never used -- the distance gate was
+        # silently dropped, so this returned True for a closing obstacle anywhere on the track.
+        # Honour it now so the overtake decision commits inside a sane window (the callers pass
+        # 7-10 m, matching the overtaking horizon) instead of from across the lap.
+        if len(self.obstacles_in_interest) == 0:
             return False
+        nearest = self.obstacles_in_interest[0]
+        gap = (nearest.s_start - self.cur_s) % self.track_length
+        closing = (self.cur_vs - nearest.vs) > self.getting_closer_rel_vel_mps
+        return bool(gap < threshold_m and closing)
 
     def _check_enemy_in_front(self) -> bool:
         horizon = self.gb_horizon_m
@@ -764,7 +859,11 @@ class StateMachine(Node):
                 ttc = (gap - self.pars["veh_params"]["length"]) / clip_vs
                 tt0 = (gap + 0.3 * self.pars["veh_params"]["length"]) / clip_vs
 
-                if obs.is_static:
+                # Treat near-stationary obstacles as static regardless of the (noisy, laggy)
+                # tracking is_static flag: a static obstacle transiently classified dynamic would
+                # otherwise be checked against a bogus predicted trajectory, making the static
+                # avoidance spline read "not free" and delaying the TRAILING->OVERTAKE switch.
+                if obs.is_static or (abs(obs.vs) < 0.5 and abs(obs.vd) < 0.5):
                     if not wpnts_data.is_closed and gap > max_gap:
                         is_free = False
                         if closest_obs is None or min_gap > gap:
@@ -778,8 +877,26 @@ class StateMachine(Node):
                             ot_d = wpnts_data.list[avoid_wpnt_idx].d_m
                         min_dist = abs(ot_d - obs_d)
                         free_dist = min_dist - obs.size / 2 - self.gb_ego_width_m / 2
-                        scaling_factor = np.clip(gap / free_scaling_reference_distance_m, 0.0, 1.0)
-                        if free_dist < lateral_width_m * scaling_factor:
+                        # For a STATIC obstacle the required clearance must be DISTANCE-
+                        # INDEPENDENT: the object isn't moving, so a line that geometrically
+                        # clears it is just as valid at 8 m as at 1 m. The original gap-scaling
+                        # (meant for moving opponents: "only trust the lateral gap once close")
+                        # made a clearing path read NOT-free while far -> the "trail up close,
+                        # then switch" artifact.
+                        #   - avoidance path: full lateral_width_m, unscaled.
+                        #   - raceline (GB):  the SMALLER static-specific margin. The obstacle-
+                        #     aware line from static_reopt clears the box by keep-out+apex_bulge
+                        #     (~0.40 m); the scaled requirement (ego/2 + 0.3 = 0.50 m at range)
+                        #     read that line as blocked -> phantom TRAILING + pointless
+                        #     re-avoidance of an obstacle the line already avoids.
+                        if is_ot_wpnts and not is_gb_track_wpnts:
+                            required_margin = lateral_width_m
+                        elif is_gb_track_wpnts:
+                            required_margin = self.lateral_width_static_gb_m
+                        else:
+                            required_margin = lateral_width_m * np.clip(
+                                gap / free_scaling_reference_distance_m, 0.0, 1.0)
+                        if free_dist < required_margin:
                             is_free = False
                             self.get_logger().info(
                                 "[State Machine] FREE False, obs dist to ot lane: {} m".format(free_dist),
@@ -921,12 +1038,39 @@ class StateMachine(Node):
             return False
 
     def _check_static_overtaking_mode(self) -> bool:
-        if (
-            self.cur_vs < 3.0
-            and self._check_getting_closer(threshold_m=7.0)
-            and self._check_latest_wpnts(self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts)
-            and self._check_free_frenet(self.cur_static_avoidance_wpnts)
-        ):
+        # SIMPLIFIED: the static spliner now owns the go/no-go decision — it publishes an evasion
+        # path ONLY when a static obstacle has a wide-enough lateral gap to pass (and clamps it
+        # inside the track). So the state machine just commits when that path is fresh and the car
+        # is on it. The old distance gate (c_closer) and the redundant free-check (c_free) — which
+        # made the car slow-trail right up to the obstacle before switching — are gone.
+        # Feasibility gate, FAIL-CLOSED: the planner publishes the signal every cycle, so stale
+        # (> static_feasible_stale_sec) or never-received means planner dead/miswired -> block
+        # the commit and keep TRAILING. (The old speed guard static_ot_speed_mps is gone: the
+        # live config had it disabled at 10.0, and entry speed is owned by the avoidance path's
+        # slow-in velocity profile, not the commit gate.)
+        feas_age = (self.now_sec() - self._static_feasible_t) if self._static_feasible_t is not None else -1.0
+        c_feasible = (self.static_avoidance_feasible
+                      and self._static_feasible_t is not None
+                      and feas_age <= self.static_feasible_stale_sec)
+        c_latest = self._check_latest_wpnts(self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts)
+        # debug: why isn't a fresh on-spline path available?
+        sa = self.static_avoidance_wpnts
+        n_sa = len(sa.wpnts) if sa is not None else 0
+        age = (self.now_sec() - time_to_float(sa.header.stamp)) if n_sa > 0 else -1.0
+        gap_dbg = md_dbg = -1.0
+        wd = self.cur_static_avoidance_wpnts
+        if wd.is_init and wd.array is not None:
+            gap_dbg = (wd.list[-1].s_m - self.cur_s) % self.track_length
+            md_dbg = float(np.min(np.linalg.norm(wd.array[:, 0:2] - self.current_position[:2], axis=1)))
+        self.get_logger().info(
+            f"[{self.name}] static_OT check: feasible={c_feasible}"
+            f"[val={self.static_avoidance_feasible},age={feas_age:.2f}(<{self.static_feasible_stale_sec})] "
+            f"latest+on_spline={c_latest}[n={n_sa},age={age:.2f}(<{wd.latest_threshold}),"
+            f"gap={gap_dbg:.2f}(>{wd.on_spline_front_horizon_thres_m}),min_dist={md_dbg:.2f}(<{wd.on_spline_min_dist_thres_m})] "
+            f"=> {c_feasible and c_latest}",
+            throttle_duration_sec=0.5,
+        )
+        if c_feasible and c_latest:
             self.static_overtaking_mode = True
             return True
         else:
@@ -934,10 +1078,23 @@ class StateMachine(Node):
 
     def _check_overtaking_mode_sustainability(self) -> bool:
         if self.static_overtaking_mode:
-            if (
-                self._check_availability(self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts)
-                and self._check_free_frenet(self.cur_static_avoidance_wpnts)
-            ):
+            # Stay in OVERTAKE while the (spliner-vetted) static path is still available and the
+            # car is on it. The spliner stops publishing once the gap closes / obstacle is passed,
+            # so availability naturally drops and we exit — no redundant free re-check needed.
+            # BUT: if the static planner explicitly reports NO feasible candidate (fresh
+            # feasible=False for longer than a blip), the situation has changed since the commit
+            # (obstacle moved/reclassified, gap closed). Riding the CACHED spline then is how the
+            # car lunged into a box 0.7 m ahead: the stale path aged into a raceline extension
+            # THROUGH the obstacle while availability hysteresis (hyst 4 s / kill 10 s) kept
+            # OVERTAKE alive. Fail over to TRAILING instead (gap PID brakes behind the obstacle).
+            feas_true_age = (self.now_sec() - self._static_feasible_true_t) \
+                if self._static_feasible_true_t is not None else float('inf')
+            if feas_true_age > self.static_feasible_lost_sec:
+                self.get_logger().warn(
+                    f"[{self.name}] static OVERTAKE dropped: planner reports infeasible "
+                    f"for {feas_true_age:.2f} s", throttle_duration_sec=1.0)
+                return False
+            if self._check_availability(self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts):
                 return True
         else:
             if self._check_availability(self.avoidance_wpnts, self.cur_avoidance_wpnts):
@@ -1068,7 +1225,15 @@ class StateMachine(Node):
             wpnts = self.cur_avoidance_wpnts
 
         diff = np.linalg.norm(wpnts.array[:, 0:2] - self.current_position[:2], axis=1)
-        min_idx = np.argmin(diff)
+        min_idx = int(np.argmin(diff))
+        # STATIC path: its entry ramp is anchored AT the car with matched heading, so while the
+        # car is still near the path's first point, splice from the start and keep that entry —
+        # the nearest-index cut throws it away and hands the controller a laterally-stepped
+        # window under SM lag. Deeper into the maneuver (damped/stale path, start left behind)
+        # the nearest-index cut remains correct.
+        if (self.static_overtaking_mode and self.splice_from_path_start
+                and diff[0] <= self.splice_start_dist_m):
+            min_idx = 0
         avoidance_wpnts = wpnts.list[min_idx:min_idx + self.n_loc_wpnts]
 
         if len(avoidance_wpnts) < self.n_loc_wpnts:
@@ -1228,6 +1393,40 @@ class StateMachine(Node):
             self.cur_gb_wpnts.initialize_traj(self.gb_wpnts)
         else:
             self.cur_gb_wpnts.list = self.gb_wpnts.wpnts
+        # Refresh the FOLLOWED avoidance trajectory only when the newly published spline MEANINGFULLY
+        # differs from the cached one (a re-detected / new obstacle changed the required lateral offset).
+        # Refreshing every cycle made the controller chase the planner's per-cycle re-anchoring jitter
+        # (path oscillation); never refreshing left OVERTAKE stuck on a stale path when a new obstacle
+        # appeared. So: keep the STABLE cached path for small cycle-to-cycle wiggles (only bump its
+        # freshness stamp) and swap to the new one only on a real change. Empty/stale publishes are left
+        # cached so the availability timers still expire OVERTAKE once the obstacle is passed.
+        # Refresh the FOLLOWED path only on a genuine NEW requirement: a BIGGER offset (a closer / new
+        # obstacle needs more room) or the OPPOSITE side (a new obstacle on the other side). A smaller
+        # same-side peak is just the planner returning to the raceline as the CURRENT obstacle slides
+        # behind -- following that mid-maneuver cuts the car back while still beside the box (the "path
+        # twists" symptom), so keep the committed spline (its exit ramp already eases back AFTER the box).
+        # When we KEEP the cached path we do NOT touch its stamp: _check_on_spline already sustains
+        # OVERTAKE while the car is on it, and letting the stamp age lets the availability timers expire
+        # OVERTAKE normally once the obstacle is passed (bumping the stamp used to wedge OVERTAKE on so it
+        # never exited / re-triggered).
+        OT_REFRESH_D_THRESH = 0.15   # [m] peak-offset change that counts as a new path (not tracking jitter)
+        for src, cur in ((self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts),
+                         (self.avoidance_wpnts, self.cur_avoidance_wpnts)):
+            if src is None or len(src.wpnts) == 0:
+                continue
+            if (self.now_sec() - time_to_float(src.header.stamp)) > cur.latest_threshold:
+                continue
+            if not cur.is_init or cur.list is None or len(cur.list) == 0:
+                cur.initialize_traj(src)
+                continue
+            peak_src = max((w.d_m for w in src.wpnts), key=abs, default=0.0)
+            peak_cur = max((w.d_m for w in cur.list), key=abs, default=0.0)
+            if peak_src * peak_cur >= 0.0:            # same side (or one is ~raceline)
+                refresh = abs(peak_src) - abs(peak_cur) > OT_REFRESH_D_THRESH   # only if it needs MORE offset
+            else:                                     # opposite side -> a new obstacle the other way
+                refresh = abs(peak_src) > OT_REFRESH_D_THRESH
+            if refresh:
+                cur.initialize_traj(src)              # real new requirement -> follow the new path
         self.cur_obstacles_in_interest = self.obstacles_in_interest
         return
 
@@ -1369,14 +1568,17 @@ class StateMachine(Node):
             self.publish_not_ready_marker()
 
         if self.force_gbtrack_state:
-            self.cur_state = StateType.GB_TRACK
-            self.local_wpnts_src = StateType.GB_TRACK
+            self._commit_state(StateType.GB_TRACK, StateType.GB_TRACK, force=True)
         elif self._check_only_ftg_zone():
-            self.cur_state = StateType.FTGONLY
-            self.local_wpnts_src = StateType.FTGONLY
+            self._commit_state(StateType.FTGONLY, StateType.FTGONLY, force=True)
             self.get_logger().warn(f"[{self.name}] FTGONLY sector !!!")
         else:
-            self.cur_state, self.local_wpnts_src = self.state_transitions[self.cur_state](self)
+            prev_state = self.cur_state
+            proposed_state, proposed_src = self.state_transitions[self.cur_state](self)
+            # Own the overtaking-ttl side-effect that used to live in OvertakingTransition (keeps
+            # the transition functions pure) and apply the min_dwell transition hysteresis.
+            self._update_overtake_ttl(prev_state, proposed_state)
+            self._commit_state(proposed_state, proposed_src)
 
         if self.cur_state == StateType.TRAILING:
             self.check_ot_cloest_target()

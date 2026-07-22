@@ -1,9 +1,17 @@
 free_scaling_reference_distance_m: 1
-hyst_timer_sec: 6.0
+# How long the SM trusts the CACHED dynamic path before re-initializing from the latest
+# publish (_check_availability). 6.0 was tuned for the old snapshot spliner whose per-cycle
+# publishes jittered (adopting them made the controller chase re-anchoring noise). The
+# lane-hold planner publishes phase-latched stable geometry -- identical lane until the
+# return ramp is armed -- so frequent adoption is step-free BY CONSTRUCTION and the return
+# (CLOSE) must be adopted quickly or the car overstays the overtaking lane.
+hyst_timer_sec: 1.5
 is_closed: false
 killing_timer_sec: 10.0
 lateral_width_m: 0.2
 latest_threshold: 0.1
+# The lane-hold path always extends hold_horizon_m (22 m) ahead, but cap the free-check
+# window at the same horizon the old planner used.
 max_horizon: 10.0
 min_horizon: 0.0
 on_spline_front_horizon_thres_m: 2.0

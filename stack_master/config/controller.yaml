@@ -2,6 +2,10 @@ controller_manager:
   ros__parameters:
     t_clip_min: 0.7
     t_clip_max: 8.0
+    # cap on the sqrt(2)*lat_err lookahead LOWER-bound inflation. Post-swap the car can sit
+    # ~1 m off the new global line (deadlock-breaker commit); uncapped, the anti-swerve bound
+    # stretched the L1 through 0.7 m corner zones -> corner-cut into the wall on the 1.4 m track.
+    l1_lat_err_cap: 1.0
     m_l1: 0.47
     q_l1: -0.2
     speed_lookahead: 0.25
@@ -28,6 +32,9 @@ controller_manager:
     steer_gain_for_speed: 1.0
     future_constant: 0.05
     AEB_thres: 0.5
+    # OVERTAKE only: the avoidance line is legitimately offset from the car, so the garbage-path
+    # AEB needs more slack there or it clamps to 2 m/s mid-maneuver.
+    AEB_thres_overtake: 0.9
     speed_diff_thres: 0.1
     start_speed: 10.0
     start_curvature_factor: 1.5

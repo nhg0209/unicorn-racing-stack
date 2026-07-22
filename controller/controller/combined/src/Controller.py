@@ -107,6 +107,8 @@ class Controller:
 
         self.loop_rate = loop_rate
         self.AEB_thres = AEB_thres
+        self.AEB_thres_overtake = AEB_thres   # manager overrides from yaml after construction
+        self.l1_lat_err_cap = t_clip_max      # manager overrides from yaml (uncapped by default)
         self.converter = converter
 
         # Parameters in the controller
@@ -231,7 +233,16 @@ class Controller:
 
         local_wpnt_dist = np.sqrt((self.position_in_map[0, 0] - nearest_local_wpnt[0])**2 + (self.position_in_map[0, 1] - nearest_local_wpnt[1])**2)
 
-        if local_wpnt_dist >= self.AEB_thres:
+        # In OVERTAKE the local line is legitimately offset from the car (avoidance hump + the
+        # SM's splice lag), so the tight garbage-path threshold false-fires mid-maneuver — a
+        # sudden 2 m/s clamp at speed is itself a spin risk. The looser threshold still catches
+        # a genuinely dead/garbage planner.
+        thres = self.AEB_thres_overtake if self.state == "OVERTAKE" else self.AEB_thres
+        if local_wpnt_dist >= thres:
+            self.logger_warn(
+                f"[Controller] AEB: nearest local wpnt {local_wpnt_dist:.2f} m away "
+                f"(state={self.state}, thres={thres:.2f}) -> clamping speed to 2.0 m/s",
+                throttle_duration_sec=1.0)
             return 2.0
         else:
             return speed
@@ -351,8 +362,14 @@ class Controller:
 
         L1_distance = (speed_scaler - curvature_scaler) + self.q_l1
 
-        # clip lower bound to avoid ultraswerve when far away from mincurv
-        lower_bound = max(self.t_clip_min, np.sqrt(2)*future_lateral_error)
+        # clip lower bound to avoid ultraswerve when far away from mincurv.
+        # The sqrt(2)*lat_err inflation is CAPPED: after a global-line swap that lands with the
+        # car off the new line (deadlock-breaker commit, SM source transients) lat_err can reach
+        # ~1 m, and an uncapped lower bound stretched the lookahead through corner zones whose
+        # normal L1 is ~0.7 m — on a 1.4 m-wide track that is a corner-cut into the wall. The cap
+        # bounds the convergence lookahead; below it the anti-swerve behaviour is unchanged.
+        lower_bound = max(self.t_clip_min,
+                          min(np.sqrt(2)*future_lateral_error, self.l1_lat_err_cap))
 
         L1_distance = np.clip(L1_distance, lower_bound, self.t_clip_max)
 

@@ -18,11 +18,24 @@
   <arg name="sim"          default="false" description="Use simulator (true) or real hardware (false)"/>
   <arg name="localization" default="cartographer"    description="gt (sim) | cartographer | pf (real)"/>
   <arg name="virtual"      default="$(var sim)" description="Inject virtual opponent/obstacles (scan overlay etc.); on by default in sim, off on the real car"/>
+  <arg name="reopt"        default="false" description="Obstacle-aware global line: run static_reopt_node + static_obstacle_layer instead of the plain global_trajectory_publisher (IFAC static-obstacle re-optimization)"/>
+  <arg name="reopt_safety_width" default="0.5" description="safety_width for the obstacle-aware re-optimizer (incl. car width). NB: the tight ifac centerline only solves plain mincurv_iqp at 0.25 or lower"/>
+  <arg name="reopt_obs_change_tol" default="0.25" description="min obstacle move [m] to re-trigger the re-opt QP (larger = detection jitter does not thrash it)"/>
+  <arg name="reopt_compute_sp" default="true" description="also re-optimize the shortest_path line (ot_interpolator consumes it); false only if the OT line is unused"/>
+  <arg name="reopt_method" default="local_window" description="obstacle-aware line optimizer: local_window (fast ONLINE windowed min-curv QP, ms/solve) | global (legacy whole-track mincurv_iqp, minutes/solve, offline-grade)"/>
+  <arg name="reopt_reach_time" default="0.0" description="[s] DEPRECATED seed for the old speed-scaled reach; the reach is now chosen by a lap-time search over [reach_min, reach_max]. Ignored."/>
+  <arg name="reopt_reach_min" default="1.0" description="[m] MIN arc half-width searched. The reach is picked to MINIMISE estimated lap time, not by local speed."/>
+  <arg name="reopt_reach_max" default="6.0" description="[m] MAX arc half-width searched. On a short tight track a wide arc is SLOW (ifac: R=10 m costs ~2x the time a reactive line loses); raise only on long open tracks."/>
+  <arg name="reopt_qp_veh_width" default="0.30" description="[m] vehicle width for the windowed QP corridor + floor (obstacle clearance is obs_margin, separate)"/>
+  <arg name="reopt_wall_margin" default="0.05" description="[m] wall reserve of the re-optimized detour. Aligned with the reactive spliner's wall reserve — the recorded apex was DRIVEN at that reserve; a larger value here shrinks the hump below the proven clearance and the all-or-nothing fit rejects it (obstacle stays reactive-only)."/>
+  <arg name="reopt_obs_margin" default="0.35" description="[m] clearance of the re-optimized line off each obstacle's edge. MUST be >= the reactive keep-out (width_car/2 + safety_margin in static_avoidance_params.yaml, currently 0.30) or the re-opt line sits inside the reactive planner's own keep-out and gets re-avoided every lap. Run stack_master/scripts/check_avoidance_margins.py after tuning either side."/>
 
   <!-- sim -> SIM config folder, real hardware -> CAR config folder -->
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/SIM" if="$(var sim)"/>
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/CAR" unless="$(var sim)"/>
   <arg name="vehicle_config" default="$(var config_dir)/vehicle_config.yaml"/>
+  <arg name="use_hokuyo" default="false" description="(real) start the Hokuyo urg_node; see low_level.launch"/>
+  <arg name="use_livox"  default="true"  description="(real) start the Livox MID-360 driver; see low_level.launch"/>
 
   <!-- ===== Sensors / Simulator (+ opponent) + Localization ===== -->
   <!-- SIM: low_level brings up gym_bridge (gt localization) + virtual opponent + mux. -->
@@ -41,6 +54,8 @@
       <arg name="localization"   value="$(var localization)"/>
       <arg name="vehicle_config" value="$(var vehicle_config)"/>
       <arg name="virtual"        value="$(var virtual)"/>
+      <arg name="use_hokuyo"     value="$(var use_hokuyo)"/>
+      <arg name="use_livox"      value="$(var use_livox)"/>
     </include>
   </group>
 
@@ -58,9 +73,43 @@
        /global_waypoints/overtaking for the state machine & local planners. -->
   <let name="maps_dir" value="$(find-pkg-share stack_master)/maps"/>
 
-  <node pkg="gb_optimizer" exec="global_trajectory_publisher" name="global_republisher" output="screen">
+  <!-- Global-waypoint publisher. Two mutually-exclusive providers of /global_waypoints:
+       - reopt:=false (default) -> global_trajectory_publisher: plain JSON republisher.
+       - reopt:=true            -> static_reopt_node (obstacle-aware republisher; re-optimizes
+         around confirmed static obstacles) + static_obstacle_layer (maps them from tracking).
+       Only ONE runs, so there is never a duplicate /global_waypoints publisher. The offline
+       map-build pipeline (create_path.launch.py) always uses global_trajectory_publisher. -->
+  <let name="racecar_version" value="SIM" if="$(var sim)"/>
+  <let name="racecar_version" value="CAR" unless="$(var sim)"/>
+
+  <node pkg="gb_optimizer" exec="global_trajectory_publisher" name="global_republisher"
+        output="screen" unless="$(var reopt)">
     <param name="map" value="$(var map)"/>
   </node>
+
+  <group if="$(var reopt)">
+    <node pkg="gb_optimizer" exec="static_reopt_node" name="static_reopt_node" output="screen">
+      <!-- OpenBLAS spawns a big thread pool that is ~1000x slower than 1 thread on the
+           windowed QP's tiny matrices; the node also pins BLAS in-process via threadpoolctl,
+           this env is a belt-and-braces fallback. -->
+      <env name="OPENBLAS_NUM_THREADS" value="1"/>
+      <env name="OMP_NUM_THREADS" value="1"/>
+      <param name="map" value="$(var map)"/>
+      <param name="racecar_version" value="$(var racecar_version)"/>
+      <param name="safety_width" value="$(var reopt_safety_width)"/>
+      <param name="safety_width_sp" value="$(var reopt_safety_width)"/>
+      <param name="obs_change_tol" value="$(var reopt_obs_change_tol)"/>
+      <param name="compute_sp" value="$(var reopt_compute_sp)"/>
+      <param name="reopt_method" value="$(var reopt_method)"/>
+      <param name="reach_time" value="$(var reopt_reach_time)"/>
+      <param name="reach_min" value="$(var reopt_reach_min)"/>
+      <param name="reach_max" value="$(var reopt_reach_max)"/>
+      <param name="qp_veh_width" value="$(var reopt_qp_veh_width)"/>
+      <param name="wall_margin" value="$(var reopt_wall_margin)"/>
+      <param name="obs_margin" value="$(var reopt_obs_margin)"/>
+    </node>
+    <node pkg="gb_optimizer" exec="static_obstacle_layer" name="static_obstacle_layer" output="screen"/>
+  </group>
 
   <!-- speed_scaling.yaml -> /global_waypoints_scaled + /sector_markers.
        sector_tuner (not velocity_scaler) also draws the RViz markers.
