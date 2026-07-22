@@ -34,6 +34,8 @@
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/SIM" if="$(var sim)"/>
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/CAR" unless="$(var sim)"/>
   <arg name="vehicle_config" default="$(var config_dir)/vehicle_config.yaml"/>
+  <arg name="use_hokuyo" default="false" description="(real) start the Hokuyo urg_node; see low_level.launch"/>
+  <arg name="use_livox"  default="true"  description="(real) start the Livox MID-360 driver; see low_level.launch"/>
 
   <!-- ===== Sensors / Simulator (+ opponent) + Localization ===== -->
   <!-- SIM: low_level brings up gym_bridge (gt localization) + virtual opponent + mux. -->
@@ -52,6 +54,8 @@
       <arg name="localization"   value="$(var localization)"/>
       <arg name="vehicle_config" value="$(var vehicle_config)"/>
       <arg name="virtual"        value="$(var virtual)"/>
+      <arg name="use_hokuyo"     value="$(var use_hokuyo)"/>
+      <arg name="use_livox"      value="$(var use_livox)"/>
     </include>
   </group>
 

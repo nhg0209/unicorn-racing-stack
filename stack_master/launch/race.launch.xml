@@ -30,6 +30,9 @@
        description="WpntArray the controller follows: /local_waypoints (state-machine output w/ avoidance) or /global_waypoints (robust raceline)"/>
   <arg name="use_pp_heading" default="false"
        description="Run pp_heading_controller instead of controller_manager (only one runs)"/>
+  <arg name="use_hokuyo" default="false" description="(real) start the Hokuyo urg_node (/scan). OFF by default: the car runs the Livox MID-360; without /scan the FTG fallback + estop are inert"/>
+  <arg name="use_livox"  default="true"  description="(real) start the Livox MID-360 driver (/livox/lidar + /livox/imu for kiss 3D localization + detection)"/>
+  <arg name="rviz"       default="false" description="(real) also start RViz with the pitwall config (2D Pose Estimate seeds kiss via /initialpose)"/>
   <arg name="reopt" default="false" description="Obstacle-aware global line (IFAC static re-optimization): static_reopt_node + static_obstacle_layer instead of plain global_trajectory_publisher"/>
   <arg name="reopt_safety_width" default="0.5" description="safety_width for the obstacle-aware re-optimizer (tight ifac map solves plain mincurv_iqp only at 0.25 or lower)"/>
   <arg name="reopt_obs_change_tol" default="0.25" description="min obstacle move [m] to re-trigger the re-opt QP; larger = detection jitter does not thrash the optimizer"/>
@@ -71,7 +74,16 @@
     <arg name="reopt_reach_max" value="$(var reopt_reach_max)"/>
     <arg name="reopt_qp_veh_width" value="$(var reopt_qp_veh_width)"/>
     <arg name="reopt_wall_margin" value="$(var reopt_wall_margin)"/>
+    <arg name="use_hokuyo" value="$(var use_hokuyo)"/>
+    <arg name="use_livox"  value="$(var use_livox)"/>
   </include>
+
+  <!-- Optional on-car RViz (sim already gets one from gym_bridge_launch). 2D Pose
+       Estimate publishes /initialpose, which seeds the kiss localization. -->
+  <group unless="$(var sim)">
+    <node pkg="rviz2" exec="rviz2" name="rviz" output="log" if="$(var rviz)"
+          args="-d $(find-pkg-share stack_master)/config/pitwall.rviz"/>
+  </group>
 
   <!-- ===== Perception: LiDAR obstacle detection (C++) + tracking (Python) =====
        detect publishes /detect/raw_obstacles (Frenet filled at the source);
@@ -86,9 +98,13 @@
     </node>
   </group>
 
-  <!-- detection_source=kiss: Livox 3D native. kiss's BevDetector (detect_en:true in
-       the kiss config) publishes cluster centers on /kiss_loc/obstacle_poses; the
-       bridge converts them to /detect/raw_obstacles (Frenet-filled) for tracking. -->
+  <!-- detection_source=kiss: kiss_icp_localization's BevDetector (detect_en:true in
+       kiss.yaml; works on the 2D-scan input too). It publishes CUBE bbox markers on
+       /kiss_loc/detections (map frame); the bridge converts them to
+       /detect/raw_obstacles (Frenet-filled) for tracking. Requires the kiss
+       localization node to be running (localization:=kiss) and the map folder to
+       contain <map>_track.yaml + <map>_ground_lidar.yaml (the node fails fast at
+       startup without them). -->
   <group if="$(eval '\'$(var det_src)\' == \'kiss\'')">
     <node pkg="perception" exec="kiss_obstacle_bridge" name="kiss_obstacle_bridge" output="screen"/>
   </group>

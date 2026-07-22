@@ -10,6 +10,15 @@
   <!-- Keyboard teleop: start keyboard_joy (pynput -> /joy_keyboard) and route the
        mux to it. The pitwall panel's Joy/Keyboard buttons can still switch at runtime. -->
   <arg name="keyboard_teleop" default="true"              description="Drive the ego with the keyboard instead of a joystick"/>
+  <!-- Real-car lidar selection. The car now runs a Livox MID-360 as the primary sensor
+       (kiss 3D localization + BEV detection). The Hokuyo is OFF by default because it is
+       currently unplugged (urg_node otherwise retry-spams). NOTE: without the Hokuyo there
+       is no /scan, so the FTG fallback (FTGONLY state / only_FTG zones / controller FTG)
+       and use_estop are inert; re-enable with use_hokuyo:=true once it is reconnected. -->
+  <arg name="use_hokuyo" default="false" description="Start the Hokuyo urg_node (/scan)"/>
+  <arg name="use_livox"  default="true"  description="Start the Livox MID-360 driver (/livox/lidar + /livox/imu)"/>
+  <arg name="livox_config" default="$(find-pkg-share livox_ros_driver2)/config/MID360_config.json"
+       description="Livox user config json (host/lidar IPs)"/>
   <!-- virtual_perception (scan_overlay + virtual opponent + static obstacles).
        Defaults ON in sim (preserves prior behavior), OFF on the real car; toggle
        with virtual:=true (e.g. to overlay a virtual opponent onto the real LiDAR). -->
@@ -35,15 +44,37 @@
       </include>
     </group>
 
-    <!-- LiDAR: publishes /scan (frame_id: laser). With virtual:=true the raw scan goes
-         to /scan_raw so scan_overlay (virtual_perception) can own /scan; otherwise the
-         identity remap leaves it on /scan. -->
+    <!-- Hokuyo 2D LiDAR: publishes /scan (frame_id: laser). With virtual:=true the raw scan
+         goes to /scan_raw so scan_overlay (virtual_perception) can own /scan; otherwise the
+         identity remap leaves it on /scan. Gated by use_hokuyo (see arg comment above). -->
     <let name="lidar_scan_out" value="/scan_raw" if="$(var virtual)"/>
     <let name="lidar_scan_out" value="/scan"     unless="$(var virtual)"/>
-    <node pkg="urg_node" exec="urg_node_driver" name="urg_node" output="screen">
-      <param from="$(var vehicle_config)"/>
-      <remap from="/scan" to="$(var lidar_scan_out)"/>
-    </node>
+    <group if="$(var use_hokuyo)">
+      <node pkg="urg_node" exec="urg_node_driver" name="urg_node" output="screen">
+        <param from="$(var vehicle_config)"/>
+        <remap from="/scan" to="$(var lidar_scan_out)"/>
+      </node>
+    </group>
+
+    <!-- Livox MID-360 driver: /livox/lidar (PointCloud2, xfer_format=0; the kiss 3D
+         localization + BEV detection input) + /livox/imu (~200 Hz). Sensor IPs live in
+         the json (livox_config arg). -->
+    <group if="$(var use_livox)">
+      <node pkg="livox_ros_driver2" exec="livox_ros_driver2_node" name="livox_lidar_publisher" output="screen">
+        <param name="xfer_format"      value="0"/>
+        <param name="multi_topic"      value="0"/>
+        <param name="data_src"         value="0"/>
+        <param name="publish_freq"     value="10.0"/>
+        <param name="output_data_type" value="0"/>
+        <param name="frame_id"         value="livox_frame"/>
+        <param name="user_config_path" value="$(var livox_config)"/>
+      </node>
+      <!-- Viz-only TF so the raw /livox/lidar cloud renders in RViz (kiss itself works in
+           the sensor frame via extrinsic params, identity by config). Adjust xyz here if
+           the mount offset should show in RViz. -->
+      <node pkg="tf2_ros" exec="static_transform_publisher" name="base_to_livox_broadcaster"
+            args="--x 0 --y 0 --z 0.1 --qx 0 --qy 0 --qz 0 --qw 1 --frame-id base_link --child-frame-id livox_frame"/>
+    </group>
 
     <!-- Static TF: base_link → laser -->
     <node pkg="tf2_ros" exec="static_transform_publisher" name="base_to_laser_broadcaster"
