@@ -1,163 +1,88 @@
-# ROS1 → ROS2 마이그레이션 갭 분석 (실제 기능 기준)
+# 스택 현황 & 잔여 갭 분석 (2026-07-22 현행화)
 
-> `MIGRATION_LOG.md`는 "빌드/임포트 통과 = 완료"로 보고 있으나, **빌드가 되는 것과 ROS1 기능이
-> 그대로 살아있는 것은 다르다.** 이 문서는 `origin/ros1` 원본과 현재 워킹트리(fix/HJ)를
-> 코드 레벨로 비교해, **무엇이 실제로 누락/변경되었는지**와 **dynamic reconfigure가 모듈별로
-> 진짜 작동하는지**를 정리한다. (수정은 하지 않음. 분석/계획 전용.)
-
-판정 기호: ✅ 충실 포팅 / 🟡 부분(빌드는 되나 기능 누락) / 🔴 다른 구현·미작동 / ⬛ 의도적 제외
+> **이 문서의 2026-06-25 버전은 폐기되었다** (내용은 git 이력 참조). 당시 "치명적 통합 결함"
+> (perception Frenet 미기입 / 컨트롤러 단순 PP / 트래킹 스텁)은 7월 커밋들로 **전부 해소**되었고,
+> 이 버전은 2026-07-22 전수 코드 분석 + 예측 파이프라인 배선 감사 기준으로
+> **실제로 남아있는 갭**만 담는다. (판정 기호: 🔴 미작동/끊김, 🟡 부분, ⬛ 의도적 제외)
 
 ---
 
-## 0. 가장 치명적인 통합 결함 (먼저 읽을 것)
+## 1. 이전 버전 치명 결함 — 해소 확인 (요약)
 
-### (a) Perception이 Frenet(s,d)을 채우지 않는다 → 실차에서 planning 전체가 굶는다 🔴
-- **ROS1**: `detect.py`와 `multi_tracking.py`가 **자체적으로 `FrenetConverter`를 들고** 장애물의
-  `s_center/d_center/vs/vd`를 채워서 `/tracking/obstacles`로 발행했다.
-  (근거: `origin/ros1:perception/scripts/detect.py:277` `get_frenet(...)`,
-  `multi_tracking.py:420,645,675` 등)
-- **ROS2 현재**: `detect_ros.py`→`/detections`(센서 프레임 x/y), `tracking_ros.py`→`/tracking/obstacles_raw`
-  (map 프레임, **Cartesian만**). Frenet 필드는 0으로 둠
-  (`tracking_ros.py:201` 주석 "so the merger can fill Frenet", 필드 세팅 `:214-227`).
-- Frenet을 실제로 채우는 노드는 `virtual_perception/tracking_merger.py:91-116` 인데,
-  **`virtual_perception`은 SIM 전용 패키지**(`low_level.launch.xml:53-55`는 sim 분기에서만 include).
-- 결과: **SIM에서는** detect→track→merger(Frenet 채움)→predictor→planner 가 이어지지만,
-  **실차에서는 `tracking_merger`가 안 떠서 `/tracking/obstacles`가 발행되지 않음** →
-  `opponent_predictor`, `state_machine`, `spliner/spliner_planner/sqp_planner/lane_change_planner`가
-  전부 입력을 못 받아 굶는다. (근거: `race.launch.xml:42-59`, planner 구독 토픽은 §5 참조)
-
-### (b) Controller가 ROS1 컨트롤러가 아니다 (CAC 단순 PP로 대체됨) 🔴
-- ROS1 컨트롤러는 MAP(steering lookup 기반) + Pure-Pursuit 하이브리드 + heading PID + trailing(추종) +
-  future-position 예측 + 속도/곡률/횡오차 스케일링 + L1 적응형 + AEB + FTG 멀티플렉싱 + 40여개 dyn 파라미터.
-- ROS2 현재(`controller_ros.py`,`PP.py`)는 **순수 Pure-Pursuit 1종 + 하드코딩 파라미터 6개**.
-  trailing/MAP/future/scaling/AEB/dyn-reconfig 전부 없음. `gapfollow/wallfollow/estop`은 따로 떠있을 뿐
-  컨트롤러에 멀티플렉싱되지 않음.
-- `steering_lookup`은 `TODO/`에 `COLCON_IGNORE`로 빠져 있고, **ROS2 어디서도 import 안 함**
-  (전 트리 grep 결과 0건) → 빌드는 안 깨지지만 **MAP 조향이 통째로 사라진 것**이 확정.
-
-### (c) Perception(detect/track/predict)이 다른 구현으로 대체됨 🔴
-- ROS1: 각도점프 클러스터링 + **L-shape 사각 피팅** + Frenet 필터링(detect.py),
-  **4-state EKF 다물체 트래킹** + static/dynamic 분류 + TTL/데이터연관(multi_tracking.py),
-  별도 패키지의 **GP(가우시안 프로세스) 궤적 예측**(`gp_traj_predictor`).
-- ROS2: 단순 데카르트 클러스터링 + AABB(피팅 없음), **칼만 없는 1프레임 트래킹 스텁**
-  (`tracking.py`의 `_associate()`는 빈 스텁, 매 프레임 트랙 재생성),
-  예측은 **등속(constant-velocity)** 1줄짜리. → ROS1 perception의 핵심 기능 대부분 미구현.
+| 6/25 지적 | 현재 상태 | 근거 |
+|---|---|---|
+| perception이 Frenet(s,d)을 안 채워 실차 planning 전멸 | ✅ 해소 | `perception/src/detect.cpp` 자체 FrenetConverter로 s/d 기입, `kiss_obstacle_bridge.py`(Livox 3D 경로)도 동일. virtual_perception 없이 실차 동작 |
+| 트래킹이 1프레임 스텁 | ✅ 해소 | `perception/scripts/multi_tracking.py` — Frenet EKF `[s,vs,d,vd]`, NN 데이터연관+TTL, 정적/동적 분류(강등 가드·near-dynamic 억제 포함) |
+| 컨트롤러가 단순 PP 6파라미터 | ✅ 해소 | `controller_manager` = L1/PP + heading PID + trailing 갭 PID + future position + 속도/조향 스케일링 + AEB + FTG 멀티플렉싱 (`controller/controller/combined/src/Controller.py`). 대안 `pp_heading_controller`(마찰원 PP)도 추가 |
+| GP 예측 미가동 | ✅ 가동 | `gp_traj_predictor` 3노드가 race.launch.xml:152-159에서 기동 (단, **활용도는 §2 참조**) |
+| dyn reconfigure 미작동 | ✅ 대부분 해소 | detect / tracking / controller_manager / state_machine / sector·ot tuner 전부 런타임 콜백 + save_yaml 보유. 플래너 4종만 저장 미지원(§3) |
+| 섹터 live 연동 끊김 | ✅ 해소 | SM이 ParameterEventHandler로 sector/ot tuner 변경 실시간 반영 (`state_machine_node.py:490-530`) |
 
 ---
 
-## 1. Controller 🔴 (가장 큰 작업)
+## 2. 예측 파이프라인 — 배선/활용 갭 (2026-07-22 감사) 🔴
 
-| 기능 (ROS1) | ROS2 | 상태 | 근거 |
+생산: `opp_prediction.py`가 `/opponent_prediction/obstacles_pred`(PredictionArray, **200스텝 × dt 0.02s = 4s** 호라이즌, `pred_s/pred_d`만 기입)를 발행.
+상대가 자기 라인 위(±0.25m)이고 반 랩 이상 관측되면 **GP 라인 추종 전파**, 아니면 **등속 전파 + force_trailing** 브랜치.
+
+### ✅ 2026-07-22 수리 완료 (P0 배선 수리)
+
+| # | 갭 | 수리 내용 |
+|---|---|---|
+| 2-1 | GP 예측이 상대가 **0.6 m 이내**일 때만 발행(그 외 빈 배열) | 근접 게이트 제거 — 상대가 자기 라인 위면 **상시 발행**. begin=현재 위치, end=호라이즌 끝 (`opp_prediction.py` GP 브랜치) |
+| 2-2 | force_trailing 삼중 사망(토픽 불일치+미소비+`not` 반전) | SM 구독을 `/opponent_prediction/force_trailing`으로 정정, `not` 제거, `_check_overtaking_mode` **진입 게이트**로 소비(지속성 게이트는 미적용 — 상대 옆 이탈 방지). `use_force_trailing`(기본 false) 옵트인 |
+| 2-3 | SM TTC 윈도우 dt 불일치(0.05 vs 생산 0.02 → 시간창 40%만 검사) | `pred_dt = 0.02` 정합 (`_check_free_frenet`) |
+| 2-6 | `/mpc_controller/ego_prediction` 완전 사망(publisher 없음+저장만) | SM 구독/콜백/변수 제거 |
+| 2-7 | 루프 페이싱 파손(spin/sleep 도달 불가, 마커 frenet 서비스 200회/사이클) | `spin_once` + wall-clock 10 Hz 페이싱, 마커 변환 **1회 배치 호출**(`_pred_markers`), pred 배열 사이클당 1회 발행으로 정리 |
+
+주의(수리의 파급): SM의 동적 free 검사가 이제 **실제로 GP 예측 궤적**을 검사한다(이전엔 예측이 거의 비어
+현재위치 폴백이 대부분). OVERTAKE 진입/유지 판정 성향이 바뀌므로 sim 재검증 필요. TTC가 예측 호라이즌
+(200×0.02=4 s)을 넘는 장애물은 예측창이 비어 free 취급되는 기존 구조는 유지(진입 게이트 `_check_getting_closer(10 m)`가 상황을 한정).
+
+### 남은 항목
+
+| # | 갭 | 상세 | 근거 |
 |---|---|---|---|
-| MAP 모드 (steering LUT) | 없음 | 🔴 MISSING | `controller_ros.py`에 lookup import 0건 |
-| Pure-Pursuit | 있음(단순) | 🟡 CHANGED | `PP.py:92-169` (CAC 스타일) |
-| heading PID 보정 | 없음 | 🔴 | ROS1 `Controller.py:544+` |
-| trailing(추종) 컨트롤 | 없음 | 🔴 | ROS1 `Controller.py:346` — head-to-head 불가 |
-| future position 예측 + IMU 융합 | 없음 | 🔴 | ROS1 `Controller.py:181` |
-| 속도 스케일링(곡률/횡오차/heading/가속) 5종 | 없음 | 🔴 | ROS1 `Controller.py:380+` |
-| L1 적응형 lookahead | 하드코딩 | 🟡 | ROS2는 `0.5+0.3v` 선형뿐 |
-| 조향 rate limit / AEB | 없음 | 🔴 | ROS1 `Controller.py:161,297` |
-| FTG 멀티플렉싱(FTGONLY) | 분리됨 | 🔴 | gapfollow가 통합 안 됨 |
-| dynamic reconfigure (40+ param) | 없음 | 🔴 | `l1_params_server.py` 미포팅 |
-| 시각화 마커 5종 | lookahead만 | 🟡 | |
+| 2-4 | **활성 동적 플래너의 예측 소비 최소** | `change_avoidance_node`(lane_change)는 `/opponent_trajectory` 평균 d(s)만 사이드 선택에 사용(`_opp_d_band`). `obstacles_pred`·GP 불확실성(`d_var/vs_var`)·재가속 예측 미사용 → **P1/P2에서 이식** | `change_avoidance_node.py:199,447-458` |
+| 2-5 | `/opponent_prediction/obstacles` 활성 소비자 없음 | 휴면 플래너 2종만 구독 — P2의 입력 후보 | `dynamic_avoidance_node.py:162`, `sqp_avoidance_node.py:95` |
+| 2-8 | 트레일링 타겟은 예측 미사용 | 컨트롤러 갭 PID는 SM이 넘긴 **현재 관측** Obstacle(s/vs)만 사용. 예측은 free 판정 bool에만 기여 | `controller_manager.py:281-288`, `state_machine_node.py:957` |
+| 2-9 | `/init_opp_trajectory` 서비스 호출자 없음 | ego 라인으로 상대 궤적 시드하는 경로 미사용 | `opp_prediction.py` 서비스 서버 |
+| 2-10 | `save_distance_front` 파라미터 무기능화 | 2-1 수리로 게이트 용도 소멸 — 선언만 남음. P1에서 재활용 또는 제거 | `opp_prediction.py:61` |
 
-난이도: **상**. trailing·MAP·future가 head-to-head 레이싱의 핵심.
+부가: `/opponent_trajectory`는 상대를 **반 랩** 관측해야 처음 생성되고(`opponent_trajectory.py:268-269`),
+그 전까지 `opp_prediction`은 시작 시 `wait_for_message`로 **블로킹**(`opp_prediction.py:281`).
+OVERTAKE 중에는 궤적 갱신 동결(`opponent_trajectory.py:60-64`).
 
 ---
 
-## 2. Perception (detection / tracking / prediction) 🔴
-
-| 항목 | ROS1 | ROS2 | 상태 |
-|---|---|---|---|
-| 클러스터링 | 각도점프+Frenet인지 | 단순 데카르트 | 🟡 CHANGED |
-| L-shape 사각 피팅 | 있음 | AABB only | 🔴 MISSING |
-| 출력 좌표계 | Frenet(s,d) | 센서/맵 Cartesian | 🔴 CHANGED (→§0a) |
-| 트래킹 | 4-state EKF 다물체 | 1프레임 스텁 | 🔴 MISSING |
-| static/dynamic 분류 | std+투표 | 없음 | 🔴 |
-| 데이터 연관 / TTL | 있음 | 빈 스텁 | 🔴 |
-| 예측 | GP 회귀 | 등속 | 🔴 CHANGED |
-| dyn reconfigure(23 param) | server+cfg+yaml | 없음 | 🔴 |
-
-난이도: **상**. 트래킹(EKF) 복원이 안정성에 가장 큰 영향.
-
----
-
-## 3. State Machine 🟡 (코어는 살아있음)
-
-- 상태 8종(GB_TRACK/TRAILING/OVERTAKE/FTGONLY/RECOVERY/ATTACK/START/LOSTLINE)·전이·행동·vel_planner: ✅ 충실 포팅.
-- dyn reconfigure: ✅ **작동** (`state_machine_params.py:241-281` 콜백 + `config/state_machine_params.yaml` 로드).
-- 🟡 **state_indicator 노드(LED) 미포팅** (`blink1` 의존; ⬛ 제외 정책과 연동).
-- 🟡 **섹터/추월존 live 갱신 불가**: 현재는 init 때 1회만 읽음(`state_machine.py:143-147,415-432` 주석
-  "sector tuner 포팅되면 live로"). sector_tuner 자체는 떠 있으나 SM과의 live 연동이 끊김.
-
----
-
-## 4. Planner (local/overtaking) 🟡
-
-5개 패키지(spliner / spliner_planner / sqp_planner / recovery_spliner / lane_change_planner) 모두
-**알고리즘 노드는 포팅됨**. 단:
-- 🔴 **`dynamic_*_server.py` 5개 전부 미포팅**, `.cfg` 5개 전부 없음.
-- 🟡 dyn reconfigure 런타임 콜백은 노드 inline으로 **있음**(아래 표) — 단 **YAML 저장(save_params)과
-  startup YAML 로드가 없음** → 튜닝값이 재부팅 시 사라짐(ROS1은 stack_master/config/*.yaml로 저장했음).
-- 의존성(frenet_conversion, grid_filter, tph, ccma)은 포팅 OK.
-
----
-
-## 5. Dynamic Reconfigure 모듈별 실제 작동 검증 (사용자 핵심 요구)
-
-"파일 존재"가 아니라 **(A)파라미터 선언 (B)런타임 콜백이 실제 반영 (C)YAML 저장 (D)startup YAML 로드**
-4가지를 모두 만족해야 "작동"으로 본다.
-
-| 모듈 | (A)선언 | (B)런타임 콜백 | (C)YAML 저장 | (D)YAML 로드 | 종합 | 근거 |
-|---|:--:|:--:|:--:|:--:|---|---|
-| controller | ✗ | ✗ | ✗ | ✗ | 🔴 BROKEN | `controller_ros.py:44-50` (6개만), 콜백 0건 |
-| perception(detect/track) | 일부 | ✗ | ✗ | ✗ | 🔴 BROKEN | `detect_ros.py:58-72`,`tracking_ros.py:58-69` |
-| spliner | ✓ | ✓ | ✗ | ✗ | 🟡 PARTIAL | `spliner_node.py:123-165, 168-230` |
-| spliner_planner | ✓ | ✓ | ✗ | ✗ | 🟡 PARTIAL | `dynamic_avoidance_node.py:115-122,198-209` |
-| sqp_planner | ✓ | ✓ | ✗ | ✗ | 🟡 PARTIAL | `sqp_avoidance_node.py:116-131,162-192` |
-| recovery_spliner | ✓ | ✓ | ✗ | ✗ | 🟡 PARTIAL | `recovery_spliner_node.py:152` |
-| lane_change_planner | ✓ | ✓ | ✗ | ✗ | 🟡 PARTIAL | `change_avoidance_node.py:171,178-191` |
-| state_machine | ✓ | ✓ | (서버 의존) | ✓ | ✅ WORKS | `state_machine_params.py:241-281`, `config/state_machine_params.yaml` |
-| sector_tuner | ✓ | ✓ | ✓ | ✓ | ✅ WORKS | `sector_tuner.py:70-157` (save_yaml 포함) |
-| overtaking_sector_tuner | ✓ | ✓ | ✓ | ✓ | ✅ WORKS | `ot_interpolator.py:64-179` |
-
-→ **dyn reconfigure 작동 기준 미달: controller·perception(완전 미작동), planner 5종(저장/로드 누락).**
-   `sector_tuner`/`overtaking_sector_tuner`가 "골드 스탠다드" 패턴(콜백+save_yaml+yaml 로드) → 나머지가 이걸 따라야 함.
-
----
-
-## 6. 지원 라이브러리 / 글로벌 플래너
+## 3. 기타 잔여 갭
 
 | 항목 | 상태 | 비고 |
 |---|---|---|
-| grid_filter | ✅ | rospy→rclpy 포팅, 소비자 6곳 `node=self` 패치 완료 |
-| polygon_filter | ⬛ EMPTY-SHELL | C++만, ROS1에도 소비자 없음 → 손실 없음 |
-| frenet_conversion(+_msgs) | ✅ | lib/msgs 분리 |
-| frenet_odom_republisher, vel_planner, lap_analyser, set_pose, random_obstacle_publisher | ✅ | |
-| gb_optimizer(글로벌) | ✅ | grid_filter 비의존 확인 |
-| steering_lookup | 🔴 IGNORED-NOT-BUILT | `TODO/`에 COLCON_IGNORE. controller가 안 쓰니 빌드는 OK지만 MAP 복원 시 필요 |
-| car_to_car_sync | ⬛ 제외 | 멀티카 동기화. 정책상 제외 |
-| state_indicator | 🟡/⬛ | LED(blink1) 의존. 제외 정책 검토 |
+| MAP(steering lookup LUT) 조향 | 🔴 미복원 | `TODO/system_identification/steering_lookup`에 차량별 Pacejka LUT csv 보존, COLCON_IGNORE. 현재 L1/PP로 대체 중 |
+| 플래너 4종 튜닝값 저장 | 🟡 | static_avoidance/lane_change는 startup yaml 로드 O·save X, recovery/start는 코드 기본값뿐. 라이브 튜닝값이 재시작 시 증발 — sector_tuner 패턴(save_yaml) 복제 필요 |
+| `planner/avoidance/fail_trailing` | 🔴 배선 없음 | SM 구독하나 publisher 없음(항상 False). `state_machine_node.py:737` |
+| ATTACK 상태 | 🟡 도달 불가 | 어떤 전이도 반환하지 않음 (`state_transitions.py`) |
+| state_indicator(LED) / car_to_car_sync | ⬛ 제외 유지 | 정책상 제외 |
 
 ---
 
-## 7. 권장 단계별 마이그레이션 계획
+## 4. 휴면 코드 인벤토리 (재활용 후보)
 
-원칙: 기능 죽이지 않기. **아래에서 위로** — 데이터(perception)가 막히면 위(planner/controller) 검증이
-불가능하므로 perception 시임부터.
+| 위치 | 내용물 | 재활용 가치 |
+|---|---|---|
+| `planner/spliner/spliner/spliner_node.py` | 자체 장애물 전파 4모드(`_predict_obs_movement:525-598`): constant / **adaptive**(도달시간 리드 + d의 지수적 라인복귀 이완, `kd_obs_pred`) / adaptive_velheuristic / heuristic | **1순위** — GP 비의존·저비용·우아한 열화. 활성 lane_change에 이식 적합 |
+| `planner/sqp_planner/sqp_avoidance_node.py` | ① 예측 장애물 배열을 직접 회피 대상으로 사용(`obs_prediction_cb:202-206`) ② **GP d(s) 프로파일을 동적 장애물 회랑 중심**으로 사용(`sqp_solver:383-395`) ③ SLSQP d-프로파일 최적화 | ②는 이식 가치 높음 (버그 주의: `:392` s[m]를 waypoint 개수로 mod) |
+| `planner/spliner_planner/dynamic_avoidance_node.py` | 예측 기반 apex 배치 구조 | 🟡 예측 대입이 `len==20` 게이트(생산자는 200)로 도달 불가(`:309`) — 사실상 사장 |
+| `prediction/.../predictor_opponent_trajectory.py` | 상대가 라인 이탈 시 **라인 복귀 곡선 GP**(Matern, `vs_var=69` 센티널) | 런치 시 `/opponent_trajectory` 경합 주의(GP 노드와 동일 토픽) — 아이디어만 이식 권장 |
+| `TODO/system_identification/` | steering_lookup(LUT 다수) + id_controller | MAP 조향 복원 시 필수 재료 |
+| `state_estimation/state_estimation/` | 구 ETH 융합 레이어(carstate_node) | 현 스택에선 대체 완료 — 삭제 후보 |
 
-- **Phase A — Perception Frenet 시임 복구 (최우선, §0a).**
-  detect/track이 실차에서도 Frenet(s,d,vs,vd)을 채우도록. (ROS1처럼 perception 내부에서 FrenetConverter를
-  쓰게 하거나, tracking_merger의 Frenet 채움 부분을 sim 비의존 노드로 분리.) 이게 풀려야 planner/SM이
-  실차에서 산다.
-- **Phase B — Tracking(EKF) 복원 (§2).** ROS1 `multi_tracking.py`의 4-state EKF·데이터연관·TTL·
-  static/dynamic 분류를 ROS2로 충실 포팅. L-shape 피팅도 detect로 복원.
-- **Phase C — Controller 복원 (§1).** ROS1 MAP/PP 하이브리드 + heading PID + trailing + future +
-  스케일링 + AEB + FTG 멀티플렉싱. steering_lookup를 `TODO/`에서 정규 패키지로 승격(COLCON_IGNORE 해제).
-- **Phase D — Prediction(GP) 복원 (§2).** 등속 → GP 회귀(`gp_traj_predictor`)로. (트래킹이 안정된 뒤.)
-- **Phase E — Dynamic reconfigure 완성 (§5).** planner 5종에 save_yaml+startup yaml 로드 추가
-  (sector_tuner 패턴 복제), controller·perception에 파라미터 전체 선언 + 콜백 + yaml 신설.
-- **Phase F — State machine live 연동 (§3).** sector/추월존 live 갱신 재연결. (옵션) state_indicator.
-- **Phase G — 통합/실차 검증.** 각 Phase 후 SIM, 마지막에 실차 토픽 그래프 점검.
+---
 
-각 Phase는 한 기능 영역이라 병렬화 가능하나, **A는 B/C/D/F의 선행조건**이므로 가장 먼저.
+## 5. 권장 순서 (동적 추월 = 개발 중 전제)
+
+1. **배선 수리(§2-1,2-3)**: GP 브랜치 발행 게이트 완화 + SM dt 0.02 정합 — 코드 몇 줄로 기존 GP 파이프라인이 살아남.
+2. **lane_change에 예측 주입(§2-4)**: spliner의 adaptive 전파(§4) 이식 → engage 타이밍/오프셋 선행 확장, sqp의 GP-회랑 아이디어로 pass window 동안 상대 예상 d(s) 기반 오프셋 산정.
+3. **죽은 배선 정리(§2-2,2-5,2-6,2-9)**: 쓸 거면 잇고, 안 쓸 거면 구독/발행 제거.
+4. 플래너 save_yaml(§3) + opp_prediction 루프 구조 정리(§2-7)는 병행 가능.

@@ -20,7 +20,7 @@ planner_change:
                                # ~2-3 m) or the gap never closes enough to engage,
                                # and BELOW the SM commit gate (10 m).
     obs_traj_tresh: 1.0        # engage only if |obs d - ego d| below this (they block our line)
-    sep_margin_m: 0.5          # required lateral clearance beyond the obstacle half-size.
+    sep_margin_m: 0.28          # required lateral clearance beyond the obstacle half-size.
                                # MUST stay > SM gb_ego_width/2 + lateral_width_m (0.2+0.2=0.4)
                                # or the SM free-check rejects the lane the planner accepted.
 
@@ -30,7 +30,7 @@ planner_change:
                                # (>= size/2 + sep_margin away from them) and grows live if
                                # they drift toward the lane; the walls always cap it.
     offset_slew_mps: 0.6       # how fast the live offset may grow/shrink [m/s]
-    spline_bound_mindist: 0.25 # path may never come closer than this to the track bounds
+    spline_bound_mindist: 0.12 # path may never come closer than this to the track bounds
 
     # --- transition geometry (lengths speed-scale: max(min_m, time_s * v)) ---
     open_ramp_min_m: 3.0
@@ -51,3 +51,14 @@ planner_change:
     target_lost_s: 1.0         # coast the target on its EKF velocity this long before
                                # treating it as lost (occlusion robustness)
     reengage_block_s: 1.0      # idle time after finishing/aborting a maneuver
+
+    # --- opponent prediction (P1 temporal, P2 spatial GP) ---
+    use_prediction: true          # master toggle; false = react to the opponent's CURRENT
+                                  # position only (pre-P1/P2 behavior), for A/B testing
+    kd_obs_pred: 1.0              # d->raceline relaxation gain for the adaptive time-forward
+                                  # propagation. higher = assume a near-line opponent returns
+                                  # to its line faster; a far-off-line opponent relaxes less
+    pred_lead_scale: 0.5         # lead time = (s-gap / closing-speed) * this. 0 disables the
+                                  # time-forward part (offset/clearance still use GP d(s))
+    engage_min_closing_mps: -0.5  # don't ENGAGE on an opponent pulling away faster than this
+                                  # (m/s, ego_vs - opp_vs). matches SM getting_closer gate

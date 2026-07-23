@@ -175,6 +175,12 @@ class ChangeAvoidanceNode(Node):
         self.reengage_block_s = 1.0
         self.kernel_size = 3            # GridFilter erosion (7 ate ~0.35 m and killed the lanes)
 
+        # --- opponent prediction (P1 temporal, P2 spatial) ---
+        self.use_prediction = True           # master toggle; False = react to CURRENT opponent pos only
+        self.kd_obs_pred = 1.0               # d->raceline relaxation gain for adaptive propagation
+        self.pred_lead_scale = 0.5           # lead time = (s-gap / closing-speed) * this; 0 = no time-forward
+        self.engage_min_closing_mps = -0.5   # don't engage an opponent pulling away faster than this
+
         self._declare_tunables()
 
         # CCMA init
@@ -242,6 +248,20 @@ class ChangeAvoidanceNode(Node):
         dbl('target_lost_s', self.target_lost_s, 0.2, 5.0, "coast time before target is dropped")
         dbl('reengage_block_s', self.reengage_block_s, 0.0, 5.0, "idle time after finishing")
 
+        # prediction (P1/P2)
+        dbl('kd_obs_pred', self.kd_obs_pred, 0.1, 10.0, "d->raceline relaxation gain")
+        dbl('pred_lead_scale', self.pred_lead_scale, 0.0, 2.0, "opponent propagation lead-time scale")
+        dbl('engage_min_closing_mps', self.engage_min_closing_mps, -3.0, 3.0, "min closing speed to engage")
+        self.declare_parameter('use_prediction', self.use_prediction, ParameterDescriptor(
+            type=ParameterType.PARAMETER_BOOL, description="enable prediction-aware engage/offset/clearance"))
+        # Read yaml/CLI overrides back into attributes. The dbl-declared params are otherwise
+        # only picked up by dyn_param_cb on a live `ros2 param set`; read them here so a
+        # differing yaml value also applies at startup.
+        self.kd_obs_pred = self.get_parameter('kd_obs_pred').value
+        self.pred_lead_scale = self.get_parameter('pred_lead_scale').value
+        self.engage_min_closing_mps = self.get_parameter('engage_min_closing_mps').value
+        self.use_prediction = self.get_parameter('use_prediction').value
+
     def dyn_param_cb(self, params: List[Parameter]):
         for param in params:
             if param.name in (
@@ -250,7 +270,9 @@ class ChangeAvoidanceNode(Node):
                     'open_ramp_min_m', 'open_ramp_time_s', 'blend_min_m',
                     'close_ramp_min_m', 'close_ramp_time_s', 'close_arm_m', 'tail_m',
                     'hold_horizon_m', 'pass_gap_m', 'pass_hyst_s', 'sep_margin_m',
-                    'target_lost_s', 'reengage_block_s'):
+                    'target_lost_s', 'reengage_block_s',
+                    'kd_obs_pred', 'pred_lead_scale', 'engage_min_closing_mps',
+                    'use_prediction'):
                 setattr(self, param.name, param.value)
         self.get_logger().info(
             f"[LaneChange] params: lane_offset_min={self.lane_offset_m:.2f} "
@@ -414,7 +436,7 @@ class ChangeAvoidanceNode(Node):
                 match = min(cands, key=lambda c: c[0])[1]
         if match is not None:
             self.target.update(id=match.id, s=match.s_center, d=match.d_center,
-                               vs=match.vs, size=max(match.size, 0.25), last_seen=now)
+                               vs=match.vs, vd=match.vd, size=max(match.size, 0.25), last_seen=now)
         else:
             # coast on the EKF velocity so the pass check keeps evolving while occluded
             self.target['s'] = (self.target['s'] + self.target['vs'] * dt) % self.scaled_max_s
@@ -435,13 +457,33 @@ class ChangeAvoidanceNode(Node):
                 continue
             if abs(o.d_center - self.current_d) > self.obs_traj_tresh:
                 continue
+            # don't engage an opponent we cannot close on (it is pulling away): the lane
+            # change would only ride the spline and slow us. TRAILING stays the fallback
+            # until it slows (e.g. into a corner) and the gap closes for real.
+            if (self.use_prediction
+                    and (self.current_vs or 0.0) - o.vs < self.engage_min_closing_mps):
+                continue
             if best is None or gap < best[0]:
                 best = (gap, o)
         if best is None:
             return None
         o = best[1]
-        return dict(id=o.id, s=o.s_center, d=o.d_center, vs=o.vs,
+        return dict(id=o.id, s=o.s_center, d=o.d_center, vs=o.vs, vd=o.vd,
                     size=max(o.size, 0.25), last_seen=self.now_sec())
+
+    def _predict_ahead(self, s: float, d: float, vs: float, vd: float = 0.0):
+        """Adaptive time-forward propagation of a DYNAMIC obstacle to roughly where it will
+        be when the ego reaches it (ported from spliner_node._predict_obs_movement, adaptive
+        mode). Lead time grows with time-to-reach; the lateral position relaxes toward the
+        raceline, exp-damped by how far off-line the obstacle currently is so a mid-overtake
+        opponent is not assumed to snap back. Pass DYNAMIC obstacles only -- a static one has
+        vs~=0 but the relaxation term would still pull its d toward the raceline."""
+        gap = (s - self.current_s) % self.scaled_max_s
+        rel_speed = float(np.clip((self.current_vs or 0.0) - vs, 0.1, 10.0))
+        lead = float(np.clip(gap / rel_speed, 0.0, 5.0)) * self.pred_lead_scale
+        delta_d = lead * vd
+        delta_d = -(d + delta_d) * float(np.exp(-abs(self.kd_obs_pred * d)))
+        return (s + lead * vs) % self.scaled_max_s, d + delta_d
 
     #################### SIDE SELECTION ####################
     def _opp_d_band(self, s_query: np.ndarray) -> np.ndarray:
@@ -511,10 +553,18 @@ class ChangeAvoidanceNode(Node):
             return
         need = self.target['size'] / 2.0 + self.sep_margin_m
         c_t = float(self._center_d(np.array([self.current_s + max(rel, 0.0)]))[0])
+        # P2: size the offset to clear the opponent's WORSE lateral case -- its measured
+        # position OR its GP line at this s (a corner can curve the GP line into our lane
+        # before the opponent visibly drifts). max/min so we never react LESS than the
+        # measured-d logic did; _opp_d_band falls back to the measured d until the GP line
+        # is trustworthy (>= 1 opponent lap).
+        opp_d_meas = self.target['d']
+        opp_d_pred = (float(self._opp_d_band(np.array([self.target['s']]))[0])
+                      if self.use_prediction else opp_d_meas)
         if self.lane_sign > 0:
-            off_need = need + self.target['d'] - c_t
+            off_need = need + max(opp_d_meas, opp_d_pred) - c_t
         else:
-            off_need = need - self.target['d'] + c_t
+            off_need = need - min(opp_d_meas, opp_d_pred) + c_t
 
         s_lin = self.current_s + np.arange(0.0, 8.0, 0.5)
         c = self._center_d(s_lin)
@@ -883,15 +933,25 @@ class ChangeAvoidanceNode(Node):
 
     def _check_lane_clear_vs_target(self, path: dict) -> bool:
         """The latched target must stay clear of the lane at ITS current s (it may have moved
-        laterally since the side vote)."""
+        laterally since the side vote). With prediction on, also require clearance at the
+        target's propagated (s,d) so an opponent moving toward the lane is caught early;
+        clear only if BOTH the current and predicted points clear (worst-case)."""
         if self.target is None:
             return True
-        rel = self._sdiff(self.target['s'], self.current_s)
-        if not (0.0 < rel < len(path['d_arr']) * 0.1):
-            return True
-        i = int(np.clip(rel / 0.1, 0, len(path['d_arr']) - 1))
-        sep = abs(float(path['d_arr'][i]) - self.target['d']) - self.target['size'] / 2.0
-        return sep >= self.sep_margin_m * 0.8
+        checks = [(self.target['s'], self.target['d'])]
+        if self.use_prediction:
+            checks.append(self._predict_ahead(
+                self.target['s'], self.target['d'], self.target['vs'], self.target.get('vd', 0.0)))
+        n = len(path['d_arr'])
+        for s_c, d_c in checks:
+            rel = self._sdiff(s_c, self.current_s)
+            if not (0.0 < rel < n * 0.1):
+                continue
+            i = int(np.clip(rel / 0.1, 0, n - 1))
+            sep = abs(float(path['d_arr'][i]) - d_c) - self.target['size'] / 2.0
+            if sep < self.sep_margin_m * 0.8:
+                return False
+        return True
 
     #################### VIZ ####################
     def _clear_markers(self):

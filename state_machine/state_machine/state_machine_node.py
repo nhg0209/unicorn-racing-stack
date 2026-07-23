@@ -228,12 +228,11 @@ class StateMachine(Node):
         self.obstacles_perception = []
         self.obstacles_prediction_id = None
         self.obstacles_prediction = []
-        self.ego_prediction = []
         self.obstacle_was_here = True
         self.side_by_side_threshold = 0.6
         self.merger = None
         self.force_trailing = False
-        self.use_force_trailing = not self.params.use_force_trailing
+        self.use_force_trailing = self.params.use_force_trailing
 
         # spliner variables
         self.splini_ttl = self.params.splini_ttl
@@ -350,7 +349,6 @@ class StateMachine(Node):
         self.create_subscription(
             PredictionArray, "/opponent_prediction/obstacles_pred", self.obstacle_prediction_cb, qos
         )
-        self.create_subscription(PredictionArray, "/mpc_controller/ego_prediction", self.ego_prediction_cb, qos)
 
         if self.ot_planner == "spliner" or self.ot_planner == "predictive_spliner":
             self.create_subscription(OTWpntArray, "/planner/avoidance/otwpnts", self.avoidance_cb, qos)
@@ -365,7 +363,7 @@ class StateMachine(Node):
                 )
         if self.ot_planner == "predictive_spliner":
             self.create_subscription(Float32MultiArray, "/planner/avoidance/merger", self.merger_cb, qos)
-            self.create_subscription(Bool, "collision_prediction/force_trailing", self.force_trailing_cb, qos)
+            self.create_subscription(Bool, "/opponent_prediction/force_trailing", self.force_trailing_cb, qos)
             self.create_subscription(Bool, "planner/avoidance/fail_trailing", self.fail_trailing_cb, qos)
 
         if not self.params.sim:
@@ -703,9 +701,6 @@ class StateMachine(Node):
             obstacles_in_interest.sort(key=lambda g_obs: g_obs[0])
             self.obstacles_in_interest = [obs for _, obs in obstacles_in_interest]
 
-    def ego_prediction_cb(self, data):
-        self.ego_prediction = data.predictions if len(data.predictions) != 0 else []
-
     def obstacle_prediction_cb(self, data):
         if len(data.predictions) != 0:
             self.obstacles_prediction_id = data.id
@@ -910,10 +905,13 @@ class StateMachine(Node):
                         start_idx = 0
                         end_idx = len(obstacle_predictions)
                         if is_ot_wpnts:
+                            # Seconds per prediction index — MUST match the 'dt' param of
+                            # /opponent_propagation_predictor (opp_prediction.py, default 0.02).
+                            pred_dt = 0.02
                             if ttc > 0:
-                                start_idx = min(int(ttc / 0.05), len(obstacle_predictions))
+                                start_idx = min(int(ttc / pred_dt), len(obstacle_predictions))
                             if tt0 > 0:
-                                end_idx = min(int(tt0 / 0.05), len(obstacle_predictions))
+                                end_idx = min(int(tt0 / pred_dt), len(obstacle_predictions))
                         for obs_pred in obstacle_predictions[start_idx:end_idx]:
                             wpnt_idx = np.argmin(abs(wpnts_data.array[:, 2] - obs_pred.pred_s))
                             wpnt_d = wpnts_data.list[wpnt_idx].d_m
@@ -1026,6 +1024,13 @@ class StateMachine(Node):
         return False
 
     def _check_overtaking_mode(self) -> bool:
+        # Predictor veto (opt-in via use_force_trailing): True while the opponent is off its
+        # learned line or fewer than one opponent-lap has been collected, i.e. the predictions
+        # this gate relies on are unreliable. Entry gate only — an OVERTAKE already committed
+        # is governed by _check_overtaking_mode_sustainability (bailing out beside an opponent
+        # is worse than finishing the maneuver).
+        if self.force_trailing:
+            return False
         if (
             self._check_ot_sector()
             and self._check_getting_closer(threshold_m=10.0)

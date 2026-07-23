@@ -2,7 +2,8 @@
 
 대상: `state_machine`, `spliner`(static/dynamic avoidance), `recovery_spliner`.
 전제: 전 스택은 **Frenet(s, d)** 좌표 위에서 동작하며, 판단 입력은 `/car_state/odom_frenet`,
-장애물은 `/tracking/obstacles`(동적) / `/tracking/raw_obstacles`(정적·미분류)에서 온다.
+장애물은 `/tracking/obstacles`(**확정** 장애물: 정적 `is_static=True` + 동적 `is_static=False`·vs 포함) /
+`/tracking/raw_obstacles`(미분류·미확정)에서 온다.
 
 > ⚠️ 2026-06-29 P0 패치 반영분: `_check_close_to_raceline_heading`가 이제 **실제 헤딩정렬**을
 > 검사한다(이전엔 `cur_d`를 라디안과 잘못 비교 → 사실상 무력). 그 결과 `RECOVERY/OVERTAKE →
@@ -49,23 +50,21 @@
 | `/detect/breakpoints_markers` | 클러스터 시작/끝 점 |
 | `/detect/obstacles_markers_new` | 빨간 큐브 = 피팅된 박스 |
 | `/detect/on_track_points` | 트랙 내부로 인정된 스캔점(measure 시) — GridFilter 검증용 |
-| `/tracking/obstacles` | **동적 장애물**(is_static=False, vs 포함) |
-| `/tracking/raw_obstacles` | 정적·미분류 |
+| `/tracking/obstacles` | **확정 장애물**(정적 is_static=True + 동적 is_static=False·vs 포함) |
+| `/tracking/raw_obstacles` | 미분류·미확정(아직 KF 확신 미달인 동적 후보 포함) |
 | `/tracking/static_dynamic_marker_pub` | 색: 빨강=미분류, 초록=정적, 파랑=동적 |
 
 ### planner (avoidance / recovery)
 | 토픽 | 용도 |
 |---|---|
 | `/planner/avoidance/otwpnts` | 동적 회피 경로(race.launch에선 lane_change_planner가 발행) |
-| `/planner/avoidance/markers_sqp` | (lane_change) 동적 회피 경로 시각화 |
-| `/spline_sample_points` | (lane_change) 샘플점 + 바운드 검사 |
+| `/planner/avoidance/markers_sqp` | (lane_change) 동적 회피 경로 + 페이즈 텍스트 시각화 |
+| `/planner/avoidance/lanes` | (lane_change) 좌/우 최소 오프셋 레인 시각화 |
 | `/planner/avoidance/merger` | (lane_change) 회피→글로벌 블렌딩 구간 [s_end, 회피끝 s] |
 | `/planner/avoidance/static_otwpnts` | 정적 회피 경로(static_avoidance_node) |
-| `/planner/avoidance/markers` | 회피 경로 시각화 |
-| `/planner/avoidance/considered_OBS` | 지금 회피 기준 잡은 장애물 |
-| `/planner/avoidance/propagated_obs` | 예측 전파된 장애물 위치 |
+| `/planner/avoidance/static_feasible` | (static) 실행가능 보고 — SM 정적 추월 fail-closed 게이트 입력 |
+| `/planner/avoidance/markers` | (static) 회피 경로 시각화 |
 | `/planner/recovery/wpnts` | 레이스라인 복귀 경로 |
-| `/planner/avoidance/spline_samples` | 스플라인 샘플점(바운드 검사 결과) |
 
 ---
 
@@ -92,11 +91,11 @@ RViz에서 `/state_marker`, `/tracking/static_dynamic_marker_pub`,
 | 장애물이 있는데 상태가 계속 GB_TRACK | `/tracking/obstacles` 비었는지 | 분류가 정적으로 빠짐 → tracking `max_std/min_std/min_nb_meas`. 또는 `interest_horizon_m`/`gb_horizon_m` 너무 짧음 |
 | 추월을 절대 안 함 | `/ot_section_check` (false?) | `ot_sectors.yaml`에 추월 허용 섹터 없음. 또는 `_check_overtaking_mode` 미충족(회피경로 비었거나 free 아님) |
 | 정적 장애물 추월만 안 됨 | `/planner/avoidance/static_feasible` 수신/신선도 | 플래너 죽음/미배선이면 게이트 fail-closed(0.5s stale). static_OT check 로그의 feasible/latest 항목 확인 |
-| 회피경로가 비어서 나옴(otwpnts empty) | `/planner/avoidance/markers` | danger_flag: 트랙바운드에 너무 근접 → `spline_bound_mindist`↓ 또는 `evasion_dist`↓. 또는 라인 안 타서 쪽전환 불가 |
+| 회피경로가 비어서 나옴(otwpnts empty) | `/planner/avoidance/markers`(정적) / `markers_sqp`(동적) | 정적: 후보 전멸(all-red) → `safety_margin`↓, `wall_margin`↓, `kappa_add_max`↑, `kernel_size` 확인(5.1). 동적: 레인 선택 실패 → `sep_margin_m`↓(0.42 미만 금지), `spline_bound_mindist`↓(5.3) |
 | 상태가 GB↔OVERTAKE 깜빡임(채터링) | `/state_machine` 빠르게 토글 | 히스테리시스 부족 → `overtaking_ttl_sec`↑, `splini_hyst_timer_sec`↑. OT 캐시 만료(2s) 확인 |
 | 추월 후 라인 복귀 안 함(RECOVERY 고착) | heading 정렬 여부 | P0 패치로 heading 게이트 활성화됨 → `recovery_planner.yaml`의 `on_spline_*`, 헤딩 정렬 20°. 8장 참고 |
 | TRAILING인데 멈춰버림 | `cur_vs`, FTG 카운터 로그 | `ftg_active=true`면 저속 지속 시 FTGONLY로 빠짐. 의도면 OK, 아니면 `ftg_active=false` |
-| 회피가 너무 늦음/급함 | `/planner/avoidance/propagated_obs` | 예측 전파 부족 → `fixed_pred_time`↑. 너무 일찍이면 ↓ |
+| 회피가 너무 늦음/급함 | `markers_sqp` 페이즈 텍스트 / `markers` | 동적: 진입 타이밍은 `engage_gap_m`(↑=일찍), 과격함은 `open_ramp_time_s`↑. 정적: `ramp_len`/`return_len`↑(완만), `lookahead_min`↑(일찍 고려) |
 | 동적 장애물 vs가 튄다/0 | `/tracking/obstacles` vs 필드 | EKF 미수렴 → tracking `var_pub`(확신 임계), `process_var_*`. `vs_reset` 이하면 정적 강등됨 |
 | 박스가 트랙밖 벽을 잡음 | `/detect/on_track_points` | GridFilter erosion 부족 → detect `filter_kernel_size`↑, `boundaries_inflation`↑ |
 | 박스가 너무 잘게 쪼개짐/합쳐짐 | `/detect/breakpoints_markers` | `new_cluster_threshold_m`, `lambda_deg`, `sigma` |
@@ -159,25 +158,37 @@ RViz에서 `/state_marker`, `/tracking/static_dynamic_marker_pub`,
 > **동적**=`lane_change_planner`/`change_avoidance_node`(`/otwpnts`, 5.3), 복귀=`recovery_spliner`(5.2).
 > 라이브 변경: `ros2 param set /<node_name> <name> <val>`.
 
-### 5.1 apex 스플라인 핵심 (static_avoidance / spliner)
-| 파라미터 | 기본 | 범위 | 의미 / 방향 |
-|---|---|---|---|
-| `evasion_dist` | 0.6 | 0.25~1.25 | 장애물에서 apex까지 횡거리. ↑=크게 비켜감(안전, 느림), ↓=아슬하게 |
-| `spline_bound_mindist` | 0.30 | 0.05~1.0 | 트랙바운드 최소 여유. 이내로 붙으면 회피 포기(danger). ↓=공격적, ↑=잘 포기 |
-| `obs_traj_tresh` | 1.0 | 0.1~1.5 | 레이스라인에서 이 횡거리 내 장애물만 회피 대상. ↓=라인 위 장애물만 |
-| `pre_apex_dist0/1/2` | 4/3/2 | 0.5~8 | apex 이전 스플라인 제어점 s거리(클수록 완만) |
-| `post_apex_dist0/1/2` | 4.5/5/5.5 | 0.5~12 | apex 이후 복귀 거리(클수록 완만 복귀) |
-| `spline_scale` | 0.8 | 0.5~2.0 | 전체 스플라인 스케일 |
-| `kd_obs_pred` | 1.0 | 0.1~10 | 예측 시 d 복원 게인(adaptive/heuristic 모드) |
-| `fixed_pred_time` | 0.15 | 0~1.0 | constant 모드 예측 전파 시간[s]. ↑=상대 미래위치로 더 일찍 회피 |
-| `post_min_dist`/`post_max_dist`/`post_sampling_dist` | 1.5/5.0/5.0 | — | 복귀 구간 샘플링 거리 |
-| `kernel_size` | 8 | 1~20 | (정적) 바운드 검사 erosion |
+### 5.1 정적 회피 — static_avoidance_node **[2026-07 Frenet 그리드 샘플링 재작성]**
+
+> 구 apex 스플라이너(`evasion_dist`/`pre·post_apex_dist`/`fixed_pred_time`)는 폐기됐다
+> (해당 코드는 미런치 `spliner/spliner_node.py`에만 남아 있음). 현재 알고리즘:
+> 장애물 옆 도달 가능한 **터미널 횡오프셋 `n_d_samples`개를 샘플** → 각 후보를
+> 진입램프(`ramp_len`) → **apex**(장애물 중심, `apex_bulge`만큼 추가 팽창) → 복귀램프
+> (`return_len`)의 quintic 쌍으로 생성 → 회랑/그리드맵/장애물박스/곡률 검사로 걸러내고 →
+> 비용 `J = w_d·편차 + w_k·곡률² + w_c·직전선택 일관성 + w_obs·근접도` 최소 후보 채택.
+> 속도는 slow-in/fast-out 프로파일, `max_weave`(2)개까지 한 경로에 슬라럼 위빙.
+> 설정: `stack_master/config/static_avoidance_params.yaml` (전부 라이브 튜닝 가능, 주석 상세).
+
+| 파라미터 | 기본 | 의미 / 방향 |
+|---|---|---|
+| `safety_margin` | 0.15 | 장애물 박스 추가 여유. 좁은 구간에서 후보 전멸 시 ↓, 박스를 스치면 ↑ |
+| `wall_margin` | 0.1 | 벽까지 허용 접근 여유 |
+| `apex_bulge` | 0.10 | 장애물 중심에서 추가로 부풀리는 폭. ↑=더 크게 돌아감(벽 캡 존재) |
+| `ramp_len` / `return_len` | 3.0 / 3.0 | 진입/복귀 램프 길이. ↑=완만 |
+| `lookahead_min` / `lookahead_k` | 8.0 / 1.5 | 고려 거리 = max(min, k·v). ↑=더 일찍 회피 시작 |
+| `n_d_samples` | 10 | 횡 오프셋 후보 수 |
+| `kappa_add_max` / `kappa_abs_max` | 5.0 / 5.5 | 레이스라인 **대비 추가** 곡률 / 절대 곡률 한계(코너-공정 검사) |
+| `a_lat_max` / `a_long_max` / `a_long_accel` | 6 / 4 / 3 | 횡가속 캡 / slow-in 감속 / fast-out 가속 |
+| `w_c` | 5.0 | 직전 후보와의 일관성 가중(채터링 억제) |
+| `max_weave` | 2 | 한 경로에 엮는 장애물 수(IFAC 2개 포맷 대응, 3개면 ↑) |
+| `kernel_size` | 3 | 그리드맵 erosion. 8이면 ~0.2 m 먹어서 레이스라인까지 거부됨 주의 |
+| `clear_gate_*` | on | re-opt 라인이 이미 회피 중이면 idle(중복 회피·apex 재기록 방지) |
 
 튜닝 직관:
-- **추월이 트랙밖으로 새거나 자주 포기** → `evasion_dist`↓, `spline_bound_mindist`↓
-- **회피가 너무 과격/멀미** → `pre/post_apex_dist`↑(완만), `spline_scale`↑
-- **회피 타이밍 늦음** → `fixed_pred_time`↑ (단 너무 크면 헛회피)
-- 코드상 **코너 바깥쪽 추월이면 자동 1.75× 완만화 + 속도 0.9×** (하드코딩, 의도된 동작)
+- **후보 전멸(all-red → TRAILING 고착)** → `safety_margin`↓, `wall_margin`↓, `kappa_add_max`↑, `kernel_size` 확인
+- **박스를 스침/충돌** → `safety_margin`↑, `apex_bulge`↑
+- **기동이 과격/멀미** → `ramp_len`/`return_len`↑, `a_long_accel`↓
+- 실행가능 여부는 `/planner/avoidance/static_feasible`로 SM에 상시 보고(0.5s stale이면 fail-closed 차단)
 
 ### 5.2 recovery_spliner
 | 파라미터 | 기본 | 의미 |
@@ -275,12 +286,13 @@ lane-hold 추월**로 동작한다 (설정: `stack_master/config/lane_change_par
 3. **섹터 설정**: 추월할 구간에 `ot_flag=true`, 위험구간 `only_FTG=true`.
 4. **추월 발동 여부**: `gb_horizon_m`/`interest_horizon_m`로 "언제 고려", `lateral_width_*`로
    "얼마나 쉽게 막힘 판정". `/state_machine`이 OVERTAKE로 들어가는지.
-5. **회피 형상**: spliner `evasion_dist`/`spline_bound_mindist`/`*_apex_dist`로 경로 다듬기.
-   `/planner/avoidance/markers`로 눈으로 확인.
+5. **회피 형상**: 정적은 `safety_margin`/`apex_bulge`/`ramp_len·return_len`(5.1), 동적은
+   `lane_offset_m`/`sep_margin_m`/`open·close_ramp_time_s`(5.3)로 경로 다듬기.
+   `/planner/avoidance/markers`(정적)·`markers_sqp`(동적)로 눈으로 확인.
 6. **안정화**: 채터링 보이면 `overtaking_ttl_sec`/`splini_hyst_timer_sec`↑.
 7. **복귀**: 추월 후 RECOVERY→GB_TRACK 매끄러운지. heading 정렬/`on_spline_*` 조정.
 8. **sim→real**: `racecar_version`(SIM/CAR) 차량동역학(ggv) 다름. real에서는 보수적으로
-   (`evasion_dist`↑, `spline_bound_mindist`↑) 시작 후 점진 공격화.
+   (`safety_margin`↑, `sep_margin_m`↑, `spline_bound_mindist`↑) 시작 후 점진 공격화.
 
 ---
 

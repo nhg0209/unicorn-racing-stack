@@ -17,8 +17,12 @@
        and use_estop are inert; re-enable with use_hokuyo:=true once it is reconnected. -->
   <arg name="use_hokuyo" default="false" description="Start the Hokuyo urg_node (/scan)"/>
   <arg name="use_livox"  default="true"  description="Start the Livox MID-360 driver (/livox/lidar + /livox/imu)"/>
-  <arg name="livox_config" default="$(find-pkg-share livox_ros_driver2)/config/MID360_config.json"
-       description="Livox user config json (host/lidar IPs)"/>
+  <!-- NOTE: livox_config is declared INSIDE the real-car use_livox group below, not here.
+       ROS 2 launch evaluates arg defaults EAGERLY at parse time (even for an unused arg),
+       and $(find-pkg-share livox_ros_driver2) throws when that hardware-only package is
+       absent (it lives on the NUC, not in this repo, and is not built on a laptop). That
+       broke sim:=true even though the livox node itself is already gated `unless sim`. -->
+
   <!-- virtual_perception (scan_overlay + virtual opponent + static obstacles).
        Defaults ON in sim (preserves prior behavior), OFF on the real car; toggle
        with virtual:=true (e.g. to overlay a virtual opponent onto the real LiDAR). -->
@@ -60,6 +64,10 @@
          localization + BEV detection input) + /livox/imu (~200 Hz). Sensor IPs live in
          the json (livox_config arg). -->
     <group if="$(var use_livox)">
+      <!-- Resolved here (real car + use_livox only) so find-pkg-share is never evaluated in
+           sim / on a laptop where livox_ros_driver2 is not built. See the note up top. -->
+      <arg name="livox_config" default="$(find-pkg-share livox_ros_driver2)/config/MID360_config.json"
+           description="Livox user config json (host/lidar IPs)"/>
       <node pkg="livox_ros_driver2" exec="livox_ros_driver2_node" name="livox_lidar_publisher" output="screen">
         <param name="xfer_format"      value="0"/>
         <param name="multi_topic"      value="0"/>

@@ -565,6 +565,19 @@ class GlobalPlanner(Node):
         # Write centerline in a csv file and get a marker array of it
         centerline_waypoints, centerline_markers = self.write_centerline(cent_with_dist)
 
+        # Also persist the reference track (centerline + track widths) next to
+        # global_waypoints.json so the static re-optimization node (reopt:=true) can load it
+        # as its clean reftrack -- static_reopt_node reads maps/<map>/centerline.csv at startup.
+        # Same [x_m, y_m, w_tr_right_m, w_tr_left_m] format the trajectory optimizer consumes
+        # (write_centerline only drops it to /tmp for the optimizer, not the map folder).
+        try:
+            cent_csv = os.path.join(self.map_dir, 'centerline.csv')
+            np.savetxt(cent_csv, np.asarray(cent_with_dist)[:, :4], delimiter=',',
+                       header='x_m,y_m,w_tr_right_m,w_tr_left_m', comments='', fmt='%.6f')
+            self.get_logger().info(f'[GB Planner]: Wrote reference track -> {cent_csv}')
+        except Exception as e:
+            self.get_logger().warn(f'[GB Planner]: Could not write centerline.csv: {e}')
+
         # Add curvature and angle to centerline waypoints
         centerline_coords = np.array([
             [coord.x_m, coord.y_m] for coord in centerline_waypoints.wpnts
