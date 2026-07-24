@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import time
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import rclpy
 from rclpy.node import Node
@@ -146,6 +146,19 @@ class ObstacleSpliner(Node):
         self.w_obs = 2.0             # cost: soft obstacle proximity
         self.obs_sigma = 0.5         # [m] soft-penalty length scale
         self.use_grid_check = True   # reject candidates crossing the eroded map
+        # --- corridor source: measure the drivable width from the MAP, not from the waypoints ---
+        # d_left/d_right come from gb_optimizer, which labels the two track contours left/right with
+        # ONE global decision taken from the start pose. When that decision comes out inverted the
+        # whole lap ships with d_left/d_right exchanged (map f: 125/128 waypoints swapped, values
+        # exact mirrors; map ifac: 0 swapped). The planner then believes the roomy side is the side
+        # the wall is actually on, samples terminal offsets straight into that wall, and the corridor
+        # filter rejects the genuinely free side -> "candidates on the opposite side of the gap".
+        # The occupancy grid is the only wall source that cannot be mislabelled, so measure the free
+        # lateral extent there and use it as the authority whenever a map is loaded.
+        self.trust_grid_bounds = True
+        self.grid_scan_max = 3.0     # [m] half-width of the lateral scan around the raceline
+        self.grid_scan_step = 0.05   # [m] lateral scan resolution (one map cell)
+        self.bounds_warn_m = 0.5     # [m] warn when waypoint bounds and the grid disagree by more
         # Raceline-clear gate: when the CURRENT global line (d=0 in its own frenet frame) already
         # clears every static obstacle ahead — the obstacle-aware line swapped in by static_reopt —
         # this planner must stay IDLE. Planning anyway re-recorded apexes on top of the swapped
@@ -195,7 +208,8 @@ class ObstacleSpliner(Node):
             'kappa_add_max', 'kappa_abs_max', 'a_lat_max', 'a_long_max', 'a_long_accel',
             'safety_margin', 'wall_margin', 'shift_min', 'shift_buffer', 'ramp_len', 'hold_after',
             'return_len', 'apex_bulge', 'max_weave', 'width_car', 'tail_m', 'w_d', 'w_k', 'w_c', 'w_obs', 'obs_sigma',
-            'use_grid_check', 'clear_gate_enable', 'clear_hyst_m', 'clear_max_cur_d',
+            'use_grid_check', 'trust_grid_bounds', 'grid_scan_max', 'grid_scan_step', 'bounds_warn_m',
+            'clear_gate_enable', 'clear_hyst_m', 'clear_max_cur_d',
             'commit_enable', 'commit_dev_max', 'commit_obs_ds', 'commit_obs_dd',
         ]))
         self.add_on_set_parameters_callback(self.dyn_param_cb)
@@ -267,6 +281,12 @@ class ObstacleSpliner(Node):
         self.declare_parameter('use_grid_check', True,
                                ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
                                                    description="Reject candidates crossing eroded map"))
+        self.declare_parameter('trust_grid_bounds', True,
+                               ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
+                                                   description="Measure the drivable corridor from the occupancy grid instead of waypoint d_left/d_right"))
+        self.declare_parameter('grid_scan_max', 3.0, dbl(0.5, 10.0, "half-width of the lateral grid corridor scan [m]"))
+        self.declare_parameter('grid_scan_step', 0.05, dbl(0.01, 0.5, "lateral grid corridor scan resolution [m]"))
+        self.declare_parameter('bounds_warn_m', 0.5, dbl(0.0, 5.0, "warn when waypoint bounds and the grid disagree by more [m]"))
         self.declare_parameter('clear_gate_enable', True,
                                ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
                                                    description="Stay idle when the current raceline already clears every obstacle ahead"))
@@ -339,6 +359,14 @@ class ObstacleSpliner(Node):
                 self.obs_sigma = float(p.value)
             elif n == 'use_grid_check':
                 self.use_grid_check = bool(p.value)
+            elif n == 'trust_grid_bounds':
+                self.trust_grid_bounds = bool(p.value)
+            elif n == 'grid_scan_max':
+                self.grid_scan_max = float(p.value)
+            elif n == 'grid_scan_step':
+                self.grid_scan_step = float(p.value)
+            elif n == 'bounds_warn_m':
+                self.bounds_warn_m = float(p.value)
             elif n == 'clear_gate_enable':
                 self.clear_gate_enable = bool(p.value)
             elif n == 'clear_hyst_m':
@@ -597,8 +625,25 @@ class ObstacleSpliner(Node):
         # side of the gap"). ifac's near-symmetric corridor hides this. Gap-anchored sampling
         # always populates BOTH sides that have room, so the correct side is never missed.
         obs_j = int(nearest.s_center / wpnt_dist) % self.gb_max_idx
-        d_hi = gb_wpnts[obs_j].d_left - sample_margin          # left corridor limit (car centre)
-        d_lo = -(gb_wpnts[obs_j].d_right - sample_margin)      # right corridor limit (car centre)
+        d_hi_wp = gb_wpnts[obs_j].d_left - sample_margin       # left corridor limit (car centre)
+        d_lo_wp = -(gb_wpnts[obs_j].d_right - sample_margin)   # right corridor limit (car centre)
+        # Prefer the corridor MEASURED in the occupancy grid: d_left/d_right are labelled left/right
+        # by one global decision in gb_optimizer and ship exchanged on some maps (see the
+        # trust_grid_bounds note in __init__), which puts every sample into the wall on the wrong side.
+        grid_cor = self._grid_corridor(nearest.s_center) if self.trust_grid_bounds else None
+        if grid_cor is not None:
+            d_lo, d_hi = grid_cor
+            if abs(d_hi - d_hi_wp) > self.bounds_warn_m or abs(d_lo - d_lo_wp) > self.bounds_warn_m:
+                self.get_logger().warn(
+                    f"[{self.name}] waypoint bounds disagree with the map at s={nearest.s_center:.1f}: "
+                    f"wpnt d=[{d_lo_wp:+.2f},{d_hi_wp:+.2f}] (d_left={gb_wpnts[obs_j].d_left:.2f} "
+                    f"d_right={gb_wpnts[obs_j].d_right:.2f}) vs grid d=[{d_lo:+.2f},{d_hi:+.2f}] -> using "
+                    f"the grid. Near-mirrored values mean global_waypoints.json has d_left/d_right "
+                    f"SWAPPED; regenerate the map (or set trust_grid_bounds:=false to force the "
+                    f"waypoint bounds).", throttle_duration_sec=5.0)
+        else:
+            d_lo, d_hi = d_lo_wp, d_hi_wp
+        cor_src = "grid" if grid_cor is not None else "wpnt"
         obox_lo = min(nearest.d_right, nearest.d_left) - obs_margin   # car-centre keep-out, right edge
         obox_hi = max(nearest.d_right, nearest.d_left) + obs_margin   # car-centre keep-out, left edge
         n_left = n_right = 0
@@ -626,19 +671,29 @@ class ObstacleSpliner(Node):
         # The nearest apex offset is SAMPLED (d_end); each LATER apex offset is auto-chosen to clear
         # that obstacle on the side nearer the previous one (smooth weave). One knot per obstacle at its
         # centre -> a single clean hump per obstacle (raceline -> apex -> raceline), no flat shoulders.
-        def _pass_offset(cor_idx, o, prev_d):
-            dl = gb_wpnts[cor_idx].d_left
-            dr = gb_wpnts[cor_idx].d_right
+        def _pass_offset(cor, o, prev_d):
+            c_lo, c_hi = cor                                  # corridor at this obstacle (car centre)
             obox_lo = min(o.d_right, o.d_left) - obs_margin   # car-centre keep-out, right edge
             obox_hi = max(o.d_right, o.d_left) + obs_margin   # car-centre keep-out, left edge
             opts = []
-            if obox_hi <= (dl - sample_margin) + 1e-6:        # room to pass on the LEFT of the obstacle
+            if obox_hi <= c_hi + 1e-6:                        # room to pass on the LEFT of the obstacle
                 opts.append(obox_hi)
-            if obox_lo >= -(dr - sample_margin) - 1e-6:       # room to pass on the RIGHT of the obstacle
+            if obox_lo >= c_lo - 1e-6:                        # room to pass on the RIGHT of the obstacle
                 opts.append(obox_lo)
             if not opts:
                 return prev_d                                  # blocked -> keep prev (obs_ok will reject)
             return min(opts, key=lambda d: abs(d - prev_d))   # side nearer the previous apex -> smooth
+
+        # Corridor per woven obstacle, measured once (not per candidate): grid first, waypoint bounds
+        # as the fallback -- same authority order as the sampled terminal offset above.
+        def _corridor_at(cor_idx, s_c):
+            g = self._grid_corridor(s_c) if self.trust_grid_bounds else None
+            if g is not None:
+                return g
+            return (-(gb_wpnts[cor_idx].d_right - sample_margin),
+                    gb_wpnts[cor_idx].d_left - sample_margin)
+
+        knot_cor = [(d_lo, d_hi)] + [_corridor_at(kc, ks) for (ks, _ko, kc) in knots[1:]]
 
         m_span = (s_local > s_entry0) & (s_local <= s_exit_end)
         span_ok = s_exit_end > s_entry0 + 1e-3
@@ -647,7 +702,7 @@ class ObstacleSpliner(Node):
         for k, d_end in enumerate(d_ends):
             d_apex = [float(d_end)]
             for i in range(1, len(knots)):
-                d_apex.append(_pass_offset(knots[i][2], knots[i][1], d_apex[-1]))
+                d_apex.append(_pass_offset(knot_cor[i], knots[i][1], d_apex[-1]))
             dv = np.full(n, self.cur_d)
             if span_ok and m_span.any():
                 # One knot per obstacle centre -> a single smooth quintic hump (raceline -> apex ->
@@ -666,8 +721,15 @@ class ObstacleSpliner(Node):
             d_cands[k] = dv
 
         # --- feasibility 1: track corridor (reject, don't clip) ---
-        bound_ok = ~(((d_cands > (d_left_arr - half_car)[None, :]) |
-                      (d_cands < -(d_right_arr - half_car)[None, :])).any(axis=1))
+        # Skipped when the grid is the corridor authority: _path_off_track then tests EVERY path
+        # point against the real eroded walls, which is the same job with a trustworthy left/right.
+        # Keeping the waypoint test as well would re-apply the possibly-swapped d_left/d_right and
+        # reject exactly the candidates on the genuinely free side.
+        if self._grid_is_authority():
+            bound_ok = np.ones(N, dtype=bool)
+        else:
+            bound_ok = ~(((d_cands > (d_left_arr - half_car)[None, :]) |
+                          (d_cands < -(d_right_arr - half_car)[None, :])).any(axis=1))
 
         # --- feasibility 2: inflated obstacle boxes ---
         # Signed centre-gap + half-span (same idiom as obs_half_s above): mod-ing s_start and
@@ -742,8 +804,8 @@ class ObstacleSpliner(Node):
                 f"[{self.name}] NO feasible candidate ({N} sampled) -> TRAILING | "
                 f"reject bounds={n_bounds} obs_box={n_obs} grid={n_grid} curv={n_curv} | "
                 f"g_near={g_near:.2f} obs_half_s={obs_half_s:.2f} n_box={len(knots)} apex_bulge={self.apex_bulge:.2f} | "
-                f"sample d_range=[{d_lo:.2f},{d_hi:.2f}] corridor@obs "
-                f"L={gb_wpnts[obs_j].d_left:.2f}/R={gb_wpnts[obs_j].d_right:.2f} | "
+                f"sample d_range=[{d_lo:.2f},{d_hi:.2f}] ({cor_src}) corridor@obs "
+                f"wpnt L={gb_wpnts[obs_j].d_left:.2f}/R={gb_wpnts[obs_j].d_right:.2f} | "
                 f"obs d=[{min(nearest.d_right, nearest.d_left):.2f},{max(nearest.d_right, nearest.d_left):.2f}] "
                 f"obs_margin={obs_margin:.2f} sample_margin={sample_margin:.2f}",
                 throttle_duration_sec=0.5)
@@ -765,7 +827,7 @@ class ObstacleSpliner(Node):
         self.get_logger().info(
             f"[{self.name}] avoid {sel_side} d_end={sel_d:+.2f} | feasible L={n_feas_left} R={n_feas_right} | "
             f"sampled {n_left}L+{n_right}R of {N} | reject bounds={n_bounds} obs={n_obs} grid={n_grid} curv={n_curv} | "
-            f"corridor d=[{d_lo:.2f},{d_hi:.2f}] obs keep-out d=[{obox_lo:.2f},{obox_hi:.2f}]",
+            f"corridor d=[{d_lo:.2f},{d_hi:.2f}] ({cor_src}) obs keep-out d=[{obox_lo:.2f},{obox_hi:.2f}]",
             throttle_duration_sec=2.0)
 
         if SMOOTH_OTWPNTS:
@@ -895,11 +957,18 @@ class ObstacleSpliner(Node):
         s_mod = c['s_mod'][sel]
         d = c['d'][sel]
         L = self.gb_max_s
-        idxs = (s_mod / wpnt_dist).astype(int) % self.gb_max_idx
-        d_left = np.array([gb_wpnts[j].d_left for j in idxs])
-        d_right = np.array([gb_wpnts[j].d_right for j in idxs])
-        if np.any(d > (d_left - half_car)) or np.any(d < -(d_right - half_car)):
-            return False
+        # Corridor: the eroded map when it is the authority (the waypoint bounds can ship with
+        # d_left/d_right exchanged, which would drop a perfectly good committed path every cycle),
+        # otherwise the waypoint corridor.
+        if self._grid_is_authority():
+            if self._path_off_track(c['xy'][sel]):
+                return False
+        else:
+            idxs = (s_mod / wpnt_dist).astype(int) % self.gb_max_idx
+            d_left = np.array([gb_wpnts[j].d_left for j in idxs])
+            d_right = np.array([gb_wpnts[j].d_right for j in idxs])
+            if np.any(d > (d_left - half_car)) or np.any(d < -(d_right - half_car)):
+                return False
         gap_wp = (s_mod - self.cur_s) % L
         for o in self.obstacles:
             if not self._obs_qualifies(o):
@@ -958,6 +1027,62 @@ class ObstacleSpliner(Node):
         mrk.points = [Point(x=float(xy[i, 0]), y=float(xy[i, 1]), z=0.0) for i in range(len(xy))]
         mrks.markers.append(mrk)
         return mrks
+
+    def _free_mask(self, xy: np.ndarray) -> Optional[np.ndarray]:
+        """Vectorised GridFilter.is_point_inside(): True where the point is in the eroded free area.
+
+        Same pixel convention as GridFilter.world_to_pixel()/is_point_inside() (row index = y, no
+        vertical flip). Returns None when no map has been received yet, so callers can fall back.
+        """
+        f = self.map_filter
+        img = getattr(f, "eroded_image", None)
+        if img is None or f.resolution is None or f.origin is None:
+            return None
+        px = ((xy[:, 0] - f.origin[0]) / f.resolution).astype(int)
+        py = ((xy[:, 1] - f.origin[1]) / f.resolution).astype(int)
+        ok = (px >= 0) & (py >= 0) & (px < img.shape[1]) & (py < img.shape[0])
+        free = np.zeros(px.shape, dtype=bool)
+        free[ok] = img[py[ok], px[ok]] == 255
+        return free
+
+    def _grid_corridor(self, s_query: float) -> Optional[Tuple[float, float]]:
+        """Free lateral extent [d_lo, d_hi] (car-centre limits) at arc length s, MEASURED in the
+        eroded occupancy grid rather than read from the waypoints' d_left/d_right.
+
+        Only the CONTIGUOUS free run containing the raceline is kept, so free space that belongs to
+        another part of the track further out cannot widen the corridor. The erosion already reserves
+        the clearance a car-centre point needs, so only wall_margin is taken off on top of it.
+        Returns None when no map is loaded (callers fall back to the waypoint bounds).
+        """
+        if self.gb_max_s is None or getattr(self, "converter", None) is None:
+            return None
+        d_scan = np.arange(-self.grid_scan_max, self.grid_scan_max + 1e-9, self.grid_scan_step)
+        s_arr = np.full(d_scan.shape, float(s_query) % self.gb_max_s)
+        resp = self.converter.get_cartesian(s_arr, d_scan)
+        xy = (resp.T if resp.ndim == 2 else resp).reshape(-1, 2)
+        free = self._free_mask(xy)
+        if free is None or not free.any():
+            return None
+        i0 = int(np.argmin(np.abs(d_scan)))
+        if not free[i0]:                       # raceline itself reads blocked -> nearest free sample
+            cand = np.flatnonzero(free)
+            i0 = int(cand[np.argmin(np.abs(d_scan[cand]))])
+        lo_i = hi_i = i0
+        while lo_i > 0 and free[lo_i - 1]:
+            lo_i -= 1
+        while hi_i < free.size - 1 and free[hi_i + 1]:
+            hi_i += 1
+        d_lo = float(d_scan[lo_i]) + self.wall_margin
+        d_hi = float(d_scan[hi_i]) - self.wall_margin
+        if d_hi < d_lo:                        # narrower than 2*wall_margin -> collapse to its middle
+            d_lo = d_hi = 0.5 * (float(d_scan[lo_i]) + float(d_scan[hi_i]))
+        return d_lo, d_hi
+
+    def _grid_is_authority(self) -> bool:
+        """True when the occupancy grid both replaces the waypoint corridor AND is checked per path
+        point -- i.e. the per-point grid test fully subsumes the waypoint-bounds test."""
+        return (self.trust_grid_bounds and self.use_grid_check and
+                getattr(self.map_filter, "eroded_image", None) is not None)
 
     def _path_off_track(self, xy: np.ndarray) -> bool:
         """True if any path point is NOT in free/drivable space (on/near a wall). Early-exits.

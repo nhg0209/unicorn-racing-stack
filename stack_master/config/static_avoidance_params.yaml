@@ -57,7 +57,34 @@ static_avoidance_planner:
     a_long_accel: 3.0       # [m/s^2] longitudinal ACCEL; forward pass ramps speed up GRADUALLY out of the
                             #         apex (fast-out). lower = gentler/longer exit acceleration.
     use_grid_check: true    # reject candidates crossing the eroded /map (GridFilter)
-    kernel_size: 3          # [cells] GridFilter erosion (8 ate ~0.2 m and rejected the raceline on ifac)
+    kernel_size: 3          # [cells] GridFilter erosion (8 ate ~0.2 m and rejected the raceline on ifac).
+                            #      With trust_grid_bounds this ALSO sets the wall clearance used for
+                            #      feasibility (3 cells @0.05 m = 0.15 m ~= half car, matching the
+                            #      half_car clearance the waypoint-corridor test used).
+
+    # --- corridor source: measure the drivable width from the MAP, not from the waypoints ---
+    # d_left/d_right come from gb_optimizer, which labels the two track contours left/right with ONE
+    # global decision taken from the start pose (extract_track_bounds), plus an optional second flip
+    # from reverse_mapping. When that comes out inverted the whole lap ships with d_left/d_right
+    # EXCHANGED -- measured on map f: 125 of 128 sampled waypoints swapped, values exact mirrors
+    # (json L/R = 2.72/0.24 where the walls really are 0.24 left / 2.72 right); map ifac: 0 swapped.
+    # The planner then thinks the roomy side is the side the wall is on, samples every terminal
+    # offset into that wall, and the corridor filter rejects the genuinely free side -> "candidates
+    # on the opposite side of the gap", and with the obstacle pushed to one side the spline is drawn
+    # beyond the wall instead of through the open space. The occupancy grid is the only wall source
+    # that cannot be mislabelled, so measure the free lateral extent there and let it win.
+    # Offline check on the real maps: correct roomy side 60/60 on f and 46/46 on ifac, 0 sampled
+    # offsets inside a wall (vs 136 with the waypoint corridor). Cost 0.07 ms/call, <=2 calls/cycle.
+    # Set false to force the old waypoint-bounds behaviour (e.g. to reproduce the bug).
+    # NOTE: needs use_grid_check: true. The per-point grid test is what REPLACES the waypoint
+    # corridor filter; with use_grid_check false the waypoint bounds stay in charge of feasibility
+    # (conservative: a swapped map then trails instead of cutting a corner, as it did before).
+    trust_grid_bounds: true
+    grid_scan_max: 3.0      # [m] half-width of the lateral scan around the raceline (>= widest half-track)
+    grid_scan_step: 0.05    # [m] scan resolution; one map cell is the useful floor
+    bounds_warn_m: 0.5      # [m] warn when the waypoint bounds and the measured corridor disagree by
+                            #      more than this -- near-mirrored values in that warning mean the map's
+                            #      global_waypoints.json has d_left/d_right swapped and wants regenerating
 
     # --- raceline-clear gate (idle when the CURRENT global line already avoids everything) ---
     # After static_reopt swaps in the obstacle-aware line, the keep-out no longer contains d=0,
