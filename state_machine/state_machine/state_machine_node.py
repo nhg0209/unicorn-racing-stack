@@ -182,6 +182,7 @@ class StateMachine(Node):
 
         # dynamic-parameter-backed attributes (aliases onto params)
         self.gb_ego_width_m = self.params.gb_ego_width_m
+        self.recovery_exit_d_m = self.params.recovery_exit_d_m
         self.lateral_width_gb_m = self.params.lateral_width_gb_m
         self.lateral_width_static_gb_m = self.params.lateral_width_static_gb_m
         self.gb_horizon_m = self.params.gb_horizon_m

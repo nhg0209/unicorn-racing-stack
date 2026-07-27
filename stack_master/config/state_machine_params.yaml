@@ -11,6 +11,12 @@ state_machine:
     track_length: 1.0
     # geometry / horizons
     gb_ego_width_m: 0.4
+    # |d| below which the car counts as back on the raceline when LEAVING a non-GB_TRACK state.
+    # Lower half of the RECOVERY hysteresis band: entry uses gb_ego_width_m (0.4), exit uses this,
+    # so it must stay < gb_ego_width_m or RECOVERY chatters. Was hardcoded at 0.05 m -- tighter
+    # than the controller's steady-state tracking error, so RECOVERY latched and the local line
+    # was sourced from the recovery spline for the whole lap.
+    recovery_exit_d_m: 0.2
     gb_horizon_m: 15.0
     interest_horizon_m: 20.0
     overtaking_horizon_m: 6.9

@@ -34,6 +34,7 @@ class StateMachineParams:
         "ftg_speed_mps",
         "ftg_timer_sec",
         "gb_ego_width_m",
+        "recovery_exit_d_m",
         "gb_horizon_m",
         "interest_horizon_m",
         "overtaking_horizon_m",
@@ -110,6 +111,21 @@ class StateMachineParams:
             ),
         )
         self.gb_ego_width_m: float = node.get_parameter("gb_ego_width_m").value
+
+        self._declare(
+            "recovery_exit_d_m", 0.2,
+            ParameterDescriptor(
+                description=(
+                    "|d| below which the car counts as back on the raceline when LEAVING a "
+                    "non-GB_TRACK state (RECOVERY/TRAILING/OVERTAKE/START/FTGONLY). Entry into "
+                    "RECOVERY uses gb_ego_width_m, so this is the lower half of the hysteresis "
+                    "band and must stay below it. Was hardcoded at 0.05 m -- tighter than normal "
+                    "tracking error, so RECOVERY never exited [m]"
+                ),
+                type=ParameterType.PARAMETER_DOUBLE,
+            ),
+        )
+        self.recovery_exit_d_m: float = node.get_parameter("recovery_exit_d_m").value
 
         self._declare(
             "gb_horizon_m", 15.0,

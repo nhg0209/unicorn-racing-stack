@@ -45,7 +45,10 @@ def RecoveryTransition(state_machine: "StateMachine") -> Tuple[StateType, StateT
     recovery_sustainability = state_machine._check_sustainability(
         state_machine.recovery_wpnts, state_machine.cur_recovery_wpnts
     )
-    close_to_raceline = state_machine._check_close_to_raceline(0.05) * state_machine._check_close_to_raceline_heading(20)
+    close_to_raceline = (
+        state_machine._check_close_to_raceline(state_machine.recovery_exit_d_m)
+        * state_machine._check_close_to_raceline_heading(20)
+    )
 
     if recovery_sustainability and not close_to_raceline:
         return StateType.RECOVERY, StateType.RECOVERY
@@ -55,7 +58,10 @@ def RecoveryTransition(state_machine: "StateMachine") -> Tuple[StateType, StateT
 
 def TrailingTransition(state_machine: "StateMachine") -> Tuple[StateType, StateType]:
     """Transitions for being in `StateType.TRAILING`"""
-    close_to_raceline = state_machine._check_close_to_raceline(0.05) * state_machine._check_close_to_raceline_heading(20)
+    close_to_raceline = (
+        state_machine._check_close_to_raceline(state_machine.recovery_exit_d_m)
+        * state_machine._check_close_to_raceline_heading(20)
+    )
     if len(state_machine.cur_obstacles_in_interest) == 0:
         return NonObstacleTransition(state_machine, close_to_raceline)
     else:
@@ -75,7 +81,10 @@ def OvertakingTransition(state_machine: "StateMachine") -> Tuple[StateType, Stat
         enemy_in_front or state_machine.overtaking_ttl_count < state_machine.overtaking_ttl_count_threshold
     ):
         return StateType.OVERTAKE, StateType.OVERTAKE
-    close_to_raceline = state_machine._check_close_to_raceline(0.05) * state_machine._check_close_to_raceline_heading(20)
+    close_to_raceline = (
+        state_machine._check_close_to_raceline(state_machine.recovery_exit_d_m)
+        * state_machine._check_close_to_raceline_heading(20)
+    )
     return GlobalTrackingTransition(state_machine, close_to_raceline)
 
 
@@ -88,7 +97,8 @@ def StartTransition(state_machine: "StateMachine") -> Tuple[StateType, StateType
         return StateType.START, StateType.START
     else:
         close_to_raceline = (
-            state_machine._check_close_to_raceline(0.05) * state_machine._check_close_to_raceline_heading(20)
+            state_machine._check_close_to_raceline(state_machine.recovery_exit_d_m)
+            * state_machine._check_close_to_raceline_heading(20)
         )
         state_machine.cur_start_wpnts.is_init = False
         return GlobalTrackingTransition(state_machine, close_to_raceline)
@@ -96,7 +106,10 @@ def StartTransition(state_machine: "StateMachine") -> Tuple[StateType, StateType
 
 def FTGOnlyTransition(state_machine: "StateMachine") -> Tuple[StateType, StateType]:
     """Transitions for being in `StateType.FTGONLY`"""
-    close_to_raceline = state_machine._check_close_to_raceline(0.05) * state_machine._check_close_to_raceline_heading(20)
+    close_to_raceline = (
+        state_machine._check_close_to_raceline(state_machine.recovery_exit_d_m)
+        * state_machine._check_close_to_raceline_heading(20)
+    )
     if len(state_machine.cur_obstacles_in_interest) == 0:
         return NonObstacleTransition(state_machine, close_to_raceline)
     else:
@@ -147,7 +160,8 @@ def ObstacleTransition(state_machine: "StateMachine", close_to_raceline) -> Tupl
     # TRAILING always follows the global raceline. The recovery spline is for rejoining the line
     # when we are off it AND the path is free (the RECOVERY return above) — it is not a trailing
     # reference. The old `elif recovery_availability -> TRAILING, RECOVERY` branch was the common
-    # case, not the exception: the callers gate close_to_raceline at 0.05 m, which normal tracking
-    # error exceeds, so trailing latched onto the recovery line and followed it away from the
-    # raceline, which kept cur_d large and the branch self-sustaining.
+    # case, not the exception: the callers gate close_to_raceline at recovery_exit_d_m, and while
+    # that was hardcoded at 0.05 m -- below normal tracking error -- trailing latched onto the
+    # recovery line and followed it away from the raceline, keeping cur_d large and the branch
+    # self-sustaining.
     return StateType.TRAILING, StateType.GB_TRACK
