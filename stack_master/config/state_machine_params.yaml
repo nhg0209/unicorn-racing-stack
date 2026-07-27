@@ -17,6 +17,12 @@ state_machine:
     # than the controller's steady-state tracking error, so RECOVERY latched and the local line
     # was sourced from the recovery spline for the whole lap.
     recovery_exit_d_m: 0.2
+    # |d| at or above which the raceline counts as LOST -> RECOVERY entry (_check_line_lost).
+    # Upper half of the band; must stay > recovery_exit_d_m. Entry was previously keyed off the
+    # per-state close_to_raceline flag, which is 0.4 m in GB_TRACK but recovery_exit_d_m elsewhere
+    # -- so trailing an opponent at |d| ~ 0.3 m entered RECOVERY while plain global tracking at the
+    # same offset did not. That asymmetry is why the recovery line only appeared while trailing.
+    recovery_entry_d_m: 0.4
     gb_horizon_m: 15.0
     interest_horizon_m: 20.0
     overtaking_horizon_m: 6.9

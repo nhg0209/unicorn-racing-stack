@@ -35,6 +35,7 @@ class StateMachineParams:
         "ftg_timer_sec",
         "gb_ego_width_m",
         "recovery_exit_d_m",
+        "recovery_entry_d_m",
         "gb_horizon_m",
         "interest_horizon_m",
         "overtaking_horizon_m",
@@ -126,6 +127,22 @@ class StateMachineParams:
             ),
         )
         self.recovery_exit_d_m: float = node.get_parameter("recovery_exit_d_m").value
+
+        self._declare(
+            "recovery_entry_d_m", 0.4,
+            ParameterDescriptor(
+                description=(
+                    "|d| at or above which the car counts as having lost the raceline, i.e. the "
+                    "RECOVERY ENTRY threshold (_check_line_lost). Upper half of the hysteresis "
+                    "band and must stay above recovery_exit_d_m. Entry used to be driven by the "
+                    "per-state close_to_raceline flag instead, which made the bar tighter while "
+                    "TRAILING than while GB_TRACKing and latched the car onto the recovery "
+                    "spline whenever it trailed an opponent [m]"
+                ),
+                type=ParameterType.PARAMETER_DOUBLE,
+            ),
+        )
+        self.recovery_entry_d_m: float = node.get_parameter("recovery_entry_d_m").value
 
         self._declare(
             "gb_horizon_m", 15.0,

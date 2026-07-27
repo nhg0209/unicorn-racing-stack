@@ -183,6 +183,7 @@ class StateMachine(Node):
         # dynamic-parameter-backed attributes (aliases onto params)
         self.gb_ego_width_m = self.params.gb_ego_width_m
         self.recovery_exit_d_m = self.params.recovery_exit_d_m
+        self.recovery_entry_d_m = self.params.recovery_entry_d_m
         self.lateral_width_gb_m = self.params.lateral_width_gb_m
         self.lateral_width_static_gb_m = self.params.lateral_width_static_gb_m
         self.gb_horizon_m = self.params.gb_horizon_m
@@ -756,6 +757,22 @@ class StateMachine(Node):
             return np.abs(self.cur_d) < self.gb_ego_width_m
         else:
             return np.abs(self.cur_d) < threshold_m
+
+    def _check_line_lost(self) -> bool:
+        """RECOVERY ENTRY gate: are we far enough off the raceline that the recovery spline is
+        worth following?
+
+        Deliberately NOT the `close_to_raceline` flag the transitions pass around. That flag is
+        the EXIT hysteresis (recovery_exit_d_m, plus a 20 deg heading term) and it is computed
+        differently per state: GlobalTrackingTransition uses gb_ego_width_m (0.4 m, lateral only)
+        while Trailing/Overtaking/Recovery/Start/FTGOnly use the much tighter recovery_exit_d_m.
+        Driving RECOVERY entry off it therefore made the bar state-dependent -- at |d| = 0.3 m the
+        car happily stays GB_TRACK, but the moment an obstacle put it in TRAILING the very same
+        offset read as 'off the line' and dropped it into RECOVERY. It then followed the recovery
+        spline, which is anchored at the car and so preserved the offset, keeping |d| large and
+        the state latched. That is why the symptom only ever showed up while trailing.
+        """
+        return bool(np.abs(self.cur_d) >= self.recovery_entry_d_m)
 
     def _check_close_to_raceline_heading(self, threshold_deg=20) -> bool:
         # True when the ego heading is aligned with the closest raceline waypoint within
