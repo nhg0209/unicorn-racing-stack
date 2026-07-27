@@ -131,7 +131,6 @@ def NonObstacleTransition(state_machine: "StateMachine", close_to_raceline) -> T
 
 
 def ObstacleTransition(state_machine: "StateMachine", close_to_raceline) -> Tuple[StateType, StateType]:
-    recovery_availability = False
     if close_to_raceline and state_machine._check_free_frenet(state_machine.cur_gb_wpnts):
         return StateType.GB_TRACK, StateType.GB_TRACK
 
@@ -144,12 +143,11 @@ def ObstacleTransition(state_machine: "StateMachine", close_to_raceline) -> Tupl
 
     if state_machine._check_overtaking_mode() or state_machine._check_static_overtaking_mode():
         return StateType.OVERTAKE, StateType.OVERTAKE
-    else:
-        if close_to_raceline:
-            return StateType.TRAILING, StateType.GB_TRACK
-        elif recovery_availability:
-            return StateType.TRAILING, StateType.RECOVERY
-        elif state_machine._check_free_frenet(state_machine.cur_gb_wpnts):
-            return StateType.TRAILING, StateType.GB_TRACK
-        else:
-            return StateType.TRAILING, StateType.GB_TRACK
+
+    # TRAILING always follows the global raceline. The recovery spline is for rejoining the line
+    # when we are off it AND the path is free (the RECOVERY return above) — it is not a trailing
+    # reference. The old `elif recovery_availability -> TRAILING, RECOVERY` branch was the common
+    # case, not the exception: the callers gate close_to_raceline at 0.05 m, which normal tracking
+    # error exceeds, so trailing latched onto the recovery line and followed it away from the
+    # raceline, which kept cur_d large and the branch self-sustaining.
+    return StateType.TRAILING, StateType.GB_TRACK
