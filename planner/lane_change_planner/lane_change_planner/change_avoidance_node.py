@@ -90,7 +90,7 @@ class ChangeAvoidanceNode(Node):
         self.center_wpnts_msg = WpntArray()
         self.center_wpnts_received = False
         self.center_s = None            # centerline sampled in the raceline frenet frame
-        self.center_d = None            # (any lane = center_d(s) + lane_sign * offset)
+        self.center_d = None            # centerline d(s); corridor reference for the lane
         self.global_waypoints = None
         self.gb_max_idx = None
         self.gb_max_s = None
@@ -117,8 +117,14 @@ class ChangeAvoidanceNode(Node):
         self.phase = PHASE_IDLE
         self.side = None                # latched at OPEN: 'left' | 'right'
         self.lane_sign = 0              # +1 = left of the centerline, -1 = right
-        self.lane_offset_cur = 0.0      # current lane offset from the centerline [m]
-        self.engaged_offset = 0.0       # offset chosen at engagement (floor for the ratchet)
+        # The lane is an s-varying profile, not a scalar offset: one constant offset had to
+        # clear the walls AND the opponent at every sample of the window, so the narrowest
+        # point vetoed the whole maneuver even when the opponent was nowhere near it.
+        self.meet_s = None              # latched s where the pass happens
+        self.lane_s = None              # unwrapped s grid of the solved lane profile
+        self.lane_d = None              # lateral profile d(s) [m], raceline frenet frame
+        self.lane_offset_cur = 0.0      # peak |d| of the current profile [m] (reporting only)
+        self.engaged_offset = 0.0       # peak |d| at engagement
         self.target = None              # dict: id/s/d/vs/size/last_seen
         self.pass_cnt = 0
         self.close_s = None             # wrapped s where the return ramp starts
@@ -149,9 +155,10 @@ class ChangeAvoidanceNode(Node):
         self.debug_plot = self.get_parameter('debug_plot').get_parameter_value().bool_value
 
         # --- tunable params (defaults; overridable via yaml / live reconfigure) ---
-        self.lane_offset_m = 0.35       # MINIMUM lane offset from the centerline; the actual
-                                        # offset is sized (and live-grown) from the opponent's
-                                        # lateral position so the SM clearance always holds
+        # DISPLAY ONLY since the lane became an s-varying profile: the pass offset is set by
+        # the opponent clearance and the walls at each s, never by a constant floor. Kept
+        # because the RViz reference lanes are useful when eyeballing a new map.
+        self.lane_offset_m = 0.35       # reference lanes drawn in RViz [m]
         self.obs_traj_tresh = 1.0       # engage: max |obs d - ego d|
         self.spline_bound_mindist = 0.25
         self.engage_gap_m = 5.0         # stay silent (TRAILING closes in at speed) until the
@@ -173,6 +180,27 @@ class ChangeAvoidanceNode(Node):
                                         # (must exceed SM gb_ego_width/2 + lateral_width_m = 0.4)
         self.target_lost_s = 1.0
         self.reengage_block_s = 1.0
+        # Lane profile solver. The opponent clearance is only required where the pass actually
+        # overlaps them; everywhere else the lane just has to fit between the walls, which the
+        # car alone always does (corridor needs 2*wall_need = 0.54 m, ifac's narrowest is 0.87).
+        self.pass_overlap_m = 0.55      # +-s where clearance is enforced = one car length
+        self.lane_max_slope = 0.35      # preferred max |dd/ds| of the lane (19 deg heading)
+        self.lane_max_slope_close = 0.55  # only if nothing fits at the preferred one (29 deg)
+        self.lane_solve_ds = 0.25       # profile solve grid [m]
+        self.pass_lead_max_s = 5.0      # cap on the predicted time-to-meet [s]
+        self.pass_hold_max_m = 12.0     # cap on how far the pass offset is held [m]
+        self.veh_length_m = 0.55        # must match veh_params.length in the SM's ttc/tt0
+        self.meet_s_slew_m = 0.15       # how fast the latched meeting point may move [m/cycle]
+        self.pass_behind_m = 5.0        # a meeting point within this far BEHIND counts as passed
+        # Keep the profile this far inside the corridor to absorb the CCMA smoothing in
+        # _publish_path. Measured on real solved profiles through ifac's curvature: the lateral
+        # displacement is ~16 mm (median of the per-path 99th pct), and the smoothing does NOT
+        # cut the bulge (peak excursion grows by 4-5 mm), so the opponent clearance is not the
+        # side at risk. 10 mm off a 120 mm spline_bound_mindist is a 13% bite; the real wall
+        # guard is the post-smoothing map check in _publish_path. A 20 mm pad cost 6.8 points
+        # of lap feasibility for no measured benefit.
+        self.lane_smooth_pad_m = 0.01
+        self._lane_dbg = ""
         self.kernel_size = 3            # GridFilter erosion (7 ate ~0.35 m and killed the lanes)
 
         # --- opponent prediction (P1 temporal, P2 spatial) ---
@@ -228,8 +256,15 @@ class ChangeAvoidanceNode(Node):
             self.declare_parameter(name, default, ParameterDescriptor(
                 type=ParameterType.PARAMETER_DOUBLE, description=desc,
                 floating_point_range=[FloatingPointRange(from_value=float(lo), to_value=float(hi), step=0.001)]))
+            # declare_parameter only seeds the parameter server: a yaml/CLI override lands there
+            # but NOT on the attribute the loop reads. Without this read-back every dbl param
+            # silently ran on its in-code default -- spline_bound_mindist 0.25 instead of the
+            # yaml's 0.12 -- so _choose_lane demanded 0.13 m more room off each wall than
+            # configured and rejected every lane on the whole lap.
+            setattr(self, name, self.get_parameter(name).value)
 
-        dbl('lane_offset_m', self.lane_offset_m, 0.15, 0.8, "minimum lane offset from centerline")
+        dbl('lane_offset_m', self.lane_offset_m, 0.15, 0.8,
+            "RViz reference lanes only -- does not affect the planned path")
         dbl('obs_traj_tresh', self.obs_traj_tresh, 0.1, 2.0, "engage: max |obs d - ego d|")
         dbl('spline_bound_mindist', self.spline_bound_mindist, 0.05, 1.0, "min distance to track bounds")
         dbl('engage_gap_m', self.engage_gap_m, 2.0, 15.0, "trail until the target gap is below this")
@@ -245,6 +280,15 @@ class ChangeAvoidanceNode(Node):
         dbl('pass_gap_m', self.pass_gap_m, 0.3, 5.0, "lead needed to trigger the return")
         dbl('pass_hyst_s', self.pass_hyst_s, 0.0, 2.0, "pass condition dwell time")
         dbl('sep_margin_m', self.sep_margin_m, 0.2, 1.5, "clearance beyond obstacle half-size")
+        dbl('pass_overlap_m', self.pass_overlap_m, 0.2, 4.0,
+            "+-s around the opponent where lateral clearance is enforced")
+        dbl('lane_max_slope', self.lane_max_slope, 0.05, 1.0, "preferred max |dd/ds| of the lane")
+        dbl('lane_max_slope_close', self.lane_max_slope_close, 0.05, 1.0,
+            "max |dd/ds| used only when nothing fits at the preferred one")
+        dbl('pass_lead_max_s', self.pass_lead_max_s, 0.5, 15.0, "cap on the time-to-meet [s]")
+        dbl('pass_hold_max_m', self.pass_hold_max_m, 1.0, 25.0, "cap on the offset hold length [m]")
+        dbl('meet_s_slew_m', self.meet_s_slew_m, 0.01, 2.0, "how fast the aim point may move [m]")
+        dbl('pass_behind_m', self.pass_behind_m, 1.0, 15.0, "meeting point this far behind = passed")
         dbl('target_lost_s', self.target_lost_s, 0.2, 5.0, "coast time before target is dropped")
         dbl('reengage_block_s', self.reengage_block_s, 0.0, 5.0, "idle time after finishing")
 
@@ -254,13 +298,18 @@ class ChangeAvoidanceNode(Node):
         dbl('engage_min_closing_mps', self.engage_min_closing_mps, -3.0, 3.0, "min closing speed to engage")
         self.declare_parameter('use_prediction', self.use_prediction, ParameterDescriptor(
             type=ParameterType.PARAMETER_BOOL, description="enable prediction-aware engage/offset/clearance"))
-        # Read yaml/CLI overrides back into attributes. The dbl-declared params are otherwise
-        # only picked up by dyn_param_cb on a live `ros2 param set`; read them here so a
-        # differing yaml value also applies at startup.
-        self.kd_obs_pred = self.get_parameter('kd_obs_pred').value
-        self.pred_lead_scale = self.get_parameter('pred_lead_scale').value
-        self.engage_min_closing_mps = self.get_parameter('engage_min_closing_mps').value
+        # dbl() reads its own params back; use_prediction is declared separately, so it needs
+        # the same treatment here.
         self.use_prediction = self.get_parameter('use_prediction').value
+        # Print what actually took effect: a yaml key that never reaches an attribute is
+        # otherwise invisible until the geometry silently rejects every lane.
+        self.get_logger().info(
+            f"[LaneChange] params in effect: sep_margin={self.sep_margin_m:.2f} "
+            f"bound_mindist={self.spline_bound_mindist:.2f} "
+            f"engage_gap={self.engage_gap_m:.1f} obs_traj_tresh={self.obs_traj_tresh:.2f} "
+            f"pass_overlap=+-{self.pass_overlap_m:.2f} "
+            f"lane_slope={self.lane_max_slope:.2f}/{self.lane_max_slope_close:.2f} "
+            f"use_prediction={self.use_prediction}")
 
     def dyn_param_cb(self, params: List[Parameter]):
         for param in params:
@@ -270,6 +319,9 @@ class ChangeAvoidanceNode(Node):
                     'open_ramp_min_m', 'open_ramp_time_s', 'blend_min_m',
                     'close_ramp_min_m', 'close_ramp_time_s', 'close_arm_m', 'tail_m',
                     'hold_horizon_m', 'pass_gap_m', 'pass_hyst_s', 'sep_margin_m',
+                    'pass_overlap_m', 'lane_max_slope', 'lane_max_slope_close',
+                    'pass_lead_max_s', 'meet_s_slew_m',
+                    'pass_behind_m', 'pass_hold_max_m',
                     'target_lost_s', 'reengage_block_s',
                     'kd_obs_pred', 'pred_lead_scale', 'engage_min_closing_mps',
                     'use_prediction'):
@@ -397,7 +449,8 @@ class ChangeAvoidanceNode(Node):
         self._publish_lane_markers()
 
     def _publish_lane_markers(self):
-        """Draw the two MINIMUM-offset lanes (the live offset may sit further out)."""
+        """Draw two fixed reference lanes for eyeballing a map in RViz. The planned path is an
+        s-varying profile solved per cycle and is NOT one of these lanes."""
         if self.center_s is None:
             return
         mrks = MarkerArray()
@@ -499,91 +552,279 @@ class ChangeAvoidanceNode(Node):
             return np.interp(s_query, os_ext, od_ext)
         return np.full_like(s_query, self.target['d'])
 
-    def _choose_lane(self) -> bool:
-        """Latch the overtaking side AND size the lane offset from the opponent's expected
-        occupancy: offset >= what keeps the SM free-check clearance (sep_margin beyond the
-        obstacle half-size) over the pass window, floored at lane_offset_m, capped by the
-        walls. Returns False when neither side fits."""
-        if self.scaled_max_s is None or self.target is None:
-            return False
-        v = max(self.current_vs or 0.0, 1.0)
-        window = max(8.0, 2.0 * v)     # s-range the pass will roughly occupy
-        s_lin = self.current_s + np.arange(0.0, window, 0.5)
-        opp_d = self._opp_d_band(s_lin)
-        c = self._center_d(s_lin)
-        need = self.target['size'] / 2.0 + self.sep_margin_m
+    def _lane_horizon(self) -> float:
+        """Solve the lane over exactly what gets published, so the geometry that passes the
+        feasibility test is the geometry the SM then evaluates. The old code checked a short
+        window and then published hold_horizon_m of the same constant offset, hard-clipped to
+        the corridor -- the clip fired at essentially every engage point, so what went out was
+        routinely not what had been validated."""
+        return min(self.hold_horizon_m, self.scaled_max_s * 0.9)
 
+    def _pass_speed(self) -> float:
+        """Speed the ego will run once the pass is committed.
+
+        NOT current_vs: while TRAILING the controller holds station behind the opponent, so
+        current_vs measures the state we are trying to leave. Closing reads ~0, the meeting
+        point collapses onto the opponent's current s, and the solver is asked to complete the
+        lane change in the length of the trailing gap -- which needs ~0.5 dd/ds (about 1 g at
+        race pace) and is correctly refused, so the car trails forever. The SM velocity-replans
+        every avoidance path from its curvature (see _publish_path), so on commit the ego runs
+        the local raceline pace."""
+        floor = max(self.current_vs or 0.0, 1.0)
+        if self.scaled_wpnts_msg is None or not self.scaled_max_s:
+            return floor
+        # Averaged over the next few metres, not sampled at one point: the raceline pace swings
+        # along the track and this value ends up in the denominator of gap/closing, where a
+        # small wobble moves the meeting point by metres.
+        span = max(int(5.0 / self.scaled_delta_s), 1)
+        i0 = int((self.current_s % self.scaled_max_s) / self.scaled_delta_s)
+        idxs = (np.arange(i0, i0 + span) % self.scaled_max_idx)
+        v = float(np.mean([self.scaled_wpnts_msg.wpnts[k].vx_mps for k in idxs]))
+        return max(v, floor)
+
+    def _update_meet_s(self):
+        """Latch the meeting point and let it drift, instead of re-aiming every 50 ms.
+
+        gap/closing is hypersensitive when the closing speed is small (0.4-0.8 m/s here): the
+        raw estimate swung 4 m cycle to cycle, the clearance band chased it, and the re-solve
+        failed on ~70% of the cycles of an approach. A pass is a commitment to a PLACE."""
+        raw = self._meet_s_raw()
+        if self.meet_s is None:
+            self.meet_s = raw
+        else:
+            step = float(np.clip(self._sdiff(raw, self.meet_s),
+                                 -self.meet_s_slew_m, self.meet_s_slew_m))
+            self.meet_s = (self.meet_s + step) % self.scaled_max_s
+
+    def _meet_s(self) -> float:
+        return self.meet_s if self.meet_s is not None else self._meet_s_raw()
+
+    def _solve_gentlest(self, s_lin, side_sign, d_prev=None, relax=0.0):
+        """Solve at the preferred slope, escalating only if nothing fits.
+
+        The cap is not a dynamics limit -- the SM re-plans the avoidance path's velocity from
+        its curvature, so a steeper lane costs pass SPEED, not grip. But it is not free either:
+        the solver keeps the lane on the raceline as long as the rate lets it, so raising the
+        cap globally makes every pass move later and sharper. Trying the gentle cap first keeps
+        the passes that already worked identical, and spends the steep one only where the
+        alternative is not passing at all -- a close trailing gap, where 0.35 refused every
+        pass on the lap from 1.8 m.
+        """
+        for slope in (self.lane_max_slope, self.lane_max_slope_close):
+            p = self._solve_profile(s_lin, side_sign, d_prev=d_prev, relax=relax, slope=slope)
+            if p is not None:
+                return p
+            if slope >= self.lane_max_slope_close:
+                break
+        return None
+
+    def _pass_hold_m(self) -> float:
+        """How far PAST the meeting point the lane must stay out.
+
+        Minimum excursion pulled the lane back to the raceline one car length past the meeting
+        point. Drawing level is not passing: at ~1 m/s of closing the ego needs another second
+        or more to get pass_gap_m clear, and it covers several metres of track doing it. A lane
+        that has already merged back by then steers into the opponent, and the SM free-check
+        reads the merged part as blocked -- which is what made the car flap between TRAILING
+        and OVERTAKE. Hold the offset until the pass is done; CLOSE owns the return."""
+        if self.target is None:
+            return self.pass_overlap_m
+        v = self._pass_speed()
+        closing = v - self.target['vs']
+        lead_needed = self.pass_gap_m + self.pass_overlap_m
+        hold = (self.pass_hold_max_m if closing <= 0.2
+                else self.pass_overlap_m + v * lead_needed / closing)
+        # The SM times its "alongside" window with clip_vs = max(cur_vs - obs.vs, 0.5) -- the
+        # TRAILING closing speed, floored -- so it looks FURTHER down the track than we do
+        # (gap 2.1 m: it checks 6.8-8.9 m ahead where we planned 3.3-7.6). The lane has to be
+        # out where the checker looks or it reads blocked and drops OVERTAKE, so extend the
+        # hold to cover it rather than argue with it.
+        clip_vs = max((self.current_vs or 0.0) - self.target['vs'], 0.5)
+        gap = self._sdiff(self.target['s'], self.current_s)
+        sm_end = gap + self.target['vs'] * (gap + 0.3 * self.veh_length_m) / clip_vs
+        meet_fwd = (self._meet_s() - self.current_s) % self.scaled_max_s
+        hold = max(hold, sm_end - meet_fwd)
+        return float(np.clip(hold, self.pass_overlap_m, self.pass_hold_max_m))
+
+    def _meet_s_raw(self) -> float:
+        """s where the ego and the opponent will actually be side by side.
+
+        Deliberately NOT _predict_ahead: that damps its lead time by pred_lead_scale (0.5,
+        tuned for the LATERAL relaxation), which puts the meeting point systematically short
+        AND makes it drift forward during the approach. The clearance band then sweeps across
+        metres of track and the re-solve fails the moment it crosses a narrow section. With
+        constant speeds gap/closing is exact and the meeting point does not move at all."""
+        L = self.scaled_max_s
+        s_o = self.target['s']
+        gap = (s_o - self.current_s + L / 2.0) % L - L / 2.0
+        closing = self._pass_speed() - self.target['vs']
+        if gap <= 0.0 or closing <= 0.2:
+            return s_o          # alongside already, or not closing: they are where they are
+        # The ego covers gap * (1 + v_opp/closing) of its OWN track before they draw level --
+        # that, not the gap, is the run-up available for the lane change.
+        return (s_o + self.target['vs'] * min(gap / closing, self.pass_lead_max_s)) % L
+
+    def _lane_bounds(self, s_lin: np.ndarray, side_sign: int):
+        """Per-sample lateral corridor [lo, hi] for one side.
+
+        Walls apply everywhere. The opponent clearance applies over one band: from their
+        CURRENT s (what the SM free-check reads each cycle) through _pass_hold_m past the
+        meeting point (where the pass finishes). Outside it the lane is free to sit on the
+        raceline, which is what keeps a narrow section elsewhere from vetoing the maneuver."""
         wp = self.scaled_wpnts_msg.wpnts
         idxs = ((s_lin % self.scaled_max_s) / self.scaled_delta_s).astype(int) % self.scaled_max_idx
         d_left = np.array([wp[j].d_left for j in idxs])
         d_right = np.array([wp[j].d_right for j in idxs])
-        wall_need = self.width_car / 2.0 + self.spline_bound_mindist
+        wall_need = self.width_car / 2.0 + self.spline_bound_mindist + self.lane_smooth_pad_m
+        lo = -(d_right - wall_need)
+        hi = d_left - wall_need
+        if self.target is not None:
+            need = self.target['size'] / 2.0 + self.sep_margin_m
+            opp_d = (self._opp_d_band(s_lin) if self.use_prediction
+                     else np.full(len(s_lin), self.target['d']))
+            # worse of measured / predicted, exactly as the scalar sizing did before
+            opp_d = (np.maximum(opp_d, self.target['d']) if side_sign > 0
+                     else np.minimum(opp_d, self.target['d']))
+            # Enforce the clearance where the cars will actually be SIDE BY SIDE. Pinning the
+            # band to the opponent's current s constrains a place the two are never at
+            # together -- while the ego closes the last metres the opponent has moved on.
+            #
+            # As a FORWARD DISTANCE, never a signed s-difference: the lap is 36.7 m, so a
+            # meeting point 25 m ahead wraps to "11.7 m behind" and the exemption below would
+            # fire, applying no opponent constraint at all and calling an empty lane feasible.
+            L = self.scaled_max_s
+            reach = float(s_lin[-1] - s_lin[0])
+            fwd = (self._meet_s() - s_lin[0]) % L
+            if fwd > L - self.pass_behind_m:
+                # meeting point already behind the car: we are alongside or just ahead, which is
+                # exactly when the offset must NOT be given up. Anchor the hold at the car.
+                fwd = 0.0
+            elif fwd > reach + self.pass_overlap_m + self.lane_solve_ds:
+                return lo, hi, False     # past the solved horizon: nothing would be checked
+            # The band runs from just before the meeting point through _pass_hold_m past it --
+            # long enough to cover the window the SM free-check reads (see _pass_hold_m). One
+            # solve-grid step of slack on each edge, because the constraint is applied at 0.25 m
+            # samples while the path is published and read at 0.1 m.
+            fs = s_lin - s_lin[0]
+            start = fwd - self.pass_overlap_m - self.lane_solve_ds
+            end = fwd + self._pass_hold_m() + self.lane_solve_ds
+            band = (fs >= start) & (fs <= end)
+            if not band.any():
+                return lo, hi, False
+            if side_sign > 0:
+                lo = np.where(band, np.maximum(lo, opp_d + need), lo)
+            else:
+                hi = np.where(band, np.minimum(hi, opp_d - need), hi)
+        return lo, hi, True
 
-        cands = {}
-        off_req = max(float(np.max(need + opp_d - c)), self.lane_offset_m)
-        off_max = float(np.min(d_left - wall_need - c))
-        if off_req <= off_max:
-            cands['left'] = (off_max - off_req, +1, off_req)
-        off_req = max(float(np.max(need - opp_d + c)), self.lane_offset_m)
-        off_max = float(np.min(c + d_right - wall_need))
-        if off_req <= off_max:
-            cands['right'] = (off_max - off_req, -1, off_req)
-        if not cands:
+    def _solve_profile(self, s_lin, side_sign, d_prev=None, relax=0.0, slope=None):
+        """Rate-limited minimum-excursion lateral profile inside the corridor, or None.
+
+        Reachable-interval propagation: the forward pass keeps what the car can still get to,
+        the backward pass keeps what can also satisfy everything downstream. An empty interval
+        anywhere means the pass is genuinely impossible -- a narrow spot away from the opponent
+        no longer counts against it, which is the whole point of going s-varying.
+
+        The profile is ANCHORED at the car's current d. Without that the solver is free to
+        start the lane already 0.6 m off the raceline and calls a pass feasible that the car
+        physically cannot reach: _build_path then blends onto it from the real car state, the
+        blend is still short of the lane where the opponent is, and _check_lane_clear_vs_target
+        aborts one cycle after engaging."""
+        lo, hi, band_ok = self._lane_bounds(s_lin, side_sign)
+        if not band_ok or np.any(lo > hi):
+            return None
+        n = len(s_lin)
+        rate = (self.lane_max_slope if slope is None else slope) * float(s_lin[1] - s_lin[0])
+        flo, fhi = lo.copy(), hi.copy()
+        if self.current_d is not None:
+            flo[0] = fhi[0] = float(np.clip(self.current_d, lo[0], hi[0]))
+        for i in range(1, n):
+            flo[i] = max(flo[i], flo[i - 1] - rate)
+            fhi[i] = min(fhi[i], fhi[i - 1] + rate)
+            if flo[i] > fhi[i]:
+                return None
+        for i in range(n - 2, -1, -1):
+            flo[i] = max(flo[i], flo[i + 1] - rate)
+            fhi[i] = min(fhi[i], fhi[i + 1] + rate)
+            if flo[i] > fhi[i]:
+                return None
+        # preference: hold the previous cycle's lane (continuity for the controller), relaxed
+        # toward the raceline by `relax` so the car comes back once the room returns
+        want = np.zeros(n) if d_prev is None else d_prev - np.clip(d_prev, -relax, relax)
+        d = np.empty(n)
+        d[0] = float(np.clip(want[0], flo[0], fhi[0]))
+        for i in range(1, n):
+            d[i] = float(np.clip(np.clip(want[i], flo[i], fhi[i]),
+                                 d[i - 1] - rate, d[i - 1] + rate))
+        return d
+
+    def _lane_profile_at(self, s_query):
+        """Lane lateral position at (unwrapped) s. Before the first solve this falls back to
+        the centerline-parallel lane so nothing can dereference a missing profile."""
+        if self.lane_s is None or self.lane_d is None:
+            return self._center_d(s_query) + self.lane_sign * self.lane_offset_cur
+        return np.interp(s_query, self.lane_s, self.lane_d)
+
+    def _choose_lane(self) -> bool:
+        """Latch the overtaking side and solve the lateral profile over the whole published
+        horizon. Returns False when neither side admits a drivable profile."""
+        if self.scaled_max_s is None or self.target is None:
             return False
-        # slight stickiness to the previously used side to damp flip-flop between engagements
-        if self.side in cands:
-            head, sign, off = cands[self.side]
-            cands[self.side] = (head + 0.05, sign, off)
-        side = max(cands, key=lambda k: cands[k][0])
-        _, self.lane_sign, off = cands[side]
-        self.side = side
-        self.engaged_offset = off
-        self.lane_offset_cur = off
+        self.meet_s = None            # fresh engagement: do not inherit an old aim point
+        self._update_meet_s()
+        s_lin = self.current_s + np.arange(0.0, self._lane_horizon(), self.lane_solve_ds)
+        cands, dbg = {}, []
+        for name, sign in (('left', +1), ('right', -1)):
+            prof = self._solve_gentlest(s_lin, sign)
+            if prof is not None:
+                cands[name] = (float(np.max(np.abs(prof))), sign, prof)
+                continue
+            lo, hi, band_ok = self._lane_bounds(s_lin, sign)
+            if not band_ok:
+                dbg.append(f"{name[0].upper()}:meeting point past the {self._lane_horizon():.0f} m horizon")
+                continue
+            short = float(np.max(lo - hi))
+            dbg.append(f"{name[0].upper()}:" +
+                       (f"corridor short {short:.2f}m" if short > 0.0 else "unreachable at "
+                        f"|dd/ds|<={self.lane_max_slope_close:.2f}"))
+        if not cands:
+            self._lane_dbg = (f"horizon={self._lane_horizon():.0f}m "
+                              f"need={self.target['size'] / 2.0 + self.sep_margin_m:.2f} "
+                              f"overlap=+-{self.pass_overlap_m:.2f} " + " ".join(dbg))
+            return False
+        self._lane_dbg = ""
+        # least lateral excursion wins; slight stickiness to the previous side damps flip-flop
+        side = max(cands, key=lambda k: -cands[k][0] + (0.05 if k == self.side else 0.0))
+        peak, sign, prof = cands[side]
+        self.side, self.lane_sign = side, sign
+        self.lane_s, self.lane_d = s_lin, prof
+        self.lane_offset_cur = self.engaged_offset = peak
         return True
 
     def _update_offset(self, dt: float):
-        """Live-adjust the lane offset while approaching/beside the target: grow (slew-limited)
-        if the opponent drifts toward our lane so the SM free-check keeps passing, shrink back
-        toward the engaged offset when room returns; always wall-capped. Frozen once the
-        target has been passed (CLOSE keeps a stable lane to ramp off from)."""
+        """Re-solve the lane against the opponent's latest position. Continuity comes from
+        preferring the previous cycle's profile; it relaxes back toward the raceline at
+        offset_slew_mps once the room returns. Not re-solved once the target has been passed,
+        so CLOSE has stable geometry to ramp off from."""
         if self.target is None or self.lane_sign == 0:
             return
-        rel = self._sdiff(self.target['s'], self.current_s)
-        if rel < -self.pass_gap_m:
+        if self._sdiff(self.target['s'], self.current_s) < -self.pass_gap_m:
             return
-        need = self.target['size'] / 2.0 + self.sep_margin_m
-        c_t = float(self._center_d(np.array([self.current_s + max(rel, 0.0)]))[0])
-        # P2: size the offset to clear the opponent's WORSE lateral case -- its measured
-        # position OR its GP line at this s (a corner can curve the GP line into our lane
-        # before the opponent visibly drifts). max/min so we never react LESS than the
-        # measured-d logic did; _opp_d_band falls back to the measured d until the GP line
-        # is trustworthy (>= 1 opponent lap).
-        opp_d_meas = self.target['d']
-        opp_d_pred = (float(self._opp_d_band(np.array([self.target['s']]))[0])
-                      if self.use_prediction else opp_d_meas)
-        if self.lane_sign > 0:
-            off_need = need + max(opp_d_meas, opp_d_pred) - c_t
-        else:
-            off_need = need - min(opp_d_meas, opp_d_pred) + c_t
-
-        s_lin = self.current_s + np.arange(0.0, 8.0, 0.5)
-        c = self._center_d(s_lin)
-        wp = self.scaled_wpnts_msg.wpnts
-        idxs = ((s_lin % self.scaled_max_s) / self.scaled_delta_s).astype(int) % self.scaled_max_idx
-        wall_need = self.width_car / 2.0 + self.spline_bound_mindist
-        if self.lane_sign > 0:
-            off_max = float(np.min(np.array([wp[j].d_left for j in idxs]) - wall_need - c))
-        else:
-            off_max = float(np.min(c + np.array([wp[j].d_right for j in idxs]) - wall_need))
-
-        tgt = float(np.clip(max(self.engaged_offset, off_need, self.lane_offset_m),
-                            0.0, max(off_max, 0.0)))
-        step = self.offset_slew_mps * dt
-        self.lane_offset_cur += float(np.clip(tgt - self.lane_offset_cur, -step, step))
+        self._update_meet_s()
+        s_lin = self.current_s + np.arange(0.0, self._lane_horizon(), self.lane_solve_ds)
+        prev = self._lane_profile_at(s_lin) if self.lane_s is not None else None
+        prof = self._solve_gentlest(s_lin, self.lane_sign, d_prev=prev,
+                                    relax=self.offset_slew_mps * dt)
+        if prof is None:
+            # keep the last good lane: the phase steps own the abort decision, and dropping the
+            # geometry here would make _build_path jump laterally mid-maneuver
+            return
+        self.lane_s, self.lane_d = s_lin, prof
+        self.lane_offset_cur = float(np.max(np.abs(prof)))
 
     #################### PATH BUILD + PUBLISH ####################
     def _lane_at(self, s: float) -> float:
-        return float(self._center_d(np.array([s]))[0]) + self.lane_sign * self.lane_offset_cur
+        return float(self._lane_profile_at(np.array([float(s)]))[0])
 
     def _lane_slope(self, s: float) -> float:
         return (self._lane_at(s + 0.3) - self._lane_at(s - 0.3)) / 0.6
@@ -604,7 +845,7 @@ class ChangeAvoidanceNode(Node):
 
         n = max(int(horizon / 0.1), 20)
         s_lin = s0 + np.arange(n) * 0.1
-        d_arr = self._center_d(s_lin) + self.lane_sign * self.lane_offset_cur
+        d_arr = self._lane_profile_at(s_lin)
 
         # --- entry blend from the actual car state ---
         e_psi = float(self.converter.get_e_psi(self.current_x, self.current_y, self.current_yaw))
@@ -612,13 +853,15 @@ class ChangeAvoidanceNode(Node):
         d_gap = abs((self.current_d or 0.0) - float(d_arr[0]))
         open_len = max(self.open_ramp_min_m, self.open_ramp_time_s * v)
         blend_len = float(np.clip(d_gap * 8.0, self.blend_min_m, open_len))
-        # engaging close behind the target: finish the lane change BEFORE reaching it, else the
-        # SM free-check sees the still-blending (near-raceline) part at the target's s -> not
-        # free -> the commit flaps and the car crawls behind the opponent
+        # The blend must finish BEFORE the stretch where the cars are side by side, else it
+        # overwrites the exact piece of lane the solver sized for the clearance and the
+        # maneuver is aborted by its own monitor one cycle after OPEN. Anchoring the profile
+        # at the car already makes d_arr[0] == current_d, so the blend only has to absorb the
+        # heading error and can be short.
         if self.phase == PHASE_OPEN and self.target is not None:
-            gap_t = -self._sdiff(self.current_s, self.target['s'])
-            if gap_t > 0.0:
-                blend_len = min(blend_len, max(1.0, 0.85 * gap_t))
+            band_start = ((self._meet_s() - s0) % L) - self.pass_overlap_m
+            if band_start > 0.0:
+                blend_len = min(blend_len, max(0.5, band_start))
 
         ce = None
         direct_close = closing and cs_u is not None and (cs_u - s0) < blend_len + 0.5
@@ -666,11 +909,13 @@ class ChangeAvoidanceNode(Node):
         if samples.shape[0] < 3 or not np.all(np.isfinite(samples)):
             return False
 
-        for i in range(samples.shape[0]):
-            if not self.map_filter.is_point_inside(samples[i, 0], samples[i, 1]):
-                return False
-
         smoothed_xy = self.ccma.filter(samples)
+        # Check what actually gets published, not the pre-smoothing samples: CCMA moves the
+        # path laterally (~16 mm typical) and it is the smoothed geometry the SM and the
+        # controller consume.
+        for i in range(smoothed_xy.shape[0]):
+            if not self.map_filter.is_point_inside(smoothed_xy[i, 0], smoothed_xy[i, 1]):
+                return False
         smoothed_sd = self.converter.get_frenet(smoothed_xy[:, 0], smoothed_xy[:, 1])
         evasion_x = np.asarray(smoothed_xy[:, 0])
         evasion_y = np.asarray(smoothed_xy[:, 1])
@@ -728,9 +973,11 @@ class ChangeAvoidanceNode(Node):
             rel = self._sdiff(o.s_center, self.current_s)
             if not (-0.5 < rel < 12.0):
                 continue
-            if (self.target is not None and o.id == self.target['id']
-                    and rel < self.width_car * 2 + 0.4):
-                continue   # beside / almost beside the latched target: no bail-out
+            if self.target is not None and o.id == self.target['id']:
+                # The latched target is _check_lane_clear_vs_target's job, and only that one
+                # asks the question in the meeting-point frame. Testing it here at its current
+                # s would re-introduce the abort this monitor is not meant to own.
+                continue
             i = int(np.clip(rel / 0.1, 0, len(path['d_arr']) - 1))
             sep = abs(float(path['d_arr'][i]) - o.d_center) - max(o.size, 0.25) / 2.0
             if sep < self.sep_margin_m * 0.8:   # small hysteresis vs the side-selection margin
@@ -761,6 +1008,9 @@ class ChangeAvoidanceNode(Node):
         self.get_logger().info(f"[LaneChange] {self.phase} -> IDLE ({why})")
         self.phase = PHASE_IDLE
         self.target = None
+        self.meet_s = None
+        self.lane_s = None
+        self.lane_d = None
         self.close_s = None
         self.close_frozen = False
         self.pass_cnt = 0
@@ -797,13 +1047,19 @@ class ChangeAvoidanceNode(Node):
             self.measure_pub.publish(Float32(data=time.perf_counter() - start_time))
 
     def _step_idle(self, now: float):
-        if now < self.idle_until or not self._ot_gate_open():
+        if now < self.idle_until:
+            self._idle_why(f"re-engage blocked for {self.idle_until - now:.1f} s")
+            return
+        if not self._ot_gate_open():
+            self._idle_why("ot_section gate closed/stale")
             return
         target = self._pick_engage_target()
         if target is None:
+            self._idle_why(self._engage_reject_reason())
             return
         self.target = target
         if not self._choose_lane():
+            self._idle_why(f"no lane fits: {self._lane_dbg}")
             self.target = None
             return
         self.phase = PHASE_OPEN
@@ -811,7 +1067,35 @@ class ChangeAvoidanceNode(Node):
         self.get_logger().info(
             f"[LaneChange] IDLE -> OPEN: target id={target['id']} "
             f"gap={self._sdiff(target['s'], self.current_s):.1f} m "
-            f"side={self.side} offset={self.lane_offset_cur:.2f} m")
+            f"side={self.side} offset={self.lane_offset_cur:.2f} m "
+            f"meet_in={(self._meet_s() - self.current_s) % self.scaled_max_s:.1f} m "
+            f"v_pass={self._pass_speed():.1f} v_opp={target['vs']:.1f}")
+
+    def _idle_why(self, why: str):
+        """One throttled line explaining why IDLE did not engage. IDLE publishes nothing, so
+        without this the node is silently indistinguishable from dead."""
+        self.get_logger().info(f"[LaneChange] IDLE: {why}", throttle_duration_sec=1.0)
+
+    def _engage_reject_reason(self) -> str:
+        """Per-gate verdict for the nearest visible dynamic obstacle ahead."""
+        if not self.obs_dynamic:
+            return f"no dynamic obstacles (obs_all={len(self.obs_all)})"
+        if self.scaled_max_s is None or self.current_s is None:
+            return "waiting for /global_waypoints_scaled or odom"
+        best, best_gap = None, None
+        for o in self.obs_dynamic:
+            gap = (o.s_center - self.current_s) % self.scaled_max_s
+            if best_gap is None or gap < best_gap:
+                best, best_gap = o, gap
+        closing = (self.current_vs or 0.0) - best.vs
+        return (f"nearest dyn id={best.id} gap={best_gap:.2f}(<={self.engage_gap_m:.1f}?"
+                f"{'ok' if best_gap <= self.engage_gap_m else 'NO'}) "
+                f"|dd|={abs(best.d_center - (self.current_d or 0.0)):.2f}"
+                f"(<={self.obs_traj_tresh:.1f}?"
+                f"{'ok' if abs(best.d_center - (self.current_d or 0.0)) <= self.obs_traj_tresh else 'NO'}) "
+                f"closing={closing:+.2f}(>={self.engage_min_closing_mps:+.1f}?"
+                f"{'ok' if closing >= self.engage_min_closing_mps else 'NO'}) "
+                f"visible={best.is_visible}")
 
     def _step_open(self, now: float):
         if self._target_lost_for(now) > self.target_lost_s:
@@ -932,26 +1216,32 @@ class ChangeAvoidanceNode(Node):
             self._to_idle(now, "merge complete")
 
     def _check_lane_clear_vs_target(self, path: dict) -> bool:
-        """The latched target must stay clear of the lane at ITS current s (it may have moved
-        laterally since the side vote). With prediction on, also require clearance at the
-        target's propagated (s,d) so an opponent moving toward the lane is caught early;
-        clear only if BOTH the current and predicted points clear (worst-case)."""
+        """Verify on the BUILT path what the solver promised: clearance from the opponent over
+        the stretch where the two are actually side by side.
+
+        This used to check the opponent's CURRENT s. Once the lane became an s-varying profile
+        that contradicts the solver by construction -- minimum excursion keeps the lane on the
+        raceline until the meeting point, so the check saw it running straight at where the
+        opponent is standing now and aborted every engagement one cycle after OPEN. Checking
+        the built path (blend and corridor clip included) against the meeting band is the same
+        question the solver answered, asked of the geometry that actually goes out."""
         if self.target is None:
             return True
-        checks = [(self.target['s'], self.target['d'])]
-        if self.use_prediction:
-            checks.append(self._predict_ahead(
-                self.target['s'], self.target['d'], self.target['vs'], self.target.get('vd', 0.0)))
         n = len(path['d_arr'])
-        for s_c, d_c in checks:
-            rel = self._sdiff(s_c, self.current_s)
-            if not (0.0 < rel < n * 0.1):
-                continue
-            i = int(np.clip(rel / 0.1, 0, n - 1))
-            sep = abs(float(path['d_arr'][i]) - d_c) - self.target['size'] / 2.0
-            if sep < self.sep_margin_m * 0.8:
-                return False
-        return True
+        fwd = (self._meet_s() - self.current_s) % self.scaled_max_s
+        if fwd > (n - 1) * 0.1:
+            return True          # meeting point past the published path, or already behind us
+        i0 = int(np.clip((fwd - self.pass_overlap_m) / 0.1, 0, n - 1))
+        i1 = int(np.clip((fwd + self.pass_overlap_m) / 0.1, 0, n - 1))
+        seg = np.asarray(path['d_arr'][i0:i1 + 1], dtype=float)
+        if seg.size == 0:
+            return True
+        d_opp = self.target['d']
+        if self.use_prediction:
+            pred = float(self._opp_d_band(np.array([self.current_s + fwd]))[0])
+            d_opp = max(pred, d_opp) if self.lane_sign > 0 else min(pred, d_opp)
+        sep = float(np.min(np.abs(seg - d_opp))) - self.target['size'] / 2.0
+        return sep >= self.sep_margin_m * 0.8
 
     #################### VIZ ####################
     def _clear_markers(self):

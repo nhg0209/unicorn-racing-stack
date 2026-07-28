@@ -11,6 +11,18 @@ state_machine:
     track_length: 1.0
     # geometry / horizons
     gb_ego_width_m: 0.4
+    # |d| below which the car counts as back on the raceline when LEAVING a non-GB_TRACK state.
+    # Lower half of the RECOVERY hysteresis band: entry uses gb_ego_width_m (0.4), exit uses this,
+    # so it must stay < gb_ego_width_m or RECOVERY chatters. Was hardcoded at 0.05 m -- tighter
+    # than the controller's steady-state tracking error, so RECOVERY latched and the local line
+    # was sourced from the recovery spline for the whole lap.
+    recovery_exit_d_m: 0.2
+    # |d| at or above which the raceline counts as LOST -> RECOVERY entry (_check_line_lost).
+    # Upper half of the band; must stay > recovery_exit_d_m. Entry was previously keyed off the
+    # per-state close_to_raceline flag, which is 0.4 m in GB_TRACK but recovery_exit_d_m elsewhere
+    # -- so trailing an opponent at |d| ~ 0.3 m entered RECOVERY while plain global tracking at the
+    # same offset did not. That asymmetry is why the recovery line only appeared while trailing.
+    recovery_entry_d_m: 0.4
     gb_horizon_m: 15.0
     interest_horizon_m: 20.0
     overtaking_horizon_m: 6.9
@@ -42,6 +54,19 @@ state_machine:
     # transition hysteresis: min time [s] a state is held before switching to a NON-safe state
     # (anti-chatter). Switches toward TRAILING/FTGONLY bypass this. 0.2 s = 16 loops @ 80 Hz.
     min_dwell_sec: 0.2
+    # How long the dynamic avoidance path may read NOT-free before OVERTAKE is dropped [s].
+    # The free-check tests one point per obstacle, so a single noisy tracker cycle fails it;
+    # believing that cycle steers the car off the pass line and back toward the opponent it is
+    # alongside, then the check passes again -- the car flaps between the spline and the global
+    # line. Entry still requires free NOW; this only debounces staying. 0 restores the old
+    # behaviour. Mirrors the static path's static_feasible_lost_sec (0.4).
+    ot_free_lost_sec: 0.4
+    # Free-check: for a DYNAMIC obstacle with no usable prediction, propagate it over the
+    # ttc..tt0 window (when the ego is actually alongside) instead of testing the path where the
+    # opponent stands now. The prediction branch already does exactly this; this makes the
+    # fallback agree with it. Near-stationary obstacles take the static branch and are never
+    # propagated. False restores the old current-s test.
+    free_check_predict_dynamic: true
     # static OVERTAKE splice: keep the reactive path's car-anchored entry (splice from the path
     # START while the car is within splice_start_dist_m of it) instead of the nearest-index cut,
     # which steps the local window laterally under SM lag. Fallback deeper in the maneuver.

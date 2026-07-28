@@ -20,15 +20,57 @@ planner_change:
                                # ~2-3 m) or the gap never closes enough to engage,
                                # and BELOW the SM commit gate (10 m).
     obs_traj_tresh: 1.0        # engage only if |obs d - ego d| below this (they block our line)
-    sep_margin_m: 0.28          # required lateral clearance beyond the obstacle half-size.
-                               # MUST stay > SM gb_ego_width/2 + lateral_width_m (0.2+0.2=0.4)
-                               # or the SM free-check rejects the lane the planner accepted.
+    sep_margin_m: 0.42          # required lateral clearance beyond the obstacle half-size.
+                               # COUPLED to the SM: _check_free_frenet accepts the lane only if
+                               #   min_dist - obs.size/2 - gb_ego_width_m/2 >= lateral_width_m
+                               # i.e. sep_margin_m >= 0.20 + 0.20 = 0.40, with gb_ego_width_m from
+                               # state_machine_params.yaml and lateral_width_m from
+                               # state_machine/config/planners/dynamic_avoidance_planner.yaml.
+                               # Below that the planner publishes a lane the SM then rejects and
+                               # the car trails forever. 0.45 keeps 0.05 m of slack for the
+                               # opponent drifting between the planner snapshot and the SM check.
+                               # Keep the slack SMALL: with the s-varying lane the pass is
+                               # separation-limited, so every cm here costs feasibility --
+                               # on ifac 0.42 still gives 49% of the lap; 0.45 drops it to 37%.
+    # --- lane profile solver ---
+    # The lane is an s-varying profile inside the track corridor, not a constant offset from
+    # the centerline. A constant offset had to clear the walls AND the opponent at every
+    # sample of the pass window, so the narrowest point in the next few metres vetoed the
+    # maneuver even when the opponent was nowhere near it: 8% of the ifac lap admitted a pass.
+    # Requiring the opponent clearance only where the pass actually overlaps them -- which is
+    # all the SM free-check ever reads, one point at argmin|s - obs_s| -- takes the same
+    # margins to 40% of the lap.
+    pass_overlap_m: 0.55       # [m] +-s around the meeting point where lateral clearance is
+                               # enforced. The cars are 0.55 m long, so their bodies overlap
+                               # exactly while |ds| < 0.55 -- this is the physical figure, not
+                               # a margin. Every extra cm is run-up taken away from the lane
+                               # change, so padding it here is paid for twice.
+    pass_hold_max_m: 12.0      # [m] cap on how far past the meeting point the pass offset is
+                               # held. Drawing level is not passing: the lane must stay out
+                               # until the ego is pass_gap_m clear, which takes several metres
+                               # of track at realistic closing speeds. Returning earlier steers
+                               # back into the opponent and makes the SM free-check flap between
+                               # TRAILING and OVERTAKE. The return itself is CLOSE's job.
+    pass_lead_max_s: 5.0       # [s] cap on the predicted time-to-meet. Guards a near-zero
+                               # closing speed from projecting the meeting point a whole lap
+                               # away; if it lands past the solve horizon the engage is
+                               # refused rather than accepted with nothing checked.
+    lane_max_slope: 0.35       # PREFERRED max |dd/ds| of the lane (19 deg heading). The
+                               # solver tries this first.
+    lane_max_slope_close: 0.55 # ...and escalates to this (29 deg) ONLY when nothing fits at
+                               # the preferred one -- a close trailing gap, where the whole
+                               # lane change has to fit in gap - pass_overlap_m. At a fixed
+                               # 0.35 a pass from 1.8 m was refused everywhere on the lap.
+                               # The cap is not a grip limit: the SM re-plans the avoidance
+                               # path's velocity from its curvature, so a steeper lane costs
+                               # pass SPEED. It is not free either -- the lane stays on the
+                               # raceline as long as the rate allows, so a globally higher cap
+                               # makes every pass move later and sharper. Hence try-then-escalate.
 
-    # --- lane geometry ---
-    lane_offset_m: 0.35        # MINIMUM lane offset from the CENTERLINE. The actual offset
-                               # is sized per engagement from the opponent's position
-                               # (>= size/2 + sep_margin away from them) and grows live if
-                               # they drift toward the lane; the walls always cap it.
+    lane_offset_m: 0.35        # RVIZ REFERENCE LANES ONLY -- has no effect on the planned
+                               # path. The lane is an s-varying profile: at each s it is
+                               # pushed out only as far as the opponent clearance and the
+                               # walls require, so a constant floor would only cost feasibility.
     offset_slew_mps: 0.6       # how fast the live offset may grow/shrink [m/s]
     spline_bound_mindist: 0.12 # path may never come closer than this to the track bounds
 

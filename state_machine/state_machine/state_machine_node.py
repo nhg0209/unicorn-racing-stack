@@ -182,6 +182,8 @@ class StateMachine(Node):
 
         # dynamic-parameter-backed attributes (aliases onto params)
         self.gb_ego_width_m = self.params.gb_ego_width_m
+        self.recovery_exit_d_m = self.params.recovery_exit_d_m
+        self.recovery_entry_d_m = self.params.recovery_entry_d_m
         self.lateral_width_gb_m = self.params.lateral_width_gb_m
         self.lateral_width_static_gb_m = self.params.lateral_width_static_gb_m
         self.gb_horizon_m = self.params.gb_horizon_m
@@ -281,6 +283,11 @@ class StateMachine(Node):
         # than this (single-cycle blips tolerated; riding the stale cached spline is not).
         self._static_feasible_true_t = None
         self.static_feasible_lost_sec = 0.4
+        # Same idea for the DYNAMIC path: last time the avoidance path read free. Entry still
+        # demands free right now; only staying in OVERTAKE is debounced.
+        self._ot_free_true_t = None
+        self.ot_free_lost_sec = self.params.ot_free_lost_sec
+        self.free_check_predict_dynamic = self.params.free_check_predict_dynamic
 
         # Transition hysteresis (anti-chatter): a state must be held >= min_dwell_sec before it may
         # switch to a NON-safe state. Switches toward the safe states bypass this. The counter/timer
@@ -756,6 +763,22 @@ class StateMachine(Node):
         else:
             return np.abs(self.cur_d) < threshold_m
 
+    def _check_line_lost(self) -> bool:
+        """RECOVERY ENTRY gate: are we far enough off the raceline that the recovery spline is
+        worth following?
+
+        Deliberately NOT the `close_to_raceline` flag the transitions pass around. That flag is
+        the EXIT hysteresis (recovery_exit_d_m, plus a 20 deg heading term) and it is computed
+        differently per state: GlobalTrackingTransition uses gb_ego_width_m (0.4 m, lateral only)
+        while Trailing/Overtaking/Recovery/Start/FTGOnly use the much tighter recovery_exit_d_m.
+        Driving RECOVERY entry off it therefore made the bar state-dependent -- at |d| = 0.3 m the
+        car happily stays GB_TRACK, but the moment an obstacle put it in TRAILING the very same
+        offset read as 'off the line' and dropped it into RECOVERY. It then followed the recovery
+        spline, which is anchored at the car and so preserved the offset, keeping |d| large and
+        the state latched. That is why the symptom only ever showed up while trailing.
+        """
+        return bool(np.abs(self.cur_d) >= self.recovery_entry_d_m)
+
     def _check_close_to_raceline_heading(self, threshold_deg=20) -> bool:
         # True when the ego heading is aligned with the closest raceline waypoint within
         # threshold_deg. The heading error is wrapped to (-pi, pi] so the seam (psi near
@@ -937,11 +960,30 @@ class StateMachine(Node):
                                 closest_obs = obs
                                 min_gap = gap
                         elif gap < max_horizon:
+                            # DYNAMIC obstacle with no usable prediction (predictor not up yet,
+                            # or tracking a different id). Propagate it ourselves over ttc..tt0
+                            # -- the same window the prediction branch above uses, i.e. the time
+                            # the ego is actually alongside. Testing where the opponent stands
+                            # NOW asks the path to clear a place the two are never at together;
+                            # an overtaking lane deliberately stays on the raceline until the
+                            # pass, so that test reads it as blocked and OVERTAKE flaps.
+                            # Near-stationary obstacles never reach here (handled as static
+                            # above), so nothing is propagated that should not be.
                             ot_d = 0
-                            if not is_gb_track_wpnts:
-                                avoid_wpnt_idx = np.argmin(abs(wpnts_data.array[:, 2] - obs.s_center))
-                                ot_d = wpnts_data.list[avoid_wpnt_idx].d_m
                             min_dist = abs(ot_d - obs.d_center)
+                            if not is_gb_track_wpnts:
+                                if self.free_check_predict_dynamic:
+                                    t_lo = max(ttc, 0.0)
+                                    t_hi = max(tt0, t_lo)
+                                    t_samples = np.linspace(t_lo, t_hi, 5)
+                                else:
+                                    t_samples = np.zeros(1)
+                                min_dist = float("inf")
+                                for t_p in t_samples:
+                                    s_p = (obs.s_center + obs.vs * t_p) % self.max_s
+                                    j = np.argmin(abs(wpnts_data.array[:, 2] - s_p))
+                                    min_dist = min(min_dist,
+                                                   abs(wpnts_data.list[j].d_m - obs.d_center))
                             free_dist = min_dist - obs.size / 2 - self.gb_ego_width_m / 2
                             scaling_factor = np.clip(gap / free_scaling_reference_distance_m, 0.0, 1.0)
                             if free_dist < lateral_width_m * scaling_factor:
@@ -1038,6 +1080,7 @@ class StateMachine(Node):
             and self._check_free_frenet(self.cur_avoidance_wpnts)
         ):
             self.static_overtaking_mode = False
+            self._ot_free_true_t = self.now_sec()
             return True
         else:
             return False
@@ -1105,7 +1148,26 @@ class StateMachine(Node):
             if self._check_availability(self.avoidance_wpnts, self.cur_avoidance_wpnts):
                 self.get_logger().debug("AVAILABLE")
                 if self._check_free_frenet(self.cur_avoidance_wpnts):
+                    self._ot_free_true_t = self.now_sec()
                     return True
+                # Debounce, mirroring static_feasible_lost_sec above. The free-check reads the
+                # path at ONE point per obstacle, so a single noisy tracker cycle fails it --
+                # and the cost of believing that cycle is high: dropping OVERTAKE steers the
+                # car back toward the raceline, i.e. toward the opponent it is alongside, and
+                # the check then passes again. That loop is the flapping between the avoidance
+                # spline and the global line. A sustained not-free still exits.
+                free_age = ((self.now_sec() - self._ot_free_true_t)
+                            if self._ot_free_true_t is not None else float("inf"))
+                if free_age <= self.ot_free_lost_sec:
+                    return True
+                self.get_logger().warn(
+                    f"[{self.name}] OVERTAKE dropped: avoidance path not free for "
+                    f"{free_age:.2f} s (> {self.ot_free_lost_sec:.2f})",
+                    throttle_duration_sec=1.0)
+            else:
+                self.get_logger().warn(
+                    f"[{self.name}] OVERTAKE dropped: avoidance path unavailable",
+                    throttle_duration_sec=1.0)
         return False
 
     ################

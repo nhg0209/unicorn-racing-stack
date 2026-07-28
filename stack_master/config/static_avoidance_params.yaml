@@ -12,7 +12,27 @@ static_avoidance_planner:
 
     # --- terminal-offset sampling ---
     n_d_samples: 10         # number of lateral offsets sampled across the drivable width at the obstacle
+    sample_gaps: true       # sample the two DRIVABLE GAPS beside the obstacle (box-edge -> wall on each
+                            #   side) instead of a uniform sweep of the whole corridor. On a wide, lopsided
+                            #   corridor (map f's wall-hugging raceline) the uniform sweep put ~all samples
+                            #   on the roomy side and gave the narrow free gap ZERO candidates -> avoidance
+                            #   flipped to the wrong side. Gap-anchored sampling always covers both sides
+                            #   that have room. false = legacy uniform sweep (n_d_samples across corridor).
     width_car: 0.30         # [m]  car width (half is reserved as clearance to walls/obstacles)
+    # Near-stationary fallback: a DYNAMIC-flagged obstacle is treated as static only when it
+    # has read below static_near_zero_mps CONTINUOUSLY for static_promote_sec. A freshly
+    # detected opponent (ego rounding a corner, opponent entering the FOV) reads vs=0.00 for a
+    # few cycles while its KF spins up, so speed alone cannot tell 'parked' from 'just seen' --
+    # but a genuinely parked obstacle keeps reading 0.00 for as long as you look at it.
+    # Raise if the car still twitches out of corners; lower if a real static box is picked up
+    # too late. 0.0 restores the old behaviour (promote immediately).
+    static_near_zero_mps: 0.15
+    static_promote_sec: 0.5
+    # Hysteresis: once promoted it stays static until it reads clearly moving (above
+    # static_demote_mps) for static_demote_sec. A bare promote-delay makes the avoidance path
+    # blink whenever the tracked speed brushes the band.
+    static_demote_mps: 0.35
+    static_demote_sec: 0.3
     safety_margin: 0.15     # [m]  extra clearance around the obstacle box. obs_margin = half_car(0.15)+
                             #      safety must cover the SIM ego collision radius (0.29 m = half car
                             #      LENGTH in gym_bridge); 0.16 -> 0.31 clears it so the car no longer
@@ -51,7 +71,34 @@ static_avoidance_planner:
     a_long_accel: 3.0       # [m/s^2] longitudinal ACCEL; forward pass ramps speed up GRADUALLY out of the
                             #         apex (fast-out). lower = gentler/longer exit acceleration.
     use_grid_check: true    # reject candidates crossing the eroded /map (GridFilter)
-    kernel_size: 3          # [cells] GridFilter erosion (8 ate ~0.2 m and rejected the raceline on ifac)
+    kernel_size: 3          # [cells] GridFilter erosion (8 ate ~0.2 m and rejected the raceline on ifac).
+                            #      With trust_grid_bounds this ALSO sets the wall clearance used for
+                            #      feasibility (3 cells @0.05 m = 0.15 m ~= half car, matching the
+                            #      half_car clearance the waypoint-corridor test used).
+
+    # --- corridor source: measure the drivable width from the MAP, not from the waypoints ---
+    # d_left/d_right come from gb_optimizer, which labels the two track contours left/right with ONE
+    # global decision taken from the start pose (extract_track_bounds), plus an optional second flip
+    # from reverse_mapping. When that comes out inverted the whole lap ships with d_left/d_right
+    # EXCHANGED -- measured on map f: 125 of 128 sampled waypoints swapped, values exact mirrors
+    # (json L/R = 2.72/0.24 where the walls really are 0.24 left / 2.72 right); map ifac: 0 swapped.
+    # The planner then thinks the roomy side is the side the wall is on, samples every terminal
+    # offset into that wall, and the corridor filter rejects the genuinely free side -> "candidates
+    # on the opposite side of the gap", and with the obstacle pushed to one side the spline is drawn
+    # beyond the wall instead of through the open space. The occupancy grid is the only wall source
+    # that cannot be mislabelled, so measure the free lateral extent there and let it win.
+    # Offline check on the real maps: correct roomy side 60/60 on f and 46/46 on ifac, 0 sampled
+    # offsets inside a wall (vs 136 with the waypoint corridor). Cost 0.07 ms/call, <=2 calls/cycle.
+    # Set false to force the old waypoint-bounds behaviour (e.g. to reproduce the bug).
+    # NOTE: needs use_grid_check: true. The per-point grid test is what REPLACES the waypoint
+    # corridor filter; with use_grid_check false the waypoint bounds stay in charge of feasibility
+    # (conservative: a swapped map then trails instead of cutting a corner, as it did before).
+    trust_grid_bounds: true
+    grid_scan_max: 3.0      # [m] half-width of the lateral scan around the raceline (>= widest half-track)
+    grid_scan_step: 0.05    # [m] scan resolution; one map cell is the useful floor
+    bounds_warn_m: 0.5      # [m] warn when the waypoint bounds and the measured corridor disagree by
+                            #      more than this -- near-mirrored values in that warning mean the map's
+                            #      global_waypoints.json has d_left/d_right swapped and wants regenerating
 
     # --- raceline-clear gate (idle when the CURRENT global line already avoids everything) ---
     # After static_reopt swaps in the obstacle-aware line, the keep-out no longer contains d=0,
@@ -60,6 +107,19 @@ static_avoidance_planner:
     clear_gate_enable: true
     clear_hyst_m: 0.03      # [m] EXTRA clearance required to enter idle (leave only on a real violation)
     clear_max_cur_d: 0.15   # [m] gate applies only with the car on the raceline (never abandons a maneuver)
+
+    # --- path commitment (temporal consistency: plan once, reuse) ---
+    # The planner re-solved from the car's instantaneous pose every 20 Hz cycle. Once the obstacle
+    # came within ramp_len the entry ramp re-anchored to the moving/erroring car and the chosen
+    # candidate shifted as the gap shrank, so the car re-avoided the SAME box weirdly on approach.
+    # With commitment the chosen path is frozen in the world frame and just re-sliced/re-published;
+    # a fresh plan is taken only on a real trigger (car off the path, box moved, slice no longer
+    # clears a live box, or maneuver done). Safety is NOT frozen: the committed slice is re-checked
+    # against live obstacles every cycle and publishes feasible=False the instant it stops clearing.
+    commit_enable: true
+    commit_dev_max: 0.35    # [m] drop the commit if the car deviates this far from the committed path
+    commit_obs_ds: 0.75     # [m] drop the commit if the triggering box's s drifts this far (re-plan apex)
+    commit_obs_dd: 0.40     # [m] ... or its d drifts this far
 
     # --- cost weights  J = w_d*Σ|d| + w_k*Σκ² + w_c*|d_end-d_end_prev| + w_obs*Σexp(-dist/σ) ---
     w_d: 1.0                # raceline deviation

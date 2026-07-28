@@ -34,12 +34,16 @@ class StateMachineParams:
         "ftg_speed_mps",
         "ftg_timer_sec",
         "gb_ego_width_m",
+        "recovery_exit_d_m",
+        "recovery_entry_d_m",
         "gb_horizon_m",
         "interest_horizon_m",
         "overtaking_horizon_m",
         "getting_closer_rel_vel_mps",
         "static_ot_distance_m",
         "min_dwell_sec",
+        "ot_free_lost_sec",
+        "free_check_predict_dynamic",
         "splice_from_path_start",
         "splice_start_dist_m",
     }
@@ -110,6 +114,37 @@ class StateMachineParams:
             ),
         )
         self.gb_ego_width_m: float = node.get_parameter("gb_ego_width_m").value
+
+        self._declare(
+            "recovery_exit_d_m", 0.2,
+            ParameterDescriptor(
+                description=(
+                    "|d| below which the car counts as back on the raceline when LEAVING a "
+                    "non-GB_TRACK state (RECOVERY/TRAILING/OVERTAKE/START/FTGONLY). Entry into "
+                    "RECOVERY uses gb_ego_width_m, so this is the lower half of the hysteresis "
+                    "band and must stay below it. Was hardcoded at 0.05 m -- tighter than normal "
+                    "tracking error, so RECOVERY never exited [m]"
+                ),
+                type=ParameterType.PARAMETER_DOUBLE,
+            ),
+        )
+        self.recovery_exit_d_m: float = node.get_parameter("recovery_exit_d_m").value
+
+        self._declare(
+            "recovery_entry_d_m", 0.4,
+            ParameterDescriptor(
+                description=(
+                    "|d| at or above which the car counts as having lost the raceline, i.e. the "
+                    "RECOVERY ENTRY threshold (_check_line_lost). Upper half of the hysteresis "
+                    "band and must stay above recovery_exit_d_m. Entry used to be driven by the "
+                    "per-state close_to_raceline flag instead, which made the bar tighter while "
+                    "TRAILING than while GB_TRACKing and latched the car onto the recovery "
+                    "spline whenever it trailed an opponent [m]"
+                ),
+                type=ParameterType.PARAMETER_DOUBLE,
+            ),
+        )
+        self.recovery_entry_d_m: float = node.get_parameter("recovery_entry_d_m").value
 
         self._declare(
             "gb_horizon_m", 15.0,
@@ -279,6 +314,35 @@ class StateMachineParams:
             ),
         )
         self.min_dwell_sec: float = node.get_parameter("min_dwell_sec").value
+
+        self._declare(
+            "ot_free_lost_sec", 0.4,
+            ParameterDescriptor(
+                description="How long the dynamic avoidance path may read NOT-free before "
+                            "OVERTAKE is dropped [s]. The free-check is a single-point test "
+                            "against a tracked opponent, so one noisy cycle fails it; without "
+                            "this debounce the car flaps between the overtake spline and the "
+                            "raceline. Mirrors static_feasible_lost_sec on the static path. "
+                            "ENTRY still requires the path to be free right now.",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=3.0, step=0.05)],
+            ),
+        )
+        self.ot_free_lost_sec: float = node.get_parameter("ot_free_lost_sec").value
+
+        self._declare(
+            "free_check_predict_dynamic", True,
+            ParameterDescriptor(
+                description="Free-check: for a DYNAMIC obstacle with no usable prediction, "
+                            "propagate it over the ttc..tt0 window (when the ego is alongside) "
+                            "instead of testing the path at its current s. Matches what the "
+                            "prediction branch already does. Near-stationary obstacles are "
+                            "unaffected -- they take the static branch and are never "
+                            "propagated. False restores the current-s test.",
+                type=ParameterType.PARAMETER_BOOL,
+            ),
+        )
+        self.free_check_predict_dynamic: bool = node.get_parameter("free_check_predict_dynamic").value
 
         self._declare(
             "splice_from_path_start", True,
