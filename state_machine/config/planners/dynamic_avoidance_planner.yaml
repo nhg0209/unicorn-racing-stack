@@ -9,7 +9,18 @@ hyst_timer_sec: 1.5
 is_closed: false
 killing_timer_sec: 10.0
 lateral_width_m: 0.2
-latest_threshold: 0.1
+# The single-threaded state_machine executor runs ~0.3-0.5 s behind on the 20 Hz avoidance
+# messages (it re-runs the heavy vel profiler inline in avoidance_cb), so measured against the
+# SM clock a perfectly-fresh publish reads as 0.3-0.5 s "old". This is the SAME failure the
+# static path hit and fixed -- see static_avoidance_planner.yaml:8-15: "At 0.1 s the freshness
+# gate NEVER passed and the car never committed to OVERTAKE." The dynamic path was simply never
+# given the same treatment.
+# This value gates TWO things, which is why it blocks entry AND sustain at once:
+#   _check_latest_wpnts  -> the 3rd AND-term of _check_overtaking_mode (entry)
+#   update_waypoints     -> whether a new publish is even a candidate for cache adoption
+# 1.0 s still bounds staleness (the car moves < ~4 m) and hyst_timer_sec/killing_timer_sec
+# remain the backstop if the planner goes silent.
+latest_threshold: 1.0
 # The lane-hold path always extends hold_horizon_m (22 m) ahead, but cap the free-check
 # window at the same horizon the old planner used.
 max_horizon: 10.0
