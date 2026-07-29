@@ -70,7 +70,11 @@ class WaypointData:
         self.stamp = None
         self.is_init = False
         self.is_gb_track_wpnts = False
+        # is_ot_wpnts is True for BOTH avoidance paths (static and dynamic). Where a check must
+        # distinguish them -- the two planners have opposite geometry contracts -- use
+        # is_dynamic_ot_wpnts, which is set only on cur_avoidance_wpnts.
         self.is_ot_wpnts = False
+        self.is_dynamic_ot_wpnts = False
         self.closest_target = None
         self.closest_gap = None
         self.is_closed = is_closed
@@ -199,6 +203,7 @@ class StateMachine(Node):
         self.cur_start_wpnts = WaypointData(self, "start_planner", False)
 
         self.cur_avoidance_wpnts.is_ot_wpnts = True
+        self.cur_avoidance_wpnts.is_dynamic_ot_wpnts = True
         self.cur_static_avoidance_wpnts.is_ot_wpnts = True
         self.cur_gb_wpnts.is_gb_track_wpnts = True
         self.cur_recovery_wpnts.vel_planner_safety_factor = 0.5
@@ -289,6 +294,7 @@ class StateMachine(Node):
         self.ot_free_lost_sec = self.params.ot_free_lost_sec
         self.free_check_predict_dynamic = self.params.free_check_predict_dynamic
         self.free_check_pass_speed = self.params.free_check_pass_speed
+        self.free_check_dynamic_ot_slow = self.params.free_check_dynamic_ot_slow
 
         # Transition hysteresis (anti-chatter): a state must be held >= min_dwell_sec before it may
         # switch to a NON-safe state. Switches toward the safe states bypass this. The counter/timer
@@ -893,6 +899,7 @@ class StateMachine(Node):
         max_horizon = wpnts_data.max_horizon
         is_gb_track_wpnts = wpnts_data.is_gb_track_wpnts
         is_ot_wpnts = wpnts_data.is_ot_wpnts
+        is_dynamic_ot_wpnts = wpnts_data.is_dynamic_ot_wpnts
         free_scaling_reference_distance_m = wpnts_data.free_scaling_reference_distance_m
         lateral_width_m = wpnts_data.lateral_width_m
 
@@ -924,7 +931,23 @@ class StateMachine(Node):
                 # tracking is_static flag: a static obstacle transiently classified dynamic would
                 # otherwise be checked against a bogus predicted trajectory, making the static
                 # avoidance spline read "not free" and delaying the TRAILING->OVERTAKE switch.
-                if obs.is_static or (abs(obs.vs) < 0.5 and abs(obs.vd) < 0.5):
+                #
+                # ...but NOT when judging a DYNAMIC overtaking path. The static branch evaluates
+                # the lane at the obstacle's CURRENT s, and the lane-hold planner's geometry
+                # contract is the opposite: minimum excursion keeps the lane on the raceline
+                # (d ~ 0) until the meeting point and only clears the opponent inside
+                # [meet_s - pass_overlap_m, meet_s + pass_hold]. With meet_s = s_o + v_opp*gap/
+                # closing, an opponent at 0.49 m/s has its clearance band starting PAST obs_s, so
+                # the static branch samples the lane where it is still on the raceline, reads
+                # NOT-free, and blocks OVERTAKE structurally and permanently. The reclassification
+                # was written to protect the STATIC spline (see the comment above) -- the dynamic
+                # path was never its intended target. A genuinely stationary obstacle routed to
+                # the dynamic branch is harmless: its ttc..tt0 propagation is a no-op.
+                treat_as_static = obs.is_static or (abs(obs.vs) < 0.5 and abs(obs.vd) < 0.5)
+                if (treat_as_static and not obs.is_static
+                        and is_dynamic_ot_wpnts and self.free_check_dynamic_ot_slow):
+                    treat_as_static = False
+                if treat_as_static:
                     if not wpnts_data.is_closed and gap > max_gap:
                         is_free = False
                         if closest_obs is None or min_gap > gap:

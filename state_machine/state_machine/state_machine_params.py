@@ -45,6 +45,7 @@ class StateMachineParams:
         "ot_free_lost_sec",
         "free_check_predict_dynamic",
         "free_check_pass_speed",
+        "free_check_dynamic_ot_slow",
         "splice_from_path_start",
         "splice_start_dist_m",
     }
@@ -358,6 +359,24 @@ class StateMachineParams:
             ),
         )
         self.free_check_pass_speed: bool = node.get_parameter("free_check_pass_speed").value
+
+        self._declare(
+            "free_check_dynamic_ot_slow", True,
+            ParameterDescriptor(
+                description="Free-check: keep a SLOW-but-moving opponent on the dynamic branch "
+                            "when testing a dynamic OVERTAKE path, instead of reclassifying it "
+                            "as static. The near-stationary reclassification exists to protect "
+                            "the STATIC avoidance spline from bogus predicted trajectories; on "
+                            "the dynamic path it is actively harmful, because the static branch "
+                            "evaluates the lane at the obstacle's CURRENT s -- where an "
+                            "overtaking lane sits on the raceline by design -- so the path reads "
+                            "NOT-free forever and OVERTAKE can never commit. For a genuinely "
+                            "stationary obstacle the ttc..tt0 propagation is a no-op, so nothing "
+                            "regresses. False restores the old routing.",
+                type=ParameterType.PARAMETER_BOOL,
+            ),
+        )
+        self.free_check_dynamic_ot_slow: bool = node.get_parameter("free_check_dynamic_ot_slow").value
 
         self._declare(
             "splice_from_path_start", True,
