@@ -16,6 +16,12 @@ SM's static requirement:
     keep-out + apex_bulge  >=  gb_ego_width_m/2 + lateral_width_static_gb_m + slack
                                (state_machine_params.yaml)
 
+FOURTH chain — the DYNAMIC overtaking path (lane_change_planner <-> SM free-check). The
+planner mirrors the SM's clearance inputs and derives its solver target and monitor abort line
+from them; if a mirror drifts, the planner publishes a lane the SM rejects and the car flaps
+OVERTAKE<->TRAILING with neither side giving up. Also checks the horizon/engage-window ordering
+the two nodes depend on. See check_dynamic_chain().
+
 Run after tuning any side:  python3 stack_master/scripts/check_avoidance_margins.py
 Exit code 0 = consistent, 1 = violation.
 """
@@ -47,6 +53,98 @@ def load_sm_params():
     p = STACK_MASTER / "config" / "state_machine_params.yaml"
     cfg = yaml.safe_load(p.read_text())["state_machine"]["ros__parameters"]
     return p, cfg
+
+
+def load_lane_change_params():
+    p = STACK_MASTER / "config" / "lane_change_params.yaml"
+    cfg = yaml.safe_load(p.read_text())["planner_change"]["ros__parameters"]
+    return p, cfg
+
+
+def load_dynamic_planner_params():
+    # state_machine/config/planners/ lives in a sibling package
+    p = STACK_MASTER.parent / "state_machine" / "config" / "planners" / "dynamic_avoidance_planner.yaml"
+    return p, yaml.safe_load(p.read_text())
+
+
+def check_dynamic_chain(sm_path, sm) -> bool:
+    """The DYNAMIC overtaking chain: lane_change_planner <-> SM free-check.
+
+    The planner derives its clearance numbers from MIRRORS of the SM's parameters
+    (_apply_margins in change_avoidance_node.py). Mirrors drift the moment someone tunes the
+    SM side alone, and the failure is silent: the planner keeps publishing a lane the SM
+    rejects and the car flaps OVERTAKE<->TRAILING. This section is the offline guard.
+    """
+    lc_path, lc = load_lane_change_params()
+    dyn_path, dyn = load_dynamic_planner_params()
+
+    print(f"\n--- dynamic chain ({lc_path.name} <-> {dyn_path.name}) ---")
+    ok = True
+
+    # 1. mirrors must equal the real values
+    mirrors = [
+        ("sm_gb_ego_width_m", float(lc["sm_gb_ego_width_m"]), float(sm["gb_ego_width_m"]), sm_path.name),
+        ("sm_lateral_width_m", float(lc["sm_lateral_width_m"]), float(dyn["lateral_width_m"]), dyn_path.name),
+    ]
+    for name, mirrored, actual, src in mirrors:
+        if abs(mirrored - actual) > 1e-9:
+            ok = False
+            print(f"FAIL: {name} = {mirrored:.3f} in {lc_path.name} but the real value is "
+                  f"{actual:.3f} in {src}.")
+            print("      The planner is sizing its lane against a stale copy of the SM's rule.")
+        else:
+            print(f"OK: {name} mirrors {src} ({actual:.3f}).")
+
+    # 2. derived margins must bracket the SM accept line correctly.
+    #    Compare what the planner will ACTUALLY compute at runtime (from its mirrors, which is
+    #    all _apply_margins has access to) against what the SM ACTUALLY requires (from the real
+    #    yamls). When the mirrors are correct these coincide; when they have drifted, this is
+    #    what makes the resulting inversion visible instead of hiding it behind corrected numbers.
+    sm_required = float(sm["gb_ego_width_m"]) / 2.0 + float(dyn["lateral_width_m"])
+    planner_assumes = float(lc["sm_gb_ego_width_m"]) / 2.0 + float(lc["sm_lateral_width_m"])
+    sep_margin = planner_assumes + float(lc["sep_slack_m"])
+    sep_monitor = planner_assumes + float(lc["sep_monitor_slack_m"])
+    print(f"  SM accept line (actual)     = {sm_required:.3f} m")
+    print(f"  planner assumes             = {planner_assumes:.3f} m")
+    print(f"  -> solver target sep_margin = {sep_margin:.3f} | monitor abort = {sep_monitor:.3f}")
+    if sep_margin < sm_required:
+        ok = False
+        print(f"FAIL: solver target ({sep_margin:.3f}) < SM accept line ({sm_required:.3f}); "
+              f"every lane would be rejected downstream. Raise sep_slack_m.")
+    if sep_monitor < sm_required:
+        ok = False
+        print(f"FAIL: monitor abort line ({sep_monitor:.3f}) < SM accept line ({sm_required:.3f}); "
+              f"the planner would hold a lane the SM rejects -> OVERTAKE<->TRAILING flapping. "
+              f"Raise sep_monitor_slack_m to >= 0.")
+    if sep_monitor > sep_margin:
+        ok = False
+        print(f"FAIL: monitor abort ({sep_monitor:.3f}) > solver target ({sep_margin:.3f}); "
+              f"the monitors would abort a lane the solver just produced.")
+    if ok:
+        print(f"OK: monitor ({sep_monitor:.3f}) >= SM accept line ({sm_required:.3f}) and "
+              f"<= solver target ({sep_margin:.3f}) -- the planner bails before the SM does.")
+
+    # 3. horizon ordering: the published path must outreach the SM's obstacle window, or the
+    #    free-check's `gap > max_gap` branch marks every obstacle beyond the path as blocking.
+    hold_horizon = float(lc["hold_horizon_m"])
+    interest = float(sm["interest_horizon_m"])
+    if hold_horizon <= interest:
+        ok = False
+        print(f"FAIL: hold_horizon_m ({hold_horizon:.1f}) <= interest_horizon_m ({interest:.1f}); "
+              f"obstacles inside the SM's window but past the published path read NOT-free.")
+    else:
+        print(f"OK: hold_horizon_m ({hold_horizon:.1f}) > interest_horizon_m ({interest:.1f}).")
+
+    # 4. the planner must engage INSIDE the SM's commit window, or it prepares a lane the SM
+    #    will not act on (and _check_getting_closer keeps answering NO).
+    engage_gap = float(lc["engage_gap_m"])
+    if engage_gap >= 10.0:  # _check_overtaking_mode passes threshold_m=10.0
+        ok = False
+        print(f"FAIL: engage_gap_m ({engage_gap:.1f}) >= the SM's getting_closer window (10.0).")
+    else:
+        print(f"OK: engage_gap_m ({engage_gap:.1f}) < the SM's getting_closer window (10.0).")
+
+    return ok
 
 
 def main() -> int:
@@ -114,6 +212,9 @@ def main() -> int:
         print(f"      Lower lateral_width_static_gb_m in {sm_path.name} or raise apex_bulge.")
     else:
         print(f"OK: line clearance ({line_clearance:.3f}) >= SM static GB requirement + slack ({required + SLACK:.3f}).")
+
+    if not check_dynamic_chain(sm_path, sm):
+        ok = False
 
     return 0 if ok else 1
 

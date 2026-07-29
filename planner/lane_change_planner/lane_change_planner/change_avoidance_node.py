@@ -176,8 +176,20 @@ class ChangeAvoidanceNode(Node):
                                         # the SM free-check read NOT-free and aborts)
         self.pass_gap_m = 1.2           # ego must lead by this to trigger CLOSE
         self.pass_hyst_s = 0.3
-        self.sep_margin_m = 0.50        # required lateral clearance beyond obs half-size
-                                        # (must exceed SM gb_ego_width/2 + lateral_width_m = 0.4)
+        # --- SM coupling: sep_margin_m and the monitor abort line are DERIVED, not declared ---
+        # The state machine runs its own independent free-check on the path we publish. Both
+        # nodes must agree about required clearance, and the coupling used to be a prose comment
+        # that had already drifted (it claimed 0.05 m of slack while the value gave 0.02). These
+        # three mirrors carry the SM's numbers; _apply_margins() derives the rest and refuses to
+        # let the planner ask for LESS than the SM does. Verified offline by
+        # stack_master/scripts/check_avoidance_margins.py.
+        self.sm_gb_ego_width_m = 0.4    # == state_machine_params.yaml: gb_ego_width_m
+        self.sm_lateral_width_m = 0.15  # == planners/dynamic_avoidance_planner.yaml: lateral_width_m
+        self.sep_slack_m = 0.07         # solver target above the SM accept line
+        self.sep_monitor_slack_m = 0.02  # monitor abort line above it (>=0 => we bail first)
+        self.sep_margin_m = 0.42        # DERIVED in _apply_margins; this is only the pre-declare seed
+        self._sm_required_m = 0.35      # DERIVED: the SM's accept line
+        self._sep_monitor_m = 0.37      # DERIVED: monitors abort below this
         self.target_lost_s = 1.0
         self.reengage_block_s = 1.0
         # Lane profile solver. The opponent clearance is only required where the pass actually
@@ -285,7 +297,17 @@ class ChangeAvoidanceNode(Node):
         dbl('hold_horizon_m', self.hold_horizon_m, 10.0, 40.0, "published path length")
         dbl('pass_gap_m', self.pass_gap_m, 0.3, 5.0, "lead needed to trigger the return")
         dbl('pass_hyst_s', self.pass_hyst_s, 0.0, 2.0, "pass condition dwell time")
-        dbl('sep_margin_m', self.sep_margin_m, 0.2, 1.5, "clearance beyond obstacle half-size")
+        # sep_margin_m is DERIVED from the SM mirrors below -- do not declare it directly.
+        dbl('sm_gb_ego_width_m', self.sm_gb_ego_width_m, 0.1, 1.0,
+            "MIRROR of state_machine_params.yaml: gb_ego_width_m")
+        dbl('sm_lateral_width_m', self.sm_lateral_width_m, 0.0, 1.0,
+            "MIRROR of planners/dynamic_avoidance_planner.yaml: lateral_width_m")
+        dbl('sep_slack_m', self.sep_slack_m, 0.0, 0.5,
+            "solver clearance target above the SM accept line")
+        # Negative is allowed on purpose: it reproduces the historical monitor line
+        # (sep_margin_m * 0.8) for A/B, even though that sat BELOW the SM's reject line.
+        dbl('sep_monitor_slack_m', self.sep_monitor_slack_m, -0.2, 0.5,
+            "monitor abort line above the SM accept line; >=0 means we bail before the SM does")
         dbl('pass_overlap_m', self.pass_overlap_m, 0.2, 4.0,
             "+-s around the opponent where lateral clearance is enforced")
         dbl('lane_max_slope', self.lane_max_slope, 0.05, 1.0, "preferred max |dd/ds| of the lane")
@@ -309,15 +331,47 @@ class ChangeAvoidanceNode(Node):
         # dbl() reads its own params back; use_prediction is declared separately, so it needs
         # the same treatment here.
         self.use_prediction = self.get_parameter('use_prediction').value
+        self._apply_margins()
         # Print what actually took effect: a yaml key that never reaches an attribute is
         # otherwise invisible until the geometry silently rejects every lane.
         self.get_logger().info(
-            f"[LaneChange] params in effect: sep_margin={self.sep_margin_m:.2f} "
+            f"[LaneChange] params in effect: sm_required={self._sm_required_m:.3f} "
+            f"sep_margin={self.sep_margin_m:.3f} sep_monitor={self._sep_monitor_m:.3f} "
             f"bound_mindist={self.spline_bound_mindist:.2f} "
             f"engage_gap={self.engage_gap_m:.1f} obs_traj_tresh={self.obs_traj_tresh:.2f} "
             f"pass_overlap=+-{self.pass_overlap_m:.2f} "
             f"lane_slope={self.lane_max_slope:.2f}/{self.lane_max_slope_close:.2f} "
-            f"use_prediction={self.use_prediction}")
+            f"use_prediction={self.use_prediction} "
+            f"engage_min_closing={self.engage_min_closing_mps:+.2f}")
+
+    def _apply_margins(self):
+        """Derive the clearance numbers from the mirrored SM parameters.
+
+        Single source of truth for a threshold that TWO nodes must agree on. The SM's
+        free-check rejects a path when |d_lane - d_opp| - size/2 < gb_ego_width_m/2 +
+        lateral_width_m; that sum is _sm_required_m. The solver aims sep_slack_m above it, and
+        the monitors abort sep_monitor_slack_m above it -- so the planner gives up marginally
+        BEFORE the SM would, instead of holding a lane the SM rejects (which is exactly the
+        OVERTAKE<->TRAILING flapping this replaced: the old monitor line was sep_margin_m * 0.8
+        = 0.336, below the SM's 0.40 reject line).
+
+        Clamps rather than raises: a conservative planner beats a dead one."""
+        self._sm_required_m = self.sm_gb_ego_width_m / 2.0 + self.sm_lateral_width_m
+        self.sep_margin_m = self._sm_required_m + self.sep_slack_m
+        self._sep_monitor_m = self._sm_required_m + self.sep_monitor_slack_m
+        if self.sep_slack_m < 0.0:
+            self.get_logger().error(
+                f"[LaneChange] sep_slack_m={self.sep_slack_m:.3f} < 0: the solver would target "
+                f"LESS clearance than the SM requires ({self._sm_required_m:.3f} m) and every "
+                f"lane would be rejected downstream. Clamping to 0.")
+            self.sep_slack_m = 0.0
+            self.sep_margin_m = self._sm_required_m
+        if self._sep_monitor_m > self.sep_margin_m:
+            self.get_logger().error(
+                f"[LaneChange] sep_monitor_slack_m={self.sep_monitor_slack_m:.3f} exceeds "
+                f"sep_slack_m={self.sep_slack_m:.3f}: the monitors would abort a lane the solver "
+                f"just produced. Clamping the monitor to the solver target.")
+            self._sep_monitor_m = self.sep_margin_m
 
     def dyn_param_cb(self, params: List[Parameter]):
         for param in params:
@@ -326,7 +380,9 @@ class ChangeAvoidanceNode(Node):
                     'engage_gap_m', 'offset_slew_mps',
                     'open_ramp_min_m', 'open_ramp_time_s', 'blend_min_m',
                     'close_ramp_min_m', 'close_ramp_time_s', 'close_arm_m', 'tail_m',
-                    'hold_horizon_m', 'pass_gap_m', 'pass_hyst_s', 'sep_margin_m',
+                    'hold_horizon_m', 'pass_gap_m', 'pass_hyst_s',
+                    'sm_gb_ego_width_m', 'sm_lateral_width_m',
+                    'sep_slack_m', 'sep_monitor_slack_m',
                     'pass_overlap_m', 'lane_max_slope', 'lane_max_slope_close',
                     'pass_lead_max_s', 'meet_s_slew_m',
                     'pass_behind_m', 'pass_hold_max_m', 'opp_pred_slack_m',
@@ -334,10 +390,14 @@ class ChangeAvoidanceNode(Node):
                     'kd_obs_pred', 'pred_lead_scale', 'engage_min_closing_mps',
                     'use_prediction'):
                 setattr(self, param.name, param.value)
+        # Re-derive: live-tuning any mirror or slack must not leave sep_margin_m/_sep_monitor_m
+        # stale, or the solver and the monitors would silently disagree with the SM.
+        self._apply_margins()
         self.get_logger().info(
             f"[LaneChange] params: lane_offset_min={self.lane_offset_m:.2f} "
             f"engage_gap={self.engage_gap_m:.1f} pass_gap={self.pass_gap_m:.2f} "
-            f"sep_margin={self.sep_margin_m:.2f} hold_horizon={self.hold_horizon_m:.1f}")
+            f"sm_required={self._sm_required_m:.3f} sep_margin={self.sep_margin_m:.3f} "
+            f"sep_monitor={self._sep_monitor_m:.3f} hold_horizon={self.hold_horizon_m:.1f}")
         return SetParametersResult(successful=True)
 
     #################### CALLBACKS ####################
@@ -1029,7 +1089,7 @@ class ChangeAvoidanceNode(Node):
                 continue
             i = int(np.clip(rel / 0.1, 0, len(path['d_arr']) - 1))
             sep = abs(float(path['d_arr'][i]) - o.d_center) - max(o.size, 0.25) / 2.0
-            if sep < self.sep_margin_m * 0.8:   # small hysteresis vs the side-selection margin
+            if sep < self._sep_monitor_m:   # derived: sits just ABOVE the SM's reject line
                 blocked = True
                 break
         if blocked:
@@ -1290,7 +1350,7 @@ class ChangeAvoidanceNode(Node):
             pred = float(self._opp_d_band(np.array([self.current_s + fwd]))[0])
             d_opp = max(pred, d_opp) if self.lane_sign > 0 else min(pred, d_opp)
         sep = float(np.min(np.abs(seg - d_opp))) - self.target['size'] / 2.0
-        return sep >= self.sep_margin_m * 0.8
+        return sep >= self._sep_monitor_m
 
     #################### VIZ ####################
     def _clear_markers(self):

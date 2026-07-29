@@ -20,18 +20,31 @@ planner_change:
                                # ~2-3 m) or the gap never closes enough to engage,
                                # and BELOW the SM commit gate (10 m).
     obs_traj_tresh: 1.0        # engage only if |obs d - ego d| below this (they block our line)
-    sep_margin_m: 0.42          # required lateral clearance beyond the obstacle half-size.
-                               # COUPLED to the SM: _check_free_frenet accepts the lane only if
-                               #   min_dist - obs.size/2 - gb_ego_width_m/2 >= lateral_width_m
-                               # i.e. sep_margin_m >= 0.20 + 0.20 = 0.40, with gb_ego_width_m from
-                               # state_machine_params.yaml and lateral_width_m from
-                               # state_machine/config/planners/dynamic_avoidance_planner.yaml.
-                               # Below that the planner publishes a lane the SM then rejects and
-                               # the car trails forever. 0.45 keeps 0.05 m of slack for the
-                               # opponent drifting between the planner snapshot and the SM check.
-                               # Keep the slack SMALL: with the s-varying lane the pass is
-                               # separation-limited, so every cm here costs feasibility --
-                               # on ifac 0.42 still gives 49% of the lap; 0.45 drops it to 37%.
+    # --- clearance: DERIVED from the SM, not declared here ---------------------------------
+    # The state machine runs an independent free-check on the lane we publish and rejects it
+    # unless  min_dist - obs.size/2 - gb_ego_width_m/2 >= lateral_width_m. Two nodes therefore
+    # have to agree on one number. That coupling used to live only in a prose comment here, and
+    # the comment had already drifted from the values (it claimed 0.05 m of slack while the
+    # numbers gave 0.02). So the planner now MIRRORS the SM's inputs and derives the rest in
+    # _apply_margins(); startup logs sm_required/sep_margin/sep_monitor, and
+    # stack_master/scripts/check_avoidance_margins.py verifies the mirrors offline.
+    #
+    #   sm_required  = sm_gb_ego_width_m/2 + sm_lateral_width_m   <- the SM's accept line
+    #   sep_margin_m = sm_required + sep_slack_m                  <- what the SOLVER targets
+    #   sep_monitor  = sm_required + sep_monitor_slack_m          <- where the MONITORS abort
+    #
+    # Keep sep_slack_m SMALL: with the s-varying lane the pass is separation-limited, so every
+    # cm costs feasibility -- on ifac a 0.42 target gives 49% of the lap, 0.45 drops it to 37%.
+    sm_gb_ego_width_m: 0.4     # MIRROR of state_machine_params.yaml: gb_ego_width_m
+    sm_lateral_width_m: 0.15   # MIRROR of planners/dynamic_avoidance_planner.yaml: lateral_width_m
+    sep_slack_m: 0.07          # -> sep_margin_m = 0.35 + 0.07 = 0.42 (unchanged from before)
+    sep_monitor_slack_m: 0.02  # -> monitors abort at 0.37, just ABOVE the SM's 0.35 reject line.
+                               # Was sep_margin_m*0.8 = 0.336, i.e. BELOW the SM's line: the
+                               # planner happily held a lane the SM rejected and the car flapped
+                               # OVERTAKE<->TRAILING with neither side ever giving up. Must stay
+                               # >= 0 and <= sep_slack_m; _apply_margins() clamps and logs an
+                               # error otherwise. Negative is permitted only to reproduce the old
+                               # behaviour for A/B.
     # --- lane profile solver ---
     # The lane is an s-varying profile inside the track corridor, not a constant offset from
     # the centerline. A constant offset had to clear the walls AND the opponent at every
