@@ -19,6 +19,9 @@ planner_change:
     # gate: only ENGAGE inside overtaking sectors (/ot_section_check fresh + true).
     # A maneuver already in progress is never aborted by sector state.
     require_ot_section: true
+    ot_gate_stale_s: 1.0       # [s] /ot_section_check older than this fails the gate CLOSED.
+                               # The SM publishes it every loop tick, so staleness means the SM
+                               # is down or mis-wired -- trailing is the safe answer.
 
     # --- engagement ---
     engage_gap_m: 5.0          # trail (at speed) until the s-gap to the target is below
@@ -94,6 +97,13 @@ planner_change:
 
     offset_slew_mps: 0.6       # how fast the live offset may grow/shrink [m/s]
     spline_bound_mindist: 0.12 # path may never come closer than this to the track bounds
+    lane_solve_ds: 0.25        # [m] grid the lateral profile is solved on. Also sets the
+                               # solver's per-step slope budget (lane_max_slope * this) and the
+                               # band slack in _lane_bounds. Finer = more Python loop per cycle.
+                               # NOTE the PUBLISHED path is resampled at PATH_DS (0.1 m), which
+                               # is a module constant, not a parameter: the CCMA window and the
+                               # curvature el_lengths both assume it.
+    width_car: 0.30            # [m] car width; with spline_bound_mindist it sets the wall keep-out
 
     # --- transition geometry (lengths speed-scale: max(min_m, time_s * v)) ---
     open_ramp_min_m: 3.0
@@ -122,6 +132,8 @@ planner_change:
     # _build_path post-processes the solved profile with an entry blend and a corridor clip that
     # can both eat into the margin the solver promised. Now checked every HOLD cycle, before
     # publishing, so a failing lane is never handed to the SM.
+    blocked_dwell_s: 0.3       # [s] an obstacle must sit on the path this long before
+                               # _path_blocked_ahead reports it (one noisy frame must not abort)
     hold_clear_check: true     # false = old behaviour (checked only at engage)
     hold_clear_fail_s: 0.15    # [s] dwell before acting on a failure (3 cycles at 20 Hz), so a
                                # single noisy tracker frame cannot abort a good maneuver. If we

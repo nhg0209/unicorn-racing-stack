@@ -82,6 +82,13 @@ import trajectory_planning_helpers as tph
 from transforms3d.euler import quat2euler
 from grid_filter.grid_filter import GridFilter
 
+# Along-path sample spacing of the PUBLISHED path [m]. Deliberately a module constant and
+# NOT a ROS parameter: the CCMA window (w_ma=10, w_cc=5) and the el_lengths handed to
+# tph.calc_head_curv_num both assume it, and two index computations
+# (_path_blocked_ahead, _check_lane_clear_vs_target) convert metres to indices with it.
+# Changing it used to require six coordinated edits, and missing one silently mis-indexed.
+PATH_DS = 0.1
+
 PHASE_IDLE = "IDLE"
 PHASE_HOLD = "HOLD"
 PHASE_CLOSE = "CLOSE"
@@ -209,6 +216,8 @@ class ChangeAvoidanceNode(Node):
         self.lane_max_slope = 0.35      # preferred max |dd/ds| of the lane (19 deg heading)
         self.lane_max_slope_close = 0.55  # only if nothing fits at the preferred one (29 deg)
         self.lane_solve_ds = 0.25       # profile solve grid [m]
+        self.blocked_dwell_s = 0.3      # dwell before _path_blocked_ahead reports blocked [s]
+        self.ot_gate_stale_s = 1.0      # /ot_section_check older than this fails the gate CLOSED [s]
         self.pass_lead_max_s = 5.0      # cap on the predicted time-to-meet [s]
         self.pass_hold_max_m = 12.0     # cap on how far the pass offset is held [m]
         self.veh_length_m = 0.55        # must match veh_params.length in the SM's ttc/tt0
@@ -321,6 +330,12 @@ class ChangeAvoidanceNode(Node):
         dbl('pass_behind_m', self.pass_behind_m, 1.0, 15.0, "meeting point this far behind = passed")
         dbl('target_lost_s', self.target_lost_s, 0.2, 5.0, "coast time before target is dropped")
         dbl('reengage_block_s', self.reengage_block_s, 0.0, 5.0, "idle time after finishing")
+        dbl('lane_solve_ds', self.lane_solve_ds, 0.1, 0.5, "lane profile solve grid [m]")
+        dbl('width_car', self.width_car, 0.1, 1.0, "car width, feeds the wall keep-out [m]")
+        dbl('blocked_dwell_s', self.blocked_dwell_s, 0.0, 2.0,
+            "dwell before an obstacle on the path counts as blocking [s]")
+        dbl('ot_gate_stale_s', self.ot_gate_stale_s, 0.2, 5.0,
+            "/ot_section_check staleness that fails the engage gate closed [s]")
         dbl('hold_clear_fail_s', self.hold_clear_fail_s, 0.0, 2.0,
             "dwell before acting on a HOLD target-clearance failure [s]")
         self.declare_parameter('hold_clear_check', self.hold_clear_check, ParameterDescriptor(
@@ -393,6 +408,7 @@ class ChangeAvoidanceNode(Node):
                     'pass_behind_m', 'pass_hold_max_m', 'opp_pred_slack_m',
                     'target_lost_s', 'reengage_block_s',
                     'hold_clear_fail_s', 'hold_clear_check',
+                    'lane_solve_ds', 'width_car', 'blocked_dwell_s', 'ot_gate_stale_s',
                     'engage_min_closing_mps',
                     'use_prediction'):
                 setattr(self, param.name, param.value)
@@ -876,8 +892,8 @@ class ChangeAvoidanceNode(Node):
             horizon = max(horizon, (cs_u - s0) + close_len + self.tail_m + 1.0)
         horizon = min(horizon, L * 0.9)
 
-        n = max(int(horizon / 0.1), 20)
-        s_lin = s0 + np.arange(n) * 0.1
+        n = max(int(horizon / PATH_DS), 20)
+        s_lin = s0 + np.arange(n) * PATH_DS
         d_arr = self._lane_profile_at(s_lin)
 
         # --- entry blend from the actual car state ---
@@ -973,7 +989,7 @@ class ChangeAvoidanceNode(Node):
 
         evasion_psi, evasion_kappa = tph.calc_head_curv_num.calc_head_curv_num(
             path=evasion_coords,
-            el_lengths=0.1 * np.ones(len(evasion_coords) - 1),
+            el_lengths=PATH_DS * np.ones(len(evasion_coords) - 1),
             is_closed=False,
         )
         evasion_psi += np.pi / 2
@@ -1009,7 +1025,7 @@ class ChangeAvoidanceNode(Node):
                 # asks the question in the meeting-point frame. Testing it here at its current
                 # s would re-introduce the abort this monitor is not meant to own.
                 continue
-            i = int(np.clip(rel / 0.1, 0, len(path['d_arr']) - 1))
+            i = int(np.clip(rel / PATH_DS, 0, len(path['d_arr']) - 1))
             sep = abs(float(path['d_arr'][i]) - o.d_center) - max(o.size, 0.25) / 2.0
             if sep < self._sep_monitor_m:   # derived: sits just ABOVE the SM's reject line
                 blocked = True
@@ -1019,13 +1035,13 @@ class ChangeAvoidanceNode(Node):
                 self.blocked_since = now
         else:
             self.blocked_since = None
-        return blocked and (now - self.blocked_since) > 0.3
+        return blocked and (now - self.blocked_since) > self.blocked_dwell_s
 
     def _ot_gate_open(self) -> bool:
         if not self.require_ot_section:
             return True
         now = self.now_sec()
-        if self.ot_section_check_t is None or (now - self.ot_section_check_t) > 1.0:
+        if self.ot_section_check_t is None or (now - self.ot_section_check_t) > self.ot_gate_stale_s:
             # The SM only publishes /ot_section_check on some transition paths, so staleness
             # here can also mean "SM idle in GB_TRACK" -- still fail closed, trailing is safe.
             self.get_logger().warn(
@@ -1271,10 +1287,10 @@ class ChangeAvoidanceNode(Node):
             return True
         n = len(path['d_arr'])
         fwd = (self._meet_s() - self.current_s) % self.scaled_max_s
-        if fwd > (n - 1) * 0.1:
+        if fwd > (n - 1) * PATH_DS:
             return True          # meeting point past the published path, or already behind us
-        i0 = int(np.clip((fwd - self.pass_overlap_m) / 0.1, 0, n - 1))
-        i1 = int(np.clip((fwd + self.pass_overlap_m) / 0.1, 0, n - 1))
+        i0 = int(np.clip((fwd - self.pass_overlap_m) / PATH_DS, 0, n - 1))
+        i1 = int(np.clip((fwd + self.pass_overlap_m) / PATH_DS, 0, n - 1))
         seg = np.asarray(path['d_arr'][i0:i1 + 1], dtype=float)
         if seg.size == 0:
             return True
