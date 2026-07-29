@@ -45,6 +45,11 @@ planner_change:
                                # exactly while |ds| < 0.55 -- this is the physical figure, not
                                # a margin. Every extra cm is run-up taken away from the lane
                                # change, so padding it here is paid for twice.
+    opp_pred_slack_m: 0.20     # [m] how far the GP prediction may move the opponent SIDEWAYS
+                               # beyond what its measured vd explains over the time-to-meet.
+                               # The tracker's measured d is the anchor; the prediction refines
+                               # it. A diverged GP fit otherwise returns a line swinging metres
+                               # and blocks both sides of the track at once.
     pass_hold_max_m: 12.0      # [m] cap on how far past the meeting point the pass offset is
                                # held. Drawing level is not passing: the lane must stay out
                                # until the ego is pass_gap_m clear, which takes several metres
@@ -95,7 +100,7 @@ planner_change:
     reengage_block_s: 1.0      # idle time after finishing/aborting a maneuver
 
     # --- opponent prediction (P1 temporal, P2 spatial GP) ---
-    use_prediction: true          # master toggle; false = react to the opponent's CURRENT
+    use_prediction: false          # master toggle; false = react to the opponent's CURRENT
                                   # position only (pre-P1/P2 behavior), for A/B testing
     kd_obs_pred: 1.0              # d->raceline relaxation gain for the adaptive time-forward
                                   # propagation. higher = assume a near-line opponent returns

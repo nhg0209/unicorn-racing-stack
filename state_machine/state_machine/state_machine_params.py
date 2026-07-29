@@ -44,6 +44,7 @@ class StateMachineParams:
         "min_dwell_sec",
         "ot_free_lost_sec",
         "free_check_predict_dynamic",
+        "free_check_pass_speed",
         "splice_from_path_start",
         "splice_start_dist_m",
     }
@@ -343,6 +344,20 @@ class StateMachineParams:
             ),
         )
         self.free_check_predict_dynamic: bool = node.get_parameter("free_check_predict_dynamic").value
+
+        self._declare(
+            "free_check_pass_speed", True,
+            ParameterDescriptor(
+                description="Free-check: time the alongside window (ttc/tt0) from the speed the "
+                            "ego will run once the overtake is committed (local raceline pace), "
+                            "not from the TRAILING closing speed. The trailing value collapses "
+                            "to the 0.5 m/s floor and places the window metres too far ahead, "
+                            "which forces the planner to hold its offset across track the pass "
+                            "never reaches. False restores the old timing.",
+                type=ParameterType.PARAMETER_BOOL,
+            ),
+        )
+        self.free_check_pass_speed: bool = node.get_parameter("free_check_pass_speed").value
 
         self._declare(
             "splice_from_path_start", True,

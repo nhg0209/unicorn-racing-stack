@@ -67,6 +67,11 @@ state_machine:
     # fallback agree with it. Near-stationary obstacles take the static branch and are never
     # propagated. False restores the old current-s test.
     free_check_predict_dynamic: true
+    # Time the alongside window from the speed the ego runs ONCE COMMITTED (local raceline
+    # pace), not from the trailing closing speed. Trailing holds station, so cur_vs - obs.vs
+    # collapses to the 0.5 m/s floor and the window lands metres too far ahead -- which forced
+    # the planner to hold its pass offset across narrow track the maneuver never touches.
+    free_check_pass_speed: true
     # static OVERTAKE splice: keep the reactive path's car-anchored entry (splice from the path
     # START while the car is within splice_start_dist_m of it) instead of the nearest-index cut,
     # which steps the local window laterally under SM lag. Fallback deeper in the maneuver.

@@ -288,6 +288,7 @@ class StateMachine(Node):
         self._ot_free_true_t = None
         self.ot_free_lost_sec = self.params.ot_free_lost_sec
         self.free_check_predict_dynamic = self.params.free_check_predict_dynamic
+        self.free_check_pass_speed = self.params.free_check_pass_speed
 
         # Transition hysteresis (anti-chatter): a state must be held >= min_dwell_sec before it may
         # switch to a NON-safe state. Switches toward the safe states bypass this. The counter/timer
@@ -790,15 +791,46 @@ class StateMachine(Node):
         heading_err = (self.current_position[2] - cloest_wpnt_psi + np.pi) % (2 * np.pi) - np.pi
         return np.abs(heading_err) < np.deg2rad(threshold_deg)
 
+    def _gb_speed_at(self, s: float) -> float:
+        """Raceline speed at s -- what the ego runs once an overtake is committed."""
+        if self.gb_wpnts is None or not self.wpnt_dist:
+            return 0.0
+        wp = self.gb_wpnts.wpnts
+        if not wp:
+            return 0.0
+        return float(wp[int(s / self.wpnt_dist) % len(wp)].vx_mps)
+
     def _check_ot_sector(self) -> bool:
+        """Is the car inside an overtaking sector? PURE -- see _publish_ot_section_check."""
         # ROS1: no overtake zone matching cur_s -> not in an OT sector (return False).
         # (An empty overtake_zones means overtaking is suppressed, as in ROS1.)
         for sector in self.overtake_zones:
             if sector[0] <= self.cur_s / self.wpnt_dist <= sector[1]:
-                self.ot_section_check_pub.publish(Bool(data=True))
                 return True
-        self.ot_section_check_pub.publish(Bool(data=False))
         return False
+
+    def _publish_ot_section_check(self):
+        """Publish /ot_section_check every cycle, from the main loop.
+
+        This used to be a side effect inside _check_ot_sector(), which only runs as the first
+        term of _check_overtaking_mode()'s and-chain -- i.e. only from ObstacleTransition. So
+        the topic fell silent in exactly the states where it matters most:
+
+          * while the SM holds OVERTAKE (OvertakingTransition never calls it),
+          * whenever ObstacleTransition returns early into RECOVERY,
+          * and entirely when force_trailing short-circuits before the call.
+
+        The lane-change planner fails its gate CLOSED after 1 s of staleness, so the moment its
+        maneuver ended it could not re-engage: it went quiet, the SM rode the cached path until
+        it aged out, dropped to TRAILING, published again, and the whole thing repeated. That
+        limit cycle is what the car felt as the overtake path appearing and vanishing.
+
+        Whether the car is in an overtaking sector is a property of its POSITION, not of which
+        branch the state machine happened to evaluate this tick.
+        """
+        if self.cur_s is None or not self.wpnt_dist:
+            return
+        self.ot_section_check_pub.publish(Bool(data=bool(self._check_ot_sector())))
 
     def _check_getting_closer(self, threshold_m=3.0) -> bool:
         # True when the nearest obstacle ahead is within threshold_m AND we are closing on it.
@@ -872,7 +904,18 @@ class StateMachine(Node):
             for obs in obstacles:
                 obs_s = obs.s_center
                 gap = (obs_s - self.cur_s) % self.max_s
+                # Closing speed for the alongside window (ttc..tt0). NOT the current one:
+                # while TRAILING the controller holds station behind the opponent, so
+                # cur_vs - obs.vs collapses to ~0 and the 0.5 m/s floor then places the window
+                # metres further down the track than the pass will ever reach. The avoidance
+                # path is velocity-replanned from its curvature on commit, so the ego runs the
+                # local raceline pace -- that is the speed the pass actually happens at.
+                # Observed: v_pass 4.0 vs opponent 2.0 (real closing 2.0) was timed at 0.5,
+                # pushing the check to 11 m ahead and forcing a 7 m offset hold that any
+                # narrow spot in between then vetoed.
                 relative_vs = self.cur_vs - obs.vs
+                if self.free_check_pass_speed:
+                    relative_vs = max(relative_vs, self._gb_speed_at(self.cur_s) - obs.vs)
                 clip_vs = max(relative_vs, 0.5)
                 ttc = (gap - self.pars["veh_params"]["length"]) / clip_vs
                 tt0 = (gap + 0.3 * self.pars["veh_params"]["length"]) / clip_vs
@@ -941,12 +984,26 @@ class StateMachine(Node):
                             min_dist = abs(wpnt_d - obs_pred.pred_d)
                             free_dist = min_dist - obs.size / 2 - self.gb_ego_width_m / 2
                             scaling_factor = np.clip(gap / free_scaling_reference_distance_m, 0.0, 1.0)
-                            if is_ot_wpnts:
+                            if is_ot_wpnts and free_dist < lateral_width_m * scaling_factor:
+                                # np.argmin returns the nearest sample even when pred_s is off
+                                # the END of the path -- then wpnt_d belongs to a completely
+                                # different piece of track and the comparison is meaningless.
+                                # ds_lookup near 0 means the lookup is real; metres means the
+                                # published path does not cover where the opponent is predicted.
+                                # age tells the other story: a cached path (killing_timer_sec
+                                # 10 s) being judged against live obstacles.
+                                ds_lookup = abs(float(wpnts_data.array[wpnt_idx, 2])
+                                                - float(obs_pred.pred_s))
+                                ds_lookup = min(ds_lookup, self.max_s - ds_lookup)
+                                age = (self.now_sec() - time_to_float(wpnts_data.stamp)
+                                       if wpnts_data.stamp is not None else -1.0)
                                 self.get_logger().warn(
-                                    f"free_dist: {free_dist}, lateral_width_m: {lateral_width_m}, "
-                                    f"scaling_factor: {scaling_factor}, obs.size: {obs.size}, "
-                                    f"wpnt_d:{wpnt_d}, obs_pred.pred_d: {obs_pred.pred_d} ",
-                                    throttle_duration_sec=0.5,
+                                    f"[{self.name}] OT path NOT free: free_dist={free_dist:+.2f} "
+                                    f"(need {lateral_width_m * scaling_factor:.2f}) "
+                                    f"lane_d={wpnt_d:+.2f} opp_d={obs_pred.pred_d:+.2f} "
+                                    f"| path age={age:.2f}s len={len(wpnts_data.list)} "
+                                    f"lookup_err={ds_lookup:.2f}m",
+                                    throttle_duration_sec=1.0,
                                 )
                             if free_dist < lateral_width_m * scaling_factor:
                                 is_free = False
@@ -1610,6 +1667,10 @@ class StateMachine(Node):
         self._handle_momentary_params()
         if self.measuring:
             start = time.perf_counter()
+
+        # Unconditional, every cycle, before any transition logic runs: the planner gates its
+        # engage on this and fails closed when it goes stale.
+        self._publish_ot_section_check()
 
         self.update_waypoints()
         self.gb_closest_target = None

@@ -190,6 +190,8 @@ class ChangeAvoidanceNode(Node):
         self.pass_lead_max_s = 5.0      # cap on the predicted time-to-meet [s]
         self.pass_hold_max_m = 12.0     # cap on how far the pass offset is held [m]
         self.veh_length_m = 0.55        # must match veh_params.length in the SM's ttc/tt0
+        self.opp_pred_slack_m = 0.20    # how far the GP may move the opponent beyond vd*t_meet
+        self._opp_d_used = {1: 0.0, -1: 0.0}   # diagnostics: opponent d the solve actually used
         self.meet_s_slew_m = 0.15       # how fast the latched meeting point may move [m/cycle]
         self.pass_behind_m = 5.0        # a meeting point within this far BEHIND counts as passed
         # Keep the profile this far inside the corridor to absorb the CCMA smoothing in
@@ -287,6 +289,8 @@ class ChangeAvoidanceNode(Node):
             "max |dd/ds| used only when nothing fits at the preferred one")
         dbl('pass_lead_max_s', self.pass_lead_max_s, 0.5, 15.0, "cap on the time-to-meet [s]")
         dbl('pass_hold_max_m', self.pass_hold_max_m, 1.0, 25.0, "cap on the offset hold length [m]")
+        dbl('opp_pred_slack_m', self.opp_pred_slack_m, 0.0, 2.0,
+            "how far the prediction may move the opponent beyond vd*t_meet [m]")
         dbl('meet_s_slew_m', self.meet_s_slew_m, 0.01, 2.0, "how fast the aim point may move [m]")
         dbl('pass_behind_m', self.pass_behind_m, 1.0, 15.0, "meeting point this far behind = passed")
         dbl('target_lost_s', self.target_lost_s, 0.2, 5.0, "coast time before target is dropped")
@@ -321,7 +325,7 @@ class ChangeAvoidanceNode(Node):
                     'hold_horizon_m', 'pass_gap_m', 'pass_hyst_s', 'sep_margin_m',
                     'pass_overlap_m', 'lane_max_slope', 'lane_max_slope_close',
                     'pass_lead_max_s', 'meet_s_slew_m',
-                    'pass_behind_m', 'pass_hold_max_m',
+                    'pass_behind_m', 'pass_hold_max_m', 'opp_pred_slack_m',
                     'target_lost_s', 'reengage_block_s',
                     'kd_obs_pred', 'pred_lead_scale', 'engage_min_closing_mps',
                     'use_prediction'):
@@ -634,12 +638,13 @@ class ChangeAvoidanceNode(Node):
         lead_needed = self.pass_gap_m + self.pass_overlap_m
         hold = (self.pass_hold_max_m if closing <= 0.2
                 else self.pass_overlap_m + v * lead_needed / closing)
-        # The SM times its "alongside" window with clip_vs = max(cur_vs - obs.vs, 0.5) -- the
-        # TRAILING closing speed, floored -- so it looks FURTHER down the track than we do
-        # (gap 2.1 m: it checks 6.8-8.9 m ahead where we planned 3.3-7.6). The lane has to be
-        # out where the checker looks or it reads blocked and drops OVERTAKE, so extend the
-        # hold to cover it rather than argue with it.
-        clip_vs = max((self.current_vs or 0.0) - self.target['vs'], 0.5)
+        # Mirror of the SM's alongside window (free_check_pass_speed): it now times ttc/tt0
+        # from the committed pass speed too, so both nodes look at the same stretch. Keep this
+        # in step with _check_free_frenet -- when the two disagreed, the SM checked 11 m ahead
+        # while we planned 7, and the hold had to stretch across narrow track to cover it,
+        # which then vetoed the pass outright.
+        clip_vs = max((self.current_vs or 0.0) - self.target['vs'],
+                      self._pass_speed() - self.target['vs'], 0.5)
         gap = self._sdiff(self.target['s'], self.current_s)
         sm_end = gap + self.target['vs'] * (gap + 0.3 * self.veh_length_m) / clip_vs
         meet_fwd = (self._meet_s() - self.current_s) % self.scaled_max_s
@@ -680,11 +685,36 @@ class ChangeAvoidanceNode(Node):
         hi = d_left - wall_need
         if self.target is not None:
             need = self.target['size'] / 2.0 + self.sep_margin_m
-            opp_d = (self._opp_d_band(s_lin) if self.use_prediction
-                     else np.full(len(s_lin), self.target['d']))
-            # worse of measured / predicted, exactly as the scalar sizing did before
-            opp_d = (np.maximum(opp_d, self.target['d']) if side_sign > 0
-                     else np.minimum(opp_d, self.target['d']))
+            # The opponent is at ONE lateral position when the cars are level: their d around
+            # the MEETING POINT. Sampling their predicted line at every s of the band -- which
+            # now runs up to pass_hold_max_m -- instead demands clearance from every place they
+            # could ever be, and the hold region is where the EGO will be later, not them. A
+            # line that swings then blocks BOTH sides at once: observed live on a 2.7 m wide
+            # track as "L:corridor short 0.43m R:corridor short 0.47m", which needs a ~1.9 m
+            # lateral swing in the sampled line. The GP predictor logs when its fit has not
+            # converged ("length_scale close to the specified upper bound"); that output must
+            # not be able to veto the whole track.
+            opp_d_ref = self.target['d']
+            if self.use_prediction:
+                w = self.pass_overlap_m
+                q = self._meet_s() + np.arange(-w, w + 1e-9, self.lane_solve_ds)
+                pred = self._opp_d_band(q % self.scaled_max_s)
+                pred = pred[np.isfinite(pred)]
+                if pred.size:
+                    # The prediction may only move the opponent as far sideways as the tracker
+                    # actually saw them moving. Without this a diverged GP fit (the predictor
+                    # logs "length_scale close to the specified upper bound") returns a line
+                    # that swings metres and vetoes both sides of the track at once, while the
+                    # MEASURED d sat at ~0 the whole time. Measurement is the anchor; the
+                    # prediction refines it, it does not get to overrule it.
+                    meet_fwd = (self._meet_s() - self.current_s) % self.scaled_max_s
+                    t_meet = meet_fwd / max(self._pass_speed(), 0.5)
+                    dev = abs(self.target.get('vd', 0.0)) * t_meet + self.opp_pred_slack_m
+                    p = float(np.max(pred)) if side_sign > 0 else float(np.min(pred))
+                    p = float(np.clip(p, self.target['d'] - dev, self.target['d'] + dev))
+                    opp_d_ref = max(p, opp_d_ref) if side_sign > 0 else min(p, opp_d_ref)
+            opp_d = np.full(len(s_lin), opp_d_ref)
+            self._opp_d_used[side_sign] = opp_d_ref
             # Enforce the clearance where the cars will actually be SIDE BY SIDE. Pinning the
             # band to the opponent's current s constrains a place the two are never at
             # together -- while the ego closes the last metres the opponent has moved on.
@@ -784,13 +814,22 @@ class ChangeAvoidanceNode(Node):
                 dbg.append(f"{name[0].upper()}:meeting point past the {self._lane_horizon():.0f} m horizon")
                 continue
             short = float(np.max(lo - hi))
+            k = int(np.argmax(lo - hi))
+            wp = self.scaled_wpnts_msg.wpnts
+            kk = int((s_lin[k] % self.scaled_max_s) / self.scaled_delta_s) % self.scaled_max_idx
+            dbg.append(f"{name[0].upper()}@+{s_lin[k] - s_lin[0]:.1f}m"
+                       f"[dl={wp[kk].d_left:.2f} dr={wp[kk].d_right:.2f} "
+                       f"oppd={self._opp_d_used.get(sign, 0.0):+.2f}]")
             dbg.append(f"{name[0].upper()}:" +
                        (f"corridor short {short:.2f}m" if short > 0.0 else "unreachable at "
                         f"|dd/ds|<={self.lane_max_slope_close:.2f}"))
         if not cands:
             self._lane_dbg = (f"horizon={self._lane_horizon():.0f}m "
                               f"need={self.target['size'] / 2.0 + self.sep_margin_m:.2f} "
-                              f"overlap=+-{self.pass_overlap_m:.2f} " + " ".join(dbg))
+                              f"overlap=+-{self.pass_overlap_m:.2f} "
+                              f"opp_d={self.target['d']:+.2f} "
+                              f"meet_in={(self._meet_s() - self.current_s) % self.scaled_max_s:.1f}m "
+                              + " ".join(dbg))
             return False
         self._lane_dbg = ""
         # least lateral excursion wins; slight stickiness to the previous side damps flip-flop
