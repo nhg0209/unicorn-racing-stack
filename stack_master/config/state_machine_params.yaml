@@ -60,7 +60,14 @@ state_machine:
     # alongside, then the check passes again -- the car flaps between the spline and the global
     # line. Entry still requires free NOW; this only debounces staying. 0 restores the old
     # behaviour. Mirrors the static path's static_feasible_lost_sec (0.4).
-    ot_free_lost_sec: 0.4
+    # Raised 0.4 -> 0.8: the SM's own view of the avoidance path is 0.3-0.5 s stale (executor
+    # lag, see dynamic_avoidance_planner.yaml:latest_threshold), so a 0.4 s debounce could not
+    # even cover one refresh of the thing it debounces. Note the hysteresis here is deliberately
+    # asymmetric in the WRONG direction and only half-fixed by this value: ENTRY needs a single
+    # free cycle, while min_dwell_sec provides no damping at all on this edge because TRAILING
+    # and OVERTAKE are both in _IMMEDIATE_STATES. Removing TRAILING from that set would delay a
+    # safe-direction transition, so it is intentionally NOT bundled with this change.
+    ot_free_lost_sec: 0.8
     # Free-check: for a DYNAMIC obstacle with no usable prediction, propagate it over the
     # ttc..tt0 window (when the ego is actually alongside) instead of testing the path where the
     # opponent stands now. The prediction branch already does exactly this; this makes the

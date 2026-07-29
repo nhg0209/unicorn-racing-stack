@@ -521,8 +521,14 @@ class ChangeAvoidanceNode(Node):
             # don't engage an opponent we cannot close on (it is pulling away): the lane
             # change would only ride the spline and slow us. TRAILING stays the fallback
             # until it slows (e.g. into a corner) and the gap closes for real.
-            if (self.use_prediction
-                    and (self.current_vs or 0.0) - o.vs < self.engage_min_closing_mps):
+            #
+            # This is a CLOSING-SPEED gate, not a prediction feature -- it reads the tracker's
+            # measured vs and nothing else. It used to be and-ed with use_prediction, so
+            # setting use_prediction:=false silently disabled it too and the planner would
+            # engage opponents that were pulling away, burn the maneuver and then eat
+            # reengage_block_s. To disable it deliberately, set engage_min_closing_mps very
+            # negative (e.g. -3.0); that is its own off-switch.
+            if (self.current_vs or 0.0) - o.vs < self.engage_min_closing_mps:
                 continue
             if best is None or gap < best[0]:
                 best = (gap, o)

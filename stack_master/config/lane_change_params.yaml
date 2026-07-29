@@ -107,5 +107,14 @@ planner_change:
                                   # to its line faster; a far-off-line opponent relaxes less
     pred_lead_scale: 0.5         # lead time = (s-gap / closing-speed) * this. 0 disables the
                                   # time-forward part (offset/clearance still use GP d(s))
+
+    # --- engage gating (NOT a prediction feature: reads the tracker's measured vs) ---
     engage_min_closing_mps: -0.5  # don't ENGAGE on an opponent pulling away faster than this
-                                  # (m/s, ego_vs - opp_vs). matches SM getting_closer gate
+                                  # (m/s, ego_vs - opp_vs). Set very negative (-3.0) to disable;
+                                  # this parameter is its own off-switch.
+                                  # NOTE: this is NOT the same value as the SM's getting_closer
+                                  # gate (state_machine_params.yaml: getting_closer_rel_vel_mps,
+                                  # currently -0.1). The planner is the looser of the two, so the
+                                  # SM gate binds first; an earlier comment here claimed they
+                                  # matched, which they never did. Deliberately kept looser --
+                                  # the planner may prepare a lane the SM has not committed to.
