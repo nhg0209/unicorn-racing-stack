@@ -8,7 +8,20 @@ free_scaling_reference_distance_m: 1
 hyst_timer_sec: 1.5
 is_closed: false
 killing_timer_sec: 10.0
-lateral_width_m: 0.2
+# Extra clearance the SM demands ON TOP OF gb_ego_width_m/2 (0.20) and the obstacle's own
+# half-size. Total SM accept line = 0.20 + lateral_width_m.
+# Lowered 0.2 -> 0.15. At 0.2 the SM demanded 0.40 m while the planner's solver targets
+# sep_margin_m = 0.42 -- 2 cm of slack, less than one CCMA lateral displacement (~16 mm) plus
+# the 0.25 m solve grid vs 0.1 m publish grid. Any tracker d jitter flipped the gate and the
+# car flapped OVERTAKE<->TRAILING.
+# Fixed on THIS side, not by raising sep_margin_m: lane_change_params.yaml records that 0.42
+# already admits a pass on only ~49% of the ifac lap (0.45 -> 37%), and every cm added to the
+# planner is paid twice, in clearance AND in run-up. The SM free-check is a sanity gate on a
+# producer that already owns the go/no-go decision (the same architecture the static path uses),
+# so it must be LOOSER than the producer's design margin, never tighter. Physical clearance is
+# unchanged -- the planner still solves to 0.42 and remains the binding constraint. 0.15 is
+# still 50% above the static path's lateral_width_m (0.1).
+lateral_width_m: 0.15
 # The single-threaded state_machine executor runs ~0.3-0.5 s behind on the 20 Hz avoidance
 # messages (it re-runs the heavy vel profiler inline in avoidance_cb), so measured against the
 # SM clock a perfectly-fresh publish reads as 0.3-0.5 s "old". This is the SAME failure the
