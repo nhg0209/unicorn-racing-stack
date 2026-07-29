@@ -112,6 +112,20 @@ planner_change:
                                # treating it as lost (occlusion robustness)
     reengage_block_s: 1.0      # idle time after finishing/aborting a maneuver
 
+    # --- HOLD target-clearance re-verification ---
+    # The lane's clearance against the opponent being overtaken used to be checked exactly ONCE,
+    # on the single cycle the old OPEN phase lasted. _path_blocked_ahead deliberately skips the
+    # latched target, so for the rest of the maneuver nothing re-verified it -- even though
+    # _build_path post-processes the solved profile with an entry blend and a corridor clip that
+    # can both eat into the margin the solver promised. Now checked every HOLD cycle, before
+    # publishing, so a failing lane is never handed to the SM.
+    hold_clear_check: true     # false = old behaviour (checked only at engage)
+    hold_clear_fail_s: 0.15    # [s] dwell before acting on a failure (3 cycles at 20 Hz), so a
+                               # single noisy tracker frame cannot abort a good maneuver. If we
+                               # are already alongside/ahead the lane is HELD anyway with a
+                               # warning: bailing to the raceline next to the opponent is worse
+                               # than a lane that is a few cm short.
+
     # --- opponent prediction (P1 temporal, P2 spatial GP) ---
     use_prediction: false          # master toggle; false = react to the opponent's CURRENT
                                   # position only (pre-P1/P2 behavior), for A/B testing

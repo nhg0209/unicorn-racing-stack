@@ -213,6 +213,58 @@ f._step_hold(f.t)
 check("blocked and 2.5 m behind -> IDLE", f.phase == cav.PHASE_IDLE)
 check("reason 'blocked, dropping back'", any("blocked, dropping back" in m for _, m in f._log.lines))
 
+print("\n=== HOLD: per-cycle target-clearance re-verification ===")
+need_clear = max(int(0.15 * 20), 1)
+# clearance fails while safely behind (2.5 m) -> abort after the dwell, not before
+f = mk(phase=cav.PHASE_HOLD, target=tgt(s=12.5), current_s=10.0, clear_ok=False)
+for i in range(need_clear - 1):
+    f._step_hold(f.t)
+check(f"no abort before the {need_clear}-cycle dwell", f.phase == cav.PHASE_HOLD,
+      f"phase={f.phase} cnt={f.clear_fail_cnt}")
+check("kept publishing while debouncing", len(f.published) == need_clear - 1)
+f._step_hold(f.t)
+check("aborts on the dwell cycle", f.phase == cav.PHASE_IDLE, f"phase={f.phase}")
+check("reason 'lane no longer clears target'",
+      any("lane no longer clears target" in m for _, m in f._log.lines))
+check("the failing lane was NOT published",
+      len(f.published) == need_clear - 1, f"published={len(f.published)}")
+
+# clearance recovers before the dwell expires -> counter resets, no abort
+f = mk(phase=cav.PHASE_HOLD, target=tgt(s=12.5), current_s=10.0, clear_ok=False)
+f._step_hold(f.t)
+f._step_hold(f.t)
+f.clear_ok = True
+f._step_hold(f.t)
+check("counter resets when clearance recovers", f.clear_fail_cnt == 0)
+check("still HOLD", f.phase == cav.PHASE_HOLD)
+
+# clearance fails while ALONGSIDE (1.0 m behind) -> hold the lane, do not steer back
+f = mk(phase=cav.PHASE_HOLD, target=tgt(s=11.0), current_s=10.0, clear_ok=False)
+for i in range(need_clear + 3):
+    f._step_hold(f.t)
+check("alongside: never aborts", f.phase == cav.PHASE_HOLD, f"phase={f.phase}")
+check("alongside: warns instead", any(lvl == "warn" and "too close alongside" in m
+                                      for lvl, m in f._log.lines))
+check("alongside: keeps publishing the lane", len(f.published) == need_clear + 3)
+
+# toggle off -> old behaviour, never checked
+f = mk(phase=cav.PHASE_HOLD, target=tgt(s=12.5), current_s=10.0, clear_ok=False,
+       hold_clear_check=False)
+for i in range(need_clear + 3):
+    f._step_hold(f.t)
+check("hold_clear_check=False reproduces the old behaviour", f.phase == cav.PHASE_HOLD)
+check("hold_clear_check=False leaves the counter untouched", f.clear_fail_cnt == 0)
+
+print("\n=== dwell counts derive from rate_hz, not a hardcoded 20 ===")
+f = mk(phase=cav.PHASE_HOLD, target=tgt(s=8.0, vs=2.0), current_s=10.0, current_vs=4.0,
+       rate_hz=40.0)
+for i in range(max(int(0.3 * 40), 1) - 1):
+    f._step_hold(f.t)
+check("at 40 Hz the pass dwell needs 12 cycles, not 6", f.phase == cav.PHASE_HOLD,
+      f"phase={f.phase} pass_cnt={f.pass_cnt}")
+f._step_hold(f.t)
+check("...and fires on the 12th", f.phase == cav.PHASE_CLOSE, f"phase={f.phase}")
+
 print("\n=== _to_idle resets the maneuver state ===")
 f = mk(phase=cav.PHASE_HOLD, target=tgt(s=13.0), lane_s=np.zeros(3), lane_d=np.zeros(3),
        close_s=5.0, close_frozen=True, pass_cnt=4, clear_fail_cnt=3, blocked_since=1.0,

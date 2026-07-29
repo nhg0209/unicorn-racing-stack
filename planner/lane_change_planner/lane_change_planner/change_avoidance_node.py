@@ -209,6 +209,13 @@ class ChangeAvoidanceNode(Node):
         self._sep_monitor_m = 0.37      # DERIVED: monitors abort below this
         self.target_lost_s = 1.0
         self.reengage_block_s = 1.0
+        # Loop rate. Used by the timer AND to convert the dwell params (pass_hyst_s,
+        # hold_clear_fail_s) into cycle counts -- it was hardcoded as a bare `* 20` next to a
+        # separate `1.0 / 20.0` timer, so changing the rate silently redefined pass_hyst_s.
+        self.rate_hz = 20.0
+        # Per-cycle re-verification that the lane still clears the target during HOLD.
+        self.hold_clear_check = True
+        self.hold_clear_fail_s = 0.15   # dwell before acting on a clearance failure [s]
         # Lane profile solver. The opponent clearance is only required where the pass actually
         # overlaps them; everywhere else the lane just has to fit between the walls, which the
         # car alone always does (corridor needs 2*wall_need = 0.54 m, ifac's narrowest is 0.87).
@@ -283,7 +290,7 @@ class ChangeAvoidanceNode(Node):
         self.wait_for_loop_messages()
         self.get_logger().info("[LaneChange] Ready!")
 
-        self.create_timer(1.0 / 20.0, self.loop)
+        self.create_timer(1.0 / self.rate_hz, self.loop)
 
     #################### PARAMS ####################
     def _declare_tunables(self):
@@ -338,6 +345,13 @@ class ChangeAvoidanceNode(Node):
         dbl('pass_behind_m', self.pass_behind_m, 1.0, 15.0, "meeting point this far behind = passed")
         dbl('target_lost_s', self.target_lost_s, 0.2, 5.0, "coast time before target is dropped")
         dbl('reengage_block_s', self.reengage_block_s, 0.0, 5.0, "idle time after finishing")
+        dbl('hold_clear_fail_s', self.hold_clear_fail_s, 0.0, 2.0,
+            "dwell before acting on a HOLD target-clearance failure [s]")
+        self.declare_parameter('hold_clear_check', self.hold_clear_check, ParameterDescriptor(
+            type=ParameterType.PARAMETER_BOOL,
+            description="re-verify every HOLD cycle that the lane still clears the target; "
+                        "False restores the old behaviour (checked only once, at engage)"))
+        self.hold_clear_check = self.get_parameter('hold_clear_check').value
 
         # prediction (P1/P2)
         dbl('kd_obs_pred', self.kd_obs_pred, 0.1, 10.0, "d->raceline relaxation gain")
@@ -404,6 +418,7 @@ class ChangeAvoidanceNode(Node):
                     'pass_lead_max_s', 'meet_s_slew_m',
                     'pass_behind_m', 'pass_hold_max_m', 'opp_pred_slack_m',
                     'target_lost_s', 'reengage_block_s',
+                    'hold_clear_fail_s', 'hold_clear_check',
                     'kd_obs_pred', 'pred_lead_scale', 'engage_min_closing_mps',
                     'use_prediction'):
                 setattr(self, param.name, param.value)
@@ -1252,12 +1267,35 @@ class ChangeAvoidanceNode(Node):
             return
 
         self.pass_cnt = self.pass_cnt + 1 if passed_now else 0
-        if self.pass_cnt >= max(int(self.pass_hyst_s * 20), 1):
+        if self.pass_cnt >= max(int(self.pass_hyst_s * self.rate_hz), 1):
             self._arm_close(now, f"passed (lead {rel:.1f} m)")
             return
 
         self._update_offset(self._dt)
         path = self._build_path(closing=False)
+        # Re-verify the lane still clears the opponent we are overtaking. Nothing else does:
+        # _path_blocked_ahead deliberately EXCLUDES the latched target, and this check used to
+        # run only from the deleted one-cycle OPEN phase -- so for the entire hold the planner
+        # trusted a promise the solver made once, even though _build_path then post-processes
+        # the profile with an entry blend and a corridor clip that can both eat into it.
+        # Checked BEFORE publishing so a lane that fails is never handed to the SM.
+        if path is not None and self.hold_clear_check:
+            if self._check_lane_clear_vs_target(path):
+                self.clear_fail_cnt = 0
+            else:
+                self.clear_fail_cnt += 1
+                if self.clear_fail_cnt >= max(int(self.hold_clear_fail_s * self.rate_hz), 1):
+                    if self._safe_to_abort():
+                        self._to_idle(now, "lane no longer clears target")
+                        return
+                    # Alongside or ahead: publishing a lane that is a few cm short beats
+                    # steering back onto the raceline right next to the opponent. Same
+                    # reasoning as _path_blocked_ahead's target exemption.
+                    self.get_logger().warn(
+                        f"[LaneChange] lane short of target clearance for "
+                        f"{self.clear_fail_cnt / self.rate_hz:.2f} s but too close alongside to "
+                        f"abort (rel={rel:+.2f} m) -- holding the lane",
+                        throttle_duration_sec=1.0)
         if path is None or not self._publish_path(path):
             self._to_idle(now, "path infeasible")
             return
