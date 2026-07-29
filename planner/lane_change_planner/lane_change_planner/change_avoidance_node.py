@@ -258,6 +258,19 @@ class ChangeAvoidanceNode(Node):
         self.lane_smooth_pad_m = 0.01
         self._lane_dbg = ""
         self.kernel_size = 3            # GridFilter erosion (7 ate ~0.35 m and killed the lanes)
+        # --- corridor source ---
+        # The waypoints' d_left/d_right cannot be trusted: on the f map they are stored EXACTLY
+        # SWAPPED across the whole lap (verified against the map contour -- at corner apexes
+        # corr(kappa, d_left - d_right) is +0.85 on f versus -0.65 on ifac, a clean mirror).
+        # A planner that believes them sizes lanes against the wrong wall: it rejects the side
+        # that is actually open and aims the accepted lane INTO the wall, where the
+        # post-smoothing map check in _publish_path then kills the whole maneuver. The eroded
+        # occupancy grid is the only corridor source a bad map cannot mislabel, and the static
+        # planner already switched to it for exactly this reason.
+        self.trust_grid_bounds = True   # False = use the waypoint d_left/d_right (legacy)
+        self.grid_scan_max = 3.0        # [m] half-width of the lateral scan around the raceline
+        self.grid_scan_step = 0.05      # [m] scan resolution
+        self.bounds_warn_m = 0.5        # warn when waypoint bounds disagree with the grid by this
 
         # --- opponent prediction (P1 temporal, P2 spatial) ---
         self.use_prediction = True           # master toggle; False = react to CURRENT opponent pos only
@@ -371,6 +384,17 @@ class ChangeAvoidanceNode(Node):
             "meeting-point drift that triggers a re-plan [m]")
         dbl('commit_obs_dd_m', self.commit_obs_dd_m, 0.05, 1.5,
             "opponent lateral drift that triggers a re-plan [m]")
+        dbl('grid_scan_max', self.grid_scan_max, 0.5, 10.0,
+            "half-width of the lateral occupancy-grid corridor scan [m]")
+        dbl('grid_scan_step', self.grid_scan_step, 0.01, 0.25, "grid corridor scan step [m]")
+        dbl('bounds_warn_m', self.bounds_warn_m, 0.05, 3.0,
+            "warn when the waypoint bounds disagree with the measured corridor by this [m]")
+        self.declare_parameter('trust_grid_bounds', self.trust_grid_bounds, ParameterDescriptor(
+            type=ParameterType.PARAMETER_BOOL,
+            description="measure the lateral corridor from the eroded occupancy grid instead of "
+                        "the waypoints' d_left/d_right (which are stored swapped on some maps). "
+                        "False restores the waypoint bounds."))
+        self.trust_grid_bounds = self.get_parameter('trust_grid_bounds').value
         self.declare_parameter('lane_commit', self.lane_commit, ParameterDescriptor(
             type=ParameterType.PARAMETER_BOOL,
             description="solve the lane ONCE at engage and follow it; False restores the "
@@ -447,6 +471,7 @@ class ChangeAvoidanceNode(Node):
                     'pass_behind_m', 'pass_hold_max_m', 'opp_pred_slack_m',
                     'target_lost_s', 'reengage_block_s',
                     'hold_clear_fail_s', 'hold_clear_check',
+                    'trust_grid_bounds', 'grid_scan_max', 'grid_scan_step', 'bounds_warn_m',
                     'lane_commit', 'commit_horizon_m', 'entry_join_tol_m',
                     'commit_dev_max_m', 'commit_meet_ds_m', 'commit_obs_dd_m',
                     'lane_solve_ds', 'width_car', 'blocked_dwell_s', 'ot_gate_stale_s',
@@ -711,6 +736,53 @@ class ChangeAvoidanceNode(Node):
         # that, not the gap, is the run-up available for the lane change.
         return (s_o + self.target['vs'] * min(gap / closing, self.pass_lead_max_s)) % L
 
+    def _free_mask(self, xy: np.ndarray) -> Optional[np.ndarray]:
+        """Vectorised GridFilter.is_point_inside(): True where the point is in the eroded free
+        area. Same pixel convention as GridFilter.world_to_pixel() (row index = y, no flip).
+        None when no map has arrived yet, so callers fall back to the waypoint bounds."""
+        f = self.map_filter
+        img = getattr(f, "eroded_image", None)
+        if img is None or f.resolution is None or f.origin is None:
+            return None
+        px = ((xy[:, 0] - f.origin[0]) / f.resolution).astype(int)
+        py = ((xy[:, 1] - f.origin[1]) / f.resolution).astype(int)
+        ok = (px >= 0) & (py >= 0) & (px < img.shape[1]) & (py < img.shape[0])
+        free = np.zeros(px.shape, dtype=bool)
+        free[ok] = img[py[ok], px[ok]] == 255
+        return free
+
+    def _grid_corridor(self, s_query: float):
+        """Free lateral extent [d_lo, d_hi] at arc length s, MEASURED in the eroded occupancy
+        grid instead of read from the waypoints' d_left/d_right.
+
+        Only the CONTIGUOUS free run containing the raceline is kept, so free space belonging
+        to another part of the track further out cannot widen the corridor. Returns None when
+        no map is loaded. Ported from the static planner, which needed it for the same reason:
+        a map whose bounds are stored swapped makes every corridor read mirrored."""
+        if self.scaled_max_s is None or self.converter is None:
+            return None
+        d_scan = np.arange(-self.grid_scan_max, self.grid_scan_max + 1e-9, self.grid_scan_step)
+        s_arr = np.full(d_scan.shape, float(s_query) % self.scaled_max_s)
+        resp = self.converter.get_cartesian(s_arr, d_scan)
+        xy = (resp.T if resp.ndim == 2 else resp).reshape(-1, 2)
+        free = self._free_mask(xy)
+        if free is None or not free.any():
+            return None
+        i0 = int(np.argmin(np.abs(d_scan)))
+        if not free[i0]:                    # raceline itself reads blocked -> nearest free sample
+            cand = np.flatnonzero(free)
+            i0 = int(cand[np.argmin(np.abs(d_scan[cand]))])
+        lo_i = hi_i = i0
+        while lo_i > 0 and free[lo_i - 1]:
+            lo_i -= 1
+        while hi_i < free.size - 1 and free[hi_i + 1]:
+            hi_i += 1
+        return float(d_scan[lo_i]), float(d_scan[hi_i])
+
+    def _grid_is_authority(self) -> bool:
+        return (self.trust_grid_bounds
+                and getattr(self.map_filter, "eroded_image", None) is not None)
+
     def _lane_bounds(self, s_lin: np.ndarray, side_sign: int):
         """Per-sample lateral corridor [lo, hi] for one side.
 
@@ -725,6 +797,37 @@ class ChangeAvoidanceNode(Node):
         wall_need = self.width_car / 2.0 + self.spline_bound_mindist + self.lane_smooth_pad_m
         lo = -(d_right - wall_need)
         hi = d_left - wall_need
+        if self._grid_is_authority():
+            # Measure the corridor instead of trusting d_left/d_right. Scanning every sample
+            # would cost a raycast per 0.25 m of a 30 m solve, so probe a coarse set of anchors
+            # and interpolate -- the corridor is smooth in s, the swap it corrects is not.
+            n_anchor = max(int(float(s_lin[-1] - s_lin[0]) / 2.0) + 1, 2)
+            a_s = np.linspace(s_lin[0], s_lin[-1], n_anchor)
+            a_lo, a_hi, ok = [], [], []
+            for s_a in a_s:
+                g = self._grid_corridor(float(s_a))
+                if g is None:
+                    ok.append(False); a_lo.append(0.0); a_hi.append(0.0)
+                else:
+                    ok.append(True); a_lo.append(g[0]); a_hi.append(g[1])
+            if all(ok):
+                g_lo = np.interp(s_lin, a_s, np.array(a_lo)) + wall_need
+                g_hi = np.interp(s_lin, a_s, np.array(a_hi)) - wall_need
+                bad = g_hi < g_lo
+                if bad.any():        # narrower than 2*wall_need: collapse to the middle
+                    mid = 0.5 * (g_lo + g_hi)
+                    g_lo = np.where(bad, mid, g_lo)
+                    g_hi = np.where(bad, mid, g_hi)
+                # A map that disagrees this much with its own geometry reports itself.
+                dis = max(float(np.max(np.abs(g_lo - lo))), float(np.max(np.abs(g_hi - hi))))
+                if dis > self.bounds_warn_m:
+                    self.get_logger().warn(
+                        f"[LaneChange] waypoint bounds disagree with the measured corridor by "
+                        f"{dis:.2f} m -- d_left/d_right in this map's global_waypoints.json are "
+                        f"probably SWAPPED. Using the occupancy grid "
+                        f"(trust_grid_bounds:=false to force the waypoint bounds).",
+                        throttle_duration_sec=10.0)
+                lo, hi = g_lo, g_hi
         if self.target is not None:
             need = self.target['size'] / 2.0 + self.sep_margin_m
             # The opponent is at ONE lateral position when the cars are level: their d around

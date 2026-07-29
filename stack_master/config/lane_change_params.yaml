@@ -97,6 +97,21 @@ planner_change:
 
     offset_slew_mps: 0.6       # how fast the live offset may grow/shrink [m/s]
     spline_bound_mindist: 0.12 # path may never come closer than this to the track bounds
+    # --- corridor source ---------------------------------------------------------------
+    # MEASURE the lateral corridor in the eroded occupancy grid instead of reading the
+    # waypoints' d_left/d_right. Those cannot be trusted: on the f map they are stored EXACTLY
+    # SWAPPED across the whole lap. Verified two ways -- at corner apexes
+    # corr(kappa, d_left-d_right) is +0.85 on f vs -0.65 on ifac (a clean mirror), and the
+    # measured corridor at s=68.4 is [-0.35, +2.15] where the waypoints claim
+    # dl=0.41 dr=2.16, i.e. [-2.16, +0.41]. A planner that believes them rejects the side that
+    # is actually open and aims the accepted lane INTO the wall, where the post-smoothing map
+    # check in _publish_path then kills the whole maneuver and eats reengage_block_s.
+    # Measured on the real f map: lane-fit rate 22/32 -> 26/32 on straights, 26/32 -> 28/32 in
+    # corners. The static planner already switched to the grid for the same reason.
+    trust_grid_bounds: true    # false = use the waypoint d_left/d_right (legacy)
+    grid_scan_max: 3.0         # [m] half-width of the lateral scan around the raceline
+    grid_scan_step: 0.05       # [m] scan resolution
+    bounds_warn_m: 0.5         # [m] disagreement above which the map reports itself as swapped
     lane_solve_ds: 0.25        # [m] grid the lateral profile is solved on. Also sets the
                                # solver's per-step slope budget (lane_max_slope * this) and the
                                # band slack in _lane_bounds. Finer = more Python loop per cycle.
