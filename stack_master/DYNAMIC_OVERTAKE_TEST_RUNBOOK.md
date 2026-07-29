@@ -30,8 +30,13 @@ target; `hold_horizon_m > interest_horizon_m`; `engage_gap_m < 10` (the SM's
 Unit test of the phase machine (no ROS running needed):
 
 ```bash
-python3 planner/lane_change_planner/test/test_phase_machine.py   # 38/38, exit 0
+python3 planner/lane_change_planner/test/test_phase_machine.py   # 60/60, exit 0
+python3 planner/lane_change_planner/test/test_grid_corridor.py   # f-map corridor vs waypoints
 ```
+
+`test_grid_corridor.py` needs no ROS running: it drives the real solver against the real f map
+and its real occupancy grid. Its first line must report ~100 % of raceline points inside the
+eroded free space — anything less means the grid pixel convention is off and the rest is noise.
 
 ---
 
@@ -92,7 +97,10 @@ Both sides of the gate now log. One run is enough to attribute a failure.
 | `IDLE: <reason>` (1 Hz) | not engaging; the reason is the per-gate verdict for the nearest dynamic obstacle |
 | `IDLE: no lane fits: … L@+X.Xm[dl=… dr=… oppd=…] L:corridor short X.XXm` | geometry refusal, per side, with the exact shortfall and the opponent-d actually used |
 | `IDLE: ot_section gate closed/stale` | `/ot_section_check` false or older than `ot_gate_stale_s` |
-| `IDLE -> HOLD (engage): target id=… gap=… side=… meet_in=… v_pass=… v_opp=…` | the engage moment and all its numbers |
+| `IDLE -> ENTRY (engage): target id=… gap=… side=… meet_in=… v_pass=… v_opp=…` | the engage moment and all its numbers; the lane is COMMITTED here |
+| `ENTRY -> HOLD (on lane, dev=…)` | the car reached the committed lane; from here it is followed, not re-solved |
+| `HOLD re-plan (<reason>)` / `ENTRY re-plan (…)` | the committed lane was replaced — reason is opponent lateral drift, meeting-point drift, or car off the lane. **Frequent re-plans mean the commit thresholds are too tight and the churn is back** |
+| `waypoint bounds disagree with the measured corridor by … SWAPPED` | this map's `d_left`/`d_right` are mirrored; the grid corridor is being used instead |
 | `HOLD -> CLOSE (passed …)` / `(target gone)` | pass complete |
 | `<PHASE> -> IDLE (<reason>)` | abort; reason is one of *target lost / target pulled away / lane no longer clears target / path infeasible / blocked, dropping back / merge complete* |
 | `lane short of target clearance … too close alongside to abort` | clearance failed while level with the opponent — the lane is deliberately held |
@@ -181,7 +189,8 @@ Each: N ≥ 5 laps, same opponent speed, same spawn `s`. Record the metrics in �
 | Metric | Source | Pass |
 |---|---|---|
 | State sequence `GB_TRACK → TRAILING → OVERTAKE → GB_TRACK` completes | `/state_machine` | ≥1 per scripted pass; OVERTAKE held ≥ 1.0 s |
-| Planner phases `IDLE → HOLD → CLOSE → IDLE (merge complete)` | `/rosout` | all present, in order. Any other `-> IDLE (…)` is an abort — record the reason |
+| Planner phases `IDLE → ENTRY → HOLD → CLOSE → IDLE (merge complete)` | `/rosout` | all present, in order. Any other `-> IDLE (…)` is an abort — record the reason |
+| **Committed-lane churn** | `/rosout` grep `re-plan` | **≤ 1 re-plan per pass.** More than that and the car is chasing a moving path again — loosen `commit_meet_ds_m` / `commit_obs_dd_m` |
 | **Min lateral clearance** = min over the pass of \|d_ego − d_opp\| | `/car_state/odom_frenet` + `/opp_racecar/odom` (ground truth) | **≥ 0.40 m**, and **must not drop** relative to the D0/baseline run |
 | Collisions | `/pitwall/events` (`gym_bridge` emits `ego: OPPONENT collision` / `ego: WALL collision`) | **0** |
 | OVERTAKE↔TRAILING oscillation | `/state_machine` timestamps | ≤1 round trip per pass; **no transition pair closer than 0.8 s** |
@@ -215,7 +224,9 @@ The fixes landed as separate commits so each can be tested alone. Ordering hazar
 
 Toggles that restore prior behaviour: `hold_clear_check: false` (HOLD clearance re-check),
 `free_check_dynamic_ot_slow: false` (slow-opponent routing), `sep_monitor_slack_m: -0.014`
-(the historical 0.336 monitor line), `use_prediction`, `engage_min_closing_mps: -3.0`.
+(the historical 0.336 monitor line), `use_prediction`, `engage_min_closing_mps: -3.0`,
+`lane_commit: false` (per-cycle re-solve — the wobble), `trust_grid_bounds: false`
+(waypoint corridor bounds instead of the measured one).
 
 ---
 
