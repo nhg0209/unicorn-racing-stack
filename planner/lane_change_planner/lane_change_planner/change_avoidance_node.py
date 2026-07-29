@@ -7,9 +7,14 @@ so the published path no longer chases a moving opponent:
   IDLE  -> planner stays SILENT until the gap to the opponent has closed to
            engage_gap_m: the approach is owned by TRAILING (controller gap PID)
            or plain raceline driving, at full speed.
-  HOLD  -> engage: latch the side, then re-solve the lane every cycle against the
-           opponent's latest position and follow it. Entered directly from IDLE
-           and held for the whole approach and pass.
+  ENTRY -> engage: latch the side and COMMIT the lane (solved once, frozen in
+           world coordinates). Only the short blend from the car onto that fixed
+           lane is re-anchored per cycle, and its feasibility is checked here,
+           while aborting is still safe.
+  HOLD  -> the car is on the committed lane: FOLLOW it. The lane is not
+           re-solved. Clearance is verified but never silently re-planned; only
+           the explicit staleness triggers (_commit_stale) re-plan, with a
+           logged reason.
   CLOSE -> once the opponent is passed (wrapped signed s-gap > pass_gap_m, held
            for pass_hyst_s), ramp back to the raceline at a latched s.
 
@@ -24,11 +29,14 @@ until the place where the two cars are actually level, and only there does it
 step aside -- which is why the state machine must NOT judge this path at the
 opponent's current s (see free_check_dynamic_ot_slow in the SM).
 
-There is no separate "open" phase: the profile is anchored at the car
-(_solve_profile pins d[0] = current_d) and re-gridded from current_s every
-cycle, so a distinct blend-on phase would have terminated on its first cycle by
-construction. The blend onto the lane lives in _build_path, not in the phase
-machine.
+WHY THE LANE IS COMMITTED. It used to be re-solved every cycle on a grid
+starting at the moving car, and _build_path re-blended from the live pose; since
+the state machine adopts every publish younger than latest_threshold, the path
+the controller was tracking was redefined 20 times a second and the car visibly
+wobbled along the evasion spline. Freezing the lane also makes ENTRY's "am I on
+the lane yet" test meaningful -- while the lane was re-solved, _solve_profile
+pinned d[0] = current_d, so that test was identically 0 < tol and any such phase
+terminated on its first cycle. lane_commit:=false restores the old behaviour.
 
 The lane geometry is stable by construction, so the state machine's cached-path
 splicing sees a consistent trajectory instead of a per-cycle re-anchored spline
@@ -90,6 +98,7 @@ from grid_filter.grid_filter import GridFilter
 PATH_DS = 0.1
 
 PHASE_IDLE = "IDLE"
+PHASE_ENTRY = "ENTRY"
 PHASE_HOLD = "HOLD"
 PHASE_CLOSE = "CLOSE"
 
@@ -135,6 +144,13 @@ class ChangeAvoidanceNode(Node):
         # clear the walls AND the opponent at every sample of the window, so the narrowest
         # point vetoed the whole maneuver even when the opponent was nowhere near it.
         self.meet_s = None              # latched s where the pass happens
+        # --- committed lane (frozen at engage; see _commit_lane) ---
+        # The lane is solved ONCE and then followed. Re-solving it every cycle re-anchored the
+        # geometry to a moving car, and because the SM adopts every fresh publish the path the
+        # controller was tracking got redefined at 20 Hz -- the car visibly wobbled along the
+        # evasion spline. Now only explicit triggers re-plan it.
+        self.commit_meet_s = None       # meeting point the frozen lane was solved for
+        self.commit_target_d = None     # opponent d the frozen lane was solved for
         self.lane_s = None              # unwrapped s grid of the solved lane profile
         self.lane_d = None              # lateral profile d(s) [m], raceline frenet frame
         self.lane_offset_cur = 0.0      # peak |d| of the current profile [m] (reporting only)
@@ -209,6 +225,13 @@ class ChangeAvoidanceNode(Node):
         # Per-cycle re-verification that the lane still clears the target during HOLD.
         self.hold_clear_check = True
         self.hold_clear_fail_s = 0.15   # dwell before acting on a clearance failure [s]
+        # --- lane commit ---
+        self.lane_commit = True         # False = legacy per-cycle re-solve
+        self.commit_horizon_m = 30.0    # span the lane is solved over at commit [m]
+        self.entry_join_tol_m = 0.15    # |d - lane(s)| below which ENTRY is complete [m]
+        self.commit_dev_max_m = 0.35    # car this far off the committed lane -> re-plan [m]
+        self.commit_meet_ds_m = 1.5     # meeting point drifted this far -> re-plan [m]
+        self.commit_obs_dd_m = 0.40     # opponent moved this far laterally -> re-plan [m]
         # Lane profile solver. The opponent clearance is only required where the pass actually
         # overlaps them; everywhere else the lane just has to fit between the walls, which the
         # car alone always does (corridor needs 2*wall_need = 0.54 m, ifac's narrowest is 0.87).
@@ -338,6 +361,22 @@ class ChangeAvoidanceNode(Node):
             "/ot_section_check staleness that fails the engage gate closed [s]")
         dbl('hold_clear_fail_s', self.hold_clear_fail_s, 0.0, 2.0,
             "dwell before acting on a HOLD target-clearance failure [s]")
+        dbl('commit_horizon_m', self.commit_horizon_m, 10.0, 60.0,
+            "span the committed lane is solved over at engage [m]")
+        dbl('entry_join_tol_m', self.entry_join_tol_m, 0.02, 0.5,
+            "|d - committed lane| below which the car counts as ON the lane [m]")
+        dbl('commit_dev_max_m', self.commit_dev_max_m, 0.05, 1.5,
+            "car this far off the committed lane triggers a re-plan [m]")
+        dbl('commit_meet_ds_m', self.commit_meet_ds_m, 0.2, 10.0,
+            "meeting-point drift that triggers a re-plan [m]")
+        dbl('commit_obs_dd_m', self.commit_obs_dd_m, 0.05, 1.5,
+            "opponent lateral drift that triggers a re-plan [m]")
+        self.declare_parameter('lane_commit', self.lane_commit, ParameterDescriptor(
+            type=ParameterType.PARAMETER_BOOL,
+            description="solve the lane ONCE at engage and follow it; False restores the "
+                        "legacy per-cycle re-solve (which re-anchored the path to the moving "
+                        "car every cycle and made the controller chase it)"))
+        self.lane_commit = self.get_parameter('lane_commit').value
         self.declare_parameter('hold_clear_check', self.hold_clear_check, ParameterDescriptor(
             type=ParameterType.PARAMETER_BOOL,
             description="re-verify every HOLD cycle that the lane still clears the target; "
@@ -408,6 +447,8 @@ class ChangeAvoidanceNode(Node):
                     'pass_behind_m', 'pass_hold_max_m', 'opp_pred_slack_m',
                     'target_lost_s', 'reengage_block_s',
                     'hold_clear_fail_s', 'hold_clear_check',
+                    'lane_commit', 'commit_horizon_m', 'entry_join_tol_m',
+                    'commit_dev_max_m', 'commit_meet_ds_m', 'commit_obs_dd_m',
                     'lane_solve_ds', 'width_car', 'blocked_dwell_s', 'ot_gate_stale_s',
                     'engage_min_closing_mps',
                     'use_prediction'):
@@ -803,16 +844,37 @@ class ChangeAvoidanceNode(Node):
                 "[LaneChange] _lane_profile_at called with no solved lane -- returning raceline",
                 throttle_duration_sec=5.0)
             return np.zeros_like(np.asarray(s_query, dtype=float))
-        return np.interp(s_query, self.lane_s, self.lane_d)
+        # Map the query INTO the committed lane's own unwrapped frame before interpolating.
+        # lane_s is unwrapped from the s at which the lane was solved, so once the lane is
+        # frozen and the car crosses the start/finish line current_s drops to ~0 while lane_s
+        # still starts near L -- a plain np.interp then clamps to lane_d[0] and the published
+        # path steps laterally at the seam. The per-cycle re-solve used to hide this by
+        # rebuilding lane_s from the new current_s every cycle.
+        L = self.scaled_max_s
+        s0 = float(self.lane_s[0])
+        sq = s0 + (np.asarray(s_query, dtype=float) - s0) % L
+        return np.interp(sq, self.lane_s, self.lane_d)
 
-    def _choose_lane(self) -> bool:
-        """Latch the overtaking side and solve the lateral profile over the whole published
-        horizon. Returns False when neither side admits a drivable profile."""
+    def _choose_lane(self, keep_side: bool = False) -> bool:
+        """Solve the lateral profile and COMMIT it: this is the only place the lane geometry
+        is produced. Returns False when neither side admits a drivable profile.
+
+        Solved over commit_horizon_m rather than the published horizon, because the frozen
+        lane has to cover the whole maneuver -- meeting point plus _pass_hold_m plus the
+        return ramp -- not just one window. Samples outside the meeting band are only
+        constrained by the walls, which the car alone always clears, so the longer span costs
+        nothing in feasibility.
+
+        keep_side: on a mid-maneuver re-plan, do not re-run side selection. Flipping sides
+        while alongside an opponent is never the right answer."""
         if self.scaled_max_s is None or self.target is None:
             return False
-        self.meet_s = None            # fresh engagement: do not inherit an old aim point
+        if not keep_side:
+            self.meet_s = None        # fresh engagement: do not inherit an old aim point
         self._update_meet_s()
-        s_lin = self.current_s + np.arange(0.0, self._lane_horizon(), self.lane_solve_ds)
+        span = min(self.commit_horizon_m if self.lane_commit else self._lane_horizon(),
+                   self.scaled_max_s * 0.9)
+        s_lin = self.current_s + np.arange(0.0, span, self.lane_solve_ds)
         cands, dbg = {}, []
         for name, sign in (('left', +1), ('right', -1)):
             prof = self._solve_gentlest(s_lin, sign)
@@ -843,12 +905,37 @@ class ChangeAvoidanceNode(Node):
             return False
         self._lane_dbg = ""
         # least lateral excursion wins; slight stickiness to the previous side damps flip-flop
-        side = max(cands, key=lambda k: -cands[k][0] + (0.05 if k == self.side else 0.0))
+        if keep_side and self.side in cands:
+            side = self.side
+        else:
+            side = max(cands, key=lambda k: -cands[k][0] + (0.05 if k == self.side else 0.0))
         peak, sign, prof = cands[side]
         self.side, self.lane_sign = side, sign
         self.lane_s, self.lane_d = s_lin, prof
         self.lane_offset_cur = peak
+        # Freeze the conditions this lane was solved for, so HOLD can tell when reality has
+        # moved far enough that the frozen geometry is no longer the right answer.
+        self.commit_meet_s = self._meet_s()
+        self.commit_target_d = self.target['d']
         return True
+
+    def _commit_stale(self) -> Optional[str]:
+        """Has the world moved far enough from what the committed lane was solved for?
+
+        Returns a reason string, or None while the frozen lane is still valid. These are the
+        ONLY things that re-plan a committed lane -- everything else is verified and either
+        tolerated or aborted, never silently re-solved underneath the controller."""
+        if self.target is None or self.commit_meet_s is None:
+            return None
+        if abs(self.target['d'] - self.commit_target_d) > self.commit_obs_dd_m:
+            return (f"opponent moved {self.target['d'] - self.commit_target_d:+.2f} m laterally")
+        meet_drift = self._sdiff(self._meet_s_raw(), self.commit_meet_s)
+        if abs(meet_drift) > self.commit_meet_ds_m:
+            return f"meeting point drifted {meet_drift:+.2f} m"
+        dev = abs((self.current_d or 0.0) - self._lane_at(self.current_s))
+        if dev > self.commit_dev_max_m:
+            return f"car {dev:.2f} m off the committed lane"
+        return None
 
     def _update_offset(self, dt: float):
         """Re-solve the lane against the opponent's latest position. Continuity comes from
@@ -902,6 +989,12 @@ class ChangeAvoidanceNode(Node):
         d_gap = abs((self.current_d or 0.0) - float(d_arr[0]))
         open_len = max(self.open_ramp_min_m, self.open_ramp_time_s * v)
         blend_len = float(np.clip(d_gap * 8.0, self.blend_min_m, open_len))
+        # Once the car is ON the committed lane the blend has no lateral work left -- it only
+        # has to leave the path tangent to the car so the controller sees no kink. Holding it
+        # at open_ramp length there would keep re-carving several metres of an otherwise
+        # frozen lane every cycle, which is exactly the churn the commit removes.
+        if self.lane_commit and self.phase == PHASE_HOLD:
+            blend_len = self.blend_min_m
         # The blend must finish BEFORE the stretch where the cars are side by side, else it
         # overwrites the exact piece of lane the solver sized for the clearance and the
         # maneuver is aborted by its own monitor. Anchoring the profile at the car already
@@ -1060,6 +1153,8 @@ class ChangeAvoidanceNode(Node):
         self.lane_d = None
         self.close_s = None
         self.close_frozen = False
+        self.commit_meet_s = None
+        self.commit_target_d = None
         self.pass_cnt = 0
         self.clear_fail_cnt = 0    # consecutive cycles the lane failed the target-clearance check
         self.blocked_since = None
@@ -1084,6 +1179,8 @@ class ChangeAvoidanceNode(Node):
 
         if self.phase == PHASE_IDLE:
             self._step_idle(now)
+        elif self.phase == PHASE_ENTRY:
+            self._step_entry(now)
         elif self.phase == PHASE_HOLD:
             self._step_hold(now)
         elif self.phase == PHASE_CLOSE:
@@ -1108,11 +1205,11 @@ class ChangeAvoidanceNode(Node):
             self._idle_why(f"no lane fits: {self._lane_dbg}")
             self.target = None
             return
-        self.phase = PHASE_HOLD
+        self.phase = PHASE_ENTRY if self.lane_commit else PHASE_HOLD
         self.pass_cnt = 0
         self.clear_fail_cnt = 0
         self.get_logger().info(
-            f"[LaneChange] IDLE -> HOLD (engage): target id={target['id']} "
+            f"[LaneChange] IDLE -> {self.phase} (engage): target id={target['id']} "
             f"gap={self._sdiff(target['s'], self.current_s):.1f} m "
             f"side={self.side} offset={self.lane_offset_cur:.2f} m "
             f"meet_in={(self._meet_s() - self.current_s) % self.scaled_max_s:.1f} m "
@@ -1155,27 +1252,99 @@ class ChangeAvoidanceNode(Node):
             return True
         return self._sdiff(self.current_s, self.target['s']) < -(self.pass_gap_m + 0.5)
 
-    def _step_hold(self, now: float):
-        lost = self._target_lost_for(now)
+    def _step_entry(self, now: float):
+        """Drive the car onto the COMMITTED lane.
+
+        This is the only phase that re-anchors geometry every cycle, and it re-anchors only
+        the short blend from the car onto a lane that is already fixed -- so the thing the
+        controller is converging to does not move. Feasibility is checked here, while we are
+        still behind the opponent and aborting is safe.
+
+        The completion test is meaningful only because the lane is frozen. When the lane was
+        re-solved every cycle the solver pinned d[0] = current_d, so |current_d - lane(s)| was
+        identically zero and the equivalent phase terminated on its first cycle."""
+        if self._abort_checks(now):
+            return
+        stale = self._commit_stale()
+        # ignore "car off the lane" here: being off it is the entire point of ENTRY
+        if stale is not None and not stale.startswith("car "):
+            if self._choose_lane(keep_side=True):
+                self.get_logger().info(f"[LaneChange] ENTRY re-plan ({stale})")
+            else:
+                self._to_idle(now, f"re-plan failed ({stale}): {self._lane_dbg}")
+                return
+
+        path = self._build_path(closing=False)
+        if path is None or not self._check_lane_clear_vs_target(path):
+            if self._safe_to_abort():
+                self._to_idle(now, "entry lane does not clear the target")
+                return
+        if path is None or not self._publish_path(path):
+            self._to_idle(now, "entry path infeasible")
+            return
+        if self._path_blocked_ahead(path, now) and self._safe_to_abort():
+            self._to_idle(now, "entry lane blocked ahead")
+            return
+
+        dev = abs((self.current_d or 0.0) - self._lane_at(self.current_s))
+        if dev < self.entry_join_tol_m:
+            self.phase = PHASE_HOLD
+            self.get_logger().info(
+                f"[LaneChange] ENTRY -> HOLD (on lane, dev={dev:.3f} m): "
+                f"following the committed lane, no further re-solve")
+        self._visualize_phase()
+
+    def _abort_checks(self, now: float) -> bool:
+        """Shared ENTRY/HOLD exits that do not depend on the phase. True = phase changed."""
         rel = self._sdiff(self.current_s, self.target['s']) if self.target else 0.0
-        # target ran away faster than we can close: nothing to overtake any more. (Inherited
-        # from the deleted OPEN phase, which could only ever check it on its single cycle.)
         if self.target is not None and rel < -(self.engage_gap_m + 4.0):
             self._to_idle(now, "target pulled away")
-            return
-        # lost while already ahead (typical: opponent left the lidar FOV behind us) counts as
-        # passing; lost for a long time while still nominally behind means nothing left to pass
+            return True
+        lost = self._target_lost_for(now)
         passed_now = self._passed() or (lost > self.target_lost_s and rel > 0.0)
         if not passed_now and lost > 3.0 * self.target_lost_s:
             self._arm_close(now, "target gone")
-            return
-
+            return True
         self.pass_cnt = self.pass_cnt + 1 if passed_now else 0
         if self.pass_cnt >= max(int(self.pass_hyst_s * self.rate_hz), 1):
             self._arm_close(now, f"passed (lead {rel:.1f} m)")
+            return True
+        return False
+
+    def _step_hold(self, now: float):
+        """FOLLOW the committed lane until the opponent is passed.
+
+        The lane is NOT re-solved here. Everything below verifies the frozen geometry and
+        either tolerates it, re-plans it explicitly (with a logged reason), or aborts -- but
+        never silently replaces the path the controller is mid-way through tracking. That
+        silent replacement is what made the car wobble: _update_offset re-solved on a grid
+        starting at the moving car, _build_path re-blended from the live pose, and the SM
+        adopts every publish younger than latest_threshold, so the tracked path was redefined
+        20 times a second."""
+        rel = self._sdiff(self.current_s, self.target['s']) if self.target else 0.0
+        if self._abort_checks(now):
             return
 
-        self._update_offset(self._dt)
+        if self.lane_commit:
+            stale = self._commit_stale()
+            if stale is not None:
+                if self._choose_lane(keep_side=True):
+                    self.get_logger().info(f"[LaneChange] HOLD re-plan ({stale})")
+                    # re-entering ENTRY would re-open the blend; only do that if the car is
+                    # genuinely off the new lane
+                    if abs((self.current_d or 0.0) - self._lane_at(self.current_s)) \
+                            > self.entry_join_tol_m:
+                        self.phase = PHASE_ENTRY
+                elif self._safe_to_abort():
+                    self._to_idle(now, f"re-plan failed ({stale}): {self._lane_dbg}")
+                    return
+                else:
+                    self.get_logger().warn(
+                        f"[LaneChange] committed lane stale ({stale}) but re-plan failed and "
+                        f"we are alongside -- holding the frozen lane",
+                        throttle_duration_sec=1.0)
+        else:
+            self._update_offset(self._dt)     # legacy per-cycle re-solve
         path = self._build_path(closing=False)
         # Re-verify the lane still clears the opponent we are overtaking. Nothing else does:
         # _path_blocked_ahead deliberately EXCLUDES the latched target, and this check used to

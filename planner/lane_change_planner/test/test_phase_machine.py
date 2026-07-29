@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Harness test of the lane-change phase machine (IDLE -> HOLD -> CLOSE).
+"""Harness test of the lane-change phase machine (IDLE -> ENTRY -> HOLD -> CLOSE).
 
 Loads the REAL change_avoidance_node module, binds the REAL phase-step
 methods onto a bare object with hand-set state, and drives them. The point is to prove:
-  1. IDLE -> HOLD happens directly, and CLOSE/IDLE transitions still work.
-  2. The OPEN guards that were deleted were either unreachable or are still covered.
-  3. _safe_to_abort() is the single abort predicate and is the conservative one.
+  1. The committed lane is solved ONCE and HOLD never re-solves it.
+  2. Only the explicit staleness triggers re-plan it, each with a logged reason.
+  3. ENTRY's completion test is meaningful (it is, only because the lane is frozen).
+  4. _safe_to_abort() is the single abort predicate and is the conservative one.
 Run (after sourcing the workspace):
   python3 planner/lane_change_planner/test/test_phase_machine.py
 """
@@ -74,6 +75,19 @@ class Fake:
         self.rate_hz = 20.0
         self.hold_clear_check = True
         self.hold_clear_fail_s = 0.15
+        self.lane_commit = True
+        self.entry_join_tol_m = 0.15
+        self.commit_dev_max_m = 0.35
+        self.commit_meet_ds_m = 1.5
+        self.commit_obs_dd_m = 0.40
+        self.commit_horizon_m = 30.0
+        self.commit_meet_s = None
+        self.commit_target_d = None
+        self.engage_gap_m = 5.0
+        self.solve_calls = 0
+        self.lane_s = np.arange(0.0, 30.0, 0.25) + 10.0
+        self.lane_d = np.zeros_like(self.lane_s)
+        self.meet_raw = 15.0
         self.close_arm_m = 1.0
         self._sep_monitor_m = 0.37
         # call recorders
@@ -116,10 +130,23 @@ class Fake:
     def _step_close(self, now):
         self.closed.append(now)
 
+    # collaborators the committed-lane logic calls
+    def _choose_lane(self, keep_side=False):
+        self.solve_calls += 1
+        self.commit_meet_s = self.meet_raw
+        self.commit_target_d = self.target['d'] if self.target else 0.0
+        return True
+
+    def _meet_s_raw(self):
+        return self.meet_raw
+
+    def _lane_at(self, s):
+        return 0.0
+
 
 # bind the REAL methods under test
 for name in ("_to_idle", "_passed", "_safe_to_abort", "_step_hold", "_arm_close", "_sdiff",
-             "_target_lost_for"):
+             "_target_lost_for", "_commit_stale", "_abort_checks", "_step_entry"):
     setattr(Fake, name, getattr(cav.ChangeAvoidanceNode, name))
 
 
@@ -146,8 +173,9 @@ def check(name, cond, extra=""):
 
 print("=== phase constants ===")
 check("PHASE_OPEN is gone", not hasattr(cav, "PHASE_OPEN"))
-check("phases are IDLE/HOLD/CLOSE",
-      (cav.PHASE_IDLE, cav.PHASE_HOLD, cav.PHASE_CLOSE) == ("IDLE", "HOLD", "CLOSE"))
+check("phases are IDLE/ENTRY/HOLD/CLOSE",
+      (cav.PHASE_IDLE, cav.PHASE_ENTRY, cav.PHASE_HOLD, cav.PHASE_CLOSE)
+      == ("IDLE", "ENTRY", "HOLD", "CLOSE"))
 check("_step_open is gone", not hasattr(cav.ChangeAvoidanceNode, "_step_open"))
 
 print("\n=== _safe_to_abort: single, conservative predicate ===")
@@ -265,16 +293,82 @@ check("at 40 Hz the pass dwell needs 12 cycles, not 6", f.phase == cav.PHASE_HOL
 f._step_hold(f.t)
 check("...and fires on the 12th", f.phase == cav.PHASE_CLOSE, f"phase={f.phase}")
 
+print("\n=== committed lane: HOLD must not re-solve ===")
+f = mk(phase=cav.PHASE_HOLD, target=tgt(s=13.0), current_s=10.0)
+f.commit_meet_s, f.commit_target_d = 15.0, 0.0
+lane_before = f.lane_d.copy()
+for i in range(20):
+    f._step_hold(f.t)
+check("20 HOLD cycles trigger 0 lane solves", f.solve_calls == 0, f"solves={f.solve_calls}")
+check("committed lane bytes unchanged", np.array_equal(f.lane_d, lane_before))
+check("still publishing every cycle", len(f.published) == 20)
+
+print("\n=== committed lane: explicit re-plan triggers ===")
+# (a) opponent drifts laterally beyond commit_obs_dd_m
+f = mk(phase=cav.PHASE_HOLD, target=tgt(s=13.0, d=0.0), current_s=10.0)
+f.commit_meet_s, f.commit_target_d = 15.0, 0.0
+f._step_hold(f.t)
+check("no re-plan while the opponent holds its line", f.solve_calls == 0)
+f.target['d'] = 0.5                      # > commit_obs_dd_m = 0.40
+f._step_hold(f.t)
+check("opponent lateral drift -> exactly one re-plan", f.solve_calls == 1)
+check("re-plan reason logged", any("HOLD re-plan" in m and "laterally" in m
+                                   for _, m in f._log.lines), str(f._log.lines[-2:]))
+# (b) meeting point drifts
+f = mk(phase=cav.PHASE_HOLD, target=tgt(s=13.0), current_s=10.0)
+f.commit_meet_s, f.commit_target_d = 15.0, 0.0
+f.meet_raw = 17.0                        # 2.0 m > commit_meet_ds_m = 1.5
+f._step_hold(f.t)
+check("meeting-point drift -> re-plan", f.solve_calls == 1)
+check("reason names the drift", any("meeting point drifted" in m for _, m in f._log.lines))
+# (c) car falls off the committed lane -> re-plan AND drop back to ENTRY
+f = mk(phase=cav.PHASE_HOLD, target=tgt(s=13.0), current_s=10.0, current_d=0.5)
+f.commit_meet_s, f.commit_target_d = 15.0, 0.0
+f._step_hold(f.t)
+check("car off the lane -> re-plan", f.solve_calls == 1)
+check("...and re-enters ENTRY to blend back on", f.phase == cav.PHASE_ENTRY, f"phase={f.phase}")
+
+print("\n=== ENTRY: completion test is meaningful (frozen lane) ===")
+f = mk(phase=cav.PHASE_ENTRY, target=tgt(s=13.0), current_s=10.0, current_d=0.5)
+f.commit_meet_s, f.commit_target_d = 15.0, 0.0
+f._step_entry(f.t)
+check("0.50 m off the lane -> stays in ENTRY", f.phase == cav.PHASE_ENTRY)
+check("ENTRY publishes", len(f.published) == 1)
+f.current_d = 0.10                        # < entry_join_tol_m = 0.15
+f._step_entry(f.t)
+check("0.10 m off the lane -> ENTRY complete", f.phase == cav.PHASE_HOLD, f"phase={f.phase}")
+check("transition logged", any("ENTRY -> HOLD (on lane" in m for _, m in f._log.lines))
+check("ENTRY never re-solved a valid commit", f.solve_calls == 0)
+
+print("\n=== ENTRY aborts while safely behind ===")
+f = mk(phase=cav.PHASE_ENTRY, target=tgt(s=12.5), current_s=10.0, current_d=0.5, clear_ok=False)
+f.commit_meet_s, f.commit_target_d = 15.0, 0.0
+f._step_entry(f.t)
+check("entry lane not clearing target -> IDLE", f.phase == cav.PHASE_IDLE)
+check("reason logged", any("entry lane does not clear the target" in m for _, m in f._log.lines))
+check("failing entry path never published", f.published == [])
+
+print("\n=== lane_commit=False restores the legacy per-cycle re-solve ===")
+f = mk(phase=cav.PHASE_HOLD, target=tgt(s=13.0), current_s=10.0, lane_commit=False)
+f.offset_calls = 0
+f._update_offset = lambda dt: setattr(f, "offset_calls", f.offset_calls + 1)
+for i in range(5):
+    f._step_hold(f.t)
+check("legacy mode re-solves every cycle", f.offset_calls == 5, f"calls={f.offset_calls}")
+check("legacy mode never uses the commit triggers", f.solve_calls == 0)
+
 print("\n=== _to_idle resets the maneuver state ===")
 f = mk(phase=cav.PHASE_HOLD, target=tgt(s=13.0), lane_s=np.zeros(3), lane_d=np.zeros(3),
        close_s=5.0, close_frozen=True, pass_cnt=4, clear_fail_cnt=3, blocked_since=1.0,
        meet_s=42.0)
+f.commit_meet_s, f.commit_target_d = 15.0, 0.0
 f._to_idle(f.t, "test")
 check("phase IDLE", f.phase == cav.PHASE_IDLE)
 check("target/meet_s/lane cleared",
       f.target is None and f.meet_s is None and f.lane_s is None and f.lane_d is None)
 check("counters reset", f.pass_cnt == 0 and f.clear_fail_cnt == 0 and f.blocked_since is None)
 check("close state cleared", f.close_s is None and f.close_frozen is False)
+check("commit refs cleared", f.commit_meet_s is None and f.commit_target_d is None)
 
 print("\n" + ("ALL PASS" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}"))
 sys.exit(1 if FAILS else 0)

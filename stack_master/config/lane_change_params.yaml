@@ -135,6 +135,26 @@ planner_change:
     blocked_dwell_s: 0.3       # [s] an obstacle must sit on the path this long before
                                # _path_blocked_ahead reports it (one noisy frame must not abort)
     hold_clear_check: true     # false = old behaviour (checked only at engage)
+
+    # --- lane commit -------------------------------------------------------------------
+    # The lane is solved ONCE at engage and then followed. It used to be re-solved every
+    # cycle on a grid starting at the moving car, and _build_path re-blended from the live
+    # pose; because the SM adopts every publish younger than latest_threshold, the path the
+    # controller was tracking got redefined 20 times a second and the car wobbled along the
+    # evasion spline. Same fix the STATIC planner already uses (its commit/_reuse_committed).
+    # Freezing the lane is also what makes ENTRY's "am I on the lane" test meaningful.
+    lane_commit: true          # false = legacy per-cycle re-solve
+    commit_horizon_m: 30.0     # [m] span the lane is solved over at engage. Must cover the
+                               # WHOLE maneuver (meeting point + pass_hold_max_m + return
+                               # ramp), not one published window, because it is not re-solved.
+                               # Samples outside the meeting band are only wall-constrained,
+                               # which the car alone always clears, so a longer span is free.
+    entry_join_tol_m: 0.15     # [m] |d - committed lane| below which ENTRY is complete
+    # Re-plan triggers. These are the ONLY things that replace a committed lane; everything
+    # else is verified and either tolerated or aborted. Too tight and the churn comes back.
+    commit_dev_max_m: 0.35     # [m] car this far off the committed lane -> re-plan (+ ENTRY)
+    commit_meet_ds_m: 1.5      # [m] meeting point drifted this far -> re-plan
+    commit_obs_dd_m: 0.40      # [m] opponent moved this far laterally -> re-plan
     hold_clear_fail_s: 0.15    # [s] dwell before acting on a failure (3 cycles at 20 Hz), so a
                                # single noisy tracker frame cannot abort a good maneuver. If we
                                # are already alongside/ahead the lane is HELD anyway with a
