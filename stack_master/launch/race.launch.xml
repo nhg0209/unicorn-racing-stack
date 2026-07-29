@@ -25,6 +25,8 @@
   <arg name="localization" default="kiss" description="Real-car localization: cartographer | pf | kiss (ignored in sim, which uses gym ground truth)"/>
   <arg name="detection_source" default="kiss" description="Obstacle detection front-end: kiss (Livox 3D BevDetector -> kiss_obstacle_bridge) | scan (2D perception/detect on /scan, Hokuyo or pointcloud_to_laserscan)"/>
   <arg name="virtual"    default="$(var sim)" description="Inject a virtual opponent + static obstacles (on by default in sim, off on the real car; e.g. virtual:=true to overlay a virtual opponent onto the real LiDAR)"/>
+  <arg name="opp_spawn"  default="false" description="(virtual) spawn the kinematic opponent at startup on the map centerline; otherwise spawn it with RViz 2D Goal Pose or stack_master/scripts/spawn_opponent.py"/>
+  <arg name="opp_mode"   default="manual" description="(virtual) opponent driving mode: manual | path (pure-pursuit on the centerline at a constant speed -- deterministic, use for regression runs) | ftg (reactive from its own lidar)"/>
   <arg name="ot_planner" default="predictive_spliner" description="overtake planner the state machine listens to (ROS1 default = predictive_spliner: listens to BOTH /planner/avoidance/otwpnts (dynamic) AND /planner/avoidance/static_otwpnts (static))"/>
   <arg name="control_topic" default="/local_waypoints"
        description="WpntArray the controller follows: /local_waypoints (state-machine output w/ avoidance) or /global_waypoints (robust raceline)"/>
@@ -64,6 +66,8 @@
     <arg name="sim"          value="$(var sim)"/>
     <arg name="localization" value="$(var localization)"/>
     <arg name="virtual"      value="$(var virtual)"/>
+    <arg name="opp_spawn"    value="$(var opp_spawn)"/>
+    <arg name="opp_mode"     value="$(var opp_mode)"/>
     <arg name="reopt"   value="$(var reopt)"/>
     <arg name="reopt_safety_width" value="$(var reopt_safety_width)"/>
     <arg name="reopt_obs_change_tol" value="$(var reopt_obs_change_tol)"/>

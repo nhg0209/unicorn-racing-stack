@@ -18,6 +18,8 @@
   <arg name="sim"          default="false" description="Use simulator (true) or real hardware (false)"/>
   <arg name="localization" default="cartographer"    description="gt (sim) | cartographer | pf (real)"/>
   <arg name="virtual"      default="$(var sim)" description="Inject virtual opponent/obstacles (scan overlay etc.); on by default in sim, off on the real car"/>
+  <arg name="opp_spawn"  default="false" description="(virtual) spawn the kinematic opponent at startup on the map centerline; otherwise spawn it with RViz 2D Goal Pose or stack_master/scripts/spawn_opponent.py"/>
+  <arg name="opp_mode"   default="manual" description="(virtual) opponent driving mode: manual | path (pure-pursuit on the centerline at a constant speed -- deterministic, use for regression runs) | ftg (reactive from its own lidar)"/>
   <arg name="reopt"        default="false" description="Obstacle-aware global line: run static_reopt_node + static_obstacle_layer instead of the plain global_trajectory_publisher (IFAC static-obstacle re-optimization)"/>
   <arg name="reopt_safety_width" default="0.5" description="safety_width for the obstacle-aware re-optimizer (incl. car width). NB: the tight ifac centerline only solves plain mincurv_iqp at 0.25 or lower"/>
   <arg name="reopt_obs_change_tol" default="0.25" description="min obstacle move [m] to re-trigger the re-opt QP (larger = detection jitter does not thrash it)"/>
@@ -45,6 +47,8 @@
       <arg name="map"            value="$(var map)"/>
       <arg name="vehicle_config" value="$(var vehicle_config)"/>
       <arg name="virtual"        value="$(var virtual)"/>
+      <arg name="opp_spawn"      value="$(var opp_spawn)"/>
+      <arg name="opp_mode"       value="$(var opp_mode)"/>
     </include>
   </group>
   <!-- REAL: localization brings up VESC/LiDAR + the chosen localization stack. -->
@@ -54,6 +58,8 @@
       <arg name="localization"   value="$(var localization)"/>
       <arg name="vehicle_config" value="$(var vehicle_config)"/>
       <arg name="virtual"        value="$(var virtual)"/>
+      <arg name="opp_spawn"      value="$(var opp_spawn)"/>
+      <arg name="opp_mode"       value="$(var opp_mode)"/>
       <arg name="use_hokuyo"     value="$(var use_hokuyo)"/>
       <arg name="use_livox"      value="$(var use_livox)"/>
     </include>
