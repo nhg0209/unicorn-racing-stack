@@ -237,7 +237,6 @@ class StateMachine(Node):
         self.obstacles_prediction = []
         self.obstacle_was_here = True
         self.side_by_side_threshold = 0.6
-        self.merger = None
         self.force_trailing = False
         self.use_force_trailing = self.params.use_force_trailing
 
@@ -376,7 +375,6 @@ class StateMachine(Node):
                     Bool, "/planner/avoidance/static_feasible", self.static_feasible_cb, qos
                 )
         if self.ot_planner == "predictive_spliner":
-            self.create_subscription(Float32MultiArray, "/planner/avoidance/merger", self.merger_cb, qos)
             self.create_subscription(Bool, "/opponent_prediction/force_trailing", self.force_trailing_cb, qos)
             self.create_subscription(Bool, "planner/avoidance/fail_trailing", self.fail_trailing_cb, qos)
 
@@ -736,9 +734,6 @@ class StateMachine(Node):
         # transforms3d uses [w, x, y, z]
         _, _, theta = transforms3d.euler.quat2euler([q.w, q.x, q.y, q.z])
         self.current_position = [x, y, theta]
-
-    def merger_cb(self, data):
-        self.merger = data.data
 
     def force_trailing_cb(self, data):
         self.force_trailing = data.data if self.use_force_trailing else False

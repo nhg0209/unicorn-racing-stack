@@ -103,13 +103,7 @@ class ChangeAvoidanceNode(Node):
         self.scaled_max_idx = None
         self.scaled_max_s = None
         self.scaled_delta_s = None
-        self.center_wpnts_msg = WpntArray()
-        self.center_wpnts_received = False
-        self.center_s = None            # centerline sampled in the raceline frenet frame
-        self.center_d = None            # centerline d(s); corridor reference for the lane
         self.global_waypoints = None
-        self.gb_max_idx = None
-        self.gb_max_s = None
         self.converter = None
 
         # --- perception state ---
@@ -117,7 +111,6 @@ class ChangeAvoidanceNode(Node):
         self.obs_dynamic: List[Obstacle] = []
         self.opponent_waypoints = []
         self.opp_on_trajectory = False
-        self.opponent_wpnts_sm = None
 
         # --- ego state ---
         self.current_s = None
@@ -126,8 +119,6 @@ class ChangeAvoidanceNode(Node):
         self.current_x = None
         self.current_y = None
         self.current_yaw = None
-        self.behavior_state = ""
-        self.local_wpnts = None
 
         # --- maneuver state ---
         self.phase = PHASE_IDLE
@@ -140,7 +131,6 @@ class ChangeAvoidanceNode(Node):
         self.lane_s = None              # unwrapped s grid of the solved lane profile
         self.lane_d = None              # lateral profile d(s) [m], raceline frenet frame
         self.lane_offset_cur = 0.0      # peak |d| of the current profile [m] (reporting only)
-        self.engaged_offset = 0.0       # peak |d| at engagement
         self.target = None              # dict: id/s/d/vs/size/last_seen
         self.pass_cnt = 0
         self.clear_fail_cnt = 0    # consecutive cycles the lane failed the target-clearance check
@@ -167,15 +157,11 @@ class ChangeAvoidanceNode(Node):
         self.declare_parameter('require_ot_section', True,
                                ParameterDescriptor(type=ParameterType.PARAMETER_BOOL))
         self.require_ot_section = self.get_parameter('require_ot_section').get_parameter_value().bool_value
-        self.declare_parameter('debug_plot', False,
-                               ParameterDescriptor(type=ParameterType.PARAMETER_BOOL))
-        self.debug_plot = self.get_parameter('debug_plot').get_parameter_value().bool_value
 
         # --- tunable params (defaults; overridable via yaml / live reconfigure) ---
         # DISPLAY ONLY since the lane became an s-varying profile: the pass offset is set by
         # the opponent clearance and the walls at each s, never by a constant floor. Kept
         # because the RViz reference lanes are useful when eyeballing a new map.
-        self.lane_offset_m = 0.35       # reference lanes drawn in RViz [m]
         self.obs_traj_tresh = 1.0       # engage: max |obs d - ego d|
         self.spline_bound_mindist = 0.25
         self.engage_gap_m = 5.0         # stay silent (TRAILING closes in at speed) until the
@@ -243,8 +229,6 @@ class ChangeAvoidanceNode(Node):
 
         # --- opponent prediction (P1 temporal, P2 spatial) ---
         self.use_prediction = True           # master toggle; False = react to CURRENT opponent pos only
-        self.kd_obs_pred = 1.0               # d->raceline relaxation gain for adaptive propagation
-        self.pred_lead_scale = 0.5           # lead time = (s-gap / closing-speed) * this; 0 = no time-forward
         self.engage_min_closing_mps = -0.5   # don't engage an opponent pulling away faster than this
 
         self._declare_tunables()
@@ -255,8 +239,6 @@ class ChangeAvoidanceNode(Node):
         # Publishers
         self.mrks_pub = self.create_publisher(MarkerArray, "/planner/avoidance/markers_sqp", QoSProfile(depth=10))
         self.evasion_pub = self.create_publisher(OTWpntArray, "/planner/avoidance/otwpnts", QoSProfile(depth=10))
-        self.merger_pub = self.create_publisher(Float32MultiArray, "/planner/avoidance/merger", QoSProfile(depth=10))
-        self.lanes_pub = self.create_publisher(MarkerArray, "/planner/avoidance/lanes", QoSProfile(depth=10))
         if self.measure:
             # NOT /planner/avoidance/latency -- that one belongs to the STATIC planner
             # (spliner/static_avoidance_node.py). Both run in the same graph, so sharing the
@@ -268,10 +250,8 @@ class ChangeAvoidanceNode(Node):
         self.create_subscription(ObstacleArray, "/tracking/obstacles", self.obs_cb, QoSProfile(depth=10))
         self.create_subscription(Odometry, "/car_state/odom_frenet", self.state_frenet_cb, QoSProfile(depth=10))
         self.create_subscription(Odometry, "/car_state/odom", self.state_cartesian_cb, QoSProfile(depth=10))
-        self.create_subscription(BehaviorStrategy, "/behavior_strategy", self.behavior_cb, QoSProfile(depth=10))
         self.create_subscription(WpntArray, "/global_waypoints", self.gb_cb, QoSProfile(depth=10))
         self.create_subscription(WpntArray, "/global_waypoints_scaled", self.scaled_wpnts_cb, QoSProfile(depth=10))
-        self.create_subscription(WpntArray, "/centerline_waypoints", self.center_wpnts_cb, QoSProfile(depth=10))
         self.create_subscription(OpponentTrajectory, "/opponent_trajectory", self.opponent_trajectory_cb, QoSProfile(depth=10))
         self.create_subscription(Bool, "/ot_section_check", self.ot_sections_check_cb, QoSProfile(depth=10))
 
@@ -283,8 +263,6 @@ class ChangeAvoidanceNode(Node):
         self.map_filter.set_erosion_kernel_size(self.kernel_size)
 
         # Wait for the centerline waypoints, then project them into the raceline frenet frame
-        self.wait_for_message_attr('center_wpnts_received')
-        self.build_center_table(center_wpnts=self.center_wpnts_msg)
 
         self.get_logger().info("[LaneChange] Waiting for messages and services...")
         self.wait_for_loop_messages()
@@ -305,8 +283,6 @@ class ChangeAvoidanceNode(Node):
             # configured and rejected every lane on the whole lap.
             setattr(self, name, self.get_parameter(name).value)
 
-        dbl('lane_offset_m', self.lane_offset_m, 0.15, 0.8,
-            "RViz reference lanes only -- does not affect the planned path")
         dbl('obs_traj_tresh', self.obs_traj_tresh, 0.1, 2.0, "engage: max |obs d - ego d|")
         dbl('spline_bound_mindist', self.spline_bound_mindist, 0.05, 1.0, "min distance to track bounds")
         dbl('engage_gap_m', self.engage_gap_m, 2.0, 15.0, "trail until the target gap is below this")
@@ -354,8 +330,6 @@ class ChangeAvoidanceNode(Node):
         self.hold_clear_check = self.get_parameter('hold_clear_check').value
 
         # prediction (P1/P2)
-        dbl('kd_obs_pred', self.kd_obs_pred, 0.1, 10.0, "d->raceline relaxation gain")
-        dbl('pred_lead_scale', self.pred_lead_scale, 0.0, 2.0, "opponent propagation lead-time scale")
         dbl('engage_min_closing_mps', self.engage_min_closing_mps, -3.0, 3.0, "min closing speed to engage")
         self.declare_parameter('use_prediction', self.use_prediction, ParameterDescriptor(
             type=ParameterType.PARAMETER_BOOL, description="enable prediction-aware engage/offset/clearance"))
@@ -407,7 +381,7 @@ class ChangeAvoidanceNode(Node):
     def dyn_param_cb(self, params: List[Parameter]):
         for param in params:
             if param.name in (
-                    'lane_offset_m', 'obs_traj_tresh', 'spline_bound_mindist',
+                    'obs_traj_tresh', 'spline_bound_mindist',
                     'engage_gap_m', 'offset_slew_mps',
                     'open_ramp_min_m', 'open_ramp_time_s', 'blend_min_m',
                     'close_ramp_min_m', 'close_ramp_time_s', 'close_arm_m', 'tail_m',
@@ -419,15 +393,14 @@ class ChangeAvoidanceNode(Node):
                     'pass_behind_m', 'pass_hold_max_m', 'opp_pred_slack_m',
                     'target_lost_s', 'reengage_block_s',
                     'hold_clear_fail_s', 'hold_clear_check',
-                    'kd_obs_pred', 'pred_lead_scale', 'engage_min_closing_mps',
+                    'engage_min_closing_mps',
                     'use_prediction'):
                 setattr(self, param.name, param.value)
         # Re-derive: live-tuning any mirror or slack must not leave sep_margin_m/_sep_monitor_m
         # stale, or the solver and the monitors would silently disagree with the SM.
         self._apply_margins()
         self.get_logger().info(
-            f"[LaneChange] params: lane_offset_min={self.lane_offset_m:.2f} "
-            f"engage_gap={self.engage_gap_m:.1f} pass_gap={self.pass_gap_m:.2f} "
+            f"[LaneChange] params: engage_gap={self.engage_gap_m:.1f} pass_gap={self.pass_gap_m:.2f} "
             f"sm_required={self._sm_required_m:.3f} sep_margin={self.sep_margin_m:.3f} "
             f"sep_monitor={self._sep_monitor_m:.3f} hold_horizon={self.hold_horizon_m:.1f}")
         return SetParametersResult(successful=True)
@@ -454,14 +427,9 @@ class ChangeAvoidanceNode(Node):
         changed = (self.global_waypoints is None or new_wp.shape != self.global_waypoints.shape
                    or not np.allclose(new_wp, self.global_waypoints))
         self.global_waypoints = new_wp
-        self.gb_max_idx = data.wpnts[-1].id
-        self.gb_max_s = data.wpnts[-1].s_m
-        # The global line can CHANGE at runtime (static re-opt swap): rebuild the converter AND
-        # re-project the centerline table into the CURRENT raceline frame.
+        # The global line can CHANGE at runtime (static re-opt swap): rebuild the converter.
         if changed and self.converter is not None:
             self.converter = self.initialize_converter()
-            if self.center_wpnts_received:
-                self.build_center_table(center_wpnts=self.center_wpnts_msg)
 
     def scaled_wpnts_cb(self, data: WpntArray):
         self.scaled_wpnts_msg = data
@@ -472,18 +440,9 @@ class ChangeAvoidanceNode(Node):
             self.scaled_max_s = data.wpnts[-1].s_m
             self.scaled_delta_s = data.wpnts[1].s_m - data.wpnts[0].s_m
 
-    def center_wpnts_cb(self, data: WpntArray):
-        self.center_wpnts_msg = data
-        self.center_wpnts_received = True
-
-    def behavior_cb(self, data: BehaviorStrategy):
-        self.behavior_state = data.state
-        self.local_wpnts = data.local_wpnts
-
     def opponent_trajectory_cb(self, data: OpponentTrajectory):
         self.opponent_waypoints = data.oppwpnts
         self.opp_on_trajectory = bool(data.opp_is_on_trajectory)
-        self.opponent_wpnts_sm = np.array([wpnt.s_m for wpnt in data.oppwpnts])
 
     def ot_sections_check_cb(self, data: Bool):
         self.ot_section_check = data.data
@@ -498,13 +457,9 @@ class ChangeAvoidanceNode(Node):
         L = self.scaled_max_s
         return ((a - b + L / 2.0) % L) - L / 2.0
 
-    def wait_for_message_attr(self, attr_name: str):
-        while not getattr(self, attr_name, False):
-            rclpy.spin_once(self)
-
     def wait_for_loop_messages(self):
         while (self.scaled_max_s is None or self.current_x is None
-               or self.current_s is None or self.local_wpnts is None):
+               or self.current_s is None):
             rclpy.spin_once(self)
 
     def initialize_converter(self) -> "FrenetConverter":
@@ -513,64 +468,6 @@ class ChangeAvoidanceNode(Node):
         converter = FrenetConverter(self.global_waypoints[:, 0], self.global_waypoints[:, 1])
         self.get_logger().info("[LaneChange] initialized FrenetConverter object")
         return converter
-
-    #################### LANE GENERATION (kept from the original node) ####################
-    def resample_lane(self, xy: np.ndarray, resolution: float = 0.1) -> np.ndarray:
-        deltas = np.diff(xy, axis=0)
-        dists = np.hypot(deltas[:, 0], deltas[:, 1])
-        s = np.concatenate([[0], np.cumsum(dists)])
-        s_new = np.arange(0, s[-1], resolution)
-        x_new = np.interp(s_new, s, xy[:, 0])
-        y_new = np.interp(s_new, s, xy[:, 1])
-        return np.stack([x_new, y_new], axis=1)
-
-    def _center_d(self, s_query):
-        """Centerline lateral offset in the raceline frenet frame, interpolated over UNWRAPPED s.
-
-        Any overtaking lane is center_d(s) + lane_sign * lane_offset_cur, so the offset can be
-        re-sized per engagement (and grown live) without regenerating any geometry.
-        """
-        L = self.center_s[-1] + (self.center_s[1] - self.center_s[0]) if self.scaled_max_s is None \
-            else self.scaled_max_s
-        cs_ext = np.concatenate([self.center_s, self.center_s + L, self.center_s + 2 * L])
-        cd_ext = np.concatenate([self.center_d, self.center_d, self.center_d])
-        return np.interp(s_query, cs_ext, cd_ext)
-
-    def build_center_table(self, center_wpnts: WpntArray):
-        xy = np.array([[w.x_m, w.y_m] for w in center_wpnts.wpnts])
-        xy = self.resample_lane(xy, resolution=0.1)
-        cs, cd = self.converter.get_frenet(xy[:, 0], xy[:, 1])
-        order = np.argsort(np.asarray(cs))
-        self.center_s = np.asarray(cs)[order]
-        self.center_d = np.asarray(cd)[order]
-        self.get_logger().info(
-            f"[LaneChange] centerline table built: {len(self.center_s)} pts, "
-            f"d range [{float(np.min(self.center_d)):.2f}, {float(np.max(self.center_d)):.2f}]")
-        self._publish_lane_markers()
-
-    def _publish_lane_markers(self):
-        """Draw two fixed reference lanes for eyeballing a map in RViz. The planned path is an
-        s-varying profile solved per cycle and is NOT one of these lanes."""
-        if self.center_s is None:
-            return
-        mrks = MarkerArray()
-        for i, sign in enumerate((+1, -1)):
-            resp = self.converter.get_cartesian(self.center_s, self.center_d + sign * self.lane_offset_m)
-            resp = resp.T if resp.ndim == 2 else resp
-            mrk = Marker(header=Header(stamp=self.get_clock().now().to_msg(), frame_id="map"))
-            mrk.ns = "ot_lanes"
-            mrk.id = i
-            mrk.type = Marker.LINE_STRIP
-            mrk.action = Marker.ADD
-            mrk.pose.orientation.w = 1.0
-            mrk.scale.x = 0.03
-            mrk.color.a = 0.6
-            mrk.color.r = 0.1 if sign > 0 else 0.9
-            mrk.color.b = 0.9 if sign > 0 else 0.1
-            mrk.color.g = 0.5
-            mrk.points = [Point(x=float(p[0]), y=float(p[1]), z=0.02) for p in resp]
-            mrks.markers.append(mrk)
-        self.lanes_pub.publish(mrks)
 
     #################### TARGET TRACKING ####################
     def _update_target(self, now: float, dt: float):
@@ -630,21 +527,6 @@ class ChangeAvoidanceNode(Node):
         return dict(id=o.id, s=o.s_center, d=o.d_center, vs=o.vs, vd=o.vd,
                     size=max(o.size, 0.25), last_seen=self.now_sec())
 
-    def _predict_ahead(self, s: float, d: float, vs: float, vd: float = 0.0):
-        """Adaptive time-forward propagation of a DYNAMIC obstacle to roughly where it will
-        be when the ego reaches it (ported from spliner_node._predict_obs_movement, adaptive
-        mode). Lead time grows with time-to-reach; the lateral position relaxes toward the
-        raceline, exp-damped by how far off-line the obstacle currently is so a mid-overtake
-        opponent is not assumed to snap back. Pass DYNAMIC obstacles only -- a static one has
-        vs~=0 but the relaxation term would still pull its d toward the raceline."""
-        gap = (s - self.current_s) % self.scaled_max_s
-        rel_speed = float(np.clip((self.current_vs or 0.0) - vs, 0.1, 10.0))
-        lead = float(np.clip(gap / rel_speed, 0.0, 5.0)) * self.pred_lead_scale
-        delta_d = lead * vd
-        delta_d = -(d + delta_d) * float(np.exp(-abs(self.kd_obs_pred * d)))
-        return (s + lead * vs) % self.scaled_max_s, d + delta_d
-
-    #################### SIDE SELECTION ####################
     def _opp_d_band(self, s_query: np.ndarray) -> np.ndarray:
         """Expected opponent lateral position over s (their line if known, else current d)."""
         if self.opp_on_trajectory and len(self.opponent_waypoints) > 10:
@@ -756,11 +638,12 @@ class ChangeAvoidanceNode(Node):
     def _meet_s_raw(self) -> float:
         """s where the ego and the opponent will actually be side by side.
 
-        Deliberately NOT _predict_ahead: that damps its lead time by pred_lead_scale (0.5,
-        tuned for the LATERAL relaxation), which puts the meeting point systematically short
-        AND makes it drift forward during the approach. The clearance band then sweeps across
-        metres of track and the re-solve fails the moment it crosses a narrow section. With
-        constant speeds gap/closing is exact and the meeting point does not move at all."""
+        Computed directly from gap/closing rather than by damping a propagated opponent state:
+        a damped lead time puts the meeting point systematically short AND makes it drift
+        forward during the approach, so the clearance band sweeps across metres of track and
+        the re-solve fails the moment it crosses a narrow section. With constant speeds
+        gap/closing is exact and the meeting point does not move at all. (The superseded
+        _predict_ahead helper this replaced has been deleted; it had no callers.)"""
         L = self.scaled_max_s
         s_o = self.target['s']
         gap = (s_o - self.current_s + L / 2.0) % L - L / 2.0
@@ -891,10 +774,19 @@ class ChangeAvoidanceNode(Node):
         return d
 
     def _lane_profile_at(self, s_query):
-        """Lane lateral position at (unwrapped) s. Before the first solve this falls back to
-        the centerline-parallel lane so nothing can dereference a missing profile."""
+        """Lane lateral position at (unwrapped) s.
+
+        Every caller runs only in HOLD/CLOSE, which are entered only after _choose_lane() has
+        set lane_s/lane_d, so the guard below is unreachable in practice. It used to fall back
+        to a centerline-parallel lane -- the last remaining consumer of the whole centerline
+        pipeline, which is why that pipeline (and its blocking startup wait on
+        /centerline_waypoints) could be deleted. Kept as a loud, non-crashing guard: returning
+        the raceline is the safe answer, and silence here would look like a lane at d=0."""
         if self.lane_s is None or self.lane_d is None:
-            return self._center_d(s_query) + self.lane_sign * self.lane_offset_cur
+            self.get_logger().error(
+                "[LaneChange] _lane_profile_at called with no solved lane -- returning raceline",
+                throttle_duration_sec=5.0)
+            return np.zeros_like(np.asarray(s_query, dtype=float))
         return np.interp(s_query, self.lane_s, self.lane_d)
 
     def _choose_lane(self) -> bool:
@@ -939,7 +831,7 @@ class ChangeAvoidanceNode(Node):
         peak, sign, prof = cands[side]
         self.side, self.lane_sign = side, sign
         self.lane_s, self.lane_d = s_lin, prof
-        self.lane_offset_cur = self.engaged_offset = peak
+        self.lane_offset_cur = peak
         return True
 
     def _update_offset(self, dt: float):
@@ -1097,10 +989,6 @@ class ChangeAvoidanceNode(Node):
                 zip(evasion_x, evasion_y, evasion_s, evasion_d, evasion_psi, evasion_kappa))
         ]
         self.evasion_pub.publish(msg)
-
-        if self.target is not None:
-            self.merger_pub.publish(Float32MultiArray(
-                data=[(self.target['s'] + self.target['size'] / 2.0) % L, float(evasion_s[-1])]))
         self._visualize_path(evasion_x, evasion_y)
         return True
 

@@ -1,12 +1,19 @@
 # Lane-hold dynamic overtaking planner (lane_change_planner / change_avoidance_node,
 # launched as planner_change in race.launch.xml). All values live-tunable via rqt.
 #
-# Maneuver: the planner stays SILENT while TRAILING closes in at speed; once the gap
-# is below engage_gap_m it latches a side, sizes the lane offset from the opponent's
-# actual lateral position (never below the SM free-check requirement), blends onto the
-# centerline-parallel lane (OPEN), keeps following it while watching the wrapped
-# s-gap (HOLD, offset auto-grows if the opponent drifts toward the lane), and ramps
-# back to the raceline once the opponent is passed (CLOSE).
+# Maneuver (IDLE -> HOLD -> CLOSE): the planner stays SILENT while TRAILING closes in at
+# speed; once the gap is below engage_gap_m it latches a side and enters HOLD, re-solving
+# the lane every cycle against the opponent's latest position; once the opponent is passed
+# it ramps back to the raceline (CLOSE).
+#
+# The lane is NOT a constant offset and NOT centerline-parallel (older comments here said
+# both). It is a lateral profile d(s) in the RACELINE frame that PREFERS d = 0 and is pushed
+# off it only inside the meeting band around meet_s -- so the car holds the racing line until
+# the point where the two cars are actually level, and only steps aside there.
+#
+# There is no separate blend-on phase: the profile is anchored at the car and re-gridded from
+# the current s every cycle, so such a phase terminated on its first cycle by construction.
+# The blend lives in _build_path.
 planner_change:
   ros__parameters:
     # gate: only ENGAGE inside overtaking sectors (/ot_section_check fresh + true).
@@ -85,16 +92,12 @@ planner_change:
                                # raceline as long as the rate allows, so a globally higher cap
                                # makes every pass move later and sharper. Hence try-then-escalate.
 
-    lane_offset_m: 0.35        # RVIZ REFERENCE LANES ONLY -- has no effect on the planned
-                               # path. The lane is an s-varying profile: at each s it is
-                               # pushed out only as far as the opponent clearance and the
-                               # walls require, so a constant floor would only cost feasibility.
     offset_slew_mps: 0.6       # how fast the live offset may grow/shrink [m/s]
     spline_bound_mindist: 0.12 # path may never come closer than this to the track bounds
 
     # --- transition geometry (lengths speed-scale: max(min_m, time_s * v)) ---
     open_ramp_min_m: 3.0
-    open_ramp_time_s: 0.8      # (the OPEN blend is additionally capped to finish BEFORE
+    open_ramp_time_s: 0.8      # (the entry blend is additionally capped to finish BEFORE
                                # the target when engaging close behind it)
     blend_min_m: 1.5           # HOLD re-anchor blend from the car onto the lane
     close_ramp_min_m: 3.0
@@ -129,11 +132,6 @@ planner_change:
     # --- opponent prediction (P1 temporal, P2 spatial GP) ---
     use_prediction: false          # master toggle; false = react to the opponent's CURRENT
                                   # position only (pre-P1/P2 behavior), for A/B testing
-    kd_obs_pred: 1.0              # d->raceline relaxation gain for the adaptive time-forward
-                                  # propagation. higher = assume a near-line opponent returns
-                                  # to its line faster; a far-off-line opponent relaxes less
-    pred_lead_scale: 0.5         # lead time = (s-gap / closing-speed) * this. 0 disables the
-                                  # time-forward part (offset/clearance still use GP d(s))
 
     # --- engage gating (NOT a prediction feature: reads the tracker's measured vs) ---
     engage_min_closing_mps: -0.5  # don't ENGAGE on an opponent pulling away faster than this
