@@ -1044,6 +1044,22 @@ class StateMachine(Node):
                             free_dist = min_dist - obs.size / 2 - self.gb_ego_width_m / 2
                             scaling_factor = np.clip(gap / free_scaling_reference_distance_m, 0.0, 1.0)
                             if free_dist < lateral_width_m * scaling_factor:
+                                if is_ot_wpnts:
+                                    # The ONLY other free-check log lives in the prediction branch
+                                    # above, but predictions need a clean opponent half-lap first --
+                                    # so early in a run every dynamic rejection happens HERE and was
+                                    # completely silent. predict_dyn=False means the lane was tested
+                                    # where the opponent stands NOW, which an overtaking lane never
+                                    # clears by design (it stays on the raceline until the pass).
+                                    self.get_logger().warn(
+                                        f"[{self.name}] OT path NOT free (no pred): "
+                                        f"free_dist={free_dist:+.2f} "
+                                        f"(need {lateral_width_m * scaling_factor:.2f}) "
+                                        f"opp_d={obs.d_center:+.2f} gap={gap:.2f} "
+                                        f"ttc={ttc:.2f} tt0={tt0:.2f} "
+                                        f"predict_dyn={self.free_check_predict_dynamic}",
+                                        throttle_duration_sec=1.0,
+                                    )
                                 is_free = False
                                 if closest_obs is None or min_gap > gap:
                                     closest_obs = obs
@@ -1122,25 +1138,84 @@ class StateMachine(Node):
             return True
         return False
 
+    def _ot_gate_dbg(self, why: str):
+        """One throttled line naming the FIRST failing AND-term of _check_overtaking_mode and
+        its measured value vs threshold. Dynamic analogue of the 'static_OT check' log below.
+
+        Without it every dynamic no-engage is indistinguishable from a dead node: all four
+        terms fail silently, while the static gate prints a full per-term verdict every 0.5 s.
+        That asymmetry is why a single run could not attribute a dynamic overtaking failure."""
+        self.get_logger().info(f"[{self.name}] dyn_OT blocked: {why}", throttle_duration_sec=0.5)
+
     def _check_overtaking_mode(self) -> bool:
         # Predictor veto (opt-in via use_force_trailing): True while the opponent is off its
         # learned line or fewer than one opponent-lap has been collected, i.e. the predictions
         # this gate relies on are unreliable. Entry gate only — an OVERTAKE already committed
         # is governed by _check_overtaking_mode_sustainability (bailing out beside an opponent
         # is worse than finishing the maneuver).
+        #
+        # The chain below MUST stay short-circuited: _check_latest_wpnts adopts the published
+        # path into the cache (initialize_traj) and _check_free_frenet writes closest_target/
+        # closest_gap, which get_farthest_target consumes. Evaluating every term up-front to
+        # build a log line would silently change both. So each term logs inside its own failure
+        # branch, reading only cached/pure state.
         if self.force_trailing:
+            self._ot_gate_dbg("force_trailing (opponent off its learned line, or < 1 opponent lap)")
             return False
-        if (
-            self._check_ot_sector()
-            and self._check_getting_closer(threshold_m=10.0)
-            and self._check_latest_wpnts(self.avoidance_wpnts, self.cur_avoidance_wpnts)
-            and self._check_free_frenet(self.cur_avoidance_wpnts)
-        ):
-            self.static_overtaking_mode = False
-            self._ot_free_true_t = self.now_sec()
-            return True
-        else:
+        # --- 1/4 overtaking sector -------------------------------------------------
+        if not self._check_ot_sector():
+            self._ot_gate_dbg(
+                f"ot_sector: wpnt_idx={self.cur_s / self.wpnt_dist:.0f} not in "
+                f"overtake_zones={self.overtake_zones} (empty => overtaking suppressed for this map)"
+            )
             return False
+        # --- 2/4 closing on the nearest obstacle ahead ------------------------------
+        if not self._check_getting_closer(threshold_m=10.0):
+            if len(self.obstacles_in_interest) == 0:
+                self._ot_gate_dbg(
+                    f"getting_closer: 0 obstacles within interest_horizon_m={self.interest_horizon_m:.1f}"
+                )
+            else:
+                o = self.obstacles_in_interest[0]
+                g = (o.s_start - self.cur_s) % self.track_length
+                c = self.cur_vs - o.vs
+                self._ot_gate_dbg(
+                    f"getting_closer: id={o.id} gap={g:.2f}(<10.00?{'ok' if g < 10.0 else 'NO'}) "
+                    f"closing={c:+.2f}(>{self.getting_closer_rel_vel_mps:+.2f}?"
+                    f"{'ok' if c > self.getting_closer_rel_vel_mps else 'NO'}) "
+                    f"static={o.is_static} vs={o.vs:+.2f}"
+                )
+            return False
+        # --- 3/4 fresh publish + car on the spline ---------------------------------
+        if not self._check_latest_wpnts(self.avoidance_wpnts, self.cur_avoidance_wpnts):
+            av = self.avoidance_wpnts
+            n_av = len(av.wpnts) if av is not None else 0
+            av_age = (self.now_sec() - time_to_float(av.header.stamp)) if n_av > 0 else -1.0
+            wd = self.cur_avoidance_wpnts
+            gap_dbg = md_dbg = -1.0
+            if wd.is_init and wd.array is not None:
+                gap_dbg = (wd.list[-1].s_m - self.cur_s) % self.track_length
+                md_dbg = float(np.min(np.linalg.norm(wd.array[:, 0:2] - self.current_position[:2], axis=1)))
+            self._ot_gate_dbg(
+                f"latest+on_spline: n={n_av},age={av_age:.2f}(<{wd.latest_threshold}),"
+                f"gap={gap_dbg:.2f}(>{wd.on_spline_front_horizon_thres_m}),"
+                f"min_dist={md_dbg:.2f}(<{wd.on_spline_min_dist_thres_m})"
+            )
+            return False
+        # --- 4/4 path free -----------------------------------------------------------
+        if not self._check_free_frenet(self.cur_avoidance_wpnts):
+            wd = self.cur_avoidance_wpnts
+            t = wd.closest_target
+            self._ot_gate_dbg(
+                f"free_frenet: blocked by id={t.id if t is not None else -1} "
+                f"d={t.d_center if t is not None else float('nan'):+.2f} "
+                f"static={t.is_static if t is not None else '?'} "
+                f"gap={wd.closest_gap:.2f} need lateral_width_m={wd.lateral_width_m}"
+            )
+            return False
+        self.static_overtaking_mode = False
+        self._ot_free_true_t = self.now_sec()
+        return True
 
     def _check_static_overtaking_mode(self) -> bool:
         # SIMPLIFIED: the static spliner now owns the go/no-go decision — it publishes an evasion

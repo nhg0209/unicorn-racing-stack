@@ -222,7 +222,11 @@ class ChangeAvoidanceNode(Node):
         self.merger_pub = self.create_publisher(Float32MultiArray, "/planner/avoidance/merger", QoSProfile(depth=10))
         self.lanes_pub = self.create_publisher(MarkerArray, "/planner/avoidance/lanes", QoSProfile(depth=10))
         if self.measure:
-            self.measure_pub = self.create_publisher(Float32, "/planner/pspliner_sqp/latency", QoSProfile(depth=10))
+            # NOT /planner/avoidance/latency -- that one belongs to the STATIC planner
+            # (spliner/static_avoidance_node.py). Both run in the same graph, so sharing the
+            # topic would interleave two planners' loop times into one meaningless histogram.
+            # (Was /planner/pspliner_sqp/latency: a leftover from the dormant sqp_planner.)
+            self.measure_pub = self.create_publisher(Float32, "/planner/lane_change/latency", QoSProfile(depth=10))
 
         # Subscribers
         self.create_subscription(ObstacleArray, "/tracking/obstacles", self.obs_cb, QoSProfile(depth=10))

@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Record the static-avoidance validation metrics for one sim run and print a summary row.
+Record the avoidance validation metrics for one sim run and print a summary row.
+Works for both the static and the dynamic (lane-change) planner -- pick the planner with
+--latency-topic; every other metric is planner-agnostic.
 
 Subscribes to the running-sim topics (no rebuild needed; run with python3 after sourcing):
   /lap_data                     f110_msgs/LapData     -> lap time, lateral error
-  /planner/avoidance/latency    std_msgs/Float32      -> planner loop time (s) -> ms stats
+  <--latency-topic>             std_msgs/Float32      -> planner loop time (s) -> ms stats
+      static  : /planner/avoidance/latency   (spliner/static_avoidance_node.py)
+      dynamic : /planner/lane_change/latency (lane_change_planner, needs measure:=true)
   /state_machine                std_msgs/String       -> state transition count (chatter)
   /tracking/obstacles           f110_msgs/ObstacleArray
   /car_state/odom               nav_msgs/Odometry     -> ego pose for clearance
@@ -28,11 +32,13 @@ from f110_msgs.msg import LapData, ObstacleArray
 
 
 class Metrics(Node):
-    def __init__(self, label, car_half_width, collision_thresh):
+    def __init__(self, label, car_half_width, collision_thresh,
+                 latency_topic="/planner/avoidance/latency"):
         super().__init__("avoidance_metrics")
         self.label = label
         self.car_half_width = car_half_width
         self.collision_thresh = collision_thresh
+        self.latency_topic = latency_topic
 
         self.ego = None
         self.latencies_ms = []
@@ -43,7 +49,7 @@ class Metrics(Node):
         self.laps = []            # (lap_count, lap_time, avg_err, max_err)
 
         self.create_subscription(Odometry, "/car_state/odom", self._odom_cb, 10)
-        self.create_subscription(Float32, "/planner/avoidance/latency", self._lat_cb, 10)
+        self.create_subscription(Float32, self.latency_topic, self._lat_cb, 10)
         self.create_subscription(String, "/state_machine", self._state_cb, 10)
         self.create_subscription(ObstacleArray, "/tracking/obstacles", self._obs_cb, 10)
         self.create_subscription(LapData, "/lap_data", self._lap_cb, 10)
@@ -114,9 +120,13 @@ def main():
     ap.add_argument("--label", default="run")
     ap.add_argument("--car-half-width", type=float, default=0.15)
     ap.add_argument("--collision-thresh", type=float, default=0.05, help="min clearance [m] below which = collision")
+    ap.add_argument("--latency-topic", default="/planner/avoidance/latency",
+                    help="static planner: /planner/avoidance/latency (default); "
+                         "dynamic lane-change planner: /planner/lane_change/latency "
+                         "(needs measure:=true in lane_change_params.yaml)")
     args = ap.parse_args()
     rclpy.init()
-    node = Metrics(args.label, args.car_half_width, args.collision_thresh)
+    node = Metrics(args.label, args.car_half_width, args.collision_thresh, args.latency_topic)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
