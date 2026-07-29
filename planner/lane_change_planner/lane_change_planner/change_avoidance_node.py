@@ -7,21 +7,38 @@ so the published path no longer chases a moving opponent:
   IDLE  -> planner stays SILENT until the gap to the opponent has closed to
            engage_gap_m: the approach is owned by TRAILING (controller gap PID)
            or plain raceline driving, at full speed.
-  OPEN  -> side latched once + lane offset sized from the opponent's actual
-           lateral position (never below the SM free-check requirement); publish
-           a quintic blend from the car onto the centerline-parallel lane.
-  HOLD  -> keep following the lane regardless of where the opponent currently
-           is. The offset auto-grows (slew-limited, wall-capped) if the opponent
-           drifts toward our lane, so the SM free-check keeps passing during the
-           whole approach instead of aborting OVERTAKE at mid gap.
+  HOLD  -> engage: latch the side, then re-solve the lane every cycle against the
+           opponent's latest position and follow it. Entered directly from IDLE
+           and held for the whole approach and pass.
   CLOSE -> once the opponent is passed (wrapped signed s-gap > pass_gap_m, held
            for pass_hyst_s), ramp back to the raceline at a latched s.
 
-The lane geometry (centerline d(s) + signed offset) is stable by construction,
-so the state machine's cached-path splicing sees a consistent trajectory instead
-of a per-cycle re-anchored spline (the source of the old wobble). Velocities are
-published as 0: the state machine velocity-replans every received path from its
-curvature.
+WHAT THE LANE ACTUALLY IS (this is not a constant offset, and not centerline-
+parallel -- earlier revisions of this docstring said both). It is a lateral
+profile d(s) in the RACELINE frame, solved on a lane_solve_ds grid by
+reachable-interval propagation with a slope limit (_solve_profile). The profile
+PREFERS d = 0 (the raceline) and is pushed off it only inside the meeting band
+[meet_s - pass_overlap_m, meet_s + _pass_hold_m()], where the corridor is
+additionally clamped away from the opponent. So the car stays on the racing line
+until the place where the two cars are actually level, and only there does it
+step aside -- which is why the state machine must NOT judge this path at the
+opponent's current s (see free_check_dynamic_ot_slow in the SM).
+
+There is no separate "open" phase: the profile is anchored at the car
+(_solve_profile pins d[0] = current_d) and re-gridded from current_s every
+cycle, so a distinct blend-on phase would have terminated on its first cycle by
+construction. The blend onto the lane lives in _build_path, not in the phase
+machine.
+
+The lane geometry is stable by construction, so the state machine's cached-path
+splicing sees a consistent trajectory instead of a per-cycle re-anchored spline
+(the source of the old wobble). Velocities are published as 0: the state machine
+velocity-replans every received path from its curvature.
+
+COUPLED TO THE STATE MACHINE: the SM runs its own independent free-check on this
+path. The clearance numbers are mirrored from its config and derived in
+_apply_margins(); stack_master/scripts/check_avoidance_margins.py verifies the
+mirrors offline. Do not hand-edit sep_margin_m.
 
 Publishes (unchanged interface):
     /planner/avoidance/otwpnts  OTWpntArray   evasion path (empty topic silence when IDLE)
@@ -66,7 +83,6 @@ from transforms3d.euler import quat2euler
 from grid_filter.grid_filter import GridFilter
 
 PHASE_IDLE = "IDLE"
-PHASE_OPEN = "OPEN"
 PHASE_HOLD = "HOLD"
 PHASE_CLOSE = "CLOSE"
 
@@ -115,7 +131,7 @@ class ChangeAvoidanceNode(Node):
 
         # --- maneuver state ---
         self.phase = PHASE_IDLE
-        self.side = None                # latched at OPEN: 'left' | 'right'
+        self.side = None                # latched at engage: 'left' | 'right'
         self.lane_sign = 0              # +1 = left of the centerline, -1 = right
         # The lane is an s-varying profile, not a scalar offset: one constant offset had to
         # clear the walls AND the opponent at every sample of the window, so the narrowest
@@ -127,6 +143,7 @@ class ChangeAvoidanceNode(Node):
         self.engaged_offset = 0.0       # peak |d| at engagement
         self.target = None              # dict: id/s/d/vs/size/last_seen
         self.pass_cnt = 0
+        self.clear_fail_cnt = 0    # consecutive cycles the lane failed the target-clearance check
         self.close_s = None             # wrapped s where the return ramp starts
         self.close_frozen = False
         self.blocked_since = None
@@ -964,10 +981,12 @@ class ChangeAvoidanceNode(Node):
         blend_len = float(np.clip(d_gap * 8.0, self.blend_min_m, open_len))
         # The blend must finish BEFORE the stretch where the cars are side by side, else it
         # overwrites the exact piece of lane the solver sized for the clearance and the
-        # maneuver is aborted by its own monitor one cycle after OPEN. Anchoring the profile
-        # at the car already makes d_arr[0] == current_d, so the blend only has to absorb the
-        # heading error and can be short.
-        if self.phase == PHASE_OPEN and self.target is not None:
+        # maneuver is aborted by its own monitor. Anchoring the profile at the car already
+        # makes d_arr[0] == current_d, so the blend only has to absorb the heading error and
+        # can be short. Applied on every engaged (non-closing) cycle: this is a min(), so it
+        # can only shorten the blend, and it used to be gated on a phase that lasted exactly
+        # one cycle.
+        if not closing and self.target is not None:
             band_start = ((self._meet_s() - s0) % L) - self.pass_overlap_m
             if band_start > 0.0:
                 blend_len = min(blend_len, max(0.5, band_start))
@@ -1123,6 +1142,7 @@ class ChangeAvoidanceNode(Node):
         self.close_s = None
         self.close_frozen = False
         self.pass_cnt = 0
+        self.clear_fail_cnt = 0    # consecutive cycles the lane failed the target-clearance check
         self.blocked_since = None
         self.idle_until = now + self.reengage_block_s
         self._clear_markers()
@@ -1145,8 +1165,6 @@ class ChangeAvoidanceNode(Node):
 
         if self.phase == PHASE_IDLE:
             self._step_idle(now)
-        elif self.phase == PHASE_OPEN:
-            self._step_open(now)
         elif self.phase == PHASE_HOLD:
             self._step_hold(now)
         elif self.phase == PHASE_CLOSE:
@@ -1171,10 +1189,11 @@ class ChangeAvoidanceNode(Node):
             self._idle_why(f"no lane fits: {self._lane_dbg}")
             self.target = None
             return
-        self.phase = PHASE_OPEN
+        self.phase = PHASE_HOLD
         self.pass_cnt = 0
+        self.clear_fail_cnt = 0
         self.get_logger().info(
-            f"[LaneChange] IDLE -> OPEN: target id={target['id']} "
+            f"[LaneChange] IDLE -> HOLD (engage): target id={target['id']} "
             f"gap={self._sdiff(target['s'], self.current_s):.1f} m "
             f"side={self.side} offset={self.lane_offset_cur:.2f} m "
             f"meet_in={(self._meet_s() - self.current_s) % self.scaled_max_s:.1f} m "
@@ -1206,37 +1225,25 @@ class ChangeAvoidanceNode(Node):
                 f"{'ok' if closing >= self.engage_min_closing_mps else 'NO'}) "
                 f"visible={best.is_visible}")
 
-    def _step_open(self, now: float):
-        if self._target_lost_for(now) > self.target_lost_s:
-            self._to_idle(now, "target lost")
-            return
-        rel = self._sdiff(self.current_s, self.target['s'])
-        if rel < -(self.engage_gap_m + 4.0):
-            self._to_idle(now, "target pulled away")
-            return
+    def _safe_to_abort(self) -> bool:
+        """Are we far enough behind the target that bailing to the raceline is safe?
 
-        self._update_offset(self._dt)
-        path = self._build_path(closing=False)
-        if path is None or not self._check_lane_clear_vs_target(path):
-            # while still clearly behind the target a safe re-selection is possible
-            if rel < -(self.width_car * 2 + 0.6):
-                self._to_idle(now, "lane no longer viable")
-                return
-        if path is None or not self._publish_path(path):
-            self._to_idle(now, "path infeasible")
-            return
-        if self._path_blocked_ahead(path, now) and rel < -(self.width_car * 2 + 0.6):
-            self._to_idle(now, "lane blocked ahead")
-            return
-
-        if abs((self.current_d or 0.0) - self._lane_at(self.current_s)) < 0.15:
-            self.phase = PHASE_HOLD
-            self.get_logger().info("[LaneChange] OPEN -> HOLD (on lane)")
-        self._visualize_phase()
+        Every abort site asks this one question. It used to be asked with two different
+        numbers: -(width_car*2 + 0.6) = -1.2 m (a dimensionally meaningless expression -- a
+        car WIDTH used as a longitudinal threshold) and -(pass_gap_m + 0.5) = -1.7 m. Bailing
+        while alongside steers us back into the opponent, so the conservative one wins."""
+        if self.target is None:
+            return True
+        return self._sdiff(self.current_s, self.target['s']) < -(self.pass_gap_m + 0.5)
 
     def _step_hold(self, now: float):
         lost = self._target_lost_for(now)
         rel = self._sdiff(self.current_s, self.target['s']) if self.target else 0.0
+        # target ran away faster than we can close: nothing to overtake any more. (Inherited
+        # from the deleted OPEN phase, which could only ever check it on its single cycle.)
+        if self.target is not None and rel < -(self.engage_gap_m + 4.0):
+            self._to_idle(now, "target pulled away")
+            return
         # lost while already ahead (typical: opponent left the lidar FOV behind us) counts as
         # passing; lost for a long time while still nominally behind means nothing left to pass
         passed_now = self._passed() or (lost > self.target_lost_s and rel > 0.0)
@@ -1254,7 +1261,7 @@ class ChangeAvoidanceNode(Node):
         if path is None or not self._publish_path(path):
             self._to_idle(now, "path infeasible")
             return
-        if self._path_blocked_ahead(path, now) and rel < -(self.pass_gap_m + 0.5):
+        if self._path_blocked_ahead(path, now) and self._safe_to_abort():
             # blocked and clearly behind the target again -> give up, SM falls back to TRAILING
             self._to_idle(now, "blocked, dropping back")
             return
