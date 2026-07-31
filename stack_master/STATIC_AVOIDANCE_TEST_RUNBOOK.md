@@ -23,6 +23,27 @@ swapped line reads blocked -> phantom TRAILING. Run after touching `static_avoid
 python3 stack_master/scripts/check_avoidance_margins.py   # exit 0 = consistent
 ```
 
+It also cross-checks that `race.launch.xml` and `base_system.launch.xml` agree on every `reopt_*`
+default, and that `race.launch.xml` forwards them all. Both used to be false: `reopt_wall_margin`
+was 0.12 in `race.launch.xml` (the entry point below) against 0.05 everywhere else, which shrank
+the avoidance humps, and `reopt_obs_margin` was not forwardable from here at all.
+
+## 0b. Re-opt line SHAPE gate (after ANY change to the re-optimizer)
+
+The re-opt failure mode is a shape, not a crash: the corridor fit can shrink a hump until the line
+exceeds the vehicle's `curvlim` and the speed plan leaves the friction budget, and nothing
+downstream complains. This walks an obstacle around the whole lap and measures the published
+GEOMETRY (never the smoothed `kappa_radpm` field). No sim, no build:
+
+```bash
+python3 planner/gb_optimizer/scripts/sweep_static_reopt.py --check           # exit 0 = pass
+python3 planner/gb_optimizer/scripts/sweep_static_reopt.py --wall-margin 0.05 0.12   # compare
+```
+
+Gates: geometric `max|kappa|` inside `curvlim`, `max(vx^2*|kappa|)` inside the ggv `ay_max`, and
+the 0.5 mm corridor-fit regression (ifac apex `(3.95, 0.24)` at `wall_margin` 0.12 must be laid
+with a reach >= 4.5 m, not the 1.24 m it collapsed to on 2026-07-30).
+
 ## 1. Bring up the sim (one terminal)
 
 ```bash
@@ -114,7 +135,7 @@ python3 stack_master/scripts/spawn_static_obstacle.py --obs "12.0,0.0" --inject 
 #   python3 stack_master/scripts/spawn_static_obstacle.py --obs "12.0,0.0; 20.0,-0.3" --inject merge
 # expect BOTH apexes captured (max_weave=2 lets the reactive path weave a close pair) and
 #   "... 2/2 obstacle apex(es) reshaped ..." in the re-opt log. If the track is too tight at one
-#   of them, expect the honest "N apex(es) CORRIDOR-REJECTED ... want X corridor max Y" warning
+#   of them, expect the honest "N apex(es) REJECTED ... want X max Y [corridor|curvature]" warning
 #   instead — that obstacle stays reactive-only BY DESIGN (no shrunken half-hump is laid).
 # The published line must stay within the friction budget: spot-check implied lateral accel
 #   (vx^2 * kappa) of /global_waypoints stays <= ggv ay_max (~4.5 for SIM) through the humps.
@@ -142,8 +163,19 @@ Measure across the 8 laps: collision count (0), per-lap lap time, laps-to-revert
 clear (target: swap committed before the NEXT lap completes), SM state timeline
 (`/state_machine`), AEB warn count in the controller log (0 during clean avoidance).
 
+Watch the per-apex shape log — it is the fastest way to see a bad hump:
+```
+[static_reopt] apex @(3.95,0.24) laid d=-0.530 (want -0.569) reach 5.00/5.25 m of 5.00 requested
+               (100%); max|kappa| 1.23 (82% of curvlim 1.50)
+```
+A `<- SHARP` warning means the corridor fit shrank the hump below half the requested reach or the
+geometry is within 10% of `curvlim`: check `reopt_wall_margin` / `reopt_fit_tol` and the reactive
+`apex_bulge`. `REJECTED ... [curvature]` means the hump would have been unsteerable and was
+honestly left to the reactive layer — expected on the tightest corners, not a bug.
+
 Unit tests for the layer + apex/commit logic (no sim needed):
 ```bash
-python3 planner/gb_optimizer/scripts/test_static_obstacle_layer.py
+python3 planner/gb_optimizer/scripts/test_static_obstacle_layer.py   # needs a sourced workspace (f110_msgs)
 python3 planner/gb_optimizer/scripts/test_static_reopt_apex.py
+python3 planner/gb_optimizer/scripts/sweep_static_reopt.py --check   # re-opt line shape gate
 ```
