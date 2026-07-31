@@ -24,7 +24,24 @@ planner_change:
                                # is down or mis-wired -- trailing is the safe answer.
 
     # --- engagement ---
-    engage_gap_m: 5.0          # trail (at speed) until the s-gap to the target is below
+    engage_gap_m: 8.0          # trail (at speed) until the s-gap to the target is below
+    engage_gap_min_m: 1.5      # ...and the LOWER bound. engage_gap_m alone let the planner
+                               # engage at gap=0.4 m: the cars are 0.55 m long, so their
+                               # bodies already overlap there and the lane only 'fits'
+                               # because the profile is anchored wherever the car is -- the
+                               # swerve then goes INTO the opponent. Measured: below ~1.5 m
+                               # no point on the lap admits a pass anyway.
+    bail_hold_max_s: 3.0       # how long the lane may be HELD beside the target before
+                               # giving up and merging back. Arming CLOSE immediately was
+                               # the other half of the drop-the-lane mistake: once the
+                               # return ramp freezes it merges regardless of the corridor,
+                               # so abandoning a maneuver alongside an opponent steers into
+                               # them either way. The lane already clears them -- hold it.
+    bail_block_m: 1.5          # while the target is within this |ds|, a failed maneuver may
+                               # NOT drop to IDLE -- it merges back through CLOSE instead.
+                               # Dropping the lane there stops publication, the SM falls to
+                               # GB_TRACK and the car steers at the raceline through the
+                               # opponent it is beside: the return-phase contact.
                                # this, then start the lane change. Must be ABOVE the
                                # trailing hold distance (controller: 0.25*v + 1.55 m,
                                # ~2-3 m) or the gap never closes enough to engage,

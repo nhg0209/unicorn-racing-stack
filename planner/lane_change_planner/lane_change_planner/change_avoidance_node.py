@@ -187,6 +187,11 @@ class ChangeAvoidanceNode(Node):
         # because the RViz reference lanes are useful when eyeballing a new map.
         self.obs_traj_tresh = 1.0       # engage: max |obs d - ego d|
         self.spline_bound_mindist = 0.25
+        self.engage_gap_min_m = 1.5     # never engage from closer than this
+        self.bail_block_m = 1.5         # no bail-to-IDLE while |ds| to the target is under this
+        self.bail_hold_max_s = 3.0      # ...and how long the lane may be held there before
+                                        # giving up and merging back through CLOSE
+        self._bail_hold_since = None
         self.engage_gap_m = 5.0         # stay silent (TRAILING closes in at speed) until the
                                         # s-gap to the target is below this
         self.offset_slew_mps = 0.6      # how fast the lane offset may grow/shrink [m/s]
@@ -331,6 +336,12 @@ class ChangeAvoidanceNode(Node):
         dbl('obs_traj_tresh', self.obs_traj_tresh, 0.1, 2.0, "engage: max |obs d - ego d|")
         dbl('spline_bound_mindist', self.spline_bound_mindist, 0.05, 1.0, "min distance to track bounds")
         dbl('engage_gap_m', self.engage_gap_m, 2.0, 15.0, "trail until the target gap is below this")
+        dbl('engage_gap_min_m', self.engage_gap_min_m, 0.0, 5.0,
+            "never engage from closer than this [m]")
+        dbl('bail_block_m', self.bail_block_m, 0.0, 5.0,
+            "no bail-to-IDLE while the target is within this |ds| [m]")
+        dbl('bail_hold_max_s', self.bail_hold_max_s, 0.0, 10.0,
+            "how long the lane may be held beside the target before merging back [s]")
         dbl('offset_slew_mps', self.offset_slew_mps, 0.1, 2.0, "lane offset grow/shrink rate")
         dbl('open_ramp_min_m', self.open_ramp_min_m, 1.0, 10.0, "min open blend length")
         dbl('open_ramp_time_s', self.open_ramp_time_s, 0.0, 3.0, "open blend = max(min, t*v)")
@@ -460,7 +471,8 @@ class ChangeAvoidanceNode(Node):
         for param in params:
             if param.name in (
                     'obs_traj_tresh', 'spline_bound_mindist',
-                    'engage_gap_m', 'offset_slew_mps',
+                    'engage_gap_m', 'engage_gap_min_m', 'bail_block_m', 'bail_hold_max_s',
+                    'offset_slew_mps',
                     'open_ramp_min_m', 'open_ramp_time_s', 'blend_min_m',
                     'close_ramp_min_m', 'close_ramp_time_s', 'close_arm_m', 'tail_m',
                     'hold_horizon_m', 'pass_gap_m', 'pass_hyst_s',
@@ -586,6 +598,12 @@ class ChangeAvoidanceNode(Node):
                 continue
             gap = (o.s_center - self.current_s) % self.scaled_max_s
             if gap > self.engage_gap_m:
+                continue
+            # engage_gap_m is only the UPPER bound. Without a floor the planner engaged at
+            # gap=0.4 m -- the cars are 0.55 m long, so their bodies already overlap there and
+            # "the lane fits" only because the profile is anchored wherever the car happens to
+            # be. The resulting swerve goes into the opponent, not around it.
+            if gap < self.engage_gap_min_m:
                 continue
             if abs(o.d_center - self.current_d) > self.obs_traj_tresh:
                 continue
@@ -1247,7 +1265,44 @@ class ChangeAvoidanceNode(Node):
         return self.ot_section_check
 
     #################### PHASE MACHINE ####################
+    def _beside_target(self) -> bool:
+        """Are the two cars longitudinally overlapping, or about to be?"""
+        if self.target is None or not self.scaled_max_s:
+            return False
+        return abs(self._sdiff(self.target['s'], self.current_s)) <= self.bail_block_m
+
     def _to_idle(self, now: float, why: str):
+        # Dropping the lane while the cars overlap is how a failed overtake ends in contact:
+        # the planner stops publishing, the SM falls back to GB_TRACK and the controller steers
+        # straight for the raceline -- through the opponent we are beside. CLOSE is the guarded
+        # way home: its ramp starts ahead of the car and it postpones the merge while an
+        # obstacle occupies the return corridor.
+        if self.phase not in (PHASE_IDLE, PHASE_CLOSE) and self._beside_target():
+            if self._bail_hold_since is None:
+                self._bail_hold_since = now
+            held = now - self._bail_hold_since
+            if held <= self.bail_hold_max_s:
+                # HOLD the lane, do not ramp home. Arming CLOSE here was the other half of the
+                # same mistake: once the return ramp freezes (close_frozen) it merges regardless
+                # of what is in the corridor, so a maneuver abandoned alongside an opponent
+                # steers into them just as surely as dropping the path did. The lane is already
+                # sized to clear them; keep publishing it until we are actually past.
+                path = self._build_path(closing=False)
+                if path is not None:
+                    self._publish_path(path)
+                self.get_logger().warn(
+                    f"[LaneChange] {self.phase}: holding the lane instead of bailing ({why}) -- "
+                    f"still beside the target, {held:.1f}s of {self.bail_hold_max_s:.1f}s",
+                    throttle_duration_sec=1.0)
+                return
+            self.get_logger().warn(
+                f"[LaneChange] {self.phase} -> CLOSE ({why}): held beside the target for "
+                f"{held:.1f}s, merging back",
+                throttle_duration_sec=1.0)
+            self._bail_hold_since = None
+            self._arm_close(now, why)
+            return
+        self._bail_hold_since = None
         self.get_logger().info(f"[LaneChange] {self.phase} -> IDLE ({why})")
         self.phase = PHASE_IDLE
         self.target = None
