@@ -17,6 +17,7 @@ Sign convention (matches gb_optimizer / tph):
     corridor coordinate u along normvec: left bound at u=-w_tr_left, right bound at u=+w_tr_right.
 """
 
+import math
 import os
 import sys
 from dataclasses import dataclass, field
@@ -148,32 +149,50 @@ _HUMP_SPAN_FRAC = 0.28   # 0.20 -> 0.28: room for the entry/exit ramp stretching
 # ifac: want -0.46 laid -0.28. Such apexes are DROPPED and reported instead.
 _APEX_KEEP_FRAC = 0.90
 
+# Peak |d''| of the C2 quintic hump in closed form: for d(u) = A*(10t^3 - 15t^4 + 6t^5),
+# t = u/r, the extrema of d'' sit at t = (1 +- 1/sqrt(3))/2 and give |d''|max = (10/sqrt(3))*|A|/r^2.
+# Verified numerically at r = 1, 2, 5 (coefficient 5.7735 in all three). Because the published
+# curvature is kappa_clean + d'', this inverts to the SMALLEST reach that keeps a hump of
+# amplitude A inside a curvature budget:  r_min = sqrt(_KAPPA_QUINTIC_C * |A| / budget).
+_KAPPA_QUINTIC_C = 10.0 / math.sqrt(3.0)          # = 5.7735
+# Curvature budget floor as a fraction of curvlim. At a raceline apex kappa_clean already sits at
+# ~curvlim, so `curvlim - max|kappa_clean|` alone goes to zero and demands an infinite reach. The
+# floor keeps r_min finite; the honest all-or-nothing drop then handles the truly impossible ones.
+_KAPPA_BUDGET_FLOOR_FRAC = 0.25
+# Default corridor-fit tolerance [m]. The corridor bounds are a `_cyclic_smooth`ed ESTIMATE that
+# ripples ~2 mm between adjacent stations, and the amplitude cap parks the hump peak exactly on
+# that bound — so a zero-tolerance test rejects reaches over a SUB-MILLIMETRE violation at the
+# station next to the apex, and the reach bisects down to whatever is sharp enough to duck under
+# the ripple. Measured on ifac: a 0.5 mm violation at station 292 collapsed the reach 5.00 -> 1.24 m,
+# which took max|kappa| 1.46 -> 1.98 (curvlim is 1.5) and cost +1.62 s on an 11.30 s lap. 5 mm is
+# 4-10% of the wall_margin it eats into, and the true track bound is still wall_margin + w_veh/2 away.
+_FIT_TOL_DEFAULT = 0.005
 
-def _hump_values(u_stn: np.ndarray, u_c: float, d: float, r_in: float, r_out: float,
-                 track_len: float):
-    """One C2 quintic hump (raceline -> apex -> raceline) sampled at the cut-linear stations
-    `u_stn`. Returns None if scipy is unavailable or the knots are degenerate."""
-    try:
-        from scipy.interpolate import BPoly
-    except Exception:
-        return None
-    lo, hi = u_c - r_in, u_c + r_out
-    if not (hi > lo + 1e-3):
-        return None
-    try:
-        poly = BPoly.from_derivatives(np.array([lo, u_c, hi]),
-                                      [[0.0, 0.0, 0.0], [float(d), 0.0, 0.0], [0.0, 0.0, 0.0]])
-    except Exception:
+
+def _hump_values(u_stn: np.ndarray, u_c: float, d: float, r_in: float, r_out: float):
+    """One C2 quintic hump (raceline -> apex -> raceline) sampled at the cut-linear stations `u_stn`.
+
+    Closed form, no scipy. `BPoly.from_derivatives([u_c-r_in, u_c, u_c+r_out], [[0,0,0], [d,0,0],
+    [0,0,0]])` IS the quintic Hermite interpolant on each half, i.e. d * smootherstep — the two agree
+    to 1.3e-15 m over randomised knots. Written out because the corridor and curvature fits evaluate
+    this hundreds of times per apex and constructing a BPoly object costs more than the arithmetic;
+    replacing it here made the 3-apex solve ~35 ms FASTER than before the curvature checks existed.
+    The final laid profile still goes through BPoly, which also weaves several apexes into one
+    polynomial. Returns None on degenerate knots."""
+    if not (r_in > 1e-6 and r_out > 1e-6 and r_in + r_out > 1e-3):
         return None
     v = np.zeros_like(u_stn)
-    m = (u_stn >= lo) & (u_stn <= hi)
-    if np.any(m):
-        v[m] = poly(u_stn[m])
+    rel = u_stn - u_c
+    for m, r in (((rel >= -r_in) & (rel <= 0.0), r_in), ((rel > 0.0) & (rel <= r_out), r_out)):
+        if np.any(m):
+            t = 1.0 - np.abs(rel[m]) / r                  # 0 at the ramp end, 1 at the apex
+            v[m] = d * t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
     return v
 
 
 def _fit_hump_to_corridor(u_stn: np.ndarray, u_c: float, d: float, r0: float, track_len: float,
-                          hi_inc: np.ndarray, lo_inc: np.ndarray, reach_floor: float):
+                          hi_inc: np.ndarray, lo_inc: np.ndarray, reach_floor: float,
+                          fit_tol: float = _FIT_TOL_DEFAULT):
     """Shrink one hump until it FITS the corridor, instead of letting the final clip chop it.
 
     Root cause this addresses: the corridor is zero-width at many scattered stations (on ifac 59/355
@@ -183,6 +202,13 @@ def _fit_hump_to_corridor(u_stn: np.ndarray, u_c: float, d: float, r0: float, tr
     extremum comb, and alpha''s 1/h^2 ~= 100 gain blows those cm-scale steps up into a curvature
     that flips sign every station. Shrinking the hump keeps it ANALYTIC (always exactly 1 extremum,
     C2 by construction) — a narrower hump is sharper but never wavy, and the clip then barely bites.
+
+    `fit_tol` is the feasibility TOLERANCE, and it is load-bearing — see _FIT_TOL_DEFAULT. Step 1
+    parks the amplitude exactly ON the bound, so with a zero tolerance the neighbouring stations
+    (where the smoothed bound ripples ~2 mm tighter) reject every reach that is still near-peak
+    there. The reach then bisects to whatever is sharp enough to fall away from the peak within
+    one station — measured on ifac: a 0.5 mm violation at the station 0.1 m from the apex collapsed
+    the reach from 5.00 m to 1.24 m, and with it max|kappa| 1.46 -> 1.98 and +1.62 s of lap time.
 
     Returns (d_fitted, r_fitted). Amplitude is capped at the apex station first, then the reach is
     bisected; the hump shrinks monotonically in both, so bisection is well posed."""
@@ -195,10 +221,10 @@ def _fit_hump_to_corridor(u_stn: np.ndarray, u_c: float, d: float, r0: float, tr
         return 0.0, r0
 
     def fits(r, amp):
-        v = _hump_values(u_stn, u_c, amp, r, r, track_len)
+        v = _hump_values(u_stn, u_c, amp, r, r)
         if v is None:
             return False
-        return bool(np.all(v <= hi_inc + 1e-9)) and bool(np.all(v >= lo_inc - 1e-9))
+        return bool(np.all(v <= hi_inc + fit_tol)) and bool(np.all(v >= lo_inc - fit_tol))
 
     if fits(r0, d):
         return d, r0
@@ -584,13 +610,20 @@ def _blas_single_thread():
 
 
 def _load_veh_dyn(input_path: str):
-    """Load (ggv, ax_max_machines, m_veh, drag_coeff, dyn_model_exp, v_max) from a
-    config/<version> directory (veh_dyn_info/*.csv + racecar_f110.ini)."""
+    """Load (ggv, ax_max_machines, m_veh, drag_coeff, dyn_model_exp, v_max, curvlim) from a
+    config/<version> directory (veh_dyn_info/*.csv + racecar_f110.ini).
+
+    `curvlim` is the vehicle's max trackable |kappa| the OFFLINE optimizer already respects
+    (`optim_opts_mincurv` hands it to iqp_handler as kappa_bound). The online path needs it as a
+    hard bound too: a hump sharper than curvlim is not steerable, so publishing it makes the
+    controller cut the line while the speed plan collapses. Consumers must tolerate a 7-tuple —
+    `_offset_lap_time` unpacks `veh[:6]` so the velocity-profile contract is unchanged.
+    """
     import re
     vdi = os.path.join(input_path, "veh_dyn_info")
     ggv = np.loadtxt(os.path.join(vdi, "ggv.csv"), delimiter=",", comments="#")
     axm = np.loadtxt(os.path.join(vdi, "ax_max_machines.csv"), delimiter=",", comments="#")
-    m_veh, drag, dyn_exp, v_max = 3.5, 0.0136, 1.0, 15.0
+    m_veh, drag, dyn_exp, v_max, curvlim = 3.5, 0.0136, 1.0, 15.0, 1.5
     ini_path = os.path.join(input_path, "racecar_f110.ini")
     if os.path.isfile(ini_path):
         # the .ini holds python-dict blocks with inline '#' comments, so pull individual
@@ -604,7 +637,8 @@ def _load_veh_dyn(input_path: str):
         drag = _key("dragcoeff", drag)
         v_max = _key("v_max", v_max)
         dyn_exp = _key("dyn_model_exp", dyn_exp)
-    return ggv, axm, m_veh, drag, dyn_exp, v_max
+        curvlim = _key("curvlim", curvlim)
+    return ggv, axm, m_veh, drag, dyn_exp, v_max, curvlim
 
 
 def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: float,
@@ -614,8 +648,11 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                          hi_inc: Optional[np.ndarray] = None,
                          lo_inc: Optional[np.ndarray] = None,
                          entry_scale: float = 1.0,
-                         exit_scale: float = 1.0
-                         ) -> Tuple[np.ndarray, int, float]:
+                         exit_scale: float = 1.0,
+                         fit_tol: float = _FIT_TOL_DEFAULT,
+                         clean_kappa: Optional[np.ndarray] = None,
+                         curvlim: float = 0.0
+                         ) -> Tuple[np.ndarray, int, float, list, list]:
     """Lateral offset d(s) on the CLOSED clean loop that PRESERVES each recorded reactive apex
     but re-grows long, gentle entry/exit ramps — the "keep the apex, press the secondary apexes"
     reshape. `apexes` are map-frame (x, y) apex points captured from the reactive spline.
@@ -632,20 +669,34 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
     shortened ramp forces a sharp S-shaped merge (curvature swing +0.6/-0.6) — the exact "unnecessary
     undulation" at the merge. Longer is always gentler here.
 
-    Returns (d_global[N], n_apex_used, entry_kappa, dropped) — `dropped` lists the apexes the
-    corridor could not hold at >= _APEX_KEEP_FRAC of their recorded amplitude (all-or-nothing;
-    each entry {"xy": (x, y), "want": d*, "fit": best_feasible_d}), so the caller can report
-    honestly and leave those obstacles to the reactive layer. Wrap is handled by cutting the
-    profile in the largest apex-free gap so no hump straddles s=0. Never raises; degrades to
-    zeros on any failure."""
+    With `curvlim > 0` (and `clean_kappa`) the hump is additionally bound by a HARD curvature limit.
+    Two steps, because the cheap estimate and the truth disagree on this track:
+      * SIZING — the quintic's peak |d''| is closed-form (_KAPPA_QUINTIC_C * |A| / r^2), so the
+        reach that would fit an additive curvature budget needs no search:
+        r_min = sqrt(_KAPPA_QUINTIC_C * |A| / budget). Used only to pick how far to GROW the reach.
+      * VERDICT — measured on the actual offset GEOMETRY (`_kappa_peak`). The additive
+        `kappa_clean + d''` model is a linearisation that reads ~45% low here, so it cannot be the
+        thing a safety limit is checked against; see `_kappa_peak`.
+    A hump over the bar is grown while the corridor allows, then has its amplitude shaved, and is
+    dropped if that would take it under _APEX_KEEP_FRAC — publishing a line the car cannot steer is
+    never the answer (nothing checked this before: `curvlim` was respected only by the offline IQP).
+
+    Returns (d_global[N], n_apex_used, entry_kappa, dropped, laid).
+    `dropped` lists the apexes that could not be laid at >= _APEX_KEEP_FRAC of their recorded
+    amplitude (all-or-nothing; each entry {"xy": (x, y), "want": d*, "fit": best_feasible_d,
+    "reason": "corridor"|"curvature"}), so the caller can report honestly and leave those obstacles
+    to the reactive layer. `laid` mirrors it for the humps that WERE laid ({"xy", "want", "laid",
+    "r_in", "r_out", "r_req", "kappa_peak"}) so the node can log why a hump ended up as sharp as it
+    did. Wrap is handled by cutting the profile in the largest apex-free gap so no hump straddles
+    s=0. Never raises; degrades to zeros on any failure."""
     N = len(s_loop)
     d_global = np.zeros(N)
     if not apexes:
-        return d_global, 0, 0.0, []
+        return d_global, 0, 0.0, [], []
     try:
         from scipy.interpolate import BPoly
     except Exception:
-        return d_global, 0, 0.0, []
+        return d_global, 0, 0.0, [], []
 
     # --- project apexes -> (s*, d*, R_in, R_out, xy); drop negligible offsets ----------------
     knots = []
@@ -659,7 +710,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         R = min(R, 0.45 * track_len)                    # never span more than ~half the loop
         knots.append((float(s_loop[i]), d_star, R, R, xa, ya))  # symmetric ramps
     if not knots:
-        return d_global, 0, 0.0, []
+        return d_global, 0, 0.0, [], []
 
     # --- cut the loop in the largest gap between apex centres (seam falls on d=0) -------------
     knots.sort(key=lambda k: k[0])
@@ -679,6 +730,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
     kn_u = sorted(((c - s_cut) % track_len, d, ri, ro, xa, ya)
                   for (c, d, ri, ro, xa, ya) in knots)
     dropped: List[dict] = []
+    laid: List[dict] = []
     # --- FIT each hump to the corridor (shrink reach, NEVER the clearance) BEFORE laying it ----
     # Without this the downstream element-wise clip does the shaping and combs the hump; see
     # _fit_hump_to_corridor. Fitting keeps every hump analytic (exactly one extremum, C2).
@@ -693,14 +745,114 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         floor_r = max(0.5, min(1.0, 0.05 * track_len))
         hi_a = np.asarray(hi_inc, float)
         lo_a = np.asarray(lo_inc, float)
+        kap_a = (np.abs(np.asarray(clean_kappa, float))
+                 if clean_kappa is not None else np.zeros(N))
+        # the clean line's own GEOMETRIC curvature — the reference the laid hump is judged against
+        try:
+            kap_geo = _menger_kappa(clean_xy)
+        except Exception:
+            kap_geo = kap_a
+        # locality budget for a GROWN reach: a hump must stay a local detour (see _HUMP_SPAN_FRAC)
+        r_grow_cap = min(max(1.0, 0.5 * _HUMP_SPAN_FRAC * track_len), 0.45 * track_len)
+
+        def _fits(u_c, r, amp):
+            v = _hump_values(u_all, u_c, amp, r, r)
+            return (v is not None and bool(np.all(v <= hi_a + fit_tol))
+                    and bool(np.all(v >= lo_a - fit_tol)))
+
+        def _kappa_budget(u_c, r):
+            """curvlim minus the clean line's own curvature over the hump span — the headroom the
+            hump's d'' may use. Only used to SIZE the reach (r_min), so it is floored: at a raceline
+            apex kappa_clean already sits at ~curvlim and a zero budget would demand r=inf. The
+            floor must never authorise a violation — that is what the geometric `_kappa_peak` vs
+            `_kappa_allow` verdict below is for, and it is why the floor may stay this loose."""
+            m = (u_all >= u_c - r) & (u_all <= u_c + r)
+            kc = float(np.max(kap_a[m])) if np.any(m) else 0.0
+            return max(curvlim - kc, _KAPPA_BUDGET_FLOOR_FRAC * curvlim)
+
+        def _kappa_peak(u_c, amp, r_i, r_o):
+            """Max |kappa| of the GEOMETRY a candidate hump would lay, over its own span.
+
+            Measured from the actual offset points, NOT from the `kappa_clean + d''` additive model
+            the rest of this file publishes. That model is the small-(d, d', kappa) linearisation of
+            the Frenet offset curvature, and on this track it is not valid: laying a 0.55 m hump at
+            reach 2.1 m next to the ifac chicane (kappa_clean 1.45) gives an additive estimate of
+            1.19 while the real geometry measures 2.11 — the offset curve's `1 - d*kappa_r` and
+            d'^2 terms are first-order here (d*kappa_r ~ 0.8, d' up to 0.49), not negligible. A
+            curvature LIMIT checked against the linearisation would pass lines the car cannot steer,
+            so the verdict has to be geometric. Menger is the right estimator: it reproduces the
+            stored clean kappa to 0.0067 1/m without differentiating a derived heading."""
+            v = _hump_values(u_all, u_c, amp, r_i, r_o)
+            if v is None:
+                return float("inf")
+            m = (u_all >= u_c - r_i) & (u_all <= u_c + r_o)
+            if not np.any(m):
+                return 0.0
+            k = _menger_kappa(clean_xy + v[:, None] * nvec_rl)
+            return float(np.max(np.abs(k[m])))
+
+        def _kappa_allow(u_c, r):
+            """The bar the laid hump must clear. `curvlim` normally, but never stricter than the
+            clean raceline's OWN geometric curvature there: if the clean line already exceeds
+            curvlim at this corner that is a property of the raceline, and dropping the apex would
+            not fix it."""
+            m = (u_all >= u_c - r) & (u_all <= u_c + r)
+            kc = float(np.max(np.abs(kap_geo[m]))) if np.any(m) else 0.0
+            return max(curvlim, kc)
+
         fitted = []
         for (u, d, ri, ro, xa, ya) in kn_u:
-            d_f, r_f = _fit_hump_to_corridor(u_all, u, d, max(ri, ro), track_len,
-                                             hi_a, lo_a, floor_r)
+            r_req = max(ri, ro)
+            d_f, r_f = _fit_hump_to_corridor(u_all, u, d, r_req, track_len,
+                                             hi_a, lo_a, floor_r, fit_tol=fit_tol)
             if abs(d_f) < max(0.03, _APEX_KEEP_FRAC * abs(d)):
-                dropped.append({"xy": (float(xa), float(ya)),
-                                "want": float(d), "fit": float(d_f)})
+                dropped.append({"xy": (float(xa), float(ya)), "want": float(d),
+                                "fit": float(d_f), "reason": "corridor"})
                 continue
+            # --- HARD curvature limit -------------------------------------------------------
+            # r_min is closed-form, so this costs no search. Widen first (free in curvature terms,
+            # ~0.08 m of extra arc), and only shave the proven clearance if the corridor refuses.
+            if curvlim > 0.0 and abs(d_f) > 1e-9:
+                for _ in range(3):                      # budget depends on the span -> re-converge
+                    budget = _kappa_budget(u, r_f)
+                    r_min = math.sqrt(_KAPPA_QUINTIC_C * abs(d_f) / budget)
+                    if r_min <= r_f + 1e-6:
+                        break
+                    # The corridor fit already returned the LARGEST feasible reach <= r_req, so
+                    # growing is only possible when it did not bite (r_f == r_req).
+                    r_top = min(r_min, r_grow_cap)
+                    if r_f >= r_req - 1e-9 and r_top > r_f:
+                        if _fits(u, r_top, d_f):
+                            r_f = r_top
+                        else:                            # largest feasible reach in (r_f, r_top]
+                            lo_g, hi_g = r_f, r_top
+                            for _ in range(20):
+                                mid = 0.5 * (lo_g + hi_g)
+                                if _fits(u, mid, d_f):
+                                    lo_g = mid
+                                else:
+                                    hi_g = mid
+                            r_f = lo_g
+                    else:
+                        break
+                # VERDICT on the actual laid curvature (the floor above may have let r_f through).
+                allow = _kappa_allow(u, r_f)
+                if _kappa_peak(u, d_f, r_f, r_f) > allow:
+                    # Shave the amplitude to whatever the curvature bar admits at this reach.
+                    # Bisection, not the closed form: with the signed sum the peak is not exactly
+                    # C*|A|/r^2 near a corner, and this lands on the true boundary either way.
+                    lo_k, hi_k = 0.0, abs(d_f)
+                    for _ in range(20):
+                        mid = 0.5 * (lo_k + hi_k)
+                        if _kappa_peak(u, math.copysign(mid, d_f), r_f, r_f) <= allow:
+                            lo_k = mid
+                        else:
+                            hi_k = mid
+                    d_f = math.copysign(lo_k, d_f)
+                    if abs(d_f) < max(0.03, _APEX_KEEP_FRAC * abs(d)):
+                        dropped.append({"xy": (float(xa), float(ya)), "want": float(d),
+                                        "fit": float(d_f), "reason": "curvature"})
+                        continue
             # ENTRY/EXIT ramps may be stretched independently of the lap-time-optimal reach:
             # a longer ramp cuts the merge-zone curvature (the S-shaped inflection where the
             # hump joins the raceline — it cannot be removed, only made shallower).
@@ -718,8 +870,8 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                 r_try = min(r_f * scale, max(r_f, span_cap - r_fixed))
                 for _ in range(12):
                     ri, ro = (r_try, r_fixed) if stretch_entry else (r_fixed, r_try)
-                    v = _hump_values(u_all, u, d_f, ri, ro, track_len)
-                    if v is not None and np.all(v <= hi_a + 1e-9) and np.all(v >= lo_a - 1e-9):
+                    v = _hump_values(u_all, u, d_f, ri, ro)
+                    if v is not None and np.all(v <= hi_a + fit_tol) and np.all(v >= lo_a - fit_tol):
                         r_best = r_try
                         break
                     r_try = 0.5 * (r_try + r_f)
@@ -730,9 +882,13 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             r_in = _stretch(entry_scale, r_f, stretch_entry=True)
             r_out = _stretch(exit_scale, r_in, stretch_entry=False)
             fitted.append((u, d_f, r_in, r_out))
+            laid.append({"xy": (float(xa), float(ya)), "want": float(d), "laid": float(d_f),
+                         "r_in": float(r_in), "r_out": float(r_out), "r_req": float(r_req),
+                         "kappa_peak": 0.0,        # filled from the laid profile below
+                         "_u": float(u)})          # join key: `fitted` gets sorted, `laid` does not
         kn_u = sorted(fitted)
         if not kn_u:
-            return d_global, 0, 0.0, dropped
+            return d_global, 0, 0.0, dropped, laid
     else:
         kn_u = [(u, d, ri, ro) for (u, d, ri, ro, _xa, _ya) in kn_u]   # no corridor: keep all
     n_ap = len(kn_u)
@@ -764,12 +920,18 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         u_stn = (s_loop - s_cut) % track_len
         d_global = np.asarray(poly(u_stn), dtype=float)
     except Exception:
-        return np.zeros(N), 0, 0.0, dropped
+        return np.zeros(N), 0, 0.0, dropped, laid
     # RAMP curvature: max |d''| over each hump's entry AND exit ramps — the merge-zone
     # inflections the driver feels joining/leaving the avoidance. It is the tiebreak the
-    # reach/stretch search minimises once the lap time is settled.
-    ds = np.gradient(u_stn) if N > 2 else np.ones(N)
+    # reach/stretch search minimises once the lap time is settled. The same pass fills each
+    # `laid` entry's kappa_peak — the GEOMETRIC max |kappa| of the laid line over its own span, so
+    # the caller logs what was really laid instead of inferring it from the reach.
     ent_k = 0.0
+    by_u = {round(e["_u"], 6): e for e in laid if "_u" in e}
+    try:
+        kap_laid = np.abs(_menger_kappa(clean_xy + d_global[:, None] * nvec_rl))
+    except Exception:
+        kap_laid = None
     for (u, d, ri, ro) in kn_u:
         m = (u_stn >= u - ri) & (u_stn <= u + ro)
         if int(np.count_nonzero(m)) < 3:
@@ -777,7 +939,13 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         seg = d_global[m]
         h = float(np.median(np.abs(np.diff(u_stn[m])))) or 1.0
         ent_k = max(ent_k, float(np.abs(np.diff(seg, 2)).max() / max(h * h, 1e-9)))
-    return d_global, len(kn_u), ent_k, dropped
+        rec = by_u.get(round(float(u), 6))
+        if rec is not None and kap_laid is not None:
+            # Geometric, matching the verdict in _kappa_peak. The additive `kappa_clean + d''` the
+            # node publishes reads ~45% low here (1.19 vs 2.11 on the ifac chicane hump), so a log
+            # built on it would report a healthy line the car in fact cannot steer.
+            rec["kappa_peak"] = float(np.max(kap_laid[m]))
+    return d_global, len(kn_u), ent_k, dropped, laid
 
 
 def _cap_speed_to_published_curvature(traj: np.ndarray, ggv, axm) -> None:
@@ -789,9 +957,20 @@ def _cap_speed_to_published_curvature(traj: np.ndarray, ggv, axm) -> None:
     implied vs ggv ay_max 4.5 on a two-hump line). The controller cannot track a plan beyond
     the friction budget, which reads as a sharp tracking-quality collapse on the swapped line.
 
-    Cap vx by ay_max over the published |kappa| (lightly smoothed so single-station kappa
-    noise doesn't notch the plan), then re-run wrap-aware backward-decel / forward-accel
-    passes so the capped profile stays reachable. Cheap (two sweeps over ~355 points)."""
+    Cap vx by ay_max over the TRUE geometry of the published points, then re-run wrap-aware
+    backward-decel / forward-accel passes so the capped profile stays reachable. Cheap (two sweeps
+    over ~355 points).
+
+    The cap must NOT read traj[:, 4]: that field is deliberately smoothed for the controller's L1
+    lookahead (`_republish_kappa` -> Menger + _cyclic_smooth(win=5)), and smoothing it again here
+    made the friction cap see a curvature the line does not have. Measured on a 3-obstacle ifac
+    line: published |kappa| max 1.36 while the real geometry was 1.70, so the published plan
+    demanded 5.20 m/s^2 of lateral accel against a 4.5 budget — 15% over, on the exact stations
+    where tracking matters. Take the max of the published field and the RAW Menger curvature of the
+    published points, so the cap can never under-report the geometry. Raw, not smoothed: measured on
+    the ifac single-hump line, smoothing the cap input costs the friction budget without buying lap
+    time — win=5 leaves max ay at 4.77 and win=3 at 4.60, while raw lands on exactly 4.50 (the clean
+    line's own value) for +0.004 s of lap time and 0.02 m/s of min speed."""
     ay_cap, a_brake, a_accel = 4.5, 5.0, 3.0
     try:
         if np.ndim(ggv) > 1 and np.shape(ggv)[1] > 2:
@@ -801,7 +980,11 @@ def _cap_speed_to_published_curvature(traj: np.ndarray, ggv, axm) -> None:
             a_accel = float(np.min(axm[:, 1]))
     except Exception:
         pass
-    kap = _cyclic_smooth(np.abs(traj[:, 4]), win=5)
+    kap = np.abs(traj[:, 4])
+    try:
+        kap = np.maximum(kap, np.abs(_menger_kappa(traj[:, 1:3])))
+    except Exception:
+        pass                                     # fall back to the published field alone
     vx = np.minimum(traj[:, 5], np.sqrt(ay_cap / np.maximum(kap, 1e-3)))
     seg = np.roll(traj[:, 1:3], -1, axis=0) - traj[:, 1:3]
     el = np.maximum(np.hypot(seg[:, 0], seg[:, 1]), 1e-6)   # el[i] = dist i -> i+1 (closed)
@@ -929,7 +1112,7 @@ def _offset_lap_time(d_global: np.ndarray, clean_xy: np.ndarray, nvec_rl: np.nda
     if clean_vx is None:
         return float("inf")
     try:
-        ggv, axm, m_veh, drag, dyn_exp, v_max = veh
+        ggv, axm, m_veh, drag, dyn_exp, v_max = veh[:6]     # veh may carry curvlim as [6]
         alpha = np.clip(d_global, lo_inc, hi_inc)
         stitch = clean_xy + alpha[:, None] * nvec_rl
         if N > 1 and np.allclose(clean_xy[-1], clean_xy[0]):
@@ -993,6 +1176,7 @@ def _reopt_local_window_impl(
     reach_min: float = 4.0,
     reach_max: float = 10.0,
     clean_kappa: Optional[np.ndarray] = None,
+    fit_tol: float = _FIT_TOL_DEFAULT,
 ) -> dict:
     """Fast ONLINE obstacle-aware raceline: reshape the REACTIVE avoidance spline into a global
     line. Each `apex` (map-frame (x,y) captured from the reactive spliner on the exploration lap)
@@ -1050,7 +1234,7 @@ def _reopt_local_window_impl(
     lo_inc = np.minimum(lo_off, 0.0)
     hi_inc = np.maximum(hi_off, 0.0)
 
-    ggv, axm, m_veh, drag, dyn_exp, v_max = _load_veh_dyn(input_path)
+    ggv, axm, m_veh, drag, dyn_exp, v_max, curvlim = _load_veh_dyn(input_path)
     veh = (ggv, axm, m_veh, drag, dyn_exp, v_max)
 
     # --- OFFSET d(s): apex-preserving reshape of the reactive spline, with the ramp REACH chosen
@@ -1075,27 +1259,29 @@ def _reopt_local_window_impl(
     if not cand_r:
         cand_r = [float(np.clip(0.5 * (reach_min + reach_max), r_lo, min(reach_max, r_cap)))]
     def _try(r, e_scale, x_scale=1.0):
-        dg, nn, ek, drp = build_offset_profile(
+        dg, nn, ek, drp, lay = build_offset_profile(
             clean_xy, s_loop, track_len, nvec_rl, apexes,
             clean_vx_arr, 0.0, r, r, hi_inc=hi_inc, lo_inc=lo_inc,
-            entry_scale=e_scale, exit_scale=x_scale)
+            entry_scale=e_scale, exit_scale=x_scale,
+            fit_tol=fit_tol, clean_kappa=clean_kappa, curvlim=curvlim)
         if nn == 0:
-            return dg, 0, float("inf"), ek, drp
+            return dg, 0, float("inf"), ek, drp, lay
         return dg, nn, _offset_lap_time(dg, clean_xy, nvec_rl, el_cl, clean_kappa,
-                                        clean_vx_arr, lo_inc, hi_inc, veh, N), ek, drp
+                                        clean_vx_arr, lo_inc, hi_inc, veh, N), ek, drp, lay
 
     # STAGE 1 — symmetric reach, minimise lap time.
     d_global, n_solved, best_est, best_ek, best_r = None, 0, float("inf"), 0.0, cand_r[0]
     apex_dropped: List[dict] = []
+    apex_laid: List[dict] = []
     for r_try in cand_r:
-        d_try, n_try, est_try, ek_try, drp_try = _try(r_try, 1.0)
+        d_try, n_try, est_try, ek_try, drp_try, lay_try = _try(r_try, 1.0)
         if n_try == 0:
             if d_global is None:
-                d_global, n_solved, apex_dropped = d_try, 0, drp_try
+                d_global, n_solved, apex_dropped, apex_laid = d_try, 0, drp_try, lay_try
             continue
         if est_try < best_est:
             d_global, n_solved, best_est, best_ek, best_r = d_try, n_try, est_try, ek_try, r_try
-            apex_dropped = drp_try
+            apex_dropped, apex_laid = drp_try, lay_try
     # STAGE 2 — stretch the ENTRY ramp (gradual turn-in), then STAGE 3 — stretch the EXIT ramp
     # too: the merge-back inflection (curvature sign flip where the hump rejoins the raceline)
     # cannot be removed, but a longer return ramp makes it shallow instead of a visible S-kink.
@@ -1105,14 +1291,16 @@ def _reopt_local_window_impl(
         tol = 0.03                                        # [s] lap-time budget for a softer turn-in
         best_e = 1.0
         for e_scale in (1.5, 2.0, 3.0):
-            d_try, n_try, est_try, ek_try, drp_try = _try(best_r, e_scale)
+            d_try, n_try, est_try, ek_try, drp_try, lay_try = _try(best_r, e_scale)
             if n_try and est_try <= best_est + tol and ek_try < best_ek:
-                d_global, n_solved, best_ek, apex_dropped, best_e = d_try, n_try, ek_try, drp_try, e_scale
+                d_global, n_solved, best_ek, best_e = d_try, n_try, ek_try, e_scale
+                apex_dropped, apex_laid = drp_try, lay_try
         tol_exit = 0.05                                   # [s] merge smoothness is worth a bit more
         for x_scale in (1.5, 2.0, 3.0):
-            d_try, n_try, est_try, ek_try, drp_try = _try(best_r, best_e, x_scale)
+            d_try, n_try, est_try, ek_try, drp_try, lay_try = _try(best_r, best_e, x_scale)
             if n_try and est_try <= best_est + tol_exit and ek_try < best_ek:
-                d_global, n_solved, best_ek, apex_dropped = d_try, n_try, ek_try, drp_try
+                d_global, n_solved, best_ek = d_try, n_try, ek_try
+                apex_dropped, apex_laid = drp_try, lay_try
     if d_global is None:
         d_global, n_solved = np.zeros(N), 0
     n_failed = 0                                          # apexes with no offset are simply absent
@@ -1285,7 +1473,8 @@ def _reopt_local_window_impl(
 
     return {"reftrack_mod": rl_mod, "report": report,
             "main": (traj, bound_r, bound_l, est), "d_right": d_right, "d_left": d_left,
-            "n_windows": n_solved, "n_failed": n_failed, "apex_dropped": apex_dropped}
+            "n_windows": n_solved, "n_failed": n_failed, "apex_dropped": apex_dropped,
+            "apex_laid": apex_laid, "curvlim": float(curvlim)}
 
 
 # ======================================================================================
