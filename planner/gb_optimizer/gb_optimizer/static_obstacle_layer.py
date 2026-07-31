@@ -186,11 +186,26 @@ class StaticObstacleLayer(Node):
         return slow
 
     def _associate(self, x: float, y: float, r: float, s: float) -> _Track:
+        """Match a detection to an existing track, or start a new one.
+
+        The gate scales with how BIG the two things are, not just `match_radius`. A flat radius
+        compares centre-to-centre distance against a constant, so the same physical box re-detected
+        (or nudged) by more than that constant silently becomes a SECOND obstacle. Measured on the
+        real car (bag verify_0731_2114): one box ended up registered four times --
+        (12.46,-0.44), (13.01,-0.82), (11.81,-0.74), (12.41,-0.73) -- all within 1 m, because a
+        contact displaced it ~0.6 m and 0.6 > match_radius. The re-optimizer then laid a hump for
+        the ghost as well (`3/3 obstacle apex(es) reshaped`) and the global line jumped 0.887 m.
+
+        Adding the mean radius keeps genuinely separate obstacles separate: the runbook's tightest
+        scenario (S4, ~0.40 m gap between two 0.5 m boxes) puts centres 0.90 m apart, still outside
+        the 0.75 m gate two 0.25 m-radius boxes get here.
+        """
         best = None
-        best_d = self.match_radius
+        best_d = None
         for t in self._tracks:
             d = math.hypot(t.x - x, t.y - y)
-            if d < best_d:
+            gate = self.match_radius + 0.5 * (t.r + r)
+            if d < gate and (best_d is None or d < best_d):
                 best_d = d
                 best = t
         if best is None:
