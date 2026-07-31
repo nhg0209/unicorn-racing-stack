@@ -326,6 +326,41 @@ class StaticReoptNode(Node):
         (map_info, est, cent_m, cent_w, glb_m, glb_w, sp_m, sp_w, bounds) = read_global_waypoints(map_name)
         return _Bundle(map_info, est, cent_w, cent_m, glb_w, glb_m, sp_w, sp_m, bounds)
 
+    def _report_line_clearance(self, traj, obstacles: List[core.Obstacle]) -> None:
+        """Measure what the line ACTUALLY clears, in the map frame, and say so.
+
+        Everything upstream reports intent -- "2/2 obstacle apex(es) reshaped" is printed whether
+        the resulting line passes 0.6 m from the box or through it. It was true for six laps
+        straight on the real car (bag verify_0731_2114) while the published line stayed ~0.2 m from
+        an obstacle that needs radius + obs_margin, so the reactive layer re-avoided it every single
+        lap and the log never said why.
+
+        This is deliberately a REPORT, not a veto: refusing the swap would leave the clean line,
+        which clears even less. It gives the missing number so a bad line is attributable at the
+        moment it is built instead of after a bag analysis.
+        """
+        try:
+            if traj is None or len(traj) == 0 or not obstacles:
+                return
+            xy = np.asarray(traj)[:, 1:3]
+            bad = []
+            for o in obstacles:
+                d = float(np.min(np.hypot(xy[:, 0] - o.x, xy[:, 1] - o.y))) - float(o.r)
+                if d < self.obs_margin:
+                    bad.append((o, d))
+            if not bad:
+                self.get_logger().info(
+                    f"[static_reopt] line clearance OK: all {len(obstacles)} obstacle(s) cleared by "
+                    f">= {self.obs_margin:.2f} m")
+                return
+            det = "; ".join(f"@({o.x:.2f},{o.y:.2f}) r={o.r:.2f} -> {d:+.2f} m" for o, d in bad)
+            self.get_logger().warning(
+                f"[static_reopt] line does NOT clear {len(bad)}/{len(obstacles)} obstacle(s) "
+                f"(need >= obs_margin {self.obs_margin:.2f} m): {det}. The reactive layer will keep "
+                f"avoiding these every lap — check the recorded apex and reopt_wall_margin")
+        except Exception as e:                      # a diagnostic must never break the build
+            self.get_logger().debug(f"[static_reopt] clearance report failed: {e}")
+
     def _build_obstacle_bundle(self, obstacles: List[core.Obstacle]) -> _Bundle:
         """Run the width-modulated re-optimization and assemble a full bundle. May raise;
         the caller runs this inside a try/except so a failure never reaches the timer."""
@@ -408,6 +443,7 @@ class StaticReoptNode(Node):
                 self.get_logger().warning(
                     f"[static_reopt] {n_no_apex} obstacle(s) had no recorded reactive apex yet — "
                     f"the reactive static-avoidance layer handles them until an apex is captured")
+            self._report_line_clearance(traj, obstacles)
         else:
             info.data = (f"[static_reopt] obstacle-aware (mincurv_iqp) est {est:.3f}s; "
                          f"affected {rep.n_affected}, infeasible {rep.n_infeasible}, "
