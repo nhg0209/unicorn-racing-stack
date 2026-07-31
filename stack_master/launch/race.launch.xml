@@ -44,7 +44,9 @@
   <arg name="reopt_reach_min" default="1.0" description="[m] MIN arc half-width searched. The reach is picked to MINIMISE estimated lap time, not by local speed."/>
   <arg name="reopt_reach_max" default="6.0" description="[m] MAX arc half-width searched. On a short tight track a wide arc is SLOW (ifac: R=10 m costs ~2x the time a reactive line loses); raise only on long open tracks."/>
   <arg name="reopt_qp_veh_width" default="0.30" description="[m] vehicle width for the windowed QP corridor + floor (obstacle clearance is obs_margin, separate)"/>
-  <arg name="reopt_wall_margin" default="0.12" description="[m] keep the re-optimized detour this far off the track walls"/>
+  <arg name="reopt_wall_margin" default="0.05" description="[m] wall reserve of the re-optimized detour. Aligned with the reactive spliner's wall reserve — the recorded apex was DRIVEN at that reserve; a larger value here shrinks the hump below the proven clearance and the all-or-nothing fit rejects it (obstacle stays reactive-only). Was 0.12 here while base_system and the node both default to 0.05: measured on ifac that inflated the worst-case lap loss from +0.49 s to +1.47 s and pushed the laid line past curvlim."/>
+  <arg name="reopt_obs_margin" default="0.35" description="[m] clearance of the re-optimized line off each obstacle's edge. MUST be >= the reactive keep-out (width_car/2 + safety_margin in static_avoidance_params.yaml, currently 0.30) or the re-opt line sits inside the reactive planner's own keep-out and gets re-avoided every lap. Run stack_master/scripts/check_avoidance_margins.py after tuning either side."/>
+  <arg name="reopt_fit_tol" default="0.005" description="[m] corridor-fit tolerance of the re-optimizer. The corridor is a smoothed estimate rippling ~2 mm between stations while the amplitude cap parks the hump peak exactly on it, so a zero tolerance rejects every wide reach over a sub-mm violation. Spent out of reopt_wall_margin."/>
   <!-- Detection front-end used effectively: sim has no Livox, so force the 2D 'scan' path there;
        the real car honours detection_source. -->
   <let name="det_src" value="scan" if="$(var sim)"/>
@@ -78,6 +80,8 @@
     <arg name="reopt_reach_max" value="$(var reopt_reach_max)"/>
     <arg name="reopt_qp_veh_width" value="$(var reopt_qp_veh_width)"/>
     <arg name="reopt_wall_margin" value="$(var reopt_wall_margin)"/>
+    <arg name="reopt_obs_margin" value="$(var reopt_obs_margin)"/>
+    <arg name="reopt_fit_tol" value="$(var reopt_fit_tol)"/>
     <arg name="use_hokuyo" value="$(var use_hokuyo)"/>
     <arg name="use_livox"  value="$(var use_livox)"/>
   </include>

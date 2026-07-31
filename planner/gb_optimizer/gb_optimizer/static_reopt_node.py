@@ -130,6 +130,13 @@ class StaticReoptNode(Node):
                                                              # bigger one here shrank the hump below
                                                              # the proven clearance (all-or-nothing
                                                              # fit then rejects it).
+        # [m] corridor-fit TOLERANCE. The corridor is a smoothed estimate that ripples ~2 mm between
+        # adjacent stations while the amplitude cap parks the hump peak exactly on it, so a
+        # zero-tolerance fit rejects every wide reach over a sub-millimetre violation and collapses
+        # the hump. Measured on ifac: 0 -> 5 mm took the fitted reach from 1.24 m to 5.00 m, the
+        # laid curvature from 1.98 to 1.46 (curvlim 1.5) and +1.62 s of lap time back to +0.05 s.
+        # Raise only if the walls are being shaved; it is spent out of wall_margin.
+        self.declare_parameter("fit_tol", 0.005)
 
         self.map_name = self.get_parameter("map").value
         self.racecar_version = self.get_parameter("racecar_version").value
@@ -150,6 +157,7 @@ class StaticReoptNode(Node):
         self.reach_max = float(self.get_parameter("reach_max").value)
         self.qp_veh_width = float(self.get_parameter("qp_veh_width").value)
         self.wall_margin = float(self.get_parameter("wall_margin").value)
+        self.fit_tol = float(self.get_parameter("fit_tol").value)
 
         self.input_path = os.path.join(
             get_package_share_directory("stack_master"), "config", self.racecar_version)
@@ -330,7 +338,7 @@ class StaticReoptNode(Node):
                 params=core.ModulationParams(obs_margin=self.obs_margin),
                 w_veh=self.qp_veh_width, clean_vx=self._clean_vx, wall_margin=self.wall_margin,
                 reach_time=self.reach_time, reach_min=self.reach_min, reach_max=self.reach_max,
-                clean_kappa=self._clean_kappa)
+                clean_kappa=self._clean_kappa, fit_tol=self.fit_tol)
         else:
             # Legacy whole-track mincurv_iqp (offline-grade; minutes/solve).
             res = core.reoptimize_with_obstacles(
@@ -363,15 +371,39 @@ class StaticReoptNode(Node):
             info.data = (f"[static_reopt] obstacle-aware (apex reshape) est {est:.3f}s; "
                          f"{n_ap}/{n_obs} obstacle apex(es) reshaped, {len(dropped)} corridor-"
                          f"rejected, {n_no_apex} without a recorded reactive apex")
+            # PER-APEX shape log. Without this a collapsed reach is invisible: the summary above
+            # reports the hump as "reshaped" whether it was laid at the 5 m reach the search asked
+            # for or bisected down to 1.2 m by the corridor fit — and the sharp one costs >1 s/lap
+            # and exceeds curvlim. Log what was actually laid, and WARN when the reach came back
+            # less than half of what was requested or the geometry is near the curvature limit.
+            curvlim = float(res.get("curvlim", 0.0))
+            for a in res.get("apex_laid", []):
+                r_req = max(a.get("r_req", 0.0), 1e-6)
+                shrink = min(a["r_in"], a["r_out"]) / r_req
+                kp, kmsg = a.get("kappa_peak", 0.0), ""
+                if curvlim > 0.0:
+                    kmsg = f" ({kp / curvlim:.0%} of curvlim {curvlim:.2f})"
+                line = (f"[static_reopt] apex @({a['xy'][0]:.2f},{a['xy'][1]:.2f}) "
+                        f"laid d={a['laid']:+.3f} (want {a['want']:+.3f}) "
+                        f"reach {a['r_in']:.2f}/{a['r_out']:.2f} m of {r_req:.2f} requested "
+                        f"({shrink:.0%}); max|kappa| {kp:.2f}{kmsg}")
+                if shrink < 0.5 or (curvlim > 0.0 and kp > 0.9 * curvlim):
+                    self.get_logger().warning(
+                        line + " <- SHARP: the corridor fit shrank this hump. Check "
+                        "reopt_wall_margin / reopt_fit_tol and the reactive apex_bulge.")
+                else:
+                    self.get_logger().info(line)
             if dropped:
                 # All-or-nothing: a hump the corridor cannot hold at ~full amplitude would NOT
                 # clear its obstacle — the shrunken line got re-avoided by the reactive layer
                 # every lap. Those obstacles stay reactive-only, and this says so per apex.
                 det = "; ".join(f"@({d['xy'][0]:.2f},{d['xy'][1]:.2f}) want {d['want']:+.2f} "
-                                f"corridor max {d['fit']:+.2f}" for d in dropped)
+                                f"max {d['fit']:+.2f} [{d.get('reason', 'corridor')}]"
+                                for d in dropped)
                 self.get_logger().warning(
-                    f"[static_reopt] {len(dropped)} apex(es) CORRIDOR-REJECTED (track too tight "
-                    f"there; reactive layer keeps handling them): {det}")
+                    f"[static_reopt] {len(dropped)} apex(es) REJECTED (reason 'corridor' = track "
+                    f"too tight, 'curvature' = the hump would exceed curvlim; reactive layer keeps "
+                    f"handling them): {det}")
             if n_no_apex:
                 self.get_logger().warning(
                     f"[static_reopt] {n_no_apex} obstacle(s) had no recorded reactive apex yet — "
@@ -699,7 +731,8 @@ class StaticReoptNode(Node):
         if obstacles and n_ap == 0:
             self.get_logger().warning(
                 f"[static_reopt] re-opt laid 0 humps for {len(obstacles)} obstacle(s) — every "
-                f"apex corridor-rejected (track too tight; see the CORRIDOR-REJECTED log). "
+                f"apex rejected (track too tight, or the hump would exceed curvlim; see the "
+                f"REJECTED log for the per-apex reason). "
                 f"Keeping the current line; those obstacles stay reactive-only")
             return
         self._pending = bundle

@@ -49,6 +49,53 @@ def load_launch_args():
     return p, args
 
 
+def check_launch_agreement() -> bool:
+    """race.launch.xml and base_system.launch.xml must agree on every reopt_* default.
+
+    This exists because of a real miss: reopt_wall_margin was 0.05 in base_system.launch.xml (and
+    in the node) but 0.12 in race.launch.xml, which is the entry point the runbook and every sim
+    run actually use. The rest of this script only reads base_system, so it reported the safe 0.05
+    and everyone believed it. Measured cost of that 7 cm on ifac: the corridor fit shrank the
+    avoidance hump, worst-case lap loss went +0.49 -> +1.47 s and the laid line exceeded curvlim.
+
+    Also flags reopt_* args base_system declares but race.launch.xml never forwards — those are
+    silently un-tunable from the documented entry point (reopt_obs_margin was one).
+    """
+    base_p = STACK_MASTER / "launch" / "base_system.launch.xml"
+    race_p = STACK_MASTER / "launch" / "race.launch.xml"
+    if not race_p.is_file():
+        return True
+    base_root, race_root = ET.parse(base_p).getroot(), ET.parse(race_p).getroot()
+    base_args = {a.get("name"): a.get("default") for a in base_root.iter("arg")
+                 if (a.get("name") or "").startswith("reopt")}
+    # <arg name=.. default=..> declarations vs <arg name=.. value=..> forwards inside <include>
+    race_args = {a.get("name"): a.get("default") for a in race_root.iter("arg")
+                 if (a.get("name") or "").startswith("reopt") and a.get("default") is not None}
+    race_fwd = {a.get("name") for a in race_root.iter("arg")
+                if (a.get("name") or "").startswith("reopt") and a.get("value") is not None}
+
+    print(f"\n--- launch agreement ({race_p.name} <-> {base_p.name}) ---")
+    ok = True
+    for name in sorted(set(base_args) & set(race_args)):
+        b, r = base_args[name], race_args[name]
+        try:
+            same = abs(float(b) - float(r)) < 1e-9
+        except (TypeError, ValueError):
+            same = str(b) == str(r)
+        if not same:
+            ok = False
+            print(f"FAIL: {name} default is {r} in {race_p.name} but {b} in {base_p.name}. "
+                  f"{race_p.name} wins for every documented run, so {b} is a fiction.")
+    missing = sorted(n for n in base_args if n not in race_fwd)
+    if missing:
+        ok = False
+        print(f"FAIL: {race_p.name} never forwards {', '.join(missing)} — un-tunable from the "
+              f"entry point the runbook uses. Add <arg name=.. value=..> to the include.")
+    if ok:
+        print(f"OK: all {len(base_args)} reopt_* defaults agree and are forwarded.")
+    return ok
+
+
 def load_sm_params():
     p = STACK_MASTER / "config" / "state_machine_params.yaml"
     cfg = yaml.safe_load(p.read_text())["state_machine"]["ros__parameters"]
@@ -194,6 +241,26 @@ def main() -> int:
         print(f"FAIL: reopt wall reserve ({reopt_reserve:.3f}) > reactive terminal reserve + slack "
               f"({react_reserve:.3f} + {SLACK:.2f}) — reactive-proven apexes will be corridor-"
               f"rejected; lower reopt_wall_margin in {launch_path.name}.")
+    else:
+        print(f"OK: reopt wall reserve ({reopt_reserve:.3f}) <= reactive terminal reserve + slack "
+              f"({react_reserve + SLACK:.3f}).")
+
+    # reopt_fit_tol is spent OUT OF reopt_wall_margin: the corridor fit is allowed to overshoot the
+    # bound by fit_tol, so the effective wall reserve is reopt_wall_margin - fit_tol. Without a
+    # tolerance the fit collapses the hump over sub-mm ripples in the smoothed bound (that was the
+    # bug); with too much, it eats the wall reserve it is measured against.
+    fit_tol = float(args.get("reopt_fit_tol", 0.0))
+    print(f"  reopt_fit_tol = {fit_tol:.4f} m -> effective wall reserve "
+          f"{reopt_reserve - fit_tol:.3f} m")
+    if fit_tol <= 0.0:
+        ok = False
+        print(f"FAIL: reopt_fit_tol is {fit_tol:.4f}. A zero-tolerance corridor fit rejects every "
+              f"wide reach over a sub-millimetre violation and collapses the avoidance hump "
+              f"(ifac: reach 5.00 -> 1.24 m, +1.62 s/lap, curvlim exceeded). Use ~0.005.")
+    elif fit_tol > 0.5 * max(reopt_wall, 1e-9):
+        ok = False
+        print(f"FAIL: reopt_fit_tol ({fit_tol:.4f}) > half of reopt_wall_margin ({reopt_wall:.3f}); "
+              f"the fit may spend most of the wall reserve. Lower it or raise reopt_wall_margin.")
 
     # --- chain member 3: SM GB free-check vs the swapped line's actual clearance -----------
     sm_path, sm = load_sm_params()
@@ -214,6 +281,8 @@ def main() -> int:
         print(f"OK: line clearance ({line_clearance:.3f}) >= SM static GB requirement + slack ({required + SLACK:.3f}).")
 
     if not check_dynamic_chain(sm_path, sm):
+        ok = False
+    if not check_launch_agreement():
         ok = False
 
     return 0 if ok else 1
