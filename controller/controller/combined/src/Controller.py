@@ -110,6 +110,14 @@ class Controller:
         self.AEB_thres_overtake = AEB_thres   # manager overrides from yaml after construction
         self.l1_lat_err_cap = t_clip_max      # manager overrides from yaml (uncapped by default)
         self.converter = converter
+        # Longitudinal limits of the PUBLISHED speed command. Defaults mirror the ggv the global
+        # trajectory is planned against (veh_dyn_info/ggv.csv ax_max = 5.0, ax_max_machines = 5.0);
+        # the manager overrides both from controller.yaml. Asking for more than this is asking for
+        # something the car cannot do — see _slew_limit_speed.
+        self.max_accel_mps2 = 5.0
+        self.max_decel_mps2 = 5.0
+        self._speed_cmd_prev = None           # last PUBLISHED command, for the slew limit
+        self._trailing_handoff = None         # ramp state while merging out of TRAILING
 
         # Parameters in the controller
         self.curr_steering_angle = 0
@@ -225,8 +233,38 @@ class Controller:
             raise Exception("L1_point is None")
 
         speed = self.AEB_for_weird_local_wpnt(speed)
+        speed = self._slew_limit_speed(speed)
 
         return speed, acceleration, jerk, steering_angle, L1_point, L1_distance, self.idx_nearest_waypoint, self.curvature_waypoints, self.future_position
+
+    def _slew_limit_speed(self, speed):
+        """Bound |d(speed_command)/dt| by the vehicle's own longitudinal limits.
+
+        Nothing else in this loop does: calc_speed_command -> speed_adjust_heading ->
+        AEB_for_weird_local_wpnt all hand their result straight to the mux. Measured on the real
+        car (bag ot_speed_0731_2034, 55.7 s): the published command moved at p99 12.2 m/s^2 and up
+        to 86.8 m/s^2, against a 5.0 m/s^2 ggv ax_max. Every discrete source feeds it -- the
+        TRAILING handoff, a static-reopt line swap, the AEB clamp engaging and releasing (2.87 ->
+        2.00 -> 3.24 in two cycles), any state change. Rather than patch each one, bound the
+        output: the car cannot execute a step anyway, so a reference containing one only costs
+        tracking error and drivetrain shock.
+
+        This is a SAFETY NET, not the fix -- a step still means something upstream is wrong, and
+        the handoff/anchor fixes remove the two known sources. Deliberately NOT applied to the
+        AEB's own decision, only to its rate: a genuine garbage-path clamp still reaches 2.0 m/s,
+        it just gets there at the braking limit instead of instantly.
+        """
+        if speed is None:
+            return speed
+        prev = self._speed_cmd_prev
+        if prev is None:                       # first cycle / after a reset: adopt as-is
+            self._speed_cmd_prev = speed
+            return speed
+        dt = 1.0 / max(self.loop_rate, 1.0)
+        up, dn = self.max_accel_mps2 * dt, self.max_decel_mps2 * dt
+        limited = min(max(speed, prev - dn), prev + up)
+        self._speed_cmd_prev = limited
+        return limited
 
     def AEB_for_weird_local_wpnt(self, speed):
         nearest_local_wpnt = self.waypoint_array_in_map[self.idx_nearest_waypoint, :2]
@@ -416,10 +454,28 @@ class Controller:
 
         if ((self.state == "TRAILING") and (self.opponent is not None)):  # Trailing controller
             speed_command = self.trailing_controller(global_speed)
+            self._trailing_handoff = speed_command      # where the handoff below must start from
         else:
+            # HANDOFF out of TRAILING. The gap PID has been holding the car down at the opponent's
+            # pace while the path speed ahead is already much higher, so assigning global_speed
+            # outright steps the command by the whole speed deficit in one 20 ms cycle. Measured on
+            # the real car (bag ot_speed_0731_2034): +1.59/+1.64/+1.67/+1.70 m/s at all four
+            # TRAILING->OVERTAKE transitions, i.e. ~80 m/s^2 of demand against a 5.0 ggv ax_max --
+            # and the REFERENCE was continuous there (vx[10] 4.94 -> 4.94), so the step was created
+            # here, not by the planner. Ramp out at the same longitudinal limit the trajectory is
+            # planned with instead; the car still accelerates to pass, it just does it feasibly.
+            if self._trailing_handoff is not None:
+                step = self.max_accel_mps2 / max(self.loop_rate, 1.0)
+                self._trailing_handoff = min(global_speed, self._trailing_handoff + step)
+                if self._trailing_handoff >= global_speed - 1e-3:
+                    self._trailing_handoff = None       # merged, hand control back to the path
+                    speed_command = global_speed
+                else:
+                    speed_command = self._trailing_handoff
+            else:
+                speed_command = global_speed
             self.trailing_speed = global_speed
             self.i_gap = 0
-            speed_command = global_speed
 
         speed_command = self.speed_adjust_lat_err(speed_command, lat_e_norm)
 

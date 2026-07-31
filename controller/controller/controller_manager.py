@@ -35,7 +35,7 @@ L1_PARAMS = [
     'speed_factor_for_lat_err', 'speed_factor_for_curvature', 'KP', 'KI', 'KD',
     'heading_error_thres', 'steer_gain_for_speed', 'future_constant', 'AEB_thres',
     'AEB_thres_overtake', 'speed_diff_thres', 'start_speed', 'start_curvature_factor',
-    'l1_lat_err_cap',
+    'l1_lat_err_cap', 'max_accel_mps2', 'max_decel_mps2',
 ]
 
 
@@ -207,6 +207,8 @@ class ControllerManager(Node):
         # not part of the positional Controller signature; delivered like the live-tuned params
         self.controller.AEB_thres_overtake = self.AEB_thres_overtake
         self.controller.l1_lat_err_cap = self.l1_lat_err_cap
+        self.controller.max_accel_mps2 = self.max_accel_mps2
+        self.controller.max_decel_mps2 = self.max_decel_mps2
         self.get_logger().info(f"[{self.name}] initialized FrenetConverter + Controller. Ready!")
 
     ############################################ CALLBACKS ############################################
@@ -340,6 +342,10 @@ class ControllerManager(Node):
         if self.state != "FTGONLY":
             speed, acceleration, jerk, steering_angle = self.controller_cycle()
         else:
+            # FTG owns the command while it runs, so the L1 slew limiter's memory of the last
+            # published speed is stale the moment we come back. Drop it: the first cycle after
+            # FTG adopts its command as-is instead of ramping from a value that is seconds old.
+            self.controller._speed_cmd_prev = None
             speed, steering_angle = self.ftg_cycle()
 
         ack_msg = self.create_ack_msg(speed, acceleration, jerk, steering_angle)

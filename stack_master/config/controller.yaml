@@ -38,4 +38,11 @@ controller_manager:
     speed_diff_thres: 0.1
     start_speed: 10.0
     start_curvature_factor: 1.5
+    # Longitudinal slew limit on the PUBLISHED speed command. Mirrors veh_dyn_info/ggv.csv
+    # (ax_max = 5.0) and ax_max_machines.csv (5.0) — the same limits the global trajectory is
+    # planned against, so this never clips a feasible plan, only steps. Measured before it
+    # existed: the command moved at up to 86.8 m/s^2 (p99 12.2) on a real run. Raise only if the
+    # ggv is raised too; lowering it makes the car sluggish out of TRAILING.
+    max_accel_mps2: 5.0
+    max_decel_mps2: 5.0
     save_params: false
