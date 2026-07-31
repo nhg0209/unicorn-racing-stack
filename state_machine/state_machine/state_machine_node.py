@@ -152,6 +152,12 @@ class StateMachine(Node):
         self.ot_sectors_params = {}
         self.only_ftg_zones = []
         self.ftg_counter = 0
+        # Static-obstacle trailing deadlock (see _check_static_trailing_deadlock). Shorter than
+        # ftg_timer_sec: behind a stationary box there is nothing to wait for, the gap PID has
+        # already converged to its only fixed point (v = 0).
+        self._static_deadlock_counter = 0
+        self.static_deadlock_speed_mps = 0.3
+        self.static_deadlock_timeout_s = 1.5
 
         self.cur_s = 0.0
         self.cur_d = 0.0
@@ -863,10 +869,53 @@ class StateMachine(Node):
             wpnts_data.initialize_traj(src_wpnts)
             return bool(self._check_on_spline(wpnts_data))
 
+    def _check_static_trailing_deadlock(self) -> bool:
+        """TRAILING behind a STATIC obstacle is a dead end, and nothing said so.
+
+        The gap PID targets `trailing_vel_gain*v + trailing_gap` behind its target. Behind a moving
+        opponent that settles at the opponent's speed; behind a stationary box the only fixed point
+        is v = 0, so the car creeps to a standstill and sits there. Measured on the real car (bag
+        verify_0731_2114): after the reactive planner went infeasible at t=53.4 the car ran
+        3.10 -> 1.50 -> 0.06 m/s and then held 0.00 m/s for the last 8 s of the run, ~1.4 m short of
+        the box, with no state change and no log line explaining it.
+
+        FTG is the designed escape (it needs no waypoints), so this feeds the same counter rather
+        than inventing a second mechanism -- but FTG is off by default (`ftg_active: false`), and
+        with it off there IS no recovery. Say that explicitly instead of stalling silently.
+        """
+        target = None
+        if self.obstacles_in_interest:
+            target = self.obstacles_in_interest[0]
+        stalled = (self.cur_state == StateType.TRAILING
+                   and abs(self.cur_vs) < self.static_deadlock_speed_mps
+                   and target is not None and target.is_static)
+        if not stalled:
+            self._static_deadlock_counter = 0
+            return False
+        self._static_deadlock_counter += 1
+        if self._static_deadlock_counter <= self.static_deadlock_timeout_s * self.rate_hz:
+            return False
+        gap = (target.s_start - self.cur_s) % self.track_length
+        self.get_logger().error(
+            f"[{self.name}] STATIC TRAILING DEADLOCK: stopped ({self.cur_vs:+.2f} m/s) "
+            f"{gap:.2f} m behind static obstacle id={target.id} for "
+            f"{self._static_deadlock_counter / self.rate_hz:.1f} s. The avoidance planner is not "
+            f"offering a usable path (static_feasible={self.static_avoidance_feasible}). "
+            + ("FTG will take over." if not self.ftg_disabled else
+               "ftg_active is FALSE, so there is NO recovery — the car will sit here."),
+            throttle_duration_sec=2.0)
+        return True
+
     def _check_ftg(self) -> bool:
         threshold = self.ftg_timer_sec * self.rate_hz
+        # A static-obstacle deadlock is exactly the situation FTG exists for, and the car can be
+        # fully stopped there (cur_vs == 0), so it satisfies the speed test below anyway — but the
+        # dedicated check reports it and uses its own, shorter timeout.
+        deadlock = self._check_static_trailing_deadlock()
         if self.ftg_disabled:
             return False
+        elif deadlock:
+            return True
         else:
             if (self.cur_state == StateType.TRAILING or self.cur_state == StateType.ATTACK) and \
                     self.cur_vs < self.ftg_speed_mps:
