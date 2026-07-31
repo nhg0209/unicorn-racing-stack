@@ -1382,6 +1382,32 @@ class StateMachine(Node):
             wpnts_msg.wpnts[i].ax_mps2 = ax_profile[i]
         wpnts[len(ax_profile)].ax_mps2 = ax_profile[-1]
 
+    def anchor_gb_index(self, s_idx: int, search_m: float = 3.0) -> int:
+        """Re-anchor an s-derived global-waypoint index to the station NEAREST THE CAR.
+
+        `cur_s` and `cur_gb_wpnts` can briefly disagree about what station a given s is: the frenet
+        converter re-takes /global_waypoints the moment static_reopt swaps the line, while this
+        node's copy comes from /global_waypoints_scaled, which sector_tuner only re-publishes on
+        its 0.5 s timer. In that gap an s-derived index points at the right NUMBER on the wrong
+        parameterisation and the local window slides along the track, away from the car.
+
+        The search is restricted to +-`search_m` around `s_idx` on purpose. A free nearest-point
+        search over the whole closed loop would snap to the wrong branch wherever the raceline runs
+        close to itself (chicane, hairpin); the s index is a good coarse anchor and only ever needs
+        a local correction. Returns `s_idx` unchanged if the position or the line is unavailable.
+        """
+        if self.current_position is None or not self.cur_gb_wpnts.is_init:
+            return s_idx
+        arr = self.cur_gb_wpnts.array
+        n = self.num_glb_wpnts
+        if arr is None or n == 0:
+            return s_idx
+        k = max(1, int(search_m / max(self.wpnt_dist, 1e-3)))
+        idx = (s_idx + np.arange(-k, k + 1)) % n
+        d = np.hypot(arr[idx, 0] - self.current_position[0],
+                     arr[idx, 1] - self.current_position[1])
+        return int(idx[int(np.argmin(d))])
+
     def mincurv_splinification(self):
         coords = np.empty((len(self.cur_gb_wpnts.list), 4))
         for i, wpnt in enumerate(self.cur_gb_wpnts.list):
@@ -1606,7 +1632,12 @@ class StateMachine(Node):
         self.emergency_pub.publish(mrk)
 
     def update_waypoints(self):
-        if not self.cur_gb_wpnts.is_init:
+        # Rebuild the cached ARRAY whenever the message actually changed, not just on the first
+        # one. The old `else` branch refreshed `.list` but left `.array` frozen at the very first
+        # /global_waypoints_scaled, so after a static-reopt line swap every position-based query
+        # (anchor_gb_index) would have been answered against the PRE-swap geometry. Keyed on the
+        # stamp so this costs one array build per publish (2 Hz), not per SM cycle (80 Hz).
+        if not self.cur_gb_wpnts.is_init or self.cur_gb_wpnts.stamp != self.gb_wpnts.header.stamp:
             self.cur_gb_wpnts.initialize_traj(self.gb_wpnts)
         else:
             self.cur_gb_wpnts.list = self.gb_wpnts.wpnts
