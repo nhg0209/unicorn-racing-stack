@@ -262,6 +262,35 @@ def main() -> int:
         print(f"FAIL: reopt_fit_tol ({fit_tol:.4f}) > half of reopt_wall_margin ({reopt_wall:.3f}); "
               f"the fit may spend most of the wall reserve. Lower it or raise reopt_wall_margin.")
 
+    # --- the raceline-CLEAR gate vs the line static_reopt actually builds -------------------
+    # The gate decides whether the current global line already avoids everything ahead. Its
+    # threshold must sit BELOW the clearance the re-opt line is built to, with room for the
+    # detection/frame error, or a correctly-cleared obstacle reads as on-path: the planner then
+    # tries to re-clear it at the full obs_margin inside a corridor the line already used, rejects
+    # every candidate, publishes feasible=False and the SM falls to TRAILING behind an obstacle it
+    # had already solved. It used obs_margin (0.30) + clear_hyst_m, leaving 2 cm against the 0.35 m
+    # re-opt build -- which is what made this fail on the car.
+    clear_margin = float(cfg.get("clear_margin_m", 0.10))
+    clear_hyst = float(cfg.get("clear_hyst_m", 0.0))
+    clear_need = width_car / 2.0 + clear_margin + clear_hyst
+    print(f"\nraceline-clear gate ({yaml_path.name}):")
+    print(f"  need = width_car/2 + clear_margin_m + clear_hyst_m = {width_car/2:.3f} + "
+          f"{clear_margin:.3f} + {clear_hyst:.3f} = {clear_need:.3f} m")
+    print(f"  re-opt line is built to reopt_obs_margin = {obs_margin:.3f} m")
+    if clear_need >= obs_margin - SLACK:
+        ok = False
+        print(f"FAIL: clear-gate need ({clear_need:.3f}) is not at least {SLACK:.2f} m below the "
+              f"re-opt build ({obs_margin:.3f}). The obstacle-aware line will re-trigger the "
+              f"reactive planner on obstacles it already clears -> all candidates rejected -> "
+              f"TRAILING. Lower clear_margin_m or raise reopt_obs_margin.")
+    elif clear_need < width_car / 2.0:
+        ok = False
+        print(f"FAIL: clear-gate need ({clear_need:.3f}) is below half the car ({width_car/2:.3f}); "
+              f"the gate would call a line clear that the car does not physically fit through.")
+    else:
+        print(f"OK: clear-gate need ({clear_need:.3f}) sits {obs_margin - clear_need:.3f} m below "
+              f"the re-opt build and >= half car ({width_car/2:.3f}).")
+
     # --- chain member 3: SM GB free-check vs the swapped line's actual clearance -----------
     sm_path, sm = load_sm_params()
     gb_ego_half = float(sm["gb_ego_width_m"]) / 2.0

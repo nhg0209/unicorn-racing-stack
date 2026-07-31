@@ -174,6 +174,7 @@ class ObstacleSpliner(Node):
         # genuine keep-out violation resumes planning. Gated on |cur_d| so a maneuver in progress
         # is never abandoned mid-hump.
         self.clear_gate_enable = True
+        self.clear_margin_m = 0.10   # [m] extra beyond half_car for the raceline-CLEAR trigger
         self.clear_hyst_m = 0.03     # [m] extra clearance required to ENTER the idle state
         self.clear_max_cur_d = 0.15  # [m] gate only applies with the car ON the raceline
         self._line_clear = False     # idle latch (hysteresis state)
@@ -218,7 +219,7 @@ class ObstacleSpliner(Node):
             'wall_margin', 'shift_min', 'shift_buffer', 'ramp_len', 'hold_after',
             'return_len', 'apex_bulge', 'max_weave', 'width_car', 'tail_m', 'w_d', 'w_k', 'w_c', 'w_obs', 'obs_sigma',
             'use_grid_check', 'trust_grid_bounds', 'grid_scan_max', 'grid_scan_step', 'bounds_warn_m',
-            'clear_gate_enable', 'clear_hyst_m', 'clear_max_cur_d',
+            'clear_gate_enable', 'clear_hyst_m', 'clear_max_cur_d', 'clear_margin_m',
             'commit_enable', 'commit_dev_max', 'commit_obs_ds', 'commit_obs_dd',
         ]))
         self.add_on_set_parameters_callback(self.dyn_param_cb)
@@ -304,6 +305,8 @@ class ObstacleSpliner(Node):
         self.declare_parameter('grid_scan_max', 3.0, dbl(0.5, 10.0, "half-width of the lateral grid corridor scan [m]"))
         self.declare_parameter('grid_scan_step', 0.05, dbl(0.01, 0.5, "lateral grid corridor scan resolution [m]"))
         self.declare_parameter('bounds_warn_m', 0.5, dbl(0.0, 5.0, "warn when waypoint bounds and the grid disagree by more [m]"))
+        self.declare_parameter('clear_margin_m', 0.10,
+                               dbl(0.0, 0.5, "extra clearance beyond half_car for the raceline-clear trigger [m]"))
         self.declare_parameter('clear_gate_enable', True,
                                ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
                                                    description="Stay idle when the current raceline already clears every obstacle ahead"))
@@ -386,6 +389,8 @@ class ObstacleSpliner(Node):
                 self.bounds_warn_m = float(p.value)
             elif n == 'clear_gate_enable':
                 self.clear_gate_enable = bool(p.value)
+            elif n == 'clear_margin_m':
+                self.clear_margin_m = float(p.value)
             elif n == 'clear_hyst_m':
                 self.clear_hyst_m = float(p.value)
             elif n == 'clear_max_cur_d':
@@ -589,7 +594,18 @@ class ObstacleSpliner(Node):
         # received two different local paths in alternation (the "duplicate path" symptom; the L1
         # point jumped between the two lines). The latch drops only on a REAL keep-out violation.
         if self.clear_gate_enable and (self._line_clear or abs(self.cur_d) < self.clear_max_cur_d):
-            need = obs_margin if self._line_clear else obs_margin + self.clear_hyst_m
+            # The trigger threshold is NOT obs_margin. obs_margin (half_car + safety_margin = 0.30)
+            # is what a NEW path is designed to, and reusing it here asks "is the current line
+            # planned to my full design clearance?" instead of "does the car fit past this box?".
+            # That re-triggers avoidance on a line that is perfectly safe: static_reopt builds to
+            # reopt_obs_margin = 0.35, so with the hysteresis the gate had 0.35 - 0.33 = 2 cm of
+            # headroom, and any error past 2 cm reads the cleared obstacle as on-path. The planner
+            # then has to find a candidate at the full 0.30 in a corridor the line already used up,
+            # rejects every one, publishes feasible=False, and the SM falls to TRAILING behind an
+            # obstacle it had already solved.
+            need = half_car + self.clear_margin_m
+            if not self._line_clear:
+                need += self.clear_hyst_m
             clear = all(
                 (min(o.d_right, o.d_left) - need) > 0.0 or (max(o.d_right, o.d_left) + need) < 0.0
                 for o in obs_ahead)

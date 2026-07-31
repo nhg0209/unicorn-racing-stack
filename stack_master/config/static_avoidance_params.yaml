@@ -107,6 +107,17 @@ static_avoidance_planner:
     clear_gate_enable: true
     clear_hyst_m: 0.03      # [m] EXTRA clearance required to enter idle (leave only on a real violation)
     clear_max_cur_d: 0.15   # [m] gate applies only with the car on the raceline (never abandons a maneuver)
+    clear_margin_m: 0.10    # [m] extra beyond half_car(0.15) for the CLEAR trigger -> need = 0.25 m from
+                            #      the box edge (+clear_hyst_m when entering idle). This is "does the car
+                            #      fit past the box", NOT the clearance a new path is designed to
+                            #      (obs_margin = half_car + safety_margin = 0.30). The gate used
+                            #      obs_margin, which left only 0.35-0.33 = 2 cm against the line
+                            #      static_reopt actually builds (reopt_obs_margin 0.35): any error past
+                            #      2 cm made an already-cleared obstacle read as on-path, the planner
+                            #      then failed to re-clear it at the full 0.30 in the corridor the line
+                            #      had already used, rejected every candidate and dropped to TRAILING.
+                            #      Raise toward 0.15 if the car idles past boxes it should still avoid;
+                            #      lower if a cleared obstacle still re-triggers avoidance.
 
     # --- path commitment (temporal consistency: plan once, reuse) ---
     # The planner re-solved from the car's instantaneous pose every 20 Hz cycle. Once the obstacle
