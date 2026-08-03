@@ -175,6 +175,7 @@ class ObstacleSpliner(Node):
         # is never abandoned mid-hump.
         self.clear_gate_enable = True
         self.clear_margin_m = 0.10   # [m] extra beyond half_car for the raceline-CLEAR trigger
+        self.reframe_warn_m = 0.05   # [m] warn when incoming obstacle d must be re-anchored by more
         self.clear_hyst_m = 0.03     # [m] extra clearance required to ENTER the idle state
         self.clear_max_cur_d = 0.15  # [m] gate only applies with the car ON the raceline
         self._line_clear = False     # idle latch (hysteresis state)
@@ -219,7 +220,7 @@ class ObstacleSpliner(Node):
             'wall_margin', 'shift_min', 'shift_buffer', 'ramp_len', 'hold_after',
             'return_len', 'apex_bulge', 'max_weave', 'width_car', 'tail_m', 'w_d', 'w_k', 'w_c', 'w_obs', 'obs_sigma',
             'use_grid_check', 'trust_grid_bounds', 'grid_scan_max', 'grid_scan_step', 'bounds_warn_m',
-            'clear_gate_enable', 'clear_hyst_m', 'clear_max_cur_d', 'clear_margin_m',
+            'clear_gate_enable', 'clear_hyst_m', 'clear_max_cur_d', 'clear_margin_m', 'reframe_warn_m',
             'commit_enable', 'commit_dev_max', 'commit_obs_ds', 'commit_obs_dd',
         ]))
         self.add_on_set_parameters_callback(self.dyn_param_cb)
@@ -305,6 +306,8 @@ class ObstacleSpliner(Node):
         self.declare_parameter('grid_scan_max', 3.0, dbl(0.5, 10.0, "half-width of the lateral grid corridor scan [m]"))
         self.declare_parameter('grid_scan_step', 0.05, dbl(0.01, 0.5, "lateral grid corridor scan resolution [m]"))
         self.declare_parameter('bounds_warn_m', 0.5, dbl(0.0, 5.0, "warn when waypoint bounds and the grid disagree by more [m]"))
+        self.declare_parameter('reframe_warn_m', 0.05,
+                               dbl(0.0, 1.0, "warn when obstacle d is re-anchored by more than this [m]"))
         self.declare_parameter('clear_margin_m', 0.10,
                                dbl(0.0, 0.5, "extra clearance beyond half_car for the raceline-clear trigger [m]"))
         self.declare_parameter('clear_gate_enable', True,
@@ -391,6 +394,8 @@ class ObstacleSpliner(Node):
                 self.clear_gate_enable = bool(p.value)
             elif n == 'clear_margin_m':
                 self.clear_margin_m = float(p.value)
+            elif n == 'reframe_warn_m':
+                self.reframe_warn_m = float(p.value)
             elif n == 'clear_hyst_m':
                 self.clear_hyst_m = float(p.value)
             elif n == 'clear_max_cur_d':
@@ -414,8 +419,57 @@ class ObstacleSpliner(Node):
         self._behavior_target = data.overtaking_targets[0] if len(data.overtaking_targets) != 0 else None
 
     def obstacles_cb(self, data: ObstacleArray):
-        self.obstacles = data.obstacles
+        self.obstacles = self._reframe_obstacles(data.obstacles)
         self._track_near_zero(self.obstacles)
+
+    def _reframe_obstacles(self, obstacles):
+        """Re-express each obstacle's (s,d) in THIS node's frenet frame, from its map (x_m,y_m).
+
+        Everything else in this planner is already in the current line's frame: gb_cb rebuilds the
+        converter whenever static_reopt swaps the global line, the corridor is measured through that
+        converter, and cur_s/cur_d come from the frenet republisher on the same /global_waypoints.
+        The obstacles were the one input that was not — they arrived carrying whatever (s,d) the
+        tracker computed in ITS frame, and that frame is a different node's copy of the line.
+
+        When the two disagree the planner places the obstacle at the wrong lateral position in its
+        own frame, so it dodges something that is not there. That has two visible outcomes, both
+        reported on the car: an obstacle the re-optimized line already clears reads as on-path (the
+        clear gate never idles, every lap re-avoids), and the evasion is solved for a phantom offset
+        — the line is already displaced by its own hump, so a dodge computed against a wrong
+        obstacle d can put the terminal offset into the wall side of the corridor.
+
+        x_m,y_m is frame-independent, so this is correct by construction regardless of upstream.
+        Box extents are preserved as offsets from the centre rather than rebuilt from `size`, so the
+        longitudinal/lateral footprint the downstream checks see is unchanged.
+        """
+        conv = getattr(self, "converter", None)
+        if conv is None or not obstacles:
+            return obstacles
+        worst = 0.0
+        for o in obstacles:
+            if o.x_m == 0.0 and o.y_m == 0.0:
+                continue                       # no map position to re-anchor from
+            try:
+                fr = conv.get_frenet(np.array([o.x_m]), np.array([o.y_m]))
+                s_new, d_new = float(fr[0, 0]), float(fr[1, 0])
+            except Exception:
+                continue
+            half = max(o.size, 0.05) * 0.5
+            ds_b = (o.s_center - o.s_start) if o.s_end != o.s_start else half
+            ds_f = (o.s_end - o.s_center) if o.s_end != o.s_start else half
+            dd_r = (o.d_center - o.d_right) if o.d_left != o.d_right else half
+            dd_l = (o.d_left - o.d_center) if o.d_left != o.d_right else half
+            worst = max(worst, abs(d_new - o.d_center))
+            o.s_center, o.d_center = s_new, d_new
+            o.s_start, o.s_end = s_new - ds_b, s_new + ds_f
+            o.d_right, o.d_left = d_new - dd_r, d_new + dd_l
+        if worst > self.reframe_warn_m:
+            self.get_logger().warning(
+                f"[{self.name}] obstacle (s,d) arrived up to {worst:.2f} m off this node's frenet "
+                f"frame and was re-anchored from (x_m,y_m). Upstream tracking is not re-projecting "
+                f"on a static_reopt line swap — planning would have dodged a phantom offset.",
+                throttle_duration_sec=5.0)
+        return obstacles
 
     def state_frenet_cb(self, data: Odometry):
         self.cur_s = data.pose.pose.position.x
