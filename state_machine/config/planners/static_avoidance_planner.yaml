@@ -10,18 +10,25 @@ free_scaling_reference_distance_m: 2.0
 # a perfectly-fresh 20 Hz spline reads as 0.3-0.5 s "old". At 0.1 s the freshness gate NEVER passed
 # and the car never committed to OVERTAKE (it trailed/crawled to the obstacle). 0.6 s tolerates the
 # executor lag; a static obstacle's escape path does not go stale in 0.6 s (car moves < ~4 m).
-# Raised 0.6 -> 1.0: the car slow-trailed a feasible-but-uncommitted obstacle all the way to a
-# collision (g_near 0.44 m) because the freshness gate intermittently exceeded 0.6 s of executor
-# lag, so the OVERTAKE commit never sustained. 1.0 s still bounds staleness (car moves < ~7 m).
+# Raised 0.6 -> 1.0 when this value was compensation for executor lag rather than a staleness
+# budget: the car slow-trailed a feasible-but-uncommitted obstacle to a collision (g_near 0.44 m)
+# because the freshness gate intermittently exceeded 0.6 s of lag, so the OVERTAKE commit never
+# sustained.
 #
-# PENDING REVERT to 0.5. This value is compensation for executor lag, not a real staleness budget,
-# and the cause has now been addressed: the SM caches the velocity profile of a geometrically
-# frozen path instead of re-solving calc_vel_profile on every 20 Hz republish (see
-# update_velocity). Once a sim run confirms the measured static-spline age stays well under 0.5 s
-# -- read it from the "static_OT check: ... age=" log line -- lower this, because a 1.0 s window
-# also tolerates a path that IS genuinely stale. Not lowered yet: the lag reduction has not been
-# measured on a running system, and guessing in the tightening direction can only cost commits.
-latest_threshold: 1.0
+# Now 0.5, the value it should have been. Three things had to land first, and all three have:
+#   * the SM caches the velocity profile of a geometrically frozen path instead of re-solving
+#     calc_vel_profile on every 20 Hz republish, which is what produced the 0.3-0.5 s lag;
+#   * adoption happens in ONE place (update_waypoints) rather than also as a side effect of the
+#     freshness check, so a path being adopted no longer depends on which gate ran first;
+#   * a forward re-slice of an already-committed path is adopted every cycle, so the cached path
+#     tracks the car instead of ageing in place for up to hyst_timer_sec.
+# The last one matters most here: what this threshold guards against is acting on a path that no
+# longer describes where the car is, and that is now handled by adopting the re-slice rather than
+# by tolerating a stale one. A 1.0 s window also tolerates a path that IS genuinely stale.
+#
+# If the sim run shows static_OT commits failing on freshness -- the "static_OT check: ... age="
+# log line is the measurement -- this is the first value to put back.
+latest_threshold: 0.5
 hyst_timer_sec: 4.0
 killing_timer_sec: 10.0
 on_spline_front_horizon_thres_m: 0.5
