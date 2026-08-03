@@ -13,20 +13,49 @@ source install/setup.bash
 ## 0. Margin consistency check (after ANY margin tuning)
 
 The re-opt line must clear obstacles by more than the reactive keep-out or it gets re-avoided
-every lap (double avoidance), AND its box-edge clearance (keep-out + apex_bulge) must exceed the
-state machine's static GB free requirement (gb_ego_width/2 + lateral_width_static_gb_m) or the
-swapped line reads blocked -> phantom TRAILING. Run after touching `static_avoidance_params.yaml`
-(`width_car`/`safety_margin`/`apex_bulge`), `state_machine_params.yaml` (`gb_ego_width_m`/
-`lateral_width_static_gb_m`), or the `reopt_obs_margin` launch arg:
+every lap (double avoidance), and the whole static chain must stay ORDERED — all three measured
+line-centre to obstacle EDGE:
+
+```
+SM requirement       = gb_ego_width_m/2 + lateral_width_static_gb_m   (state_machine_params.yaml)
+clear-gate stay      = width_car/2 + clear_margin_m                   (static_avoidance_params.yaml)
+enforced laid floor  = reopt_obs_margin                               (base_system.launch.xml)
+
+SM requirement  <=  clear-gate stay  <=  enforced floor - slack
+```
+
+Between the first two sits a DEAD BAND: an obstacle clearing by more than the planner needs to go
+idle but less than the SM needs to call the line free leaves *both* standing down — TRAILING
+behind a line that is already driving around the obstacle. That is what 0.35 vs 0.25 produced on
+the car. The drift triggers (`reopt_obs_change_tol`, `reopt_clearance_dirty`) must fit inside the
+headroom between the floor and the SM requirement, or a box can drift the followed line under the
+requirement with nothing left to react.
+
+The floor is ENFORCED, not aspirational: `static_reopt_core` accepts a hump only if the geometry
+it lays clears the box edge by `reopt_obs_margin` (retrying once wider, else dropping it for the
+reactive layer), and `static_reopt_node` refuses to publish a line that misses an obstacle it
+claims to have reshaped. Run after touching `static_avoidance_params.yaml`
+(`width_car`/`safety_margin`/`apex_bulge`/`clear_margin_m`), `state_machine_params.yaml`
+(`gb_ego_width_m`/`lateral_width_static_gb_m`), or any `reopt_*` launch arg:
 
 ```bash
 python3 stack_master/scripts/check_avoidance_margins.py   # exit 0 = consistent
 ```
 
 It also cross-checks that `race.launch.xml` and `base_system.launch.xml` agree on every `reopt_*`
-default, and that `race.launch.xml` forwards them all. Both used to be false: `reopt_wall_margin`
-was 0.12 in `race.launch.xml` (the entry point below) against 0.05 everywhere else, which shrank
-the avoidance humps, and `reopt_obs_margin` was not forwardable from here at all.
+default, that `race.launch.xml` forwards them all, and reports where `static_reopt_node`'s own
+`declare_parameter` defaults differ from the launch values (those apply under `ros2 run`). The
+first two used to be false: `reopt_wall_margin` was 0.12 in `race.launch.xml` (the entry point
+below) against 0.05 everywhere else, which shrank the avoidance humps, and `reopt_obs_margin` was
+not forwardable from here at all.
+
+## 0c. Planner / re-opt unit gates (no sim, no build)
+
+```bash
+python3 planner/spliner/test/test_clear_gate.py             # raceline-CLEAR gate + per-id latch
+python3 planner/gb_optimizer/scripts/test_static_reopt_apex.py   # apex bookkeeping, clearance floor,
+                                                                 # drift trigger, publish veto
+```
 
 ## 0b. Re-opt line SHAPE gate (after ANY change to the re-optimizer)
 
