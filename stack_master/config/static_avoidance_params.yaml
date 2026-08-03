@@ -188,7 +188,16 @@ static_avoidance_planner:
     # clears a live box, or maneuver done). Safety is NOT frozen: the committed slice is re-checked
     # against live obstacles every cycle and publishes feasible=False the instant it stops clearing.
     commit_enable: true
-    commit_dev_max: 0.35    # [m] drop the commit if the car deviates this far from the committed path
+    commit_dev_max: 0.6     # [m] deviation at which the committed path's ENTRY is re-anchored onto
+                            #      the car. Was 0.35 -- BELOW the controller's ~0.5 m steady-state
+                            #      tracking error -- and it dropped the commit outright, so normal
+                            #      tracking error triggered a full re-plan, the fresh plan was
+                            #      anchored at the displaced car, the controller tracked it with the
+                            #      same error, and the next cycle dropped it again. That loop is the
+                            #      oscillation. Now above the error, and the response is a soft
+                            #      re-anchor of the entry only (apex, clearance and exit untouched).
+    commit_reanchor_len_m: 2.0  # [m] arc length the entry correction is faded out over (smootherstep)
+    commit_reanchor_max_m: 1.0  # [m] beyond this it is not an entry fix -> take the full re-plan
     commit_obs_ds: 0.75     # [m] drop the commit if the triggering box's s drifts this far (re-plan apex)
     commit_obs_dd: 0.40     # [m] ... or its d drifts this far
 

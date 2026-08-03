@@ -237,7 +237,13 @@ class ObstacleSpliner(Node):
         # feasibility is RE-DERIVED against live obstacles every cycle here: the geometry is
         # frozen, the safety verdict is not.
         self.commit_enable = True
-        self.commit_dev_max = 0.35   # [m] drop the commit if |cur_d - committed_d(car)| exceeds this
+        # [m] deviation at which the committed path's ENTRY is re-anchored onto the car (it is no
+        # longer a drop -- see _reanchor_commit). Must sit ABOVE the controller's steady-state
+        # tracking error (~0.5 m, documented in state_machine_params.yaml recovery_exit_d_m), or
+        # the correction fires continuously on error the controller has not actually failed at.
+        self.commit_dev_max = 0.6
+        self.commit_reanchor_len_m = 2.0   # [m] arc length the entry correction is faded out over
+        self.commit_reanchor_max_m = 1.0   # [m] beyond this it is not an entry fix -> full re-plan
         self.commit_obs_ds = 0.75    # [m] drop the commit if the triggering box's s drifts this far
         self.commit_obs_dd = 0.40    # [m] ... or its d drifts this far (re-plan the apex around it)
         self._committed = None       # cached selected path (frenet + cartesian arrays) or None
@@ -264,6 +270,7 @@ class ObstacleSpliner(Node):
             'clear_latch_ttl_s', 'squeeze_enable', 'squeeze_steps', 'squeeze_safety_floor_m',
             'squeeze_wall_floor_m', 'squeeze_max_speed_mps', 'relax_hold_s',
             'commit_enable', 'commit_dev_max', 'commit_obs_ds', 'commit_obs_dd',
+            'commit_reanchor_len_m', 'commit_reanchor_max_m',
         ]))
         self.add_on_set_parameters_callback(self.dyn_param_cb)
 
@@ -382,7 +389,9 @@ class ObstacleSpliner(Node):
         self.declare_parameter('commit_enable', True,
                                ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
                                                    description="Commit to a chosen evasion path and reuse it (temporal consistency) instead of re-solving every cycle"))
-        self.declare_parameter('commit_dev_max', 0.35, dbl(0.05, 2.0, "drop the commit if the car deviates this far from the committed path [m]"))
+        self.declare_parameter('commit_dev_max', 0.6, dbl(0.05, 2.0, "re-anchor the committed path's entry if the car deviates this far from it [m]"))
+        self.declare_parameter('commit_reanchor_len_m', 2.0, dbl(0.5, 10.0, "arc length the entry re-anchor is faded out over [m]"))
+        self.declare_parameter('commit_reanchor_max_m', 1.0, dbl(0.1, 3.0, "deviation beyond which a full re-plan is taken instead [m]"))
         self.declare_parameter('commit_obs_ds', 0.75, dbl(0.05, 5.0, "drop the commit if the triggering obstacle s drifts this far [m]"))
         self.declare_parameter('commit_obs_dd', 0.40, dbl(0.05, 2.0, "drop the commit if the triggering obstacle d drifts this far [m]"))
 
@@ -484,6 +493,10 @@ class ObstacleSpliner(Node):
                     self._committed = None
             elif n == 'commit_dev_max':
                 self.commit_dev_max = float(p.value)
+            elif n == 'commit_reanchor_len_m':
+                self.commit_reanchor_len_m = float(p.value)
+            elif n == 'commit_reanchor_max_m':
+                self.commit_reanchor_max_m = float(p.value)
             elif n == 'commit_obs_ds':
                 self.commit_obs_ds = float(p.value)
             elif n == 'commit_obs_dd':
@@ -1292,10 +1305,20 @@ class ObstacleSpliner(Node):
         sel = slice(i0, len(c['s_mod']))
 
         # --- lateral deviation: has the controller fallen off the committed path? ---
+        # SOFT re-anchor, not a drop. Dropping the commit here means re-planning from the car's
+        # instantaneous pose, and that is a loop: the fresh plan starts at the displaced car, so
+        # its entry is displaced too, the controller tracks it with the same error, and the next
+        # cycle drops it again. What the geometry actually needs is not a new apex -- the apex is
+        # still exactly where the obstacle is -- it is a new ENTRY from where the car really is.
+        # So bend the first commit_reanchor_len_m of the committed path to start at the car's
+        # current d and blend back onto the committed geometry, leaving everything from there on
+        # (apex included) untouched.
         d_car = float(np.interp(car_prog, s_local, c['d']))   # committed d at the car
         if abs(self.cur_d - d_car) > self.commit_dev_max:
-            self._committed = None                            # re-anchor once from the current pose
-            return None
+            if not self._reanchor_commit(c, car_prog, s_local):
+                self._committed = None                        # blend impossible -> full re-plan
+                return None
+            d_car = float(np.interp(car_prog, s_local, c['d']))
 
         # --- freshness: did a triggering box move a lot (while still ahead) ? ---
         # A box that briefly drops out of tracking is tolerated (skip): it is static, the frozen
@@ -1334,6 +1357,55 @@ class ObstacleSpliner(Node):
         wpnts = self._commit_to_msg(c, sel)
         self._publish_feasible(True)
         return wpnts, self._commit_markers(c, sel)
+
+    def _reanchor_commit(self, c, car_prog, s_local) -> bool:
+        """Bend the START of the committed path onto the car, keeping the apex where it is.
+
+        The tracking error this handles is a controller property, not a planning error: the apex is
+        still exactly where the obstacle is, and re-planning from the displaced car only reproduces
+        the same displacement one cycle later -- a fresh plan is anchored AT the car, so its entry
+        carries the error into the new geometry and the next cycle drops it again. That loop is the
+        oscillation. Correcting only the entry breaks it: the offset the car actually has is faded
+        out over commit_reanchor_len_m with a smootherstep (C2 at both ends, so no kink is handed
+        to the controller), and every station past the blend -- the apex, the clearance, the exit
+        ramp -- is untouched.
+
+        Safety is not weakened: _reuse_committed re-runs _commit_slice_clear on the bent path
+        against the LIVE obstacles and the corridor immediately after this returns, and publishes
+        feasible=False if the bend has broken it.
+
+        Returns False when the correction is too large to be an entry adjustment, in which case the
+        caller does the full re-plan it always did.
+        """
+        try:
+            d = c['d']
+            i0 = int(np.searchsorted(s_local, car_prog))
+            i0 = int(np.clip(i0, 0, len(d) - 1))
+            delta = float(self.cur_d) - float(np.interp(car_prog, s_local, d))
+            if abs(delta) > self.commit_reanchor_max_m:
+                return False
+            blend = max(self.commit_reanchor_len_m, 1e-3)
+            t = np.clip((s_local - car_prog) / blend, 0.0, 1.0)
+            w = 1.0 - t * t * t * (10.0 + t * (-15.0 + 6.0 * t))   # 1 at the car, 0 after `blend`
+            w[s_local < car_prog] = 1.0                            # behind the car: carried along
+            c['d'] = d + delta * w
+            # geometry, heading and curvature must describe the BENT path, not the old one
+            resp = self.converter.get_cartesian(c['s_mod'], c['d'])
+            c['xy'] = (resp.T if resp.ndim == 2 else resp).reshape(-1, 2)
+            if len(c['xy']) > 2:
+                # the committed path's own station spacing, same idiom do_spline uses
+                el = np.maximum(np.diff(s_local), 1e-3)
+                psi_, kappa_ = tph.calc_head_curv_num.calc_head_curv_num(
+                    path=c['xy'], el_lengths=el, is_closed=False)
+                c['psi'] = psi_ + np.pi / 2.0
+                c['kappa'] = kappa_
+            self.get_logger().info(
+                f"[{self.name}] commit re-anchored: entry bent {delta:+.2f} m over {blend:.1f} m; "
+                f"apex and clearance kept", throttle_duration_sec=1.0)
+            return True
+        except Exception as e:                       # never let this be the thing that crashes
+            self.get_logger().warn(f"[{self.name}] commit re-anchor failed: {e}")
+            return False
 
     def _commit_slice_clear(self, c, sel, gb_wpnts, wpnt_dist, obs_margin, half_car) -> bool:
         """True if the committed forward slice stays inside the track corridor AND clears every
