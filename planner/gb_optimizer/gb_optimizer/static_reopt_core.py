@@ -1309,6 +1309,41 @@ def _menger_kappa(xy_closed: np.ndarray) -> np.ndarray:
     return np.append(k, k[0]) if dup else k
 
 
+def _on_clean_mask(traj: np.ndarray, clean_xy: np.ndarray, dev_tol: float = 0.02):
+    """(mask, nearest_clean_index) for published points that have REJOINED the clean raceline.
+
+    Distance is to the clean POLYLINE (point-to-segment), not to its vertices. That distinction is
+    the whole usefulness of this mask: the clean line is sampled every ~0.1 m, so a published point
+    lying exactly ON it but between two vertices is up to 0.05 m from the nearest vertex — over any
+    sane tolerance. Measured on a 2-hump ifac line, the vertex test called 67% of the points
+    "deviating" with a median residual of 31.9 mm, while the segment test gives 21% and a median of
+    0.0 mm — and 21% is exactly the span the humps occupy. Everything built on this mask (clean
+    curvature and clean speed restoration) was therefore firing on a minority of the stations it
+    should have.
+
+    Positions, not indices: the resample and the detour both change arc length, so index/s matching
+    would compare different places on the track.
+    """
+    cx = np.asarray(clean_xy, float)
+    ax, ay = cx[:, 0], cx[:, 1]
+    bx, by = np.roll(ax, -1), np.roll(ay, -1)
+    dx, dy = bx - ax, by - ay
+    seg2 = np.maximum(dx * dx + dy * dy, 1e-12)
+    px, py = traj[:, 1], traj[:, 2]
+    t = np.clip(((px[:, None] - ax[None, :]) * dx[None, :]
+                 + (py[:, None] - ay[None, :]) * dy[None, :]) / seg2[None, :], 0.0, 1.0)
+    qx = ax[None, :] + t * dx[None, :]
+    qy = ay[None, :] + t * dy[None, :]
+    d2 = (px[:, None] - qx) ** 2 + (py[:, None] - qy) ** 2
+    j = np.argmin(d2, axis=1)
+    on_clean = np.sqrt(d2[np.arange(len(j)), j]) <= dev_tol
+    # Report the nearer ENDPOINT of the winning segment: callers index per-station clean arrays
+    # (kappa, vx) with it, and on a clean stretch the two endpoints agree to the sampling error.
+    tj = t[np.arange(len(j)), j]
+    j_pt = np.where(tj > 0.5, (j + 1) % len(ax), j)
+    return on_clean, j_pt
+
+
 def _republish_kappa(traj: np.ndarray, clean_xy: np.ndarray, clean_kappa: Optional[np.ndarray],
                      dev_tol: float = 0.02) -> np.ndarray:
     """Curvature CONSISTENT with the published points.
@@ -1326,13 +1361,7 @@ def _republish_kappa(traj: np.ndarray, clean_xy: np.ndarray, clean_kappa: Option
     if clean_kappa is None:
         return k_geo
     ck = np.asarray(clean_kappa, float)
-    cx = np.asarray(clean_xy, float)
-    # nearest clean station for every published point (positions, not indices — the resample and
-    # the detour both shift arc length, so index/s matching would compare different places)
-    d2 = ((traj[:, 1][:, None] - cx[None, :, 0]) ** 2 +
-          (traj[:, 2][:, None] - cx[None, :, 1]) ** 2)
-    j = np.argmin(d2, axis=1)
-    on_clean = np.sqrt(d2[np.arange(len(j)), j]) <= dev_tol
+    on_clean, j = _on_clean_mask(traj, clean_xy, dev_tol)
     out = k_geo.copy()
     out[on_clean] = ck[j[on_clean]]
     return out
@@ -1732,8 +1761,20 @@ def _reopt_local_window_impl(
             traj[-1, 5] = traj[0, 5]
         except Exception:
             pass                                     # keep the windowed profile on any failure
-        # ... and the SPEED must stay feasible over the published curvature in every case
-        # (also re-runs the wrap-aware decel/accel sweeps) — see _cap_speed_to_published_curvature.
+        # RESTORE the clean line's TUNED speed wherever the geometry has rejoined it. The full-lap
+        # re-solve above is a fresh closed-loop velocity profile over the whole track, so it
+        # replaces the tuned raceline speeds everywhere -- including the 60-80% of the lap the
+        # obstacles never touch. Those values are not a solver output to be recomputed: they carry
+        # sector scaling and hand tuning the solver knows nothing about, and silently re-deriving
+        # them makes an obstacle at one corner change the speed plan at every other. Same mask and
+        # same reasoning as the curvature restoration in _republish_kappa.
+        if clean_vx_arr is not None:
+            on_clean, j_cl = _on_clean_mask(traj, clean_xy)
+            traj[on_clean, 5] = clean_vx_arr[j_cl[on_clean]]
+        # ... and the SPEED must stay feasible over the published curvature in every case (also
+        # re-runs the wrap-aware decel/accel sweeps, which is what smooths the joins the
+        # restoration above leaves at the edges of each arc) — see
+        # _cap_speed_to_published_curvature. It stays the FINAL pass for exactly that reason.
         _cap_speed_to_published_curvature(traj, ggv, axm)
         # ax likewise has to describe the PUBLISHED vx over the PUBLISHED spacing. It was computed
         # on the pre-resample grid and then linearly interpolated, leaving it inconsistent by up to
