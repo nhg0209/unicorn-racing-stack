@@ -84,6 +84,13 @@ class StaticObstacleLayer(Node):
         self.declare_parameter("unlatch_gap_max", 5.0)       # [m] window far edge (< obs_horizon_m,
                                                              # sized so a fast pass still fits the streak)
         self.declare_parameter("unlatch_clear_msgs", 20)     # consecutive clear msgs -> unlatch (~0.5 s @40 Hz)
+        # ...but the streak must COMPLETE within one approach, and the ego is only inside the
+        # window for (gap_max - gap_min)/v seconds. At the shipped 4 m window that is 20 messages
+        # only up to 8 m/s; above it the streak is structurally impossible and the fast-unlatch
+        # path silently stops existing. So the requirement is scaled by the crossing time, floored
+        # so the decision never rests on a couple of frames. See _clear_msgs_needed.
+        self.declare_parameter("unlatch_msg_rate_hz", 40.0)  # tracking publish rate used for the scale
+        self.declare_parameter("unlatch_clear_msgs_min", 6)  # never unlatch on fewer than this
         # Streak is also SUSPENDED while the ego is OFF the raceline (|d| above this): mid-avoidance
         # the sensor geometry on the very obstacle being avoided is skewed (wall-adjacent boxes
         # flicker under detect's boundary inflation at those angles) — observed: a live obstacle
@@ -104,9 +111,13 @@ class StaticObstacleLayer(Node):
         self.unlatch_gap_min = float(self.get_parameter("unlatch_gap_min").value)
         self.unlatch_gap_max = float(self.get_parameter("unlatch_gap_max").value)
         self.unlatch_clear_msgs = int(self.get_parameter("unlatch_clear_msgs").value)
+        self.unlatch_msg_rate_hz = float(self.get_parameter("unlatch_msg_rate_hz").value)
+        self.unlatch_clear_msgs_min = int(self.get_parameter("unlatch_clear_msgs_min").value)
         self.unlatch_max_ego_d = float(self.get_parameter("unlatch_max_ego_d").value)
 
         self._ego_d: Optional[float] = None
+        self._ego_vs: Optional[float] = None
+        self._line_xy = None                  # geometry the tracks' `s` values are expressed in
         self._tracks: List[_Track] = []
         self._next_marker_id = 0
         self._ego_s: Optional[float] = None
@@ -128,13 +139,40 @@ class StaticObstacleLayer(Node):
 
     # ----------------------------------------------------------------------------------
     def glb_cb(self, msg: WpntArray):
-        if msg.wpnts:
-            self._track_length = msg.wpnts[-1].s_m
+        if not msg.wpnts:
+            return
+        self._track_length = msg.wpnts[-1].s_m
+        # RE-ANCHOR every track's `s` when the LINE changes. static_reopt swaps /global_waypoints
+        # for an obstacle-aware one whose arc length differs (a 0.6 m apex adds ~1 m of lap), so an
+        # `s` captured on the old line names a different place on the new one. Every gap this node
+        # computes -- the observation-opportunity test, the unlatch window, the occlusion guard --
+        # is (t.s - ego_s), with ego_s coming from the frenet republisher on the NEW line. So after
+        # a swap those gaps are wrong by the arc-length difference, and the fast-unlatch window is
+        # only 4 m wide.
+        #
+        # x,y is frame-independent, so re-project each track onto the new polyline. Same fix, same
+        # reason, as the obstacle re-anchoring in static_avoidance_node and the state machine.
+        try:
+            xy = [(w.x_m, w.y_m, w.s_m) for w in msg.wpnts]
+            if self._line_xy is not None and len(xy) == len(self._line_xy) and all(
+                    abs(a[0] - b[0]) < 1e-9 and abs(a[1] - b[1]) < 1e-9
+                    for a, b in zip(xy, self._line_xy)):
+                return                                    # same geometry -> nothing to re-anchor
+            if self._line_xy is not None and self._tracks:
+                for t in self._tracks:
+                    t.s = min(xy, key=lambda w: (w[0] - t.x) ** 2 + (w[1] - t.y) ** 2)[2]
+                self.get_logger().info(
+                    f"[static_obs_layer] global line changed — re-anchored s for "
+                    f"{len(self._tracks)} track(s)")
+            self._line_xy = xy
+        except Exception as e:                            # never let bookkeeping kill the callback
+            self.get_logger().warn(f"[static_obs_layer] s re-anchor failed: {e}")
 
     def frenet_cb(self, msg: Odometry):
         s = msg.pose.pose.position.x
         self._ego_s = s
         self._ego_d = msg.pose.pose.position.y   # unlatch streak suspends while off-line
+        self._ego_vs = msg.twist.twist.linear.x  # scales the clear-view streak requirement
         # Lap boundary needs the previous sample near the end of the lap AND a full lap of
         # accumulated forward travel (mirrors static_reopt_node's gate): a parked car whose s
         # flickers across the seam, a reversing car, or a localization jump must never count a
@@ -171,11 +209,18 @@ class StaticObstacleLayer(Node):
                 continue
             if not self._is_static_like(obs):
                 continue
+            # A remembered-but-unseen detection (is_visible=False) is TRACKER MEMORY, not an
+            # observation, and it must not reach _associate at all. It used to: the visibility test
+            # was applied only to the clear-view streak, so a memory frame still ran the EMA update,
+            # incremented `hits`, set seen_this_lap and reset miss_laps -- i.e. a track could be
+            # CONFIRMED, and could be held alive across laps, entirely on the tracker replaying its
+            # own memory of it. Positive absence is the whole basis of removal here, so evidence
+            # that is not an observation cannot be allowed to count as one.
+            if not getattr(obs, "is_visible", True):
+                continue
             r = max(obs.size / 2.0, self.min_radius)
             t = self._associate(obs.x_m, obs.y_m, r, obs.s_center)
-            # a remembered-but-unseen obstacle (is_visible=False) is tracker memory, not an
-            # observation — it must not defeat the clear-view streak below
-            if t is not None and getattr(obs, "is_visible", True):
+            if t is not None:
                 seen_now.add(id(t))
         self._update_unlatch_streaks(msg, seen_now)
 
@@ -228,6 +273,25 @@ class StaticObstacleLayer(Node):
                 f"[static_obs_layer] CONFIRMED static obstacle @({best.x:.2f},{best.y:.2f}) r={best.r:.2f}")
         return best
 
+    def _clear_msgs_needed(self) -> int:
+        """Clear-view messages required to unlatch, scaled by how long the ego is IN the window.
+
+        The streak has to complete within ONE approach (it resets outside the window), so the ceiling
+        is set by physics: the window is unlatch_gap_max - unlatch_gap_min metres long, the ego
+        crosses it in that over its speed, and tracking publishes at ~40 Hz. At the shipped 4 m
+        window and 20 messages, the streak is structurally impossible to complete above 8 m/s --
+        the removal path silently stops existing at racing speed, which is exactly where a stale
+        obstacle costs the most.
+
+        Scale it instead of widening the window: a wider window means judging "no detection there"
+        from further away, which is the weaker evidence. Floored so the decision never rests on a
+        couple of frames however fast the ego is going.
+        """
+        v = abs(self._ego_vs) if self._ego_vs is not None else 0.0
+        span = max(self.unlatch_gap_max - self.unlatch_gap_min, 0.0)
+        fits = int(math.floor(self.unlatch_msg_rate_hz * span / max(v, 1.0)))
+        return int(max(self.unlatch_clear_msgs_min, min(self.unlatch_clear_msgs, fits)))
+
     def _update_unlatch_streaks(self, msg: ObstacleArray, seen_now):
         """Sighting-based fast unlatch (see the unlatch_* parameter block)."""
         if not self.unlatch_enable or self._ego_s is None or not self._track_length:
@@ -258,7 +322,7 @@ class StaticObstacleLayer(Node):
                 survivors.append(t)           # opponent between ego and the spot: suspend, don't count
                 continue
             t.clear_streak += 1
-            if t.clear_streak >= self.unlatch_clear_msgs:
+            if t.clear_streak >= self._clear_msgs_needed():
                 self.get_logger().info(
                     f"[static_obs_layer] UNLATCHED static obstacle @({t.x:.2f},{t.y:.2f}) — "
                     f"{t.clear_streak} consecutive clear views of its spot, no detection")

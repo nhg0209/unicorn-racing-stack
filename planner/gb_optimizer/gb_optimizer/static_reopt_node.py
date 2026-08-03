@@ -228,6 +228,12 @@ class StaticReoptNode(Node):
         # wiped every record) that is why the line reverted to clean after a lap.
         self._obs_ids: List[int] = []           # marker ids, index-aligned with _obstacles
         self._apex_miss = {}                    # key -> consecutive frames the obstacle was absent
+        # Apex movement at or above this counts as a MAJOR change: worth discarding a queued
+        # (pending) line over. Below it the queued line and the rebuilt one differ by centimetres,
+        # and the queued one is allowed to commit first — see _mark_dirty.
+        self.declare_parameter("apex_major_change_m", 0.10)
+        self.apex_major_change_m = float(self.get_parameter("apex_major_change_m").value)
+        self._apex_change_major = False
         # Obstacle keys whose clearance drift has already re-armed the solve against the CURRENTLY
         # active line. Without this latch the trigger re-fires every frame until the new line is
         # committed — and _mark_dirty discards the pending, so the very swap that would restore
@@ -606,16 +612,27 @@ class StaticReoptNode(Node):
             self._mark_dirty()
         self.get_logger().info("[static_reopt] obstacle set + apex records CLEARED by external request")
 
-    def _mark_dirty(self):
-        """Arm the rebuild trigger AND discard any pending bundle: a pending built from the
-        PREVIOUS obstacle/apex state is stale — it both blocked the fresh rebuild (the solve gate
-        requires _pending is None) and, once committed, installed an outdated line. Observed: a
-        spurious unlatch->re-confirm flap (set 1->0->1) left a pending CLEAN revert queued while
-        the obstacle was confirmed again — the re-opt then never ran."""
+    def _mark_dirty(self, keep_pending: bool = False):
+        """Arm the rebuild trigger, and by default discard any pending bundle.
+
+        A pending built from the PREVIOUS obstacle/apex state is normally stale — it both blocked
+        the fresh rebuild (the solve gate requires _pending is None) and, once committed, installed
+        an outdated line. Observed: a spurious unlatch->re-confirm flap (set 1->0->1) left a pending
+        CLEAN revert queued while the obstacle was confirmed again — the re-opt then never ran.
+
+        `keep_pending` is for the case where that reasoning does not apply: a MINOR apex refinement,
+        where the queued line and the line the rebuild would produce differ by centimetres. Throwing
+        the pending away there costs a whole swap opportunity, because the commit gates (reactive
+        idle + the lines agreeing over the controller's look-ahead) are hardest to satisfy exactly
+        where the obstacles are — so the lap-2 swap slips to lap 3 for a 5 cm improvement nobody
+        asked for. Keeping it lets the good-enough line commit now; the flag stays armed and the
+        refinement lands on the next solve, which runs as soon as the pending clears.
+        """
         self._obstacles_dirty = True
         self._dirty_since = self.get_clock().now().nanoseconds * 1e-9
-        self._pending = None
-        self._pending_dev = None
+        if not keep_pending:
+            self._pending = None
+            self._pending_dev = None
 
     def _clearance_drifted(self, obs: List[core.Obstacle], ids: List[int]) -> bool:
         """Has an obstacle drifted into the clearance of the line the car is FOLLOWING?
@@ -711,11 +728,13 @@ class StaticReoptNode(Node):
         if not self._obstacles:
             return
         if self._record_apexes(wx, wy, wd):
+            # A MINOR refinement keeps any pending bundle alive so the swap it is waiting for can
+            # still land; only a new/relocated apex is worth throwing that away. See _mark_dirty.
             # A new/better apex is a REASON to rebuild. Without this, an obstacle set collected
             # BEFORE its apex existed (near-start obstacle: confirmed only after the pass; the
             # seam-crossing retry then built a 0-apex clean-equivalent and burned the flag) left
             # the solve gate in frenet_cb permanently closed -> reactive re-avoidance every lap.
-            self._mark_dirty()
+            self._mark_dirty(keep_pending=not self._apex_change_major)
 
     def _adopt_orphan_apexes(self):
         """Re-key apex records whose track id vanished (the layer re-issues marker ids on an
@@ -769,7 +788,9 @@ class StaticReoptNode(Node):
     def _record_apexes(self, wx, wy, wd) -> bool:
         """Associate one reactive path with the confirmed obstacles and update the apex records.
         Returns True when any apex was newly recorded or MOVED by more than 5 cm in amplitude
-        (or 10 cm in position) — a rebuild-worthy change.
+        (or 10 cm in position) — a rebuild-worthy change. Also sets `_apex_change_major`, which
+        separates "a new obstacle to lay a hump for" from "the same hump, a few centimetres
+        different": only the former is worth discarding a pending bundle over (see _mark_dirty).
 
         The record is NEWEST-WINS, not keep-the-max: the historical max RATCHETED — one outlier
         path from a displaced frame (stuck/flap phases) permanently inflated the hump (measured:
@@ -780,6 +801,7 @@ class StaticReoptNode(Node):
         OWNERSHIP first: give every spline point to its NEAREST obstacle, then let each obstacle
         pick its apex only from the points it owns — a second obstacle sitting inside the FIRST
         one's avoidance hump must not record that hump as its own apex."""
+        self._apex_change_major = False
         keys = self._keys_for(self._obstacles, self._obs_ids)
         ox = np.fromiter((o.x for o in self._obstacles), float, len(self._obstacles))
         oy = np.fromiter((o.y for o in self._obstacles), float, len(self._obstacles))
@@ -830,12 +852,17 @@ class StaticReoptNode(Node):
             self._apex_by_obs[key] = (ax_x, ax_y, abs(float(d_rec)))
             if prev is None:
                 changed = True
+                self._apex_change_major = True          # a hump that did not exist before
                 self.get_logger().info(
                     f"[static_reopt] recorded reactive apex for obstacle @({o.x:.2f},{o.y:.2f}) "
                     f"-> apex xy=({ax_x:.2f},{ax_y:.2f}) d={d_rec:+.2f}m")
-            elif (abs(abs(float(d_rec)) - prev[2]) > 0.05
-                  or float(np.hypot(prev[0] - ax_x, prev[1] - ax_y)) > 0.10):
-                changed = True
+            else:
+                d_amp = abs(abs(float(d_rec)) - prev[2])
+                d_pos = float(np.hypot(prev[0] - ax_x, prev[1] - ax_y))
+                if d_amp > 0.05 or d_pos > 0.10:
+                    changed = True
+                    if d_amp >= self.apex_major_change_m or d_pos >= self.apex_major_change_m:
+                        self._apex_change_major = True
         return changed
 
     def _apex_pairs(self, obstacles: List[core.Obstacle]) -> List[tuple]:

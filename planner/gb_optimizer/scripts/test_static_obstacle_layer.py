@@ -27,10 +27,11 @@ def make_node():
     return node
 
 
-def odom(s, d=0.0):
+def odom(s, d=0.0, vs=0.0):
     m = Odometry()
     m.pose.pose.position.x = s
     m.pose.pose.position.y = d
+    m.twist.twist.linear.x = vs
     return m
 
 
@@ -144,12 +145,94 @@ def test_lap_guard():
     print("PASS lap forward-progress guard")
 
 
+def test_unlatch_streak_scales_with_speed():
+    # The streak must COMPLETE within one approach, and the ego is only inside the 4 m window for
+    # (gap_max-gap_min)/v seconds. At a flat 20 messages that is impossible above 8 m/s -- the
+    # fast-unlatch path silently stopped existing at racing speed.
+    node = make_node()
+    node.frenet_cb(odom(0.0, vs=1.0))
+    assert node._clear_msgs_needed() == node.unlatch_clear_msgs, "slow ego: full requirement"
+    node.frenet_cb(odom(0.0, vs=8.0))
+    assert node._clear_msgs_needed() == 20, "at 8 m/s exactly 20 messages still fit"
+    node.frenet_cb(odom(0.0, vs=16.0))
+    n_fast = node._clear_msgs_needed()
+    assert n_fast < node.unlatch_clear_msgs, "fast ego: fewer messages fit in the window"
+    assert n_fast >= node.unlatch_clear_msgs_min, "...but never fewer than the floor"
+    node.frenet_cb(odom(0.0, vs=200.0))
+    assert node._clear_msgs_needed() == node.unlatch_clear_msgs_min, "floor holds at any speed"
+    # ...and the streak can now actually complete at speed
+    node = make_node()
+    t = confirm_obstacle(node, s=10.0)
+    node.frenet_cb(odom(7.0, vs=16.0))            # gap 3.0 m -> inside [1, 5]
+    for _ in range(node._clear_msgs_needed()):
+        node.obstacles_cb(arr())
+    assert not node._tracks, "a clear-view streak must be completable at racing speed"
+    print("PASS unlatch streak requirement scales with speed")
+
+
+def test_memory_frame_does_not_confirm_or_feed_a_track():
+    # is_visible=False is tracker MEMORY. It used to reach _associate, so it ran the EMA update,
+    # incremented hits, set seen_this_lap and reset miss_laps -- a track could be CONFIRMED, and
+    # kept alive across laps, purely on the tracker replaying its own memory.
+    node = make_node()
+    for _ in range(node.confirm_hits * 2):
+        node.obstacles_cb(arr(det(3.0, 0.0, 10.0, visible=False)))
+    assert not node._tracks, "memory frames alone must never create or confirm a track"
+    # a confirmed track must not have its lap accounting refreshed by memory either
+    node = make_node()
+    t = confirm_obstacle(node, s=10.0)
+    t.seen_this_lap = False
+    t.miss_laps = 1
+    hits_before = t.hits
+    node.obstacles_cb(arr(det(3.0, 0.0, 10.0, visible=False)))
+    assert t.hits == hits_before and not t.seen_this_lap and t.miss_laps == 1, \
+        "a memory frame must not count as an observation"
+    print("PASS a remembered detection neither confirms nor feeds a track")
+
+
+def test_track_s_reanchors_on_a_line_swap():
+    # static_reopt swaps /global_waypoints for a line whose arc length differs, so an `s` captured
+    # on the old line names a different place on the new one -- and every gap this node computes is
+    # (t.s - ego_s) against an ego_s from the NEW line.
+    node = StaticObstacleLayer()
+    line_a = WpntArray()
+    for k in range(41):
+        w = Wpnt(); w.s_m = float(k); w.x_m = float(k); w.y_m = 0.0
+        line_a.wpnts.append(w)
+    node.glb_cb(line_a)
+    t = confirm_obstacle(node, x=10.0, y=0.0, s=10.0)
+    assert abs(t.s - 10.0) < 1e-6
+    # same geometry republished -> no churn
+    node.glb_cb(line_a)
+    assert abs(t.s - 10.0) < 1e-6, "an unchanged line must not re-anchor anything"
+    # swapped line: an avoidance hump between x=2 and x=8 bulges the line and LENGTHENS it, so
+    # every station past the hump carries a larger s than it did on the clean line.
+    import math
+    line_b = WpntArray()
+    xs = [float(k) for k in range(41)]
+    ys = [0.6 * math.exp(-((x - 5.0) ** 2) / 2.0) for x in xs]
+    acc = 0.0
+    for k, (x, y) in enumerate(zip(xs, ys)):
+        if k:
+            acc += math.hypot(x - xs[k - 1], y - ys[k - 1])
+        w = Wpnt(); w.s_m = acc; w.x_m = x; w.y_m = y
+        line_b.wpnts.append(w)
+    node.glb_cb(line_b)
+    expected = line_b.wpnts[10].s_m            # nearest point on the new line to the track at x=10
+    assert abs(t.s - expected) < 1e-6, f"s must follow the new parameterisation, got {t.s}"
+    assert t.s > 10.0, "the swapped line is longer, so the station past the hump moved"
+    print(f"PASS track s re-anchored on a line swap (10.00 -> {t.s:.3f} m)")
+
+
 def main():
     rclpy.init()
     try:
         for fn in (test_confirm_and_unlatch, test_ego_offline_suspends_streak,
                    test_sighting_resets_streak, test_memory_detection_does_not_reset,
-                   test_occlusion_suspends, test_window_exit_resets, test_lap_guard):
+                   test_occlusion_suspends, test_window_exit_resets, test_lap_guard,
+                   test_unlatch_streak_scales_with_speed,
+                   test_memory_frame_does_not_confirm_or_feed_a_track,
+                   test_track_s_reanchors_on_a_line_swap):
             fn()
     finally:
         rclpy.shutdown()

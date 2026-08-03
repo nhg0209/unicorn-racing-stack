@@ -72,6 +72,8 @@ def make_node():
     n.obs_margin = 0.35
     n.clearance_dirty_m = 0.30
     n._clearance_dirty_keys = set()
+    n.apex_major_change_m = 0.10
+    n._apex_change_major = False
     n.active = straight_bundle()      # real node always has one (clean bundle at startup)
     # straight clean line along x with a 0.7 m corridor each side (apex plausibility check)
     n._clean_xy = np.column_stack([np.arange(0.0, 40.0, 0.1), np.zeros(400)])
@@ -335,6 +337,35 @@ def test_clearance_drift_retriggers_once():
     print("PASS clearance drift re-arms the solve exactly once per active line")
 
 
+def test_minor_apex_refinement_keeps_the_pending():
+    # Discarding a queued bundle for a 5 cm apex refinement costs a whole swap opportunity: the
+    # commit gates are hardest to satisfy exactly where the obstacles are, so the lap-2 swap slips
+    # to lap 3 for an improvement nobody asked for. A NEW or relocated apex still discards it.
+    n = make_node()
+    n._obstacles = [core.Obstacle(5.0, -0.2, 0.15)]
+    n._obs_ids = [7]
+    n.otwpnts_cb(path_msg(HUMP))                       # first apex -> major, no pending yet
+    assert n._apex_change_major is True
+
+    sentinel = object()
+    n._pending, n._pending_dev = sentinel, np.zeros(3)
+    n._obstacles_dirty = False
+    # shrink, not grow: growth is capped by the overshoot clamp at the obstacle's requirement
+    nudged = [(x, y * 0.83, d * 0.83) for x, y, d in HUMP]     # 0.40 -> 0.33: >5 cm, <10 cm
+    n.otwpnts_cb(path_msg(nudged))
+    assert n._obstacles_dirty, "a >5cm change must still arm the rebuild"
+    assert n._apex_change_major is False, "…but 6 cm is not a major change"
+    assert n._pending is sentinel, "the queued line must survive a minor refinement"
+
+    n._pending, n._pending_dev = sentinel, np.zeros(3)
+    n._obstacles_dirty = False
+    shrunk = [(x, y * 0.5, d * 0.5) for x, y, d in HUMP]       # 0.40 -> 0.20: 20 cm, major
+    n.otwpnts_cb(path_msg(shrunk))
+    assert n._obstacles_dirty and n._apex_change_major, "20 cm must read as a major change"
+    assert n._pending is None, "a major apex change must discard the queued line"
+    print("PASS a minor apex refinement keeps the pending bundle, a major one drops it")
+
+
 def test_line_clearance_veto():
     # A line that does not clear an obstacle it CLAIMS to have reshaped must not be published;
     # one that misses an obstacle no hump was laid for is fine (reactive layer's job).
@@ -484,5 +515,6 @@ if __name__ == "__main__":
     test_amplitude_comes_from_the_obstacle_not_the_apex()
     test_raceline_already_clear_lays_nothing()
     test_clearance_drift_retriggers_once()
+    test_minor_apex_refinement_keeps_the_pending()
     test_line_clearance_veto()
     print("ALL PASS")
