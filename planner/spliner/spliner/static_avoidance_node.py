@@ -662,6 +662,64 @@ class ObstacleSpliner(Node):
     def _relax_active(self) -> bool:
         return (self.get_clock().now().nanoseconds * 1e-9) < self._relax_until
 
+    def _gate_samples(self, obs_ahead, anchor, corridor, obs_margin: float) -> List[float]:
+        """Terminal offsets aimed at the lanes left free by ALL boxes overlapping `anchor` in s.
+
+        The gap sampling above measures its two free intervals against the anchor box alone. With a
+        second box at overlapping s that is not enough: its keep-out cuts one or both of those
+        intervals, so a uniform linspace across them puts samples inside it and hits the lane
+        BETWEEN the two boxes only by luck. On a cluster the free lane is narrow and the luck runs
+        out -- which is the reported "every candidate rejected" with a passable gap present.
+
+        Subtract every overlapping keep-out from the corridor and return, for each surviving
+        sub-interval, its midpoint and the edge nearer the raceline. Bounded to two samples per
+        overlapping obstacle, and only sub-intervals a car actually fits through are offered.
+        """
+        try:
+            d_lo, d_hi = corridor
+            L = self.gb_max_s
+            a_lo = (anchor.s_start - obs_margin - self.cur_s) % L
+            a_hi = (anchor.s_end + obs_margin - self.cur_s) % L
+            free = [(d_lo, d_hi)]
+            n_over = 0
+            for o in obs_ahead:
+                o_lo = (o.s_start - obs_margin - self.cur_s) % L
+                o_hi = (o.s_end + obs_margin - self.cur_s) % L
+                if o is not anchor and (o_lo > a_hi or o_hi < a_lo):
+                    continue                            # disjoint in s -> its keep-out is elsewhere
+                if o is not anchor:
+                    n_over += 1                         # budget counts the EXTRA boxes only...
+                cut_lo = min(o.d_right, o.d_left) - obs_margin
+                cut_hi = max(o.d_right, o.d_left) + obs_margin
+                nxt = []
+                for lo, hi in free:
+                    if cut_hi <= lo or cut_lo >= hi:    # cut misses this interval
+                        nxt.append((lo, hi))
+                        continue
+                    if lo < cut_lo:
+                        nxt.append((lo, cut_lo))
+                    if cut_hi < hi:
+                        nxt.append((cut_hi, hi))
+                free = nxt                              # ...but the anchor IS subtracted, or the
+                                                        # lane BETWEEN the boxes never appears
+            if not n_over:
+                return []                               # single box: the linspace gaps already cover it
+            # widest-first is the wrong order here: a wide lane already gets linspace coverage, the
+            # narrow gate between two boxes is the one nothing is aiming at. Offer the lanes
+            # NEAREST the raceline, which is also what the cost function would pick.
+            free = [(lo, hi) for lo, hi in free if (hi - lo) > 1e-6]
+            free.sort(key=lambda iv: abs(0.5 * (iv[0] + iv[1])))
+            out = []
+            for lo, hi in free[:max(1, 2 * n_over)]:
+                mid = 0.5 * (lo + hi)
+                out.append(mid)
+                out.append(lo if abs(lo) < abs(hi) else hi)     # the edge nearer the raceline
+                if len(out) >= 2 * n_over:
+                    break
+            return [float(v) for v in out]
+        except Exception:                                # sampling extra candidates is never critical
+            return []
+
     @staticmethod
     def _line_clears_obstacle(o, need: float) -> bool:
         """Does the FOLLOWED line (d = 0 in this node's frenet frame) pass `o` by `need`?
@@ -1078,6 +1136,13 @@ class ObstacleSpliner(Node):
             if hi_right >= d_lo - 1e-6:
                 right = np.linspace(d_lo, hi_right, n_side); n_right = int(right.size)
                 d_list += list(right)
+            # The two gaps above are measured against the NEAREST box only, so with a second box at
+            # overlapping s the linspace samples land wherever they land -- including inside the
+            # other box's keep-out, and the genuinely free lane BETWEEN two boxes gets a sample only
+            # by luck. That is the clustered-obstacle all-rejected case: the gate exists, nothing
+            # aimed at it. Subtract the overlapping keep-outs from both gaps and aim at what
+            # survives explicitly.
+            d_list += self._gate_samples(obs_ahead, nearest, (d_lo, d_hi), obs_margin)
             d_ends = np.unique(np.round(np.asarray(d_list, dtype=float), 4))
             d_ends[int(np.argmin(np.abs(d_ends)))] = 0.0       # snap nearest sample onto the raceline
         else:
