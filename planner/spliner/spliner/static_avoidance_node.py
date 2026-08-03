@@ -244,6 +244,8 @@ class ObstacleSpliner(Node):
         self.commit_dev_max = 0.6
         self.commit_reanchor_len_m = 2.0   # [m] arc length the entry correction is faded out over
         self.commit_reanchor_max_m = 1.0   # [m] beyond this it is not an entry fix -> full re-plan
+        self.preramp_len_m = 3.0     # [m] decay the car's current d to the raceline within this
+                                     #     much of the path BEFORE the hump's entry ramp
         self.commit_obs_ds = 0.75    # [m] drop the commit if the triggering box's s drifts this far
         self.commit_obs_dd = 0.40    # [m] ... or its d drifts this far (re-plan the apex around it)
         self._committed = None       # cached selected path (frenet + cartesian arrays) or None
@@ -270,7 +272,7 @@ class ObstacleSpliner(Node):
             'clear_latch_ttl_s', 'squeeze_enable', 'squeeze_steps', 'squeeze_safety_floor_m',
             'squeeze_wall_floor_m', 'squeeze_max_speed_mps', 'relax_hold_s',
             'commit_enable', 'commit_dev_max', 'commit_obs_ds', 'commit_obs_dd',
-            'commit_reanchor_len_m', 'commit_reanchor_max_m',
+            'commit_reanchor_len_m', 'commit_reanchor_max_m', 'preramp_len_m',
         ]))
         self.add_on_set_parameters_callback(self.dyn_param_cb)
 
@@ -392,6 +394,7 @@ class ObstacleSpliner(Node):
         self.declare_parameter('commit_dev_max', 0.6, dbl(0.05, 2.0, "re-anchor the committed path's entry if the car deviates this far from it [m]"))
         self.declare_parameter('commit_reanchor_len_m', 2.0, dbl(0.5, 10.0, "arc length the entry re-anchor is faded out over [m]"))
         self.declare_parameter('commit_reanchor_max_m', 1.0, dbl(0.1, 3.0, "deviation beyond which a full re-plan is taken instead [m]"))
+        self.declare_parameter('preramp_len_m', 3.0, dbl(0.0, 15.0, "decay the car's current d to the raceline within this much of the path before the hump [m]"))
         self.declare_parameter('commit_obs_ds', 0.75, dbl(0.05, 5.0, "drop the commit if the triggering obstacle s drifts this far [m]"))
         self.declare_parameter('commit_obs_dd', 0.40, dbl(0.05, 2.0, "drop the commit if the triggering obstacle d drifts this far [m]"))
 
@@ -497,6 +500,8 @@ class ObstacleSpliner(Node):
                 self.commit_reanchor_len_m = float(p.value)
             elif n == 'commit_reanchor_max_m':
                 self.commit_reanchor_max_m = float(p.value)
+            elif n == 'preramp_len_m':
+                self.preramp_len_m = float(p.value)
             elif n == 'commit_obs_ds':
                 self.commit_obs_ds = float(p.value)
             elif n == 'commit_obs_dd':
@@ -1015,13 +1020,32 @@ class ObstacleSpliner(Node):
             d_apex = [float(d_end)]
             for i in range(1, len(knots)):
                 d_apex.append(_pass_offset(knot_cor[i], knots[i][1], d_apex[-1]))
-            dv = np.full(n, self.cur_d)
+            # PRE-RAMP, i.e. everything before the hump's entry. This used to hold the car's CURRENT
+            # lateral offset flat all the way to s_entry0 -- with a 15 m lookahead and a 4.5 m entry
+            # ramp that is up to 10.5 m of published path carrying the instantaneous tracking error
+            # as a DC offset, and the hump itself then started from that offset rather than from the
+            # raceline. The controller reads it as "stay off the line", which is the opposite of
+            # what is wanted while the obstacle is still far away.
+            # Decay it to the raceline with a quintic (C2 at both ends) inside min(preramp_len_m,
+            # s_entry0), then hold zero until the hump opens. When s_entry0 == 0 the maneuver starts
+            # AT the car and the car-anchored entry is kept, heading and all.
+            d_start = self.cur_d if s_entry0 <= 0.0 else 0.0
+            dv = np.zeros(n)
+            if s_entry0 > 0.0 and abs(self.cur_d) > 1e-9:
+                pre = min(self.preramp_len_m, s_entry0)
+                if pre > 1e-6:
+                    t = np.clip(s_local / pre, 0.0, 1.0)
+                    w = 1.0 - t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
+                    m_pre = s_local <= s_entry0
+                    dv[m_pre] = self.cur_d * w[m_pre]
+            elif s_entry0 <= 0.0:
+                dv[:] = self.cur_d
             if span_ok and m_span.any():
                 # One knot per obstacle centre -> a single smooth quintic hump (raceline -> apex ->
                 # raceline). d'=0 at each apex makes it the peak. apex_bulge pushes the peak FURTHER
                 # from the obstacle (wider swing); the feasibility filter verifies box clearance.
                 bp_s = [s_entry0]
-                bp_d = [[self.cur_d, dp0, 0.0]]
+                bp_d = [[d_start, dp0, 0.0]]
                 for (s_c, _o, _cor), da in zip(knots, d_apex):
                     d_peak = da + float(np.sign(da)) * self.apex_bulge
                     bp_s.append(s_c)

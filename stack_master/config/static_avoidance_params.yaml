@@ -198,6 +198,12 @@ static_avoidance_planner:
                             #      re-anchor of the entry only (apex, clearance and exit untouched).
     commit_reanchor_len_m: 2.0  # [m] arc length the entry correction is faded out over (smootherstep)
     commit_reanchor_max_m: 1.0  # [m] beyond this it is not an entry fix -> take the full re-plan
+    # [m] the published path before the hump's entry ramp used to HOLD the car's current lateral
+    # offset flat all the way to s_entry0 -- with a 15 m lookahead and a 4.5 m entry ramp that is up
+    # to 10.5 m of path carrying the instantaneous tracking error as a DC offset, and the hump then
+    # started from that offset instead of from the raceline. Decay it to the raceline within this
+    # distance (quintic, C2 at both ends) and hold zero until the hump opens. 0 = no pre-ramp.
+    preramp_len_m: 3.0
     commit_obs_ds: 0.75     # [m] drop the commit if the triggering box's s drifts this far (re-plan apex)
     commit_obs_dd: 0.40     # [m] ... or its d drifts this far
 
