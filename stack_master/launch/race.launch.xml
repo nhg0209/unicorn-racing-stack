@@ -37,7 +37,8 @@
   <arg name="rviz"       default="false" description="(real) also start RViz with the pitwall config (2D Pose Estimate seeds kiss via /initialpose)"/>
   <arg name="reopt" default="false" description="Obstacle-aware global line (IFAC static re-optimization): static_reopt_node + static_obstacle_layer instead of plain global_trajectory_publisher"/>
   <arg name="reopt_safety_width" default="0.5" description="safety_width for the obstacle-aware re-optimizer (tight ifac map solves plain mincurv_iqp only at 0.25 or lower)"/>
-  <arg name="reopt_obs_change_tol" default="0.25" description="min obstacle move [m] to re-trigger the re-opt QP; larger = detection jitter does not thrash the optimizer"/>
+  <arg name="reopt_obs_change_tol" default="0.05" description="min obstacle move [m] to re-trigger the re-opt QP; larger = detection jitter does not thrash the optimizer. Bounded above by reopt_obs_margin (0.35) minus the SM's static requirement (0.25): a drift this tolerance ignores must not eat that headroom. Was 0.25, which let a box walk the followed line under the SM requirement without re-triggering anything."/>
+  <arg name="reopt_clearance_dirty" default="0.30" description="[m] rebuild as soon as the ACTIVE line's clearance to a box it used to clear drops below this, however far the box moved (reopt_obs_change_tol only measures the cause). SM static requirement 0.25 + slack."/>
   <arg name="reopt_compute_sp" default="true" description="also re-optimize the shortest_path line (consumed by ot_interpolator); set false only if the OT line is unused"/>
   <arg name="reopt_method" default="local_window" description="obstacle-aware line optimizer: local_window (fast ONLINE windowed min-curv QP) | global (legacy whole-track mincurv_iqp, offline-grade)"/>
   <arg name="reopt_reach_time" default="0.0" description="[s] DEPRECATED seed for the old speed-scaled reach; the reach is now chosen by a lap-time search over [reach_min, reach_max]. Ignored."/>
@@ -73,6 +74,7 @@
     <arg name="reopt"   value="$(var reopt)"/>
     <arg name="reopt_safety_width" value="$(var reopt_safety_width)"/>
     <arg name="reopt_obs_change_tol" value="$(var reopt_obs_change_tol)"/>
+    <arg name="reopt_clearance_dirty" value="$(var reopt_clearance_dirty)"/>
     <arg name="reopt_compute_sp" value="$(var reopt_compute_sp)"/>
     <arg name="reopt_method" value="$(var reopt_method)"/>
     <arg name="reopt_reach_time" value="$(var reopt_reach_time)"/>

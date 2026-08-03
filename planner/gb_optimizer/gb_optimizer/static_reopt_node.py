@@ -62,12 +62,12 @@ class _Bundle:
         "cent_wpnts", "cent_markers",
         "glb_wpnts", "glb_markers",
         "sp_wpnts", "sp_markers",
-        "trackbounds", "n_apex", "clearance_ok",
+        "trackbounds", "n_apex", "clearance_ok", "clearance_by_key",
     )
 
     def __init__(self, map_info, est_lap_time, cent_wpnts, cent_markers,
                  glb_wpnts, glb_markers, sp_wpnts, sp_markers, trackbounds, n_apex=0,
-                 clearance_ok=True):
+                 clearance_ok=True, clearance_by_key=None):
         # n_apex = humps ACTUALLY laid into this line. 0 means the geometry is the clean raceline
         # even if obstacles were passed in (no apex recorded, or the corridor could not hold it).
         self.n_apex = n_apex
@@ -75,6 +75,10 @@ class _Bundle:
         # obs_margin, measured on the built geometry. False = do NOT publish it (see
         # _check_line_clearance); the previous good line is kept instead.
         self.clearance_ok = clearance_ok
+        # clearance_by_key = per-obstacle edge clearance of THIS line at the positions it was
+        # built from. The baseline the drift trigger compares live positions against, so it must
+        # travel with the line rather than with the node (see _clearance_drifted).
+        self.clearance_by_key = clearance_by_key or {}
         self.map_info = map_info
         self.est_lap_time = est_lap_time
         self.cent_wpnts = cent_wpnts
@@ -110,6 +114,13 @@ class StaticReoptNode(Node):
         self.declare_parameter("swap_at_startfinish", True)
         self.declare_parameter("swap_timeout_s", 4.0)        # force swap if no s-wrap seen
         self.declare_parameter("obs_change_tol", 0.10)       # [m] min move to count as a change
+        # [m] CONSEQUENCE trigger, complementing obs_change_tol's cause trigger. obs_change_tol
+        # fires on how far a box moved, which says nothing about whether the move mattered; this
+        # fires when the ACTIVE line has stopped clearing a box it used to clear. Set at the SM's
+        # static GB requirement (gb_ego_width_m/2 + lateral_width_static_gb_m = 0.25) plus slack,
+        # i.e. rebuild BEFORE the free-check would call the line blocked and drop to TRAILING.
+        # Must stay between that requirement and obs_margin — check_avoidance_margins.py verifies.
+        self.declare_parameter("clearance_dirty_m", 0.30)
         self.declare_parameter("compute_sp", True)
         # re-optimization method:
         #   "local_window" (default) — fast ONLINE windowed min-curvature QP stitched into the
@@ -155,6 +166,7 @@ class StaticReoptNode(Node):
         self.swap_at_sf = bool(self.get_parameter("swap_at_startfinish").value)
         self.swap_timeout_s = float(self.get_parameter("swap_timeout_s").value)
         self.obs_change_tol = float(self.get_parameter("obs_change_tol").value)
+        self.clearance_dirty_m = float(self.get_parameter("clearance_dirty_m").value)
         self.compute_sp = bool(self.get_parameter("compute_sp").value)
         self.reopt_method = str(self.get_parameter("reopt_method").value)
         self.reach_time = float(self.get_parameter("reach_time").value)
@@ -209,6 +221,11 @@ class StaticReoptNode(Node):
         # wiped every record) that is why the line reverted to clean after a lap.
         self._obs_ids: List[int] = []           # marker ids, index-aligned with _obstacles
         self._apex_miss = {}                    # key -> consecutive frames the obstacle was absent
+        # Obstacle keys whose clearance drift has already re-armed the solve against the CURRENTLY
+        # active line. Without this latch the trigger re-fires every frame until the new line is
+        # committed — and _mark_dirty discards the pending, so the very swap that would restore
+        # the clearance could never land. Cleared when the active line changes.
+        self._clearance_dirty_keys = set()
         self.declare_parameter("apex_miss_frames", 20)   # tolerate this many missing frames
         self.apex_miss_frames = int(self.get_parameter("apex_miss_frames").value)
         # publish the bundle only when the active line CHANGES (+ a slow keep-alive), NOT on every
@@ -443,6 +460,7 @@ class StaticReoptNode(Node):
         rep = res["report"]
         info = String()
         clearance_ok = True                 # `global` method: no per-apex geometry to check
+        clearance_by_key = {}
         if self.reopt_method == "local_window":
             n_ap = res.get("n_windows", 0)
             dropped = res.get("apex_dropped", [])
@@ -498,6 +516,11 @@ class StaticReoptNode(Node):
                     f"[static_reopt] {n_no_apex} obstacle(s) had no recorded reactive apex yet — "
                     f"the reactive static-avoidance layer handles them until an apex is captured")
             clearance_ok = self._check_line_clearance(traj, obstacles, res.get("apex_laid", []))
+            # Baseline for the drift trigger: what THIS line clears each box by, at the positions
+            # it was built from. Travels with the bundle so the comparison is always against the
+            # line that is actually active (a pending bundle may never commit).
+            clearance_by_key = dict(zip(self._keys_for(obstacles, self._obs_ids),
+                                        self._line_clearances(traj, obstacles)))
         else:
             info.data = (f"[static_reopt] obstacle-aware (mincurv_iqp) est {est:.3f}s; "
                          f"affected {rep.n_affected}, infeasible {rep.n_infeasible}, "
@@ -508,7 +531,8 @@ class StaticReoptNode(Node):
         return _Bundle(info, lap,
                        self.clean_bundle.cent_wpnts, self.clean_bundle.cent_markers,
                        glb_w, glb_m, sp_w, sp_m, self.clean_bundle.trackbounds,
-                       n_apex=int(res.get("n_windows", 0)), clearance_ok=clearance_ok)
+                       n_apex=int(res.get("n_windows", 0)), clearance_ok=clearance_ok,
+                       clearance_by_key=clearance_by_key)
 
     # ----------------------------------------------------------------------------------
     # obstacle input: COLLECT only (batch re-opt happens at the start/finish crossing)
@@ -539,7 +563,7 @@ class StaticReoptNode(Node):
                     del self._apex_by_obs[k]
                     self._apex_miss.pop(k, None)
 
-        if not self._obstacles_changed(obs):
+        if not self._clearance_drifted(obs, ids) and not self._obstacles_changed(obs):
             self._obs_ids = ids           # ids can be re-issued without the position changing
             self._adopt_orphan_apexes()   # re-issued ids must not orphan the apex records
             return
@@ -568,6 +592,7 @@ class StaticReoptNode(Node):
         self._apex_by_obs.clear()
         self._apex_miss.clear()
         self._path_buffer.clear()   # no retro-resurrection of just-cleared apexes
+        self._clearance_dirty_keys.clear()
         if self._obstacles:
             self._obstacles = []
             self._obs_ids = []
@@ -584,6 +609,48 @@ class StaticReoptNode(Node):
         self._dirty_since = self.get_clock().now().nanoseconds * 1e-9
         self._pending = None
         self._pending_dev = None
+
+    def _clearance_drifted(self, obs: List[core.Obstacle], ids: List[int]) -> bool:
+        """Has an obstacle drifted into the clearance of the line the car is FOLLOWING?
+
+        `obs_change_tol` is a cause trigger: it fires on how far a box moved, and says nothing
+        about whether the move mattered. Between the tolerance and the margin chain there is a
+        band where a sub-tolerance drift is still enough to take the active line under the SM's
+        static requirement — the line then reads BLOCKED, the car drops to TRAILING, and nothing
+        ever re-solves because the obstacle "did not move". This is the consequence trigger for
+        exactly that band: it fires on the quantity the downstream gates actually test.
+
+        Only obstacles this line CLEARED when it was built can fire it. One that was already
+        short (its hump was honestly dropped; the reactive layer owns it) would otherwise re-arm a
+        deterministic rebuild that changes nothing, every frame, forever.
+
+        Latched per key against the active line, because _mark_dirty discards the pending bundle:
+        an unlatched trigger would re-fire until the new line commits and so prevent it from ever
+        committing.
+        """
+        base = getattr(self.active, "clearance_by_key", None)
+        if not base or not obs:
+            return False
+        try:
+            _s, xa, ya = self._bundle_xy(self.active)
+        except Exception:                       # a trigger must never break the callback
+            return False
+        thr = self.clearance_dirty_m
+        drifted = False
+        for o, key in zip(obs, self._keys_for(obs, ids)):
+            was = base.get(key)
+            if was is None or was < thr or key in self._clearance_dirty_keys:
+                continue                        # never cleared by this line, or already reported
+            now = float(np.min(np.hypot(xa - o.x, ya - o.y))) - float(o.r)
+            if now >= thr:
+                continue
+            self._clearance_dirty_keys.add(key)
+            drifted = True
+            self.get_logger().warning(
+                f"[static_reopt] obstacle @({o.x:.2f},{o.y:.2f}) drifted into the active line: "
+                f"clearance {was:+.2f} -> {now:+.2f} m, under {thr:.2f} — re-optimizing before "
+                f"the state machine reads the line as blocked")
+        return drifted
 
     def _obstacles_changed(self, new: List[core.Obstacle]) -> bool:
         if len(new) != len(self._obstacles):
@@ -934,6 +1001,7 @@ class StaticReoptNode(Node):
         self._pending = None
         self._pending_dev = None
         self.active = bundle
+        self._clearance_dirty_keys.clear()       # new line -> new clearance baseline to drift from
         # tell caching consumers to re-take the new geometry, repeatedly and FAST (notify_cb)
         self._notify_scaler_ticks = self.notify_ticks
         kind = "CLEAN" if bundle is self.clean_bundle else "OBSTACLE-AWARE"

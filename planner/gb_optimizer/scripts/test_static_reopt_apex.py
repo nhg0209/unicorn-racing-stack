@@ -69,6 +69,10 @@ def make_node():
     n.clean_bundle = object()
     n._notify_scaler_ticks = 0
     n.notify_ticks = 0
+    n.obs_margin = 0.35
+    n.clearance_dirty_m = 0.30
+    n._clearance_dirty_keys = set()
+    n.active = straight_bundle()      # real node always has one (clean bundle at startup)
     # straight clean line along x with a 0.7 m corridor each side (apex plausibility check)
     n._clean_xy = np.column_stack([np.arange(0.0, 40.0, 0.1), np.zeros(400)])
     n._clean_dr = np.full(400, 0.7)
@@ -283,6 +287,32 @@ def test_clearance_floor_grows_a_short_apex():
     print("PASS a short recorded apex is grown to the floor")
 
 
+def test_clearance_drift_retriggers_once():
+    # A box that drifts 0.15 m -- under any sane obs_change_tol -- can still take the followed
+    # line under the SM's static requirement. The consequence trigger must catch that, and must
+    # fire ONCE per active line: _mark_dirty discards the pending, so an unlatched trigger would
+    # stop the very rebuild it asked for from ever committing.
+    n = make_node()
+    n.active = straight_bundle()                       # line along y=0
+    n.active.clearance_by_key = {("id", 7): 0.40}      # built with 0.40 m of edge clearance
+    n._mark_dirty = lambda: setattr(n, "_obstacles_dirty", True)
+
+    far = [core.Obstacle(5.0, 0.55, 0.15)]             # 0.55 - 0.15 = 0.40 m -> fine
+    assert n._clearance_drifted(far, [7]) is False
+
+    near = [core.Obstacle(5.0, 0.40, 0.15)]            # 0.25 m -> under the 0.30 threshold
+    assert n._clearance_drifted(near, [7]) is True, "drift into the line must re-arm the solve"
+    assert n._clearance_drifted(near, [7]) is False, "and must not re-fire on the same line"
+
+    # An obstacle this line never cleared is the reactive layer's job -- it must never re-arm a
+    # deterministic rebuild that would change nothing.
+    n2 = make_node()
+    n2.active = straight_bundle()
+    n2.active.clearance_by_key = {("id", 7): 0.12}     # hump was dropped; line was always short
+    assert n2._clearance_drifted([core.Obstacle(5.0, 0.20, 0.15)], [7]) is False
+    print("PASS clearance drift re-arms the solve exactly once per active line")
+
+
 def test_line_clearance_veto():
     # A line that does not clear an obstacle it CLAIMS to have reshaped must not be published;
     # one that misses an obstacle no hump was laid for is fine (reactive layer's job).
@@ -430,5 +460,6 @@ if __name__ == "__main__":
     test_breaker_refuses_poisoned_pending()
     test_clearance_floor_is_enforced_and_drops_honestly()
     test_clearance_floor_grows_a_short_apex()
+    test_clearance_drift_retriggers_once()
     test_line_clearance_veto()
     print("ALL PASS")

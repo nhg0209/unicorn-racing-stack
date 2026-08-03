@@ -22,7 +22,8 @@
   <arg name="opp_mode"   default="manual" description="(virtual) opponent driving mode: manual | path (pure-pursuit on the centerline at a constant speed -- deterministic, use for regression runs) | ftg (reactive from its own lidar)"/>
   <arg name="reopt"        default="false" description="Obstacle-aware global line: run static_reopt_node + static_obstacle_layer instead of the plain global_trajectory_publisher (IFAC static-obstacle re-optimization)"/>
   <arg name="reopt_safety_width" default="0.5" description="safety_width for the obstacle-aware re-optimizer (incl. car width). NB: the tight ifac centerline only solves plain mincurv_iqp at 0.25 or lower"/>
-  <arg name="reopt_obs_change_tol" default="0.25" description="min obstacle move [m] to re-trigger the re-opt QP (larger = detection jitter does not thrash it)"/>
+  <arg name="reopt_obs_change_tol" default="0.05" description="min obstacle move [m] to re-trigger the re-opt QP (larger = detection jitter does not thrash it). Bounded ABOVE by the margin chain: the line is built to reopt_obs_margin (0.35) and the SM calls it blocked below gb_ego_width_m/2 + lateral_width_static_gb_m (0.25), so a drift this tolerance ignores must not eat that 0.10 m of headroom. It was 0.25 — a box could walk 25 cm, take the followed line under the SM requirement, and never re-trigger anything. Verified by stack_master/scripts/check_avoidance_margins.py."/>
+  <arg name="reopt_clearance_dirty" default="0.30" description="[m] CONSEQUENCE rebuild trigger: re-optimize as soon as the ACTIVE line's clearance to a box it used to clear falls below this, whatever the box moved. reopt_obs_change_tol only measures the cause. Set at the SM's static requirement (0.25) + slack, i.e. rebuild before the free-check would call the line blocked. Must stay between that requirement and reopt_obs_margin."/>
   <arg name="reopt_compute_sp" default="true" description="also re-optimize the shortest_path line (ot_interpolator consumes it); false only if the OT line is unused"/>
   <arg name="reopt_method" default="local_window" description="obstacle-aware line optimizer: local_window (fast ONLINE windowed min-curv QP, ms/solve) | global (legacy whole-track mincurv_iqp, minutes/solve, offline-grade)"/>
   <arg name="reopt_reach_time" default="0.0" description="[s] DEPRECATED seed for the old speed-scaled reach; the reach is now chosen by a lap-time search over [reach_min, reach_max]. Ignored."/>
@@ -106,6 +107,7 @@
       <param name="safety_width" value="$(var reopt_safety_width)"/>
       <param name="safety_width_sp" value="$(var reopt_safety_width)"/>
       <param name="obs_change_tol" value="$(var reopt_obs_change_tol)"/>
+      <param name="clearance_dirty_m" value="$(var reopt_clearance_dirty)"/>
       <param name="compute_sp" value="$(var reopt_compute_sp)"/>
       <param name="reopt_method" value="$(var reopt_method)"/>
       <param name="reach_time" value="$(var reopt_reach_time)"/>
