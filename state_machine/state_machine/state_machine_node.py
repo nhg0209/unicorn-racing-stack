@@ -170,6 +170,9 @@ class StateMachine(Node):
         # commanded head speed tracks the car, coarse enough that a frozen path is solved once.
         self._vel_cache = {}
         self.vel_cache_quant_mps = 0.25
+        # obstacle id -> last time it was reported is_visible (STATIC obstacles only); see
+        # obstacle_perception_cb's debounce.
+        self._last_visible_t = {}
 
         self.cur_s = 0.0
         self.cur_d = 0.0
@@ -213,6 +216,7 @@ class StateMachine(Node):
         self.reframe_warn_m = self.params.reframe_warn_m
         self.squeeze_speed_cap_mps = self.params.squeeze_speed_cap_mps
         self.avoidance_ay_max = self.params.avoidance_ay_max
+        self.static_invisible_grace_sec = self.params.static_invisible_grace_sec
         # Frenet frame of the line the car is ACTUALLY following (/global_waypoints), rebuilt
         # whenever static_reopt swaps it. Incoming obstacles are re-anchored through this; see
         # _reframe_obstacles. None until the first global line arrives -> obstacles pass through.
@@ -828,12 +832,28 @@ class StateMachine(Node):
             self.obstacles_perception = data.obstacles[:]
             self.obstacles = data.obstacles
             obstacles_in_interest = []
+            now = self.now_sec()
             for obs in data.obstacles:
                 # detection-gated: ignore a remembered (currently-unseen) STATIC obstacle so state
                 # decisions track what the car actually sees, not a stored position ("knows in
                 # advance"). Dynamic obstacles are left as-is (handled via prediction + short ttl).
-                if obs.is_static and not obs.is_visible:
-                    continue
+                #
+                # DEBOUNCED. is_visible is a per-frame verdict from a lidar that a static box
+                # occludes, clips at the FOV edge, and returns few points from at range -- so it
+                # drops out for single frames while the obstacle is plainly still there. Acting on
+                # each drop emptied obstacles_in_interest for that cycle, which flipped the state
+                # (ObstacleTransition -> NonObstacleTransition) and the trailing target with it.
+                # A static obstacle cannot leave, so a brief loss of sight is a sensing artifact,
+                # not news: hold it for static_invisible_grace_sec after it was last seen. The
+                # detection gate is preserved -- an obstacle never seen, or gone for longer than
+                # the grace period, is still ignored.
+                if obs.is_static:
+                    if obs.is_visible:
+                        self._last_visible_t[obs.id] = now
+                    else:
+                        seen = self._last_visible_t.get(obs.id)
+                        if seen is None or (now - seen) > self.static_invisible_grace_sec:
+                            continue
                 gap = (obs.s_start - self.cur_s) % self.track_length
                 if gap < self.interest_horizon_m:
                     obstacles_in_interest.append((gap, obs))
@@ -842,6 +862,11 @@ class StateMachine(Node):
             # if the list is ordered (perception does not guarantee any order).
             obstacles_in_interest.sort(key=lambda g_obs: g_obs[0])
             self.obstacles_in_interest = [obs for _, obs in obstacles_in_interest]
+            # Bound the visibility memory: a track that has been out of sight for well past the
+            # grace period is gone, and its id will not come back (the tracker issues a new one).
+            if len(self._last_visible_t) > 32:
+                cutoff = now - 2.0 * self.static_invisible_grace_sec
+                self._last_visible_t = {k: t for k, t in self._last_visible_t.items() if t > cutoff}
 
     def obstacle_prediction_cb(self, data):
         if len(data.predictions) != 0:

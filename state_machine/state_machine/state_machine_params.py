@@ -41,6 +41,7 @@ class StateMachineParams:
         "reframe_warn_m",
         "squeeze_speed_cap_mps",
         "avoidance_ay_max",
+        "static_invisible_grace_sec",
         "overtaking_horizon_m",
         "getting_closer_rel_vel_mps",
         "static_ot_distance_m",
@@ -208,6 +209,22 @@ class StateMachineParams:
             ),
         )
         self.avoidance_ay_max: float = node.get_parameter("avoidance_ay_max").value
+
+        self._declare(
+            "static_invisible_grace_sec", 1.5,
+            ParameterDescriptor(
+                description="How long [s] a STATIC obstacle stays in the interest list after it "
+                            "was last reported is_visible. The flag is a per-frame lidar verdict "
+                            "that drops out on occlusion / FOV edge / sparse returns at range, "
+                            "while a static obstacle cannot actually leave -- so acting on each "
+                            "drop flipped the state and the trailing target for that cycle. 0 "
+                            "restores the undebounced behaviour.",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=10.0, step=0.1)],
+            ),
+        )
+        self.static_invisible_grace_sec: float = \
+            node.get_parameter("static_invisible_grace_sec").value
 
         self._declare(
             "overtaking_horizon_m", 6.9,

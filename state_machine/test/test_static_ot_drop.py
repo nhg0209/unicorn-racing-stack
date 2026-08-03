@@ -154,10 +154,50 @@ def test_drop_arms_a_reentry_cooldown():
     print("PASS a drop arms a short re-entry cooldown that then expires")
 
 
+def test_static_obstacle_survives_a_visibility_blip():
+    # is_visible is a per-frame lidar verdict; a static obstacle cannot leave. Dropping it on a
+    # single invisible frame emptied obstacles_in_interest and flipped the state for that cycle.
+    n = sm()
+    n.timetrials_only = False
+    n.cur_s = 0.0
+    n.track_length = 40.0
+    n.interest_horizon_m = 20.0
+    n._last_visible_t = {}
+    n.static_invisible_grace_sec = 1.5
+    n.converter = None                     # skip the frenet re-anchor; not what is under test
+    n._reframe_obstacles = lambda o: o
+
+    def box(visible):
+        return types.SimpleNamespace(id=5, is_static=True, is_visible=visible,
+                                     s_start=5.0, s_center=5.2, d_center=0.0)
+
+    n.obstacle_perception_cb(types.SimpleNamespace(obstacles=[box(True)]))
+    assert len(n.obstacles_in_interest) == 1
+    n._t += 0.05                            # one dropped frame
+    n.obstacle_perception_cb(types.SimpleNamespace(obstacles=[box(False)]))
+    assert len(n.obstacles_in_interest) == 1, "a visibility blip must not empty the interest list"
+    n._t += n.static_invisible_grace_sec + 0.1
+    n.obstacle_perception_cb(types.SimpleNamespace(obstacles=[box(False)]))
+    assert len(n.obstacles_in_interest) == 0, "...but the detection gate must still close"
+    # never seen at all -> never held
+    n2 = sm()
+    n2.timetrials_only = False
+    n2.cur_s = 0.0
+    n2.track_length = 40.0
+    n2.interest_horizon_m = 20.0
+    n2._last_visible_t = {}
+    n2.static_invisible_grace_sec = 1.5
+    n2._reframe_obstacles = lambda o: o
+    n2.obstacle_perception_cb(types.SimpleNamespace(obstacles=[box(False)]))
+    assert len(n2.obstacles_in_interest) == 0
+    print("PASS a static obstacle survives a visibility blip but not a real loss")
+
+
 if __name__ == "__main__":
     test_trailing_holds_the_avoidance_reference_while_off_the_line()
     test_reference_returns_to_the_raceline_when_appropriate()
     test_trailing_keeps_its_target_across_the_reference_switch()
     test_availability_blip_is_debounced_like_feasibility()
     test_drop_arms_a_reentry_cooldown()
+    test_static_obstacle_survives_a_visibility_blip()
     print("ALL PASS")

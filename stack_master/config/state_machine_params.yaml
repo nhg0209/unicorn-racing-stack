@@ -42,6 +42,13 @@ state_machine:
     # the raceline limit was silently undoing the planner's own intent and making the spline crawl.
     # 5.0 splits the difference. The global line is unaffected.
     avoidance_ay_max: 5.0
+    # [s] how long a STATIC obstacle stays in the interest list after it was last reported
+    # is_visible. The flag is a per-frame lidar verdict that drops out on occlusion, at the FOV
+    # edge, and on sparse returns at range -- while a static obstacle cannot actually leave. Acting
+    # on each drop emptied obstacles_in_interest for that cycle, flipping the state
+    # (ObstacleTransition -> NonObstacleTransition) and the trailing target with it. The detection
+    # gate is preserved: never-seen, or gone longer than this, is still ignored. 0 = old behaviour.
+    static_invisible_grace_sec: 1.5
     overtaking_horizon_m: 6.9
     emergency_break_horizon: 0.5
     # safety
