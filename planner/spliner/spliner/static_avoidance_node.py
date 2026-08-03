@@ -662,6 +662,18 @@ class ObstacleSpliner(Node):
     def _relax_active(self) -> bool:
         return (self.get_clock().now().nanoseconds * 1e-9) < self._relax_until
 
+    @staticmethod
+    def _line_clears_obstacle(o, need: float) -> bool:
+        """Does the FOLLOWED line (d = 0 in this node's frenet frame) pass `o` by `need`?
+
+        The keep-out interval around the box, widened by `need` on both sides, simply must not
+        contain d = 0. Shared by the raceline-CLEAR gate (which asks it at the gate's own
+        threshold, to decide whether to plan at all) and the knot loop (which asks it at
+        obs_margin, to decide whether this obstacle needs an apex).
+        """
+        return ((min(o.d_right, o.d_left) - need) > 0.0
+                or (max(o.d_right, o.d_left) + need) < 0.0)
+
     def _bulge_away_from(self, da: float, o) -> float:
         """Signed apex_bulge that pushes the peak FURTHER FROM THE OBSTACLE.
 
@@ -765,8 +777,7 @@ class ObstacleSpliner(Node):
             oid = int(o.id)
             latched = (now_s - self._clear_latch.get(oid, -1e18)) < self.clear_latch_ttl_s
             need = base if (latched and not cancelling) else base + self.clear_hyst_m
-            if ((min(o.d_right, o.d_left) - need) > 0.0
-                    or (max(o.d_right, o.d_left) + need) < 0.0):
+            if self._line_clears_obstacle(o, need):
                 self._clear_latch[oid] = now_s
             else:
                 self._clear_latch.pop(oid, None)
@@ -949,7 +960,19 @@ class ObstacleSpliner(Node):
         e_psi = float(self.converter.get_e_psi(self.cur_x, self.cur_y, self.cur_yaw))
         cur_dp = float(np.tan(np.clip(e_psi, -0.5, 0.5)))
         knots = []          # [(s_centre, obstacle, corridor_idx), ...] strictly increasing in s
+        n_already_clear = 0
         for o in obs_ahead:
+            # An obstacle the FOLLOWED line already passes at the full keep-out needs no apex: the
+            # path is welcome to stay where it is beside it. Spending a knot on one costs twice --
+            # it consumes a max_weave slot a genuinely blocking box needed, and it bends the line
+            # away from a raceline that was already correct there, which then gets recorded as this
+            # obstacle's reactive apex and walks the re-optimized line outward every lap.
+            # Deliberately tested at obs_margin, NOT at the clear gate's own (smaller) threshold:
+            # obs_ok enforces obs_margin on every obstacle whether or not it got a knot, so this is
+            # exactly the condition under which skipping the knot cannot make obs_ok reject.
+            if self._line_clears_obstacle(o, obs_margin):
+                n_already_clear += 1
+                continue
             s_c = float(np.clip((o.s_center - self.cur_s) % self.gb_max_s, 0.3, lookahead))
             if knots and s_c <= knots[-1][0] + 0.4:
                 continue                                   # too close in s to the previous apex -> merge
@@ -970,6 +993,24 @@ class ObstacleSpliner(Node):
                 + ". They are still enforced by obs_ok, so the path must clear them without being "
                   "shaped around them — raise max_weave if this keeps rejecting every candidate.",
                 throttle_duration_sec=2.0)
+        if not knots:
+            # Reachable only with the clear gate disabled -- with it on, an obstacle cleared at
+            # obs_margin is also cleared at the gate's smaller threshold, so the gate has already
+            # idled. Nothing to shape around either way.
+            self.get_logger().info(
+                f"[{self.name}] all {len(obs_ahead)} obstacle(s) ahead are already cleared by the "
+                f"followed line (>= {obs_margin:.2f} m) -> no avoidance needed",
+                throttle_duration_sec=2.0)
+            self._committed = None
+            return None if squeeze else _empty()
+        # Anchor the gap sampling on the first box we are actually shaping around, not on the
+        # nearest one in the list -- that one may have been skipped as already cleared.
+        nearest = knots[0][1]
+        self.obs_in_interest = nearest
+        if n_already_clear:
+            self.get_logger().info(
+                f"[{self.name}] {n_already_clear} obstacle(s) ahead already cleared by the line; "
+                f"knots spent on the {len(knots)} that are not", throttle_duration_sec=2.0)
         g_near = (nearest.s_center - self.cur_s) % self.gb_max_s       # forward gap to nearest obstacle
         obs_half_s = ((nearest.s_end - nearest.s_start) % self.gb_max_s) / 2.0
         s_entry0 = max(0.0, knots[0][0] - self.ramp_len)              # gentle ramp OUT starts here
