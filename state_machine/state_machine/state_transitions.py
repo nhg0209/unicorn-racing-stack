@@ -168,7 +168,16 @@ def ObstacleTransition(state_machine: "StateMachine", close_to_raceline) -> Tupl
     if state_machine._check_overtaking_mode() or state_machine._check_static_overtaking_mode():
         return StateType.OVERTAKE, StateType.OVERTAKE
 
-    # TRAILING always follows the global raceline. The recovery spline is for rejoining the line
+    # Dropping a static OVERTAKE while the car is still OUT on the avoidance hump used to snap the
+    # reference straight back to the raw raceline — which, for a static obstacle, is the line that
+    # runs INTO it. The controller steered toward the obstacle while the gap PID braked for it.
+    # Hold the avoidance geometry until the car is genuinely back near the line, so the drop is a
+    # deceleration and not a swerve toward the thing being avoided. The predicate is conservative
+    # (off the line AND still on the cached path) and side-effect free.
+    if state_machine._hold_static_avoidance_reference():
+        return StateType.TRAILING, StateType.OVERTAKE
+
+    # Otherwise TRAILING follows the global raceline. The recovery spline is for rejoining the line
     # when we are off it AND the path is free (the RECOVERY return above) — it is not a trailing
     # reference. The old `elif recovery_availability -> TRAILING, RECOVERY` branch was the common
     # case, not the exception: the callers gate close_to_raceline at recovery_exit_d_m, and while

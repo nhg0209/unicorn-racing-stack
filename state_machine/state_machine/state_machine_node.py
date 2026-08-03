@@ -307,6 +307,19 @@ class StateMachine(Node):
         # than this (single-cycle blips tolerated; riding the stale cached spline is not).
         self._static_feasible_true_t = None
         self.static_feasible_lost_sec = 0.4
+        # ...and the SYMMETRIC debounce on the other sustain term. The static branch dropped
+        # OVERTAKE on a single failed _check_availability while the feasibility term next to it
+        # tolerated 0.4 s of blips -- so the cheaper, noisier term decided the exit. Availability
+        # depends on message freshness against an executor that runs 0.3-0.5 s behind, so one late
+        # publish was enough. Same window, same reason.
+        self._static_avail_true_t = None
+        self.static_avail_lost_sec = 0.4
+        # After a static OVERTAKE drop, refuse to re-commit for this long. The drop and the
+        # re-entry gate read almost the same inputs, so without it the pair oscillates at the
+        # message rate: drop -> path still fresh -> re-enter -> drop. Short enough to stay a
+        # debounce (24 cycles at 80 Hz), not a lockout.
+        self._static_ot_cooldown_until = None
+        self.static_ot_reentry_cooldown_sec = 0.3
         # Same idea for the DYNAMIC path: last time the avoidance path read free. Entry still
         # demands free right now; only staying in OVERTAKE is debounced.
         self._ot_free_true_t = None
@@ -1410,6 +1423,16 @@ class StateMachine(Node):
         # the commit and keep TRAILING. (The old speed guard static_ot_speed_mps is gone: the
         # live config had it disabled at 10.0, and entry speed is owned by the avoidance path's
         # slow-in velocity profile, not the commit gate.)
+        # Re-entry cooldown after a drop: the drop and this gate read almost the same inputs, so
+        # without a pause the pair oscillates at the message rate (drop -> path still fresh ->
+        # re-enter -> drop), which is the OVERTAKE<->TRAILING flapping.
+        if (self._static_ot_cooldown_until is not None
+                and self.now_sec() < self._static_ot_cooldown_until):
+            self.get_logger().info(
+                f"[{self.name}] static_OT check: in re-entry cooldown for "
+                f"{self._static_ot_cooldown_until - self.now_sec():.2f} s after a drop",
+                throttle_duration_sec=0.5)
+            return False
         feas_age = (self.now_sec() - self._static_feasible_t) if self._static_feasible_t is not None else -1.0
         c_feasible = (self.static_avoidance_feasible
                       and self._static_feasible_t is not None
@@ -1438,6 +1461,30 @@ class StateMachine(Node):
         else:
             return False
 
+    def _hold_static_avoidance_reference(self) -> bool:
+        """While TRAILING off the raceline, is the last static-avoidance slice still the right
+        local reference?
+
+        ObstacleTransition returns (TRAILING, GB_TRACK), so the instant a static OVERTAKE drops the
+        reference snaps from the avoidance spline the car is physically ON back to the raw
+        raceline -- which, for a static obstacle, is the line that runs INTO it. The controller then
+        steers toward the obstacle while the gap PID brakes for it, and the resulting swerve-toward
+        is what re-triggers the whole cycle. Holding the avoidance geometry until the car is
+        genuinely back near the raceline turns the drop into a deceleration instead.
+
+        Deliberately conservative: it requires the car to still be off the line by more than
+        recovery_exit_d_m AND to still be ON the cached path. Once either fails, GB_TRACK is the
+        correct reference and the normal cache TTL expires the path.
+
+        Pure predicate -- transitions must not have side effects.
+        """
+        if abs(self.cur_d) <= self.recovery_exit_d_m:
+            return False
+        wd = self.cur_static_avoidance_wpnts
+        if not wd.is_init or wd.array is None or wd.list is None or len(wd.list) == 0:
+            return False
+        return bool(self._check_on_spline(wd))
+
     def _check_overtaking_mode_sustainability(self) -> bool:
         if self.static_overtaking_mode:
             # Stay in OVERTAKE while the (spliner-vetted) static path is still available and the
@@ -1455,9 +1502,26 @@ class StateMachine(Node):
                 self.get_logger().warn(
                     f"[{self.name}] static OVERTAKE dropped: planner reports infeasible "
                     f"for {feas_true_age:.2f} s", throttle_duration_sec=1.0)
+                self._static_ot_cooldown_until = self.now_sec() + self.static_ot_reentry_cooldown_sec
                 return False
             if self._check_availability(self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts):
+                self._static_avail_true_t = self.now_sec()
                 return True
+            # Debounce, SYMMETRIC with static_feasible_lost_sec above. Availability is a freshness
+            # test against an executor that runs 0.3-0.5 s behind, so a single late publish failed
+            # it -- and dropping OVERTAKE on that hands the car back to the raceline, which for a
+            # static obstacle is the line that runs into it. Without this the noisier of the two
+            # sustain terms decided the exit while the other tolerated 0.4 s of blips.
+            avail_age = ((self.now_sec() - self._static_avail_true_t)
+                         if self._static_avail_true_t is not None else float("inf"))
+            if avail_age <= self.static_avail_lost_sec:
+                return True
+            self.get_logger().warn(
+                f"[{self.name}] static OVERTAKE dropped: avoidance path unavailable for "
+                f"{avail_age:.2f} s (> {self.static_avail_lost_sec:.2f})",
+                throttle_duration_sec=1.0)
+            self._static_ot_cooldown_until = self.now_sec() + self.static_ot_reentry_cooldown_sec
+            return False
         else:
             if self._check_availability(self.avoidance_wpnts, self.cur_avoidance_wpnts):
                 self.get_logger().debug("AVAILABLE")
@@ -1902,6 +1966,16 @@ class StateMachine(Node):
                 closest_target = self.cur_start_wpnts.closest_target
                 local_wpnts_src = StateType.START
             return [closest_target], local_wpnts_src
+
+        if local_wpnts_src == StateType.OVERTAKE:
+            # Reached while TRAILING holds the avoidance geometry as its reference (see
+            # _hold_static_avoidance_reference). The SOURCE changed; the target did not -- the car
+            # is still keeping a gap to the same obstacle. Without this the branch fell through to
+            # `return []` and TRAILING lost its target the moment the reference switched, i.e. the
+            # gap PID had nothing to brake for on the exact path where it must.
+            for wd in (self.cur_static_avoidance_wpnts, self.cur_gb_wpnts):
+                if wd.closest_target is not None:
+                    return [wd.closest_target], local_wpnts_src
 
         return [], local_wpnts_src
 
