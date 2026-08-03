@@ -110,10 +110,21 @@ static_avoidance_planner:
     a_long_accel: 3.0       # [m/s^2] longitudinal ACCEL; forward pass ramps speed up GRADUALLY out of the
                             #         apex (fast-out). lower = gentler/longer exit acceleration.
     use_grid_check: true    # reject candidates crossing the eroded /map (GridFilter)
-    kernel_size: 3          # [cells] GridFilter erosion (8 ate ~0.2 m and rejected the raceline on ifac).
-                            #      With trust_grid_bounds this ALSO sets the wall clearance used for
-                            #      feasibility (3 cells @0.05 m = 0.15 m ~= half car, matching the
-                            #      half_car clearance the waypoint-corridor test used).
+    kernel_size: 3          # [cells] GridFilter erosion KERNEL size (8 ate ~0.2 m and rejected the
+                            #      raceline on ifac). NB: the kernel size is not the erosion DEPTH.
+                            #      cv2.erode with a k x k rect kernel eats floor(k/2) cells, so at the
+                            #      maps' 0.05 m/cell a kernel of 3 reserves 0.05 m, not 0.15 m -- the
+                            #      old note here read "3 cells @0.05 m = 0.15 m ~= half car" and the
+                            #      8 -> ~0.2 m figure beside it already contradicted that (8 -> 4
+                            #      cells -> 0.2 m). It matters because _grid_corridor takes only
+                            #      wall_margin off the measured free extent, on the stated grounds
+                            #      that "the erosion already reserves the clearance a car-centre
+                            #      point needs": it reserves 0.05 m, a third of half a car. With
+                            #      trust_grid_bounds the real car-centre wall reserve is therefore
+                            #      erosion + wall_margin = 0.05 + 0.10 = 0.15 m = exactly half the
+                            #      car and nothing more, against 0.25 m (half_car + wall_margin) on
+                            #      the waypoint-corridor path. Corrected as a comment only -- raising
+                            #      the kernel changes feasibility and is a tuning decision.
 
     # --- corridor source: measure the drivable width from the MAP, not from the waypoints ---
     # d_left/d_right come from gb_optimizer, which labels the two track contours left/right with ONE

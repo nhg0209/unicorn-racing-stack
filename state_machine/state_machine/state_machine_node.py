@@ -223,7 +223,6 @@ class StateMachine(Node):
         self.converter = None
         self._converter_xy = None
         self.getting_closer_rel_vel_mps = self.params.getting_closer_rel_vel_mps
-        self.static_ot_distance_m = self.params.static_ot_distance_m
 
         self.last_recovery_update_time = None
         self.cur_gb_wpnts = WaypointData(self, "global_tracking", True)

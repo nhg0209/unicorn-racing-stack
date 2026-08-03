@@ -44,7 +44,6 @@ class StateMachineParams:
         "static_invisible_grace_sec",
         "overtaking_horizon_m",
         "getting_closer_rel_vel_mps",
-        "static_ot_distance_m",
         "min_dwell_sec",
         "ot_free_lost_sec",
         "free_check_predict_dynamic",
@@ -355,18 +354,6 @@ class StateMachineParams:
             ),
         )
         self.getting_closer_rel_vel_mps: float = node.get_parameter("getting_closer_rel_vel_mps").value
-
-        self._declare(
-            "static_ot_distance_m", 12.0,
-            ParameterDescriptor(
-                description="Forward gap [m] within which a static obstacle triggers the "
-                            "TRAILING->OVERTAKE commit (getting_closer window for static avoidance). "
-                            "Larger = commit earlier / avoid slow-trailing a stationary obstacle.",
-                type=ParameterType.PARAMETER_DOUBLE,
-                floating_point_range=[FloatingPointRange(from_value=1.0, to_value=25.0, step=0.5)],
-            ),
-        )
-        self.static_ot_distance_m: float = node.get_parameter("static_ot_distance_m").value
 
         self._declare(
             "min_dwell_sec", 0.2,

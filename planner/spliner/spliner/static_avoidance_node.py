@@ -110,7 +110,10 @@ class ObstacleSpliner(Node):
         self._emit_markers = True    # build+publish candidate markers only on decimated cycles
 
         # --- sampling-planner param defaults (all overridable via ROS params / config yaml) ---
-        self.kernel_size = 3         # GridFilter erosion (cells); 8 ate ~0.2 m and rejected the raceline
+        self.kernel_size = 3         # GridFilter erosion KERNEL (cells), NOT the erosion depth:
+                                     # cv2.erode eats floor(k/2) cells, so 3 reserves ONE cell
+                                     # (0.05 m at the maps' resolution). 8 ate ~0.2 m and rejected
+                                     # the raceline. See _grid_corridor.
         self.lookahead_min = 8.0     # [m]
         self.lookahead_k = 1.5       # [s]  lookahead = max(lookahead_min, k * cur_vs)
         self.n_d_samples = 13        # terminal offsets sampled across the width
@@ -1436,8 +1439,15 @@ class ObstacleSpliner(Node):
         eroded occupancy grid rather than read from the waypoints' d_left/d_right.
 
         Only the CONTIGUOUS free run containing the raceline is kept, so free space that belongs to
-        another part of the track further out cannot widen the corridor. The erosion already reserves
-        the clearance a car-centre point needs, so only wall_margin is taken off on top of it.
+        another part of the track further out cannot widen the corridor. Only wall_margin is taken
+        off on top of the measured extent, because the erosion already reserves some of what a
+        car-centre point needs -- but note HOW MUCH: cv2.erode with a kernel_size x kernel_size
+        rect kernel eats floor(kernel_size/2) cells, so the shipped kernel of 3 reserves ONE cell,
+        0.05 m at the maps' resolution, not the ~half car an older comment claimed. The effective
+        car-centre wall reserve on this path is therefore 0.05 + wall_margin = 0.15 m, i.e. exactly
+        half the car with nothing to spare, against half_car + wall_margin = 0.25 m on the
+        waypoint-corridor path. Raise kernel_size (or wall_margin) if the car runs too close to
+        walls with trust_grid_bounds on.
         Returns None when no map is loaded (callers fall back to the waypoint bounds).
         """
         if self.gb_max_s is None or getattr(self, "converter", None) is None:
