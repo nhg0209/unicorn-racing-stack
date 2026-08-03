@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import math
 import time
 from typing import List, Optional, Tuple
 
@@ -661,6 +662,28 @@ class ObstacleSpliner(Node):
     def _relax_active(self) -> bool:
         return (self.get_clock().now().nanoseconds * 1e-9) < self._relax_until
 
+    def _bulge_away_from(self, da: float, o) -> float:
+        """Signed apex_bulge that pushes the peak FURTHER FROM THE OBSTACLE.
+
+        It used to be `sign(da) * apex_bulge` -- further from d = 0, which is only the same thing
+        while the obstacle straddles the raceline. It does not while the obstacle sits to one side
+        of the line, and that is the normal case on a swapped static_reopt line, where the followed
+        line is itself displaced and every box reads off-centre in d.
+
+        Concretely: a box at d_center = +0.50 passed on the RIGHT gives da = +0.05 (its keep-out
+        edge). sign(da) is positive, so the bulge moved the peak to +0.15 -- 0.10 m TOWARD the
+        obstacle and inside the keep-out obs_ok then tests it against. The candidate is rejected,
+        and since the bulge is applied to every candidate, so is every other one: feasible=False on
+        geometry that was fine before the bulge was added to it.
+
+        Degenerate case (the apex sits exactly on the obstacle's centreline) keeps the old sign;
+        there is no "away" to pick and obs_ok will reject it either way.
+        """
+        d_c = float(getattr(o, "d_center", 0.0))
+        if abs(da - d_c) < 1e-6:
+            return float(np.sign(da)) * self.apex_bulge
+        return math.copysign(self.apex_bulge, da - d_c)
+
     def _anchor_car_idx(self, s_idx: int, gb_wpnts, wpnt_dist: float, search_m: float = 3.0) -> int:
         """Re-anchor the s-derived grid start to the station NEAREST THE CAR.
 
@@ -1084,7 +1107,7 @@ class ObstacleSpliner(Node):
                 bp_s = [s_entry0]
                 bp_d = [[d_start, dp0, 0.0]]
                 for (s_c, _o, _cor), da in zip(knots, d_apex):
-                    d_peak = da + float(np.sign(da)) * self.apex_bulge
+                    d_peak = da + self._bulge_away_from(da, _o)
                     bp_s.append(s_c)
                     bp_d.append([d_peak, 0.0, 0.0])
                 bp_s.append(s_exit_end)
