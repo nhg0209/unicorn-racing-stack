@@ -9,12 +9,19 @@ same topics the rest of the stack already consumes. gb_optimizer itself is untou
 its library functions are imported (see static_reopt_core, memory: project-ifac-static-reopt).
 
 HARD GUARANTEE — it must NEVER stop publishing a valid raceline:
-  * re-optimization runs in a BACKGROUND thread, so the republish timer never blocks;
   * ANY re-opt failure (infeasible QP, exception) is swallowed — the node keeps the last
     valid bundle (obstacle-aware if one was ever built for the current obstacles, else clean);
-  * the timer only ever publishes a fully-built bundle held under a lock.
+  * `active` is only ever rebound to a fully-built bundle.
 So even a track-blocking obstacle degrades to "publish the previous good line" (the reactive
 planner then handles what the global line cannot) — it never emits nothing or a broken line.
+
+THREADING — the solve is SYNCHRONOUS on the single-threaded rclpy executor, inside frenet_cb.
+This header used to claim a background thread and a lock, and neither has ever existed (see the
+state block in __init__): the `local_window` solve is ~10 ms with BLAS pinned to one thread, which
+is why running it inline is acceptable, and the absence of concurrency is precisely why no lock is
+needed. The claim mattered because it read as a latency guarantee the code does not provide — a
+slow solve DOES block the executor, and the legacy `reopt_method: "global"` path (minutes per
+solve) must therefore never be used online.
 
 Obstacle input (phase 1, before the perception static-layer exists): a MarkerArray on
 `/static_reopt/obstacles`; each marker -> Obstacle(x, y, r=max(scale.x,scale.y)/2 or the
