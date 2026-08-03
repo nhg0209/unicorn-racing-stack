@@ -661,6 +661,28 @@ class ObstacleSpliner(Node):
     def _relax_active(self) -> bool:
         return (self.get_clock().now().nanoseconds * 1e-9) < self._relax_until
 
+    def _anchor_car_idx(self, s_idx: int, gb_wpnts, wpnt_dist: float, search_m: float = 3.0) -> int:
+        """Re-anchor the s-derived grid start to the station NEAREST THE CAR.
+
+        Same idiom, and the same reason, as the state machine's anchor_gb_index. cur_s comes from
+        the frenet republisher on /global_waypoints, while this grid is indexed into
+        /global_waypoints_scaled, which sector_tuner only re-publishes on its 0.5 s timer. After a
+        static_reopt line swap the two disagree for up to that long: `cur_s / wpnt_dist` then names
+        the right NUMBER on the wrong parameterisation, and the whole planned grid -- entry ramp,
+        apex station, corridor lookups -- slides along the track away from the car.
+
+        Bounded to +-search_m for the same reason as there: a free nearest-point search over the
+        closed loop snaps to the wrong branch wherever the raceline runs close to itself.
+        """
+        if self.cur_x is None or self.cur_y is None or not gb_wpnts:
+            return s_idx
+        n = self.gb_max_idx
+        k = max(1, int(search_m / max(wpnt_dist, 1e-3)))
+        idx = (s_idx + np.arange(-k, k + 1)) % n
+        dx = np.fromiter((gb_wpnts[j].x_m - self.cur_x for j in idx), float, len(idx))
+        dy = np.fromiter((gb_wpnts[j].y_m - self.cur_y for j in idx), float, len(idx))
+        return int(idx[int(np.argmin(dx * dx + dy * dy))])
+
     def _squeeze_schedule(self):
         """(safety_margin, wall_margin) pairs to retry an all-rejected plan with, widest first.
 
@@ -918,7 +940,8 @@ class ObstacleSpliner(Node):
         span = min(s_exit_end + self.tail_m, self.gb_max_s * 0.9)
 
         # --- s-grid for the path ---
-        car_idx = int(self.cur_s / wpnt_dist) % self.gb_max_idx
+        car_idx = self._anchor_car_idx(int(self.cur_s / wpnt_dist) % self.gb_max_idx,
+                                       gb_wpnts, wpnt_dist)
         grid_start_s = gb_wpnts[car_idx].s_m
         n = max(int(span / wpnt_dist), 5)
         idxs = (car_idx + np.arange(n)) % self.gb_max_idx
