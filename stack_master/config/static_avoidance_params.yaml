@@ -91,7 +91,13 @@ static_avoidance_planner:
     apex_bulge: 0.10        # [m] extra offset at the box CENTRE beyond the clearance value: the path peaks
                             #      here (widest, furthest from the obstacle). higher = swing WIDER around the
                             #      obstacle; 0 = flat hold. Limited by corridor (bulge past the wall -> reject).
-    max_weave: 2            # max obstacles woven into ONE path (slalom). At 1 a close pair broke:
+    # 2 -> 3. The node already supported 3; the yaml was the binding limit, and it does not merely
+    # cost coverage of the third box -- it makes the whole plan infeasible. The feasibility filter
+    # (obs_ok) tests EVERY obstacle inside the 15 m lookahead, while only max_weave of them get a
+    # knot. A third box therefore contributes a keep-out that nothing shapes the path around, and
+    # the return ramp after the second apex runs straight through it, so every candidate is
+    # rejected -> feasible=False -> TRAILING. The IFAC format is 3 boxes.
+    max_weave: 3            # max obstacles woven into ONE path (slalom). At 1 a close pair broke:
                             #       every single-apex candidate around obstacle A ran through B and
                             #       was rejected by the box check -> NO feasible path (TRAILING) and
                             #       B's apex was never captured, so the re-opt only ever knew A.

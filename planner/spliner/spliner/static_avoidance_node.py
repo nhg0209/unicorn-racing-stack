@@ -933,6 +933,20 @@ class ObstacleSpliner(Node):
             knots.append((s_c, o, int(o.s_center / wpnt_dist) % self.gb_max_idx))
             if len(knots) >= self.max_weave:
                 break
+        # An obstacle inside the lookahead that did NOT get a knot is not merely uncovered -- it
+        # still contributes its keep-out to obs_ok, so the path is shaped around max_weave boxes and
+        # then judged against all of them. The return ramp after the last apex runs straight through
+        # whatever was left out, and every candidate is rejected. Name them: this is otherwise
+        # indistinguishable from a genuinely impassable section in the all-rejected diagnostic.
+        if len(obs_ahead) > len(knots):
+            missed = [o for o in obs_ahead if all(o is not ko for (_s, ko, _c) in knots)]
+            self.get_logger().warn(
+                f"[{self.name}] {len(missed)} of {len(obs_ahead)} obstacle(s) ahead got NO knot "
+                f"(max_weave={self.max_weave}): "
+                + "; ".join(f"id={o.id} s={o.s_center:.1f} d={o.d_center:+.2f}" for o in missed)
+                + ". They are still enforced by obs_ok, so the path must clear them without being "
+                  "shaped around them — raise max_weave if this keeps rejecting every candidate.",
+                throttle_duration_sec=2.0)
         g_near = (nearest.s_center - self.cur_s) % self.gb_max_s       # forward gap to nearest obstacle
         obs_half_s = ((nearest.s_end - nearest.s_start) % self.gb_max_s) / 2.0
         s_entry0 = max(0.0, knots[0][0] - self.ramp_len)              # gentle ramp OUT starts here
