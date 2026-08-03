@@ -25,6 +25,11 @@ state_machine:
     recovery_entry_d_m: 0.4
     gb_horizon_m: 15.0
     interest_horizon_m: 20.0
+    # [m] warn when an incoming obstacle's (s,d) has to be re-anchored into this node's frenet
+    # frame by more than this. Non-zero means upstream tracking did not re-project on a
+    # static_reopt line swap, and the free-check would have judged the swapped line against
+    # lateral offsets measured on the OLD one.
+    reframe_warn_m: 0.05
     overtaking_horizon_m: 6.9
     emergency_break_horizon: 0.5
     # safety

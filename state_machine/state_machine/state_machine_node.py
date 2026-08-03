@@ -41,6 +41,8 @@ from f110_msgs.msg import (
 
 import trajectory_planning_helpers as tph
 
+from frenet_conversion.frenet_converter import FrenetConverter
+
 from vel_planner.vel_planner import calc_vel_profile
 from state_machine.states_types import StateType
 from state_machine import states
@@ -198,6 +200,12 @@ class StateMachine(Node):
         self.lateral_width_static_gb_m = self.params.lateral_width_static_gb_m
         self.gb_horizon_m = self.params.gb_horizon_m
         self.interest_horizon_m = self.params.interest_horizon_m
+        self.reframe_warn_m = self.params.reframe_warn_m
+        # Frenet frame of the line the car is ACTUALLY following (/global_waypoints), rebuilt
+        # whenever static_reopt swaps it. Incoming obstacles are re-anchored through this; see
+        # _reframe_obstacles. None until the first global line arrives -> obstacles pass through.
+        self.converter = None
+        self._converter_xy = None
         self.getting_closer_rel_vel_mps = self.params.getting_closer_rel_vel_mps
         self.static_ot_distance_m = self.params.static_ot_distance_m
 
@@ -693,6 +701,77 @@ class StateMachine(Node):
     def glb_wpnts_og_cb(self, data):
         if self.max_speed == -1:
             self.max_speed = max([wpnt.vx_mps for wpnt in data.wpnts])
+        # /global_waypoints -- NOT the scaled copy this node's geometry comes from -- is the line
+        # the frenet republisher parameterises cur_s/cur_d on and the line static_reopt swaps. It
+        # is therefore the frame in which "d = 0" means "on the line the car is following", which
+        # is exactly what the free-check assumes when it compares an obstacle's d against the
+        # raceline. Rebuild the converter on an ACTUAL geometry change only (no per-message churn:
+        # the topic is republished on a keep-alive timer).
+        try:
+            xy = np.array([[w.x_m, w.y_m] for w in data.wpnts], dtype=float)
+            if (self._converter_xy is not None and xy.shape == self._converter_xy.shape
+                    and np.allclose(xy, self._converter_xy)):
+                return
+            psi = np.array([w.psi_rad for w in data.wpnts], dtype=float)
+            self.converter = FrenetConverter(xy[:, 0], xy[:, 1], psi)
+            self._converter_xy = xy
+            self.get_logger().info(f"[{self.name}] (re)built FrenetConverter on /global_waypoints "
+                                   f"({len(data.wpnts)} pts)")
+        except Exception as e:  # noqa: BLE001 -- never let this kill the SM's obstacle input
+            self.get_logger().warn(f"[{self.name}] FrenetConverter rebuild failed: {e}")
+
+    def _reframe_obstacles(self, obstacles):
+        """Re-express each obstacle's (s,d) in THIS node's frenet frame, from its map (x_m,y_m).
+
+        Same fix as fa0b974 made in static_avoidance_node, applied to the consumer that decides
+        whether the car goes TRAILING. The free-check's static branch reduces to
+
+            |ot_d - obs.d_center| - obs.size/2 - gb_ego_width_m/2  >=  required margin
+
+        with ot_d = 0 on the global line, so obs.d_center is asked to be the obstacle's lateral
+        offset from the line the car is following RIGHT NOW. What arrives is whatever (s,d) the
+        tracker computed in ITS copy of the line. Before the first static_reopt swap the two agree;
+        after one they do not, and the SM then judges the swapped line using offsets measured on
+        the line it replaced -- reading an obstacle the new line drives 0.5 m around as sitting on
+        it (phantom TRAILING), or an obstacle it passes close to as cleared.
+
+        x_m,y_m is frame-independent, so re-projecting from it is correct by construction whatever
+        upstream did. Box extents are carried as offsets from the centre rather than rebuilt from
+        `size`, so the footprint every downstream check sees is unchanged.
+
+        NOT covered: /opponent_prediction/obstacles_pred carries its own pred_s/pred_d, produced by
+        the predictor in its own frame. That is the DYNAMIC branch of the free-check and needs the
+        predictor to re-project; it is not something this node can fix from x_m,y_m.
+        """
+        conv = self.converter
+        if conv is None or not obstacles:
+            return obstacles
+        worst = 0.0
+        for o in obstacles:
+            if o.x_m == 0.0 and o.y_m == 0.0:
+                continue                       # no map position to re-anchor from
+            try:
+                fr = conv.get_frenet(np.array([o.x_m]), np.array([o.y_m]))
+                s_new, d_new = float(fr[0, 0]), float(fr[1, 0])
+            except Exception:
+                continue
+            half = max(o.size, 0.05) * 0.5
+            ds_b = (o.s_center - o.s_start) if o.s_end != o.s_start else half
+            ds_f = (o.s_end - o.s_center) if o.s_end != o.s_start else half
+            dd_r = (o.d_center - o.d_right) if o.d_left != o.d_right else half
+            dd_l = (o.d_left - o.d_center) if o.d_left != o.d_right else half
+            worst = max(worst, abs(d_new - o.d_center))
+            o.s_center, o.d_center = s_new, d_new
+            o.s_start, o.s_end = s_new - ds_b, s_new + ds_f
+            o.d_right, o.d_left = d_new - dd_r, d_new + dd_l
+        if worst > self.reframe_warn_m:
+            self.get_logger().warning(
+                f"[{self.name}] obstacle (s,d) arrived up to {worst:.2f} m off this node's frenet "
+                f"frame and was re-anchored from (x_m,y_m). Upstream tracking is not re-projecting "
+                f"on a static_reopt line swap — the free-check would have judged the swapped line "
+                f"against offsets measured on the old one.",
+                throttle_duration_sec=5.0)
+        return obstacles
 
     def graphbased_wpts_cb(self, data):
         arr = np.asarray(data.data)
@@ -701,6 +780,10 @@ class StateMachine(Node):
 
     def obstacle_perception_cb(self, data):
         if not self.timetrials_only:
+            # Re-anchor FIRST: every (s,d) read below -- the interest-window gap, the free-check's
+            # d_center, the trailing target -- has to be in the frame of the line the car is
+            # following, not the one the tracker happened to hold.
+            data.obstacles = self._reframe_obstacles(data.obstacles)
             self.obstacles_perception = data.obstacles[:]
             self.obstacles = data.obstacles
             obstacles_in_interest = []

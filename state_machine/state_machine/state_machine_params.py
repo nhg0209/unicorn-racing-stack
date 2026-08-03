@@ -38,6 +38,7 @@ class StateMachineParams:
         "recovery_entry_d_m",
         "gb_horizon_m",
         "interest_horizon_m",
+        "reframe_warn_m",
         "overtaking_horizon_m",
         "getting_closer_rel_vel_mps",
         "static_ot_distance_m",
@@ -165,6 +166,18 @@ class StateMachineParams:
             ),
         )
         self.interest_horizon_m: float = node.get_parameter("interest_horizon_m").value
+
+        self._declare(
+            "reframe_warn_m", 0.05,
+            ParameterDescriptor(
+                description="Warn when an incoming obstacle's (s,d) has to be re-anchored into "
+                            "this node's frenet frame by more than this [m]. A large value means "
+                            "upstream tracking is not re-projecting on a static_reopt line swap.",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=1.0, step=0.01)],
+            ),
+        )
+        self.reframe_warn_m: float = node.get_parameter("reframe_warn_m").value
 
         self._declare(
             "overtaking_horizon_m", 6.9,
