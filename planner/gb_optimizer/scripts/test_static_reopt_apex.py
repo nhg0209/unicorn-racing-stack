@@ -270,21 +270,43 @@ def test_clearance_floor_is_enforced_and_drops_honestly():
     print("PASS clearance floor accepts what clears and drops what cannot")
 
 
-def test_clearance_floor_grows_a_short_apex():
-    # The recorded apex is a LOWER bound on what the obstacle needs. A reactive apex driven at
-    # 0.30 m of edge clearance is 5 cm short of the floor -- the retry must ask the corridor for
-    # the missing amplitude instead of dropping the obstacle.
+def test_amplitude_comes_from_the_obstacle_not_the_apex():
+    # The hump is sized by the BOX (d_obs + side*(r + obs_margin)), not by replaying the reactive
+    # apex -- replaying it makes the global line a copy of the local one, with the same lap-time
+    # cost and no reason to swap. Two very different recorded apexes on the same side of the same
+    # obstacle must therefore produce the SAME line.
     xy, s, L, nvec = _straight_frame()
     obs = (20.0, 0.0, 0.15)
-    apex = [(20.0, -0.45)]                        # 0.45 - 0.15 = 0.30 m of edge clearance
     roomy = np.full(len(xy), 1.0)
+
+    def solve(apex_d):
+        return core.build_offset_profile(
+            xy, s, L, nvec, [(20.0, apex_d)], None, 0.0, 3.0, 3.0,
+            hi_inc=roomy, lo_inc=-roomy, obstacles=[obs], obs_margin=0.35)
+
+    _d, n_a, _e, drop_a, laid_a = solve(-0.45)     # reactive drove 0.30 m off the box edge
+    _d, n_b, _e, drop_b, laid_b = solve(-0.75)     # ...or a very wide 0.60 m
+    assert n_a == 1 and n_b == 1 and not drop_a and not drop_b, (drop_a, drop_b)
+    assert abs(laid_a[0]["laid"] - laid_b[0]["laid"]) < 1e-6, \
+        "the recorded apex must not set the amplitude"
+    # ...and that amplitude is the obstacle's requirement, tighter than the reactive 0.55 m
+    assert abs(laid_a[0]["want"] - 0.50) < 1e-6, laid_a[0]["want"]
+    assert laid_a[0]["clear"] >= 0.35 - 1e-9
+    assert abs(laid_a[0]["laid"]) < 0.55, "the global line must be tighter than the reactive one"
+    print(f"PASS amplitude is obstacle-derived ({laid_a[0]['laid']:+.3f} m for both apexes)")
+
+
+def test_raceline_already_clear_lays_nothing():
+    # d_need is a CONSTRAINT, not a set-point: an obstacle the raceline already stands off by
+    # r + obs_margin needs no hump, however far the reactive layer happened to swing around it.
+    xy, s, L, nvec = _straight_frame()
+    obs = (20.0, 0.9, 0.15)                        # 0.9 m to the -d side; raceline clears by 0.75
+    roomy = np.full(len(xy), 1.5)
     _d, n, _e, dropped, laid = core.build_offset_profile(
-        xy, s, L, nvec, apex, None, 0.0, 3.0, 3.0,
+        xy, s, L, nvec, [(20.0, -0.4)], None, 0.0, 3.0, 3.0,
         hi_inc=roomy, lo_inc=-roomy, obstacles=[obs], obs_margin=0.35)
-    assert n == 1 and not dropped, f"short apex must be grown, not dropped ({dropped})"
-    assert laid[0]["clear"] >= 0.35 - 1e-9
-    assert abs(laid[0]["laid"]) > abs(laid[0]["want"]), "the retry must widen the hump"
-    print("PASS a short recorded apex is grown to the floor")
+    assert n == 0 and not laid and not dropped, (n, laid, dropped)
+    print("PASS an obstacle the raceline already clears gets no hump")
 
 
 def test_clearance_drift_retriggers_once():
@@ -459,7 +481,8 @@ if __name__ == "__main__":
     test_deadlock_breaker()
     test_breaker_refuses_poisoned_pending()
     test_clearance_floor_is_enforced_and_drops_honestly()
-    test_clearance_floor_grows_a_short_apex()
+    test_amplitude_comes_from_the_obstacle_not_the_apex()
+    test_raceline_already_clear_lays_nothing()
     test_clearance_drift_retriggers_once()
     test_line_clearance_veto()
     print("ALL PASS")

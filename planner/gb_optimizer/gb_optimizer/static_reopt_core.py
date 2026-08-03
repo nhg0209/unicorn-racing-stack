@@ -684,18 +684,23 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
     steer is never the answer (nothing checked this before: `curvlim` was respected only by the
     offline IQP).
 
+    AMPLITUDE. With `obstacles` the target offset is derived from the BOX (d_obs + side*(r +
+    obs_margin)), not replayed from the recorded apex — see the knot loop. The apex only chooses
+    the side and stands as evidence that the side is drivable.
+
     ACCEPTANCE FLOOR. With `obstacles` (map-frame (x, y, r) index-aligned with `apexes`, entries
     may be None) and `obs_margin > 0`, a hump is accepted only when the geometry it would lay
     passes the obstacle's EDGE by at least `obs_margin` — the same hypot scan the node reports on
     the published line, so what is enforced here is exactly what is measured there. A short hump is
     retried ONCE at the amplitude that would reach the floor (re-fitted to the corridor, allowed to
-    keep the wider reach), and dropped with reason "clearance" if the corridor cannot hold it. This
-    replaces judging the hump by amplitude RATIO (>= _APEX_KEEP_FRAC of the recorded apex), which
-    is a proxy for clearance and a loose one: 0.90 of a 0.55 m apex leaves 0.345 m off a 0.15 m box
-    where the SM and the reactive planner both expect the line to be built to obs_margin, and the
-    error compounds because the recorded apex is a lateral offset while the clearance that matters
-    is a 2-D distance on a curving line. Without obstacle geometry (offline sweeps) the ratio test
-    remains the only available proxy and is still used.
+    keep the wider reach), and dropped with reason "clearance" if the corridor cannot hold it. The
+    target amplitude above is the LATERAL offset that would clear the box; the floor is a 2-D
+    distance on a curving line, so the two differ slightly and the retry is the normal path, not an
+    exception. This replaces judging the hump by amplitude RATIO (>= _APEX_KEEP_FRAC of the
+    recorded apex), which is a proxy for clearance and a loose one: 0.90 of a 0.55 m apex leaves
+    0.345 m off a 0.15 m box where the SM and the reactive planner both expect the line to be built
+    to obs_margin. Without obstacle geometry (offline sweeps) the ratio test remains the only
+    available proxy and is still used.
 
     Returns (d_global[N], n_apex_used, entry_kappa, dropped, laid).
     `dropped` lists the apexes that could not be laid at the acceptance floor (all-or-nothing; each
@@ -716,19 +721,43 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         return d_global, 0, 0.0, [], []
 
     # --- project apexes -> (s*, d*, R_in, R_out, xy, obs); drop negligible offsets ------------
-    # `obs` (map-frame x, y, r or None) rides along so the acceptance floor below can measure the
-    # clearance of the geometry each hump would lay against the box it exists to clear.
+    # `obs` (map-frame x, y, r or None) rides along so the amplitude and the acceptance floor
+    # below can both be derived from the box the hump exists to clear.
     knots = []
     for k_i, (xa, ya) in enumerate(apexes):
         i = int(np.argmin(np.hypot(clean_xy[:, 0] - xa, clean_xy[:, 1] - ya)))
         d_star = float((np.array([xa, ya], float) - clean_xy[i]) @ nvec_rl[i])
         if abs(d_star) < 0.03:
             continue                                    # apex on the raceline -> no avoidance
+        ob = obstacles[k_i] if (obstacles is not None and k_i < len(obstacles)) else None
+        # AMPLITUDE FROM THE OBSTACLE, not from the recorded apex. The apex is what the REACTIVE
+        # planner drove: keep-out (width_car/2 + safety_margin) + apex_bulge, i.e. its own design
+        # clearance plus a deliberate extra swing. Replaying it makes the global line a copy of the
+        # local one -- same offset, same lap-time cost, no reason to swap. What the global line
+        # actually owes the obstacle is r + obs_margin from its centre, which on the shipped
+        # numbers is 0.50 m against the reactive 0.55 m: a genuinely tighter line, and the whole
+        # point of re-optimizing at all.
+        #
+        # The recorded apex keeps two jobs it is uniquely good at: it says which SIDE the obstacle
+        # was passed on (a decision that needs the corridor and the grid, which this function does
+        # not have), and it is standing evidence that a path on that side is drivable.
+        d_target = d_star
+        if ob is not None and obs_margin > 0.0:
+            j = int(np.argmin(np.hypot(clean_xy[:, 0] - ob[0], clean_xy[:, 1] - ob[1])))
+            d_obs = float((np.array([ob[0], ob[1]], float) - clean_xy[j]) @ nvec_rl[j])
+            side = 1.0 if d_star >= d_obs else -1.0     # the side the reactive layer proved
+            need = float(ob[2]) + float(obs_margin)
+            # It is a CONSTRAINT, not a set-point: if the raceline already stands off the box by
+            # `need` on that side there is nothing to lay, however far the reactive path swung.
+            if side * (0.0 - d_obs) >= need - 1e-9:
+                continue
+            d_target = d_obs + side * need
+            if abs(d_target) < 0.03:
+                continue
         v = float(clean_vx[i]) if clean_vx is not None else 3.0
         R = float(np.clip(reach_time * v, reach_min, reach_max))
         R = min(R, 0.45 * track_len)                    # never span more than ~half the loop
-        ob = obstacles[k_i] if (obstacles is not None and k_i < len(obstacles)) else None
-        knots.append((float(s_loop[i]), d_star, R, R, xa, ya, ob))  # symmetric ramps
+        knots.append((float(s_loop[i]), d_target, R, R, xa, ya, ob))  # symmetric ramps
     if not knots:
         return d_global, 0, 0.0, [], []
 
