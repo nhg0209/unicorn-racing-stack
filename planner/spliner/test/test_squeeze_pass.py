@@ -31,9 +31,27 @@ exec(compile(src, str(MOD), "exec"), san.__dict__)
 ObstacleSpliner = san.ObstacleSpliner
 
 
+class _Clock:
+    def __init__(self): self.t = 100.0
+    def now(self): return types.SimpleNamespace(nanoseconds=int(self.t * 1e9))
+
+
+class _Log:
+    def info(self, *a, **k): pass
+    def warning(self, *a, **k): pass
+    warn = warning
+
+
 def node(cur_vs=0.0, safety=0.15, wall=0.10, enable=True, steps=2,
          s_floor=0.05, w_floor=0.05, v_max=3.0):
     n = ObstacleSpliner.__new__(ObstacleSpliner)
+    n.name = "static_avoidance_planner"
+    n._clock = _Clock()
+    n.get_clock = lambda: n._clock
+    n.get_logger = lambda: _Log()
+    n.relax_hold_s = 2.0
+    n._relax_until = 0.0
+    n._committed = None
     n.cur_vs = cur_vs
     n.safety_margin = safety
     n.wall_margin = wall
@@ -71,6 +89,28 @@ def test_schedule_disabled_and_already_at_floor():
     print("PASS schedule is empty when disabled or already at/below the floor")
 
 
+def test_relax_overrides_the_gates_but_not_the_floors():
+    # The SM only sends /planner/avoidance/relax once the car is STOPPED behind an obstacle this
+    # planner reported infeasible. That is a stronger statement than either gate approximates, so
+    # it overrides both -- and the floors are still the floors.
+    n = node(cur_vs=6.0, enable=False)
+    assert n._squeeze_schedule() == [], "gates hold without a request"
+    n.relax_cb(types.SimpleNamespace(data=True))
+    assert n._committed is None
+    sched = n._squeeze_schedule()
+    assert sched, "a relax request must force the pass past both gates"
+    assert abs(sched[-1][0] - 0.05) < 1e-9 and abs(sched[-1][1] - 0.05) < 1e-9, \
+        "...but never past the floors"
+    # and it expires
+    n._clock.t += n.relax_hold_s + 0.1
+    assert n._squeeze_schedule() == [], "the override must expire with relax_hold_s"
+    # a False message is not a request
+    n2 = node(cur_vs=6.0, enable=False)
+    n2.relax_cb(types.SimpleNamespace(data=False))
+    assert n2._squeeze_schedule() == []
+    print("PASS a relax request overrides both squeeze gates, expires, and respects the floors")
+
+
 def test_commit_records_the_margin_and_the_marking():
     n = node(cur_vs=0.0)
     obs = [types.SimpleNamespace(id=3, s_center=5.0, d_center=0.2)]
@@ -95,5 +135,6 @@ if __name__ == "__main__":
     test_schedule_steps_down_to_the_floor()
     test_schedule_respects_the_speed_gate()
     test_schedule_disabled_and_already_at_floor()
+    test_relax_overrides_the_gates_but_not_the_floors()
     test_commit_records_the_margin_and_the_marking()
     print("ALL PASS")

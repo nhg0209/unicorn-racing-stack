@@ -160,6 +160,11 @@ class StateMachine(Node):
         self._static_deadlock_counter = 0
         self.static_deadlock_speed_mps = 0.3
         self.static_deadlock_timeout_s = 1.5
+        # Rate limit for the /planner/avoidance/relax request the deadlock raises. Re-sent (not
+        # one-shot) because the planner may not be able to act on the first one; rate-limited (not
+        # per-cycle) because each request drops the planner's committed path.
+        self._relax_sent_t = None
+        self.relax_repeat_sec = 2.0
 
         self.cur_s = 0.0
         self.cur_d = 0.0
@@ -409,6 +414,11 @@ class StateMachine(Node):
         self.state_mrk = self.create_publisher(Marker, "/state_marker", 10)
         self.emergency_pub = self.create_publisher(Marker, "/emergency_marker", 5)
         self.ot_section_check_pub = self.create_publisher(Bool, "/ot_section_check", 1)
+        # Deadlock recovery request to the static planner: "you reported no feasible path and the
+        # car has now been stopped behind that obstacle for static_deadlock_timeout_s -- retry it
+        # at reduced margins". Absolute name and deliberately NOT remapped per-planner, mirroring
+        # /planner/avoidance/static_feasible: it is a static-planner interlock, not an OT lane.
+        self.relax_pub = self.create_publisher(Bool, "/planner/avoidance/relax", 10)
         # ROS1 published this from dynamic_statemachine_server when the save_start_traj
         # rqt button was pressed; re-homed here as a momentary param (see loop()).
         self.save_start_traj_pub = self.create_publisher(Bool, "/save_start_traj", 1)
@@ -970,9 +980,17 @@ class StateMachine(Node):
         3.10 -> 1.50 -> 0.06 m/s and then held 0.00 m/s for the last 8 s of the run, ~1.4 m short of
         the box, with no state change and no log line explaining it.
 
-        FTG is the designed escape (it needs no waypoints), so this feeds the same counter rather
-        than inventing a second mechanism -- but FTG is off by default (`ftg_active: false`), and
-        with it off there IS no recovery. Say that explicitly instead of stalling silently.
+        Detecting it is not enough: this used to log and hand over to FTG, which is off by default
+        (`ftg_active: false`) and, on the real car, has no /scan to work from at all -- so the
+        "escape" was a log line and the car sat there. The deadlock now REQUESTS one, on
+        /planner/avoidance/relax: the static planner answers it with a reduced-margin retry
+        (squeeze pass) of the section it just failed to solve. The request is what makes this a
+        recovery rather than a post-mortem, and it does not depend on FTG being enabled.
+
+        Re-sent every `relax_repeat_sec` while the deadlock persists rather than once, because the
+        planner may not be able to act on the first one (a stale commit still being unwound, the
+        obstacle momentarily untracked), and rate-limited rather than sent at 80 Hz because each
+        one drops the planner's committed path.
         """
         target = None
         if self.obstacles_in_interest:
@@ -987,13 +1005,19 @@ class StateMachine(Node):
         if self._static_deadlock_counter <= self.static_deadlock_timeout_s * self.rate_hz:
             return False
         gap = (target.s_start - self.cur_s) % self.track_length
+        now = self.now_sec()
+        asked = False
+        if (self._relax_sent_t is None) or (now - self._relax_sent_t) >= self.relax_repeat_sec:
+            self.relax_pub.publish(Bool(data=True))
+            self._relax_sent_t = now
+            asked = True
         self.get_logger().error(
             f"[{self.name}] STATIC TRAILING DEADLOCK: stopped ({self.cur_vs:+.2f} m/s) "
             f"{gap:.2f} m behind static obstacle id={target.id} for "
             f"{self._static_deadlock_counter / self.rate_hz:.1f} s. The avoidance planner is not "
             f"offering a usable path (static_feasible={self.static_avoidance_feasible}). "
-            + ("FTG will take over." if not self.ftg_disabled else
-               "ftg_active is FALSE, so there is NO recovery — the car will sit here."),
+            + ("Requested a reduced-margin retry on /planner/avoidance/relax."
+               if asked else "Reduced-margin retry already requested; waiting."),
             throttle_duration_sec=2.0)
         return True
 

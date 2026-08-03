@@ -152,6 +152,8 @@ class ObstacleSpliner(Node):
         self.squeeze_safety_floor_m = 0.05  # [m] tightest obstacle clearance the pass may ask for
         self.squeeze_wall_floor_m = 0.05    # [m] tightest wall reserve the pass may ask for
         self.squeeze_max_speed_mps = 3.0    # [m/s] above this, "no candidate" still means TRAILING
+        self.relax_hold_s = 2.0             # [s] a deadlock relax request forces the pass this long
+        self._relax_until = 0.0             # wall time the current relax request expires
         self.shift_min = 1.0         # [m] min arc length over which the lateral maneuver completes
         self.shift_buffer = 0.5      # [m] finish the shift this far before the obstacle near-edge
         self.ramp_len = 4.0          # [m] gentle entry-ramp length (raceline -> apex)
@@ -253,7 +255,7 @@ class ObstacleSpliner(Node):
             'use_grid_check', 'trust_grid_bounds', 'grid_scan_max', 'grid_scan_step', 'bounds_warn_m',
             'clear_gate_enable', 'clear_hyst_m', 'clear_max_cur_d', 'clear_margin_m', 'reframe_warn_m',
             'clear_latch_ttl_s', 'squeeze_enable', 'squeeze_steps', 'squeeze_safety_floor_m',
-            'squeeze_wall_floor_m', 'squeeze_max_speed_mps',
+            'squeeze_wall_floor_m', 'squeeze_max_speed_mps', 'relax_hold_s',
             'commit_enable', 'commit_dev_max', 'commit_obs_ds', 'commit_obs_dd',
         ]))
         self.add_on_set_parameters_callback(self.dyn_param_cb)
@@ -265,6 +267,10 @@ class ObstacleSpliner(Node):
         self.create_subscription(Odometry, "/car_state/odom", self.state_cb, 10)
         self.create_subscription(WpntArray, "/global_waypoints", self.gb_cb, 10)
         self.create_subscription(WpntArray, "/global_waypoints_scaled", self.gb_scaled_cb, 10)
+        # Deadlock recovery request from the state machine: the car has been stopped behind a
+        # static obstacle this planner reported infeasible. Absolute name, deliberately NOT
+        # remapped per-planner (mirrors /planner/avoidance/static_feasible).
+        self.create_subscription(Bool, "/planner/avoidance/relax", self.relax_cb, 10)
 
         self.mrks_pub = self.create_publisher(MarkerArray, "/planner/avoidance/markers", 10)
         self.evasion_pub = self.create_publisher(OTWpntArray, "/planner/avoidance/otwpnts", 10)
@@ -327,6 +333,8 @@ class ObstacleSpliner(Node):
                                dbl(0.0, 0.5, "tightest wall reserve the squeeze pass may ask for [m]"))
         self.declare_parameter('squeeze_max_speed_mps', 3.0,
                                dbl(0.0, 10.0, "above this speed, no feasible candidate still means TRAILING [m/s]"))
+        self.declare_parameter('relax_hold_s', 2.0,
+                               dbl(0.0, 30.0, "how long a deadlock relax request forces the squeeze pass [s]"))
         self.declare_parameter('shift_min', 1.0, dbl(0.3, 10.0, "min arc length for the lateral maneuver [m]"))
         self.declare_parameter('shift_buffer', 0.5, dbl(0.0, 5.0, "finish the shift this far before the obstacle [m]"))
         self.declare_parameter('ramp_len', 4.0, dbl(0.5, 15.0, "ramp length onto the offset [m]"))
@@ -449,6 +457,8 @@ class ObstacleSpliner(Node):
                 self.squeeze_wall_floor_m = float(p.value)
             elif n == 'squeeze_max_speed_mps':
                 self.squeeze_max_speed_mps = float(p.value)
+            elif n == 'relax_hold_s':
+                self.relax_hold_s = float(p.value)
             elif n == 'clear_gate_enable':
                 self.clear_gate_enable = bool(p.value)
             elif n == 'clear_margin_m':
@@ -601,6 +611,31 @@ class ObstacleSpliner(Node):
         self.get_logger().info(f"[{self.name}] initialized FrenetConverter object")
         return converter
 
+    def relax_cb(self, msg: Bool):
+        """The state machine has certified a static TRAILING deadlock: stopped behind an obstacle
+        this planner reported infeasible, for longer than its timeout.
+
+        That is a stronger statement than anything this node can observe on its own -- it knows
+        only that no candidate passed, not that the consequence was a standstill -- so it overrides
+        both squeeze gates for relax_hold_s: the enable flag (an operator may have turned the pass
+        off without knowing it is the only way out of this section) and the speed gate (whose whole
+        purpose is to establish that a mis-clearance would be survivable, which being stationary
+        establishes far better than any threshold).
+
+        The committed path is dropped: it is what the car is currently stuck behind.
+        """
+        if not msg.data:
+            return
+        now = self.get_clock().now().nanoseconds * 1e-9
+        self._relax_until = now + self.relax_hold_s
+        self._committed = None
+        self.get_logger().warn(
+            f"[{self.name}] relax requested (static TRAILING deadlock) -> forcing a reduced-margin "
+            f"retry for {self.relax_hold_s:.1f} s", throttle_duration_sec=1.0)
+
+    def _relax_active(self) -> bool:
+        return (self.get_clock().now().nanoseconds * 1e-9) < self._relax_until
+
     def _squeeze_schedule(self):
         """(safety_margin, wall_margin) pairs to retry an all-rejected plan with, widest first.
 
@@ -610,14 +645,19 @@ class ObstacleSpliner(Node):
         empty when the design margins are already at or below the floors -- there is nothing left to
         give -- so the caller falls through to the existing diagnostic + feasible=False.
 
+        A live relax request (see relax_cb) overrides the enable flag and the speed gate, but never
+        the floors: the SM has established that the car is stopped and stuck, which is the thing
+        those two gates were approximating.
+
         The schedule interpolates linearly to the floor in squeeze_steps attempts rather than
         jumping straight to it, so a section that only needs a couple of centimetres is driven with
         the couple of centimetres it needs.
         """
-        if not self.squeeze_enable:
+        forced = self._relax_active()
+        if not self.squeeze_enable and not forced:
             return []
         v = abs(self.cur_vs) if self.cur_vs is not None else 0.0
-        if v >= self.squeeze_max_speed_mps:
+        if v >= self.squeeze_max_speed_mps and not forced:
             return []
         s0, w0 = self.safety_margin, self.wall_margin
         s1 = min(self.squeeze_safety_floor_m, s0)

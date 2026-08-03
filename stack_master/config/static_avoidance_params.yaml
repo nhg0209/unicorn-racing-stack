@@ -65,6 +65,12 @@ static_avoidance_planner:
     squeeze_max_speed_mps: 3.0    # [m/s] above this, "no feasible candidate" still means TRAILING.
                                   #       Trading clearance for motion is only defensible where a
                                   #       mis-clearance is survivable.
+    relax_hold_s: 2.0             # [s] how long a /planner/avoidance/relax request (the SM's static
+                                  #     TRAILING deadlock recovery) forces the squeeze pass, overriding
+                                  #     squeeze_enable and squeeze_max_speed_mps but never the floors.
+                                  #     The SM only sends it once the car is STOPPED behind an obstacle
+                                  #     this planner reported infeasible -- a stronger statement than
+                                  #     the speed gate was approximating.
 
     # --- maneuver shape: gentle ramp OUT -> APEX (peak offset at obstacle, curvature loaded) -> gentle ramp back ---
     # Two quintics meet at the apex; outer ends are tangent to the raceline (d''=0) so entry/exit are
