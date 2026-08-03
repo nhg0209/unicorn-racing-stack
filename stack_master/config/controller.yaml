@@ -32,9 +32,14 @@ controller_manager:
     steer_gain_for_speed: 1.0
     future_constant: 0.05
     AEB_thres: 0.5
-    # OVERTAKE only: the avoidance line is legitimately offset from the car, so the garbage-path
-    # AEB needs more slack there or it clamps to 2 m/s mid-maneuver.
+    # Used whenever the LOCAL WINDOW is an offset line (max|d_m| > AEB_offline_d_thres), not when
+    # the state happens to be named OVERTAKE: an offset line is legitimately far from the car, and
+    # the tight garbage-path threshold clamps to 2 m/s against it. Keying on the state name missed
+    # the cases where the SM hands the same avoidance geometry to the controller under TRAILING
+    # (holding the avoidance reference through a drop, and on the trailing approach) -- there the
+    # 0.5 m bar fired and released repeatedly, i.e. a sawtooth in the speed command.
     AEB_thres_overtake: 0.9
+    AEB_offline_d_thres: 0.1
     speed_diff_thres: 0.1
     start_speed: 10.0
     start_curvature_factor: 1.5

@@ -108,6 +108,8 @@ class Controller:
         self.loop_rate = loop_rate
         self.AEB_thres = AEB_thres
         self.AEB_thres_overtake = AEB_thres   # manager overrides from yaml after construction
+        self.AEB_offline_d_thres = 0.1        # [m] max|d| above which the local window counts
+                                              #     as an OFFSET line -> use AEB_thres_overtake
         self.l1_lat_err_cap = t_clip_max      # manager overrides from yaml (uncapped by default)
         self.converter = converter
         # Longitudinal limits of the PUBLISHED speed command. Defaults mirror the ggv the global
@@ -271,15 +273,25 @@ class Controller:
 
         local_wpnt_dist = np.sqrt((self.position_in_map[0, 0] - nearest_local_wpnt[0])**2 + (self.position_in_map[0, 1] - nearest_local_wpnt[1])**2)
 
-        # In OVERTAKE the local line is legitimately offset from the car (avoidance hump + the
-        # SM's splice lag), so the tight garbage-path threshold false-fires mid-maneuver — a
-        # sudden 2 m/s clamp at speed is itself a spin risk. The looser threshold still catches
-        # a genuinely dead/garbage planner.
-        thres = self.AEB_thres_overtake if self.state == "OVERTAKE" else self.AEB_thres
+        # Choose the threshold from the PATH, not from the state name. An avoidance line is
+        # legitimately offset from the car (the hump itself, plus the SM's adoption lag), so the
+        # tight garbage-path threshold false-fires while following one -- and a sudden 2 m/s clamp
+        # at speed is itself a spin risk. Keying that off state == "OVERTAKE" was the wrong
+        # question: the state machine hands the SAME avoidance geometry to the controller while
+        # TRAILING (holding the avoidance reference through a drop, and during the trailing
+        # approach), and in those states the 0.5 m threshold fired against a path that was never
+        # meant to sit under the car -- a 2.0 m/s clamp toggling on and off, which is a sawtooth in
+        # the speed command. What actually justifies the looser bar is the geometry being offset,
+        # so test that: max |d| over the local window.
+        d_col = self.waypoint_array_in_map[:, 8]
+        offline_d = float(np.max(np.abs(d_col))) if d_col.size else 0.0
+        off_line = offline_d > self.AEB_offline_d_thres
+        thres = self.AEB_thres_overtake if off_line else self.AEB_thres
         if local_wpnt_dist >= thres:
             self.logger_warn(
                 f"[Controller] AEB: nearest local wpnt {local_wpnt_dist:.2f} m away "
-                f"(state={self.state}, thres={thres:.2f}) -> clamping speed to 2.0 m/s",
+                f"(state={self.state}, max|d|={offline_d:.2f}, thres={thres:.2f}) "
+                f"-> clamping speed to 2.0 m/s",
                 throttle_duration_sec=1.0)
             return 2.0
         else:
