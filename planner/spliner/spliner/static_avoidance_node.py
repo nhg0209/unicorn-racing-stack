@@ -156,9 +156,13 @@ class ObstacleSpliner(Node):
         self._relax_until = 0.0             # wall time the current relax request expires
         self.shift_min = 1.0         # [m] min arc length over which the lateral maneuver completes
         self.shift_buffer = 0.5      # [m] finish the shift this far before the obstacle near-edge
-        self.ramp_len = 4.0          # [m] gentle entry-ramp length (raceline -> apex)
+        # Peak curvature of the maneuver scales as amplitude/length^2 and the speed it can be
+        # driven at as sqrt(a_lat/kappa), so the ramp lengths are a speed knob, not just a comfort
+        # one. Kept equal to static_avoidance_params.yaml so `ros2 run` does not silently plan a
+        # sharper maneuver than the documented configuration.
+        self.ramp_len = 4.5          # [m] gentle entry-ramp length (raceline -> apex)
         self.hold_after = 0.5        # [m] (unused in apex-loaded profile; kept for param compatibility)
-        self.return_len = 2.5        # [m] gentle exit-ramp length (apex -> raceline)
+        self.return_len = 4.5        # [m] gentle exit-ramp length (apex -> raceline)
         self.apex_bulge = 0.10       # [m] extra offset at the box CENTRE (apex) beyond the clearance
                                      # value: higher = car swings WIDER around the obstacle. 0 = flat hold.
         self.max_weave = 3           # max obstacles woven into one path (slalom); 1 = single-apex only
@@ -337,9 +341,9 @@ class ObstacleSpliner(Node):
                                dbl(0.0, 30.0, "how long a deadlock relax request forces the squeeze pass [s]"))
         self.declare_parameter('shift_min', 1.0, dbl(0.3, 10.0, "min arc length for the lateral maneuver [m]"))
         self.declare_parameter('shift_buffer', 0.5, dbl(0.0, 5.0, "finish the shift this far before the obstacle [m]"))
-        self.declare_parameter('ramp_len', 4.0, dbl(0.5, 15.0, "ramp length onto the offset [m]"))
+        self.declare_parameter('ramp_len', 4.5, dbl(0.5, 15.0, "ramp length onto the offset [m]"))
         self.declare_parameter('hold_after', 0.5, dbl(0.0, 5.0, "hold the offset past the obstacle far-edge [m]"))
-        self.declare_parameter('return_len', 2.5, dbl(0.5, 10.0, "ramp length back to the raceline [m]"))
+        self.declare_parameter('return_len', 4.5, dbl(0.5, 10.0, "ramp length back to the raceline [m]"))
         self.declare_parameter('apex_bulge', 0.10, dbl(0.0, 1.0, "extra apex offset beyond clearance: higher=wider avoidance [m]"))
         self.declare_parameter('max_weave', 3, intd(1, 5, "max obstacles woven into one path (slalom); 1=single-apex"))
         self.declare_parameter('width_car', 0.30, dbl(0.1, 1.0, "car width [m]"))

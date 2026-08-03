@@ -78,9 +78,16 @@ static_avoidance_planner:
     # (a held offset violates the narrow corridor downstream -> all-red). Slalom handled by replanning.
     shift_min: 1.0          # [m]  min apex arc length (keeps the apex ahead of the car when very close)
     shift_buffer: 1.0       # [m]  (unused in apex-loaded profile; kept for param compatibility)
-    ramp_len: 3.0           # [m]  gentle entry-ramp length (raceline -> apex)
+    # Ramp lengths 3.0 -> 4.5. The maneuver's peak curvature scales as amplitude/length^2, so
+    # stretching the ramps by 1.5x cuts it by ~2.2x -- and the speed the avoidance is driven at is
+    # sqrt(a_lat/kappa), so on a straight the curvature-limited cap rises from ~3.75 to ~5.0 m/s
+    # for the same apex offset and the same lateral-accel budget. Nothing else changes: the apex,
+    # the clearance and the corridor test are untouched, the hump just opens and closes further
+    # out. Affordable now that lookahead_min is 15 m -- at 8 m a 4.5 m entry ramp would not have
+    # fitted ahead of the obstacle. Feasibility still rejects a ramp the corridor cannot hold.
+    ramp_len: 4.5           # [m]  gentle entry-ramp length (raceline -> apex)
     hold_after: 0.5         # [m]  (unused in apex-loaded profile; kept for param compatibility)
-    return_len: 3.0         # [m]  gentle exit-ramp length (apex -> raceline)
+    return_len: 4.5         # [m]  gentle exit-ramp length (apex -> raceline)
     apex_bulge: 0.10        # [m] extra offset at the box CENTRE beyond the clearance value: the path peaks
                             #      here (widest, furthest from the obstacle). higher = swing WIDER around the
                             #      obstacle; 0 = flat hold. Limited by corridor (bulge past the wall -> reject).

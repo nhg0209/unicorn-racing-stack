@@ -35,6 +35,13 @@ state_machine:
     # squeeze_*). The geometry is legal but the error budget is spent, so it is driven slowly.
     # This node owns the velocity profile of every path it receives, so the cap has to live here.
     squeeze_speed_cap_mps: 2.5
+    # [m/s^2] lateral-accel limit used when THIS node re-profiles an AVOIDANCE path, replacing the
+    # global ggv's ay column (4.5) for that path only. The ggv is tuned for the raceline; an
+    # avoidance is a brief deliberate excursion, and the planner already sizes it at a_lat_max 6.0
+    # (static_avoidance_params.yaml) before this node overwrites the profile -- so re-profiling at
+    # the raceline limit was silently undoing the planner's own intent and making the spline crawl.
+    # 5.0 splits the difference. The global line is unaffected.
+    avoidance_ay_max: 5.0
     overtaking_horizon_m: 6.9
     emergency_break_horizon: 0.5
     # safety

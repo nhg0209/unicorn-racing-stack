@@ -40,6 +40,7 @@ class StateMachineParams:
         "interest_horizon_m",
         "reframe_warn_m",
         "squeeze_speed_cap_mps",
+        "avoidance_ay_max",
         "overtaking_horizon_m",
         "getting_closer_rel_vel_mps",
         "static_ot_distance_m",
@@ -192,6 +193,21 @@ class StateMachineParams:
             ),
         )
         self.squeeze_speed_cap_mps: float = node.get_parameter("squeeze_speed_cap_mps").value
+
+        self._declare(
+            "avoidance_ay_max", 5.0,
+            ParameterDescriptor(
+                description="Lateral-accel limit [m/s^2] used when THIS node re-profiles an "
+                            "avoidance path, replacing the global ggv's ay column for that path "
+                            "only. The ggv is tuned for the raceline; an avoidance is a brief "
+                            "deliberate excursion the planner itself already sizes at a higher "
+                            "a_lat_max, so re-profiling it at the raceline limit is what made the "
+                            "avoidance spline crawl. Does not affect the global line.",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=1.0, to_value=12.0, step=0.1)],
+            ),
+        )
+        self.avoidance_ay_max: float = node.get_parameter("avoidance_ay_max").value
 
         self._declare(
             "overtaking_horizon_m", 6.9,

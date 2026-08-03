@@ -165,6 +165,11 @@ class StateMachine(Node):
         # per-cycle) because each request drops the planner's committed path.
         self._relax_sent_t = None
         self.relax_repeat_sec = 2.0
+        # Velocity-profile cache, one slot per path source (see update_velocity). The quantum is
+        # how much v_start may drift before the profile is re-solved: fine enough that the
+        # commanded head speed tracks the car, coarse enough that a frozen path is solved once.
+        self._vel_cache = {}
+        self.vel_cache_quant_mps = 0.25
 
         self.cur_s = 0.0
         self.cur_d = 0.0
@@ -207,6 +212,7 @@ class StateMachine(Node):
         self.interest_horizon_m = self.params.interest_horizon_m
         self.reframe_warn_m = self.params.reframe_warn_m
         self.squeeze_speed_cap_mps = self.params.squeeze_speed_cap_mps
+        self.avoidance_ay_max = self.params.avoidance_ay_max
         # Frenet frame of the line the car is ACTUALLY following (/global_waypoints), rebuilt
         # whenever static_reopt swaps it. Incoming obstacles are re-anchored through this; see
         # _reframe_obstacles. None until the first global line arrives -> obstacles pass through.
@@ -668,7 +674,9 @@ class StateMachine(Node):
     #############
     def save_start_traj_cb(self, msg):
         if len(self.cur_start_wpnts_candidate.wpnts) != 0:
-            self.update_velocity(self.cur_start_wpnts_candidate, self.cur_start_wpnts.vel_planner_safety_factor)
+            self.update_velocity(self.cur_start_wpnts_candidate,
+                                 self.cur_start_wpnts.vel_planner_safety_factor,
+                                 cache_key="start")
             self.cur_start_wpnts.initialize_traj(self.cur_start_wpnts_candidate)
             self.cur_state = StateType.START
 
@@ -680,12 +688,14 @@ class StateMachine(Node):
 
     def recovery_wpnts_cb(self, data: WpntArray):
         if len(data.wpnts) != 0:
-            self.update_velocity(data, self.cur_recovery_wpnts.vel_planner_safety_factor)
+            self.update_velocity(data, self.cur_recovery_wpnts.vel_planner_safety_factor,
+                                 cache_key="recovery")
         self.recovery_wpnts = data
 
     def avoidance_cb(self, data: OTWpntArray):
         if len(data.wpnts) != 0:
-            self.update_velocity(data, self.cur_avoidance_wpnts.vel_planner_safety_factor)
+            self.update_velocity(data, self.cur_avoidance_wpnts.vel_planner_safety_factor,
+                                 ay_max=self.avoidance_ay_max, cache_key="dynamic")
         self.avoidance_wpnts = data
 
     def static_avoidance_cb(self, data: OTWpntArray):
@@ -697,7 +707,7 @@ class StateMachine(Node):
             # owns the velocity profile of every path it receives.
             cap = self.squeeze_speed_cap_mps if data.ot_line == "squeeze" else None
             self.update_velocity(data, self.cur_static_avoidance_wpnts.vel_planner_safety_factor,
-                                 v_cap=cap)
+                                 v_cap=cap, ay_max=self.avoidance_ay_max, cache_key="static")
         self.static_avoidance_wpnts = data
 
     def start_wpnts_cb(self, data: OTWpntArray):
@@ -1551,7 +1561,17 @@ class StateMachine(Node):
     ################
     # HELPER FUNCS #
     ################
-    def update_velocity(self, wpnts_msg, safety_factor=1.0, v_cap=None):
+    def update_velocity(self, wpnts_msg, safety_factor=1.0, v_cap=None, ay_max=None,
+                        cache_key="default"):
+        """Re-profile a planner's path with THIS node's vehicle dynamics, in place.
+
+        `ay_max` overrides the ggv's lateral-accel column for this path only (see
+        avoidance_ay_max): the global ggv is tuned for the raceline, and an avoidance maneuver is a
+        deliberate, brief excursion that the planner itself already sizes at a higher a_lat_max --
+        re-profiling it at the raceline's limit is what made the avoidance spline crawl.
+
+        `cache_key` selects a per-source slot in the profile cache; see the note on the key below.
+        """
         if self.ggv is None or self.gb_wpnts is None:
             return  # velocity replanning unavailable (no veh dyn info / no gb wpnts yet)
         wpnts = wpnts_msg.wpnts
@@ -1579,39 +1599,71 @@ class StateMachine(Node):
         glb_start_idx = int(wpnts_msg.wpnts[-1].s_m / self.wpnt_dist)
         v_end = self.gb_wpnts.wpnts[glb_start_idx % len(self.gb_wpnts.wpnts)].vx_mps
 
-        ax_max_machines_sf = self.ax_max_machines.copy()
-        b_ax_max_machines_sf = self.b_ax_max_machines.copy()
-        ax_max_machines_sf[:, 1] *= safety_factor
-        b_ax_max_machines_sf[:, 1] *= safety_factor
+        # --- profile cache -------------------------------------------------------------------
+        # calc_vel_profile is the expensive part of this node, and a COMMITTED planner path is
+        # geometrically FROZEN: the planner republishes the same points at 20 Hz and this solved
+        # them again for every one. That is what put the single-threaded executor 0.3-0.5 s behind
+        # (documented in static_avoidance_planner.yaml's latest_threshold), and the freshness gate
+        # built on top of that lag is what then blocked the OVERTAKE commit -- so the cost of the
+        # recomputation was not lost time, it was a lost maneuver.
+        #
+        # The profile is NOT a pure function of the geometry -- it is solved from the current speed
+        # -- so v_start/v_end are part of the key, QUANTIZED: within a quarter of a m/s the
+        # resulting profile does not meaningfully differ, and beyond it we re-solve. One slot per
+        # source, because the static and dynamic planners both publish at 20 Hz and a single-entry
+        # cache would just thrash between them.
+        key = (hash(np.asarray(kappa, dtype=np.float64).tobytes()),
+               hash(np.asarray(el_lengths, dtype=np.float64).tobytes()),
+               round(float(self.cur_vs) / self.vel_cache_quant_mps),
+               round(float(v_end) / self.vel_cache_quant_mps),
+               round(float(safety_factor), 3),
+               None if v_cap is None else round(float(v_cap), 3),
+               None if ay_max is None else round(float(ay_max), 3))
+        hit = self._vel_cache.get(cache_key)
+        if hit is not None and hit[0] == key:
+            vx_profile, ax_profile = hit[1], hit[2]
+        else:
+            ax_max_machines_sf = self.ax_max_machines.copy()
+            b_ax_max_machines_sf = self.b_ax_max_machines.copy()
+            ax_max_machines_sf[:, 1] *= safety_factor
+            b_ax_max_machines_sf[:, 1] *= safety_factor
 
-        vx_profile = calc_vel_profile(
-            ax_max_machines=ax_max_machines_sf,
-            kappa=kappa,
-            el_lengths=el_lengths,
-            closed=False,
-            drag_coeff=self.pars["veh_params"]["dragcoeff"],
-            m_veh=self.pars["veh_params"]["mass"],
-            b_ax_max_machines=b_ax_max_machines_sf,
-            ggv=self.ggv,
-            v_max=self.pars["veh_params"]["v_max"],
-            filt_window=self.pars["vel_calc_opts"]["vel_profile_conv_filt_window"],
-            dyn_model_exp=self.pars["vel_calc_opts"]["dyn_model_exp"],
-            v_start=self.cur_vs,
-            v_end=v_end,
-        )
+            # ggv columns are [v, ax_max, ay_max]. Overriding the lateral column decouples an
+            # avoidance path from the raceline's cornering budget without touching the global one.
+            ggv = self.ggv
+            if ay_max is not None and ay_max > 0.0:
+                ggv = self.ggv.copy()
+                ggv[:, 2] = float(ay_max)
 
-        # Applied AFTER the profile so ax below describes the speeds actually published. The
-        # solver's v_start is the current speed, so a cap below it yields a decelerating profile
-        # rather than a step -- which is what a reduced-clearance path wants.
-        if v_cap is not None and v_cap > 0.0:
-            vx_profile = np.minimum(vx_profile, float(v_cap))
+            vx_profile = calc_vel_profile(
+                ax_max_machines=ax_max_machines_sf,
+                kappa=kappa,
+                el_lengths=el_lengths,
+                closed=False,
+                drag_coeff=self.pars["veh_params"]["dragcoeff"],
+                m_veh=self.pars["veh_params"]["mass"],
+                b_ax_max_machines=b_ax_max_machines_sf,
+                ggv=ggv,
+                v_max=self.pars["veh_params"]["v_max"],
+                filt_window=self.pars["vel_calc_opts"]["vel_profile_conv_filt_window"],
+                dyn_model_exp=self.pars["vel_calc_opts"]["dyn_model_exp"],
+                v_start=self.cur_vs,
+                v_end=v_end,
+            )
+
+            # Applied BEFORE ax so the accelerations describe the speeds actually published. The
+            # solver's v_start is the current speed, so a cap below it yields a decelerating
+            # profile rather than a step -- which is what a reduced-clearance path wants.
+            if v_cap is not None and v_cap > 0.0:
+                vx_profile = np.minimum(vx_profile, float(v_cap))
+
+            ax_profile = tph.calc_ax_profile.calc_ax_profile(
+                vx_profile=vx_profile, el_lengths=el_lengths, eq_length_output=False
+            )
+            self._vel_cache[cache_key] = (key, vx_profile, ax_profile)
 
         for i in range(len(vx_profile)):
             wpnts_msg.wpnts[i].vx_mps = vx_profile[i]
-
-        ax_profile = tph.calc_ax_profile.calc_ax_profile(
-            vx_profile=vx_profile, el_lengths=el_lengths, eq_length_output=False
-        )
         for i in range(len(ax_profile)):
             wpnts_msg.wpnts[i].ax_mps2 = ax_profile[i]
         wpnts[len(ax_profile)].ax_mps2 = ax_profile[-1]
