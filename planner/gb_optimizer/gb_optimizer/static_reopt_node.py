@@ -62,14 +62,19 @@ class _Bundle:
         "cent_wpnts", "cent_markers",
         "glb_wpnts", "glb_markers",
         "sp_wpnts", "sp_markers",
-        "trackbounds", "n_apex",
+        "trackbounds", "n_apex", "clearance_ok",
     )
 
     def __init__(self, map_info, est_lap_time, cent_wpnts, cent_markers,
-                 glb_wpnts, glb_markers, sp_wpnts, sp_markers, trackbounds, n_apex=0):
+                 glb_wpnts, glb_markers, sp_wpnts, sp_markers, trackbounds, n_apex=0,
+                 clearance_ok=True):
         # n_apex = humps ACTUALLY laid into this line. 0 means the geometry is the clean raceline
         # even if obstacles were passed in (no apex recorded, or the corridor could not hold it).
         self.n_apex = n_apex
+        # clearance_ok = every obstacle this line claims to have reshaped is really cleared by
+        # obs_margin, measured on the built geometry. False = do NOT publish it (see
+        # _check_line_clearance); the previous good line is kept instead.
+        self.clearance_ok = clearance_ok
         self.map_info = map_info
         self.est_lap_time = est_lap_time
         self.cent_wpnts = cent_wpnts
@@ -326,8 +331,18 @@ class StaticReoptNode(Node):
         (map_info, est, cent_m, cent_w, glb_m, glb_w, sp_m, sp_w, bounds) = read_global_waypoints(map_name)
         return _Bundle(map_info, est, cent_w, cent_m, glb_w, glb_m, sp_w, sp_m, bounds)
 
-    def _report_line_clearance(self, traj, obstacles: List[core.Obstacle]) -> None:
-        """Measure what the line ACTUALLY clears, in the map frame, and say so.
+    def _line_clearances(self, traj, obstacles: List[core.Obstacle]) -> List[float]:
+        """Distance from the line to each obstacle's EDGE [m], index-aligned with `obstacles`.
+
+        One hypot scan per obstacle over every published station — the same measurement the core's
+        acceptance floor enforces per hump, so the two cannot disagree about what "cleared" means.
+        """
+        xy = np.asarray(traj)[:, 1:3]
+        return [float(np.min(np.hypot(xy[:, 0] - o.x, xy[:, 1] - o.y))) - float(o.r)
+                for o in obstacles]
+
+    def _check_line_clearance(self, traj, obstacles: List[core.Obstacle], laid: List[dict]) -> bool:
+        """Measure what the line ACTUALLY clears, in the map frame, and VETO it if it does not.
 
         Everything upstream reports intent -- "2/2 obstacle apex(es) reshaped" is printed whether
         the resulting line passes 0.6 m from the box or through it. It was true for six laps
@@ -335,45 +350,74 @@ class StaticReoptNode(Node):
         an obstacle that needs radius + obs_margin, so the reactive layer re-avoided it every single
         lap and the log never said why.
 
-        This is deliberately a REPORT, not a veto: refusing the swap would leave the clean line,
-        which clears even less. It gives the missing number so a bad line is attributable at the
-        moment it is built instead of after a bag analysis.
+        It used to be a pure report, on the argument that refusing the swap leaves the clean line,
+        which clears even less. That argument only holds for the FIRST build: the fallback is not
+        the clean line, it is whatever is currently active — and once an obstacle-aware line is
+        active, publishing a worse one is a strict regression the stack cannot detect. The core now
+        drops a hump it cannot lay to obs_margin (reason "clearance") and reports it, so a line
+        arriving here short is a genuine escape: the woven/resampled geometry is not what the
+        per-hump gate accepted. Keep the previous good line and say exactly which obstacle failed.
+
+        Obstacles with NO hump at all (never reactively avoided, or honestly dropped) are expected
+        to read short — they are the reactive layer's job and must not veto the line that was built
+        for the others. Only apexes the core claims it LAID are held to the floor.
+
+        Returns True when the line may be published.
         """
         try:
             if traj is None or len(traj) == 0 or not obstacles:
-                return
-            xy = np.asarray(traj)[:, 1:3]
-            bad = []
-            for o in obstacles:
-                d = float(np.min(np.hypot(xy[:, 0] - o.x, xy[:, 1] - o.y))) - float(o.r)
-                if d < self.obs_margin:
-                    bad.append((o, d))
+                return True
+            gaps = self._line_clearances(traj, obstacles)
+            bad = [(o, d) for o, d in zip(obstacles, gaps) if d < self.obs_margin]
             if not bad:
                 self.get_logger().info(
                     f"[static_reopt] line clearance OK: all {len(obstacles)} obstacle(s) cleared by "
                     f">= {self.obs_margin:.2f} m")
-                return
+                return True
+            # Which of the short ones did the core promise to have reshaped? Match by position:
+            # `apex_laid` carries the apex point, which sits within ~one clearance of its obstacle.
+            laid_xy = [a["xy"] for a in (laid or [])]
+            broken = [(o, d) for o, d in bad
+                      if any(np.hypot(ax - o.x, ay - o.y) < 1.5 for ax, ay in laid_xy)]
             det = "; ".join(f"@({o.x:.2f},{o.y:.2f}) r={o.r:.2f} -> {d:+.2f} m" for o, d in bad)
-            self.get_logger().warning(
-                f"[static_reopt] line does NOT clear {len(bad)}/{len(obstacles)} obstacle(s) "
-                f"(need >= obs_margin {self.obs_margin:.2f} m): {det}. The reactive layer will keep "
-                f"avoiding these every lap — check the recorded apex and reopt_wall_margin")
+            if not broken:
+                self.get_logger().info(
+                    f"[static_reopt] {len(bad)}/{len(obstacles)} obstacle(s) are NOT cleared by the "
+                    f"line (need >= {self.obs_margin:.2f} m): {det}. No hump was laid for them — "
+                    f"the reactive layer keeps handling those, as designed")
+                return True
+            det_b = "; ".join(f"@({o.x:.2f},{o.y:.2f}) r={o.r:.2f} -> {d:+.2f} m" for o, d in broken)
+            self.get_logger().error(
+                f"[static_reopt] REFUSING to publish: {len(broken)} obstacle(s) the re-opt claims "
+                f"to have reshaped are cleared by less than obs_margin {self.obs_margin:.2f} m: "
+                f"{det_b}. Keeping the previous line — check the recorded apex and "
+                f"reopt_wall_margin / reopt_fit_tol")
+            return False
         except Exception as e:                      # a diagnostic must never break the build
-            self.get_logger().debug(f"[static_reopt] clearance report failed: {e}")
+            self.get_logger().debug(f"[static_reopt] clearance check failed: {e}")
+            return True
 
     def _build_obstacle_bundle(self, obstacles: List[core.Obstacle]) -> _Bundle:
         """Run the width-modulated re-optimization and assemble a full bundle. May raise;
         the caller runs this inside a try/except so a failure never reaches the timer."""
         if self.reopt_method == "local_window":
             # Reshape the recorded reactive apexes into the global line (keep apex, gentle ramps).
-            apexes = self._apex_list(obstacles)
+            # The apex's OWN obstacle goes with it: obs_margin is a hard acceptance floor in the
+            # core, so a hump that would not clear its box is grown once and then dropped for the
+            # reactive layer rather than laid short (which used to pass the amplitude-ratio test
+            # at 0.90 x apex = ~0.345 m of edge clearance, under the 0.35 m everything downstream
+            # assumes the line is built to).
+            pairs = self._apex_pairs(obstacles)
+            apexes = [xy for xy, _o in pairs]
+            apex_obs = [(float(o.x), float(o.y), float(o.r)) for _xy, o in pairs]
             res = core.reoptimize_local_window(
                 self._clean_xy, self._clean_dr, self._clean_dl, self.reftrack,
                 apexes, self.input_path,
                 params=core.ModulationParams(obs_margin=self.obs_margin),
                 w_veh=self.qp_veh_width, clean_vx=self._clean_vx, wall_margin=self.wall_margin,
                 reach_time=self.reach_time, reach_min=self.reach_min, reach_max=self.reach_max,
-                clean_kappa=self._clean_kappa, fit_tol=self.fit_tol)
+                clean_kappa=self._clean_kappa, fit_tol=self.fit_tol,
+                apex_obstacles=apex_obs)
         else:
             # Legacy whole-track mincurv_iqp (offline-grade; minutes/solve).
             res = core.reoptimize_with_obstacles(
@@ -398,6 +442,7 @@ class StaticReoptNode(Node):
 
         rep = res["report"]
         info = String()
+        clearance_ok = True                 # `global` method: no per-apex geometry to check
         if self.reopt_method == "local_window":
             n_ap = res.get("n_windows", 0)
             dropped = res.get("apex_dropped", [])
@@ -418,10 +463,14 @@ class StaticReoptNode(Node):
                 kp, kmsg = a.get("kappa_peak", 0.0), ""
                 if curvlim > 0.0:
                     kmsg = f" ({kp / curvlim:.0%} of curvlim {curvlim:.2f})"
+                # Clearance of the WOVEN profile — the number the acceptance floor is about, and
+                # the one the reactive planner and the SM will independently re-derive downstream.
+                gap = float(a.get("clear", float("nan")))
+                cmsg = "" if gap != gap else f"; clears {gap:+.3f} m (floor {self.obs_margin:.2f})"
                 line = (f"[static_reopt] apex @({a['xy'][0]:.2f},{a['xy'][1]:.2f}) "
                         f"laid d={a['laid']:+.3f} (want {a['want']:+.3f}) "
                         f"reach {a['r_in']:.2f}/{a['r_out']:.2f} m of {r_req:.2f} requested "
-                        f"({shrink:.0%}); max|kappa| {kp:.2f}{kmsg}")
+                        f"({shrink:.0%}); max|kappa| {kp:.2f}{kmsg}{cmsg}")
                 if shrink < 0.5 or (curvlim > 0.0 and kp > 0.9 * curvlim):
                     self.get_logger().warning(
                         line + " <- SHARP: the corridor fit shrank this hump. Check "
@@ -429,21 +478,26 @@ class StaticReoptNode(Node):
                 else:
                     self.get_logger().info(line)
             if dropped:
-                # All-or-nothing: a hump the corridor cannot hold at ~full amplitude would NOT
-                # clear its obstacle — the shrunken line got re-avoided by the reactive layer
-                # every lap. Those obstacles stay reactive-only, and this says so per apex.
-                det = "; ".join(f"@({d['xy'][0]:.2f},{d['xy'][1]:.2f}) want {d['want']:+.2f} "
-                                f"max {d['fit']:+.2f} [{d.get('reason', 'corridor')}]"
-                                for d in dropped)
+                # All-or-nothing: a hump that cannot be laid clear of its obstacle would NOT
+                # relieve the reactive layer — the shrunken line got re-avoided every lap. Those
+                # obstacles stay reactive-only, and this says so per apex, with the measured
+                # clearance where the acceptance floor is what rejected it.
+                def _det(d):
+                    s = (f"@({d['xy'][0]:.2f},{d['xy'][1]:.2f}) want {d['want']:+.2f} "
+                         f"max {d['fit']:+.2f} [{d.get('reason', 'corridor')}]")
+                    if "clear" in d:
+                        s += f" clears {d['clear']:+.2f} of {d['need']:.2f} needed"
+                    return s
                 self.get_logger().warning(
                     f"[static_reopt] {len(dropped)} apex(es) REJECTED (reason 'corridor' = track "
-                    f"too tight, 'curvature' = the hump would exceed curvlim; reactive layer keeps "
-                    f"handling them): {det}")
+                    f"too tight, 'curvature' = the hump would exceed curvlim, 'clearance' = even "
+                    f"grown wider it does not clear the box by obs_margin; reactive layer keeps "
+                    f"handling them): {'; '.join(_det(d) for d in dropped)}")
             if n_no_apex:
                 self.get_logger().warning(
                     f"[static_reopt] {n_no_apex} obstacle(s) had no recorded reactive apex yet — "
                     f"the reactive static-avoidance layer handles them until an apex is captured")
-            self._report_line_clearance(traj, obstacles)
+            clearance_ok = self._check_line_clearance(traj, obstacles, res.get("apex_laid", []))
         else:
             info.data = (f"[static_reopt] obstacle-aware (mincurv_iqp) est {est:.3f}s; "
                          f"affected {rep.n_affected}, infeasible {rep.n_infeasible}, "
@@ -454,7 +508,7 @@ class StaticReoptNode(Node):
         return _Bundle(info, lap,
                        self.clean_bundle.cent_wpnts, self.clean_bundle.cent_markers,
                        glb_w, glb_m, sp_w, sp_m, self.clean_bundle.trackbounds,
-                       n_apex=int(res.get("n_windows", 0)))
+                       n_apex=int(res.get("n_windows", 0)), clearance_ok=clearance_ok)
 
     # ----------------------------------------------------------------------------------
     # obstacle input: COLLECT only (batch re-opt happens at the start/finish crossing)
@@ -710,15 +764,23 @@ class StaticReoptNode(Node):
                 changed = True
         return changed
 
-    def _apex_list(self, obstacles: List[core.Obstacle]) -> List[tuple]:
-        """Map-frame (x,y) apex points for the confirmed obstacles that have a recorded reactive
-        apex. Obstacles never reactively avoided contribute nothing (clean line kept there)."""
+    def _apex_pairs(self, obstacles: List[core.Obstacle]) -> List[tuple]:
+        """((x, y) apex, obstacle) for every confirmed obstacle that has a recorded reactive apex.
+
+        The pairing is what lets the core enforce a clearance floor: an apex on its own is just a
+        point to interpolate through, while the obstacle it belongs to is the thing the laid hump
+        has to measurably miss. Obstacles never reactively avoided contribute nothing (clean line
+        kept there, reactive layer handles them)."""
         out = []
-        for key in self._keys_for(obstacles, self._obs_ids):
+        for o, key in zip(obstacles, self._keys_for(obstacles, self._obs_ids)):
             rec = self._apex_by_obs.get(key)
             if rec is not None:
-                out.append((rec[0], rec[1]))
+                out.append(((rec[0], rec[1]), o))
         return out
+
+    def _apex_list(self, obstacles: List[core.Obstacle]) -> List[tuple]:
+        """Map-frame (x,y) apex points only — the trigger gates just need to know one exists."""
+        return [xy for xy, _o in self._apex_pairs(obstacles)]
 
     def _rebuild_and_swap(self, reason: str):
         """Solve ONE re-opt over the whole confirmed obstacle set. Called once a full exploration
@@ -763,6 +825,13 @@ class StaticReoptNode(Node):
         # Corridor rejection is DETERMINISTIC (same apexes + same track -> same answer), so the
         # trigger stays burned — no retry loop; a new/better apex re-arms it via otwpnts_cb, and
         # transient solve failures take the exception path above instead.
+        # The built line measurably fails to clear an obstacle it claims to have reshaped. Never
+        # install it: from an obstacle-aware active it is a strict regression nothing downstream
+        # can detect, and from the clean active it buys a detour that still needs the reactive
+        # layer. Deterministic (same apexes + track -> same answer), so the trigger stays burned;
+        # a new/better apex re-arms it via otwpnts_cb.
+        if obstacles and not getattr(bundle, "clearance_ok", True):
+            return
         n_ap = getattr(bundle, "n_apex", 0)
         if obstacles and n_ap == 0:
             self.get_logger().warning(

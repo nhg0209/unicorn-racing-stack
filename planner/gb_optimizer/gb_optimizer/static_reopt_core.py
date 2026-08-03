@@ -651,7 +651,9 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                          exit_scale: float = 1.0,
                          fit_tol: float = _FIT_TOL_DEFAULT,
                          clean_kappa: Optional[np.ndarray] = None,
-                         curvlim: float = 0.0
+                         curvlim: float = 0.0,
+                         obstacles: Optional[List[Optional[Tuple[float, float, float]]]] = None,
+                         obs_margin: float = 0.0
                          ) -> Tuple[np.ndarray, int, float, list, list]:
     """Lateral offset d(s) on the CLOSED clean loop that PRESERVES each recorded reactive apex
     but re-grows long, gentle entry/exit ramps — the "keep the apex, press the secondary apexes"
@@ -678,17 +680,32 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         `kappa_clean + d''` model is a linearisation that reads ~45% low here, so it cannot be the
         thing a safety limit is checked against; see `_kappa_peak`.
     A hump over the bar is grown while the corridor allows, then has its amplitude shaved, and is
-    dropped if that would take it under _APEX_KEEP_FRAC — publishing a line the car cannot steer is
-    never the answer (nothing checked this before: `curvlim` was respected only by the offline IQP).
+    dropped if that would take it under the acceptance floor — publishing a line the car cannot
+    steer is never the answer (nothing checked this before: `curvlim` was respected only by the
+    offline IQP).
+
+    ACCEPTANCE FLOOR. With `obstacles` (map-frame (x, y, r) index-aligned with `apexes`, entries
+    may be None) and `obs_margin > 0`, a hump is accepted only when the geometry it would lay
+    passes the obstacle's EDGE by at least `obs_margin` — the same hypot scan the node reports on
+    the published line, so what is enforced here is exactly what is measured there. A short hump is
+    retried ONCE at the amplitude that would reach the floor (re-fitted to the corridor, allowed to
+    keep the wider reach), and dropped with reason "clearance" if the corridor cannot hold it. This
+    replaces judging the hump by amplitude RATIO (>= _APEX_KEEP_FRAC of the recorded apex), which
+    is a proxy for clearance and a loose one: 0.90 of a 0.55 m apex leaves 0.345 m off a 0.15 m box
+    where the SM and the reactive planner both expect the line to be built to obs_margin, and the
+    error compounds because the recorded apex is a lateral offset while the clearance that matters
+    is a 2-D distance on a curving line. Without obstacle geometry (offline sweeps) the ratio test
+    remains the only available proxy and is still used.
 
     Returns (d_global[N], n_apex_used, entry_kappa, dropped, laid).
-    `dropped` lists the apexes that could not be laid at >= _APEX_KEEP_FRAC of their recorded
-    amplitude (all-or-nothing; each entry {"xy": (x, y), "want": d*, "fit": best_feasible_d,
-    "reason": "corridor"|"curvature"}), so the caller can report honestly and leave those obstacles
-    to the reactive layer. `laid` mirrors it for the humps that WERE laid ({"xy", "want", "laid",
-    "r_in", "r_out", "r_req", "kappa_peak"}) so the node can log why a hump ended up as sharp as it
-    did. Wrap is handled by cutting the profile in the largest apex-free gap so no hump straddles
-    s=0. Never raises; degrades to zeros on any failure."""
+    `dropped` lists the apexes that could not be laid at the acceptance floor (all-or-nothing; each
+    entry {"xy": (x, y), "want": d*, "fit": best_feasible_d, "reason":
+    "corridor"|"curvature"|"clearance", plus "clear"/"need" for the clearance reason}), so the
+    caller can report honestly and leave those obstacles to the reactive layer. `laid` mirrors it
+    for the humps that WERE laid ({"xy", "want", "laid", "r_in", "r_out", "r_req", "kappa_peak",
+    "clear"}) so the node can log why a hump ended up as sharp as it did and what it really clears.
+    Wrap is handled by cutting the profile in the largest apex-free gap so no hump straddles s=0.
+    Never raises; degrades to zeros on any failure."""
     N = len(s_loop)
     d_global = np.zeros(N)
     if not apexes:
@@ -698,9 +715,11 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
     except Exception:
         return d_global, 0, 0.0, [], []
 
-    # --- project apexes -> (s*, d*, R_in, R_out, xy); drop negligible offsets ----------------
+    # --- project apexes -> (s*, d*, R_in, R_out, xy, obs); drop negligible offsets ------------
+    # `obs` (map-frame x, y, r or None) rides along so the acceptance floor below can measure the
+    # clearance of the geometry each hump would lay against the box it exists to clear.
     knots = []
-    for (xa, ya) in apexes:
+    for k_i, (xa, ya) in enumerate(apexes):
         i = int(np.argmin(np.hypot(clean_xy[:, 0] - xa, clean_xy[:, 1] - ya)))
         d_star = float((np.array([xa, ya], float) - clean_xy[i]) @ nvec_rl[i])
         if abs(d_star) < 0.03:
@@ -708,7 +727,8 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         v = float(clean_vx[i]) if clean_vx is not None else 3.0
         R = float(np.clip(reach_time * v, reach_min, reach_max))
         R = min(R, 0.45 * track_len)                    # never span more than ~half the loop
-        knots.append((float(s_loop[i]), d_star, R, R, xa, ya))  # symmetric ramps
+        ob = obstacles[k_i] if (obstacles is not None and k_i < len(obstacles)) else None
+        knots.append((float(s_loop[i]), d_star, R, R, xa, ya, ob))  # symmetric ramps
     if not knots:
         return d_global, 0, 0.0, [], []
 
@@ -727,8 +747,8 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
     # Between two apexes whose ramps OVERLAP we weave straight apex->apex (no return-to-0 knot);
     # otherwise each hump opens from and closes back to the raceline. `zero` = [d,d',d''] all 0.
     zero = [0.0, 0.0, 0.0]
-    kn_u = sorted(((c - s_cut) % track_len, d, ri, ro, xa, ya)
-                  for (c, d, ri, ro, xa, ya) in knots)
+    kn_u = sorted((((c - s_cut) % track_len, d, ri, ro, xa, ya, ob)
+                   for (c, d, ri, ro, xa, ya, ob) in knots), key=lambda k: k[0])
     dropped: List[dict] = []
     laid: List[dict] = []
     # --- FIT each hump to the corridor (shrink reach, NEVER the clearance) BEFORE laying it ----
@@ -791,6 +811,39 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             k = _menger_kappa(clean_xy + v[:, None] * nvec_rl)
             return float(np.max(np.abs(k[m])))
 
+        need_clear = float(obs_margin) if obstacles is not None else 0.0
+
+        def _clearance(u_c, amp, r_i, r_o, ob):
+            """Min distance from the geometry ONE hump would lay to the obstacle's EDGE [m].
+
+            The same measurement static_reopt_node makes on the published line
+            (`_line_clearances`): a hypot scan over every station, minus the obstacle radius.
+            Scanned over the WHOLE loop on purpose — the stations that decide the verdict are
+            usually the ones just OUTSIDE the ramp, where the line has already returned to the
+            raceline and is therefore back beside the box. A span-limited scan would report the
+            apex's clearance and miss exactly the case a too-short ramp creates.
+
+            +inf when this apex has no obstacle attached (nothing to enforce); -inf on degenerate
+            knots so a hump that cannot even be evaluated can never be accepted."""
+            if ob is None:
+                return float("inf")
+            v = _hump_values(u_all, u_c, amp, r_i, r_o)
+            if v is None:
+                return float("-inf")
+            pts = clean_xy + v[:, None] * nvec_rl
+            return float(np.min(np.hypot(pts[:, 0] - ob[0], pts[:, 1] - ob[1]))) - float(ob[2])
+
+        def _accepts(d_now, d_want, ob, u_c, r_i, r_o):
+            """Is this hump good enough to lay? (ok, clearance_or_None).
+
+            With obstacle geometry the bar is ABSOLUTE: the laid line must clear the box edge by
+            obs_margin. Without it, fall back to the amplitude-ratio proxy (offline sweeps, and
+            the `global` re-opt method, have no per-apex box to measure against)."""
+            if need_clear > 0.0 and ob is not None:
+                gap = _clearance(u_c, d_now, r_i, r_o, ob)
+                return gap >= need_clear, gap
+            return abs(d_now) >= max(0.03, _APEX_KEEP_FRAC * abs(d_want)), None
+
         def _kappa_allow(u_c, r):
             """The bar the laid hump must clear. `curvlim` normally, but never stricter than the
             clean raceline's OWN geometric curvature there: if the clean line already exceeds
@@ -801,13 +854,29 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             return max(curvlim, kc)
 
         fitted = []
-        for (u, d, ri, ro, xa, ya) in kn_u:
+        for (u, d, ri, ro, xa, ya, ob) in kn_u:
             r_req = max(ri, ro)
             d_f, r_f = _fit_hump_to_corridor(u_all, u, d, r_req, track_len,
                                              hi_a, lo_a, floor_r, fit_tol=fit_tol)
-            if abs(d_f) < max(0.03, _APEX_KEEP_FRAC * abs(d)):
-                dropped.append({"xy": (float(xa), float(ya)), "want": float(d),
-                                "fit": float(d_f), "reason": "corridor"})
+            ok, gap = _accepts(d_f, d, ob, u, r_f, r_f)
+            if not ok and gap is not None:
+                # ONE retry, at the amplitude that WOULD reach the floor. The recorded reactive
+                # apex is a lower bound on what the obstacle needs, not an upper one: a hump that
+                # clears by 0.30 m where 0.35 is required is fixed by asking the corridor for 5 cm
+                # more, not by handing the obstacle back to the reactive layer. The reach is asked
+                # for at r_req again — a wider hump is gentler AND clears further out.
+                d_want = math.copysign(abs(d_f) + (need_clear - gap), d)
+                d_r, r_r = _fit_hump_to_corridor(u_all, u, d_want, r_req, track_len,
+                                                 hi_a, lo_a, floor_r, fit_tol=fit_tol)
+                ok_r, gap_r = _accepts(d_r, d, ob, u, r_r, r_r)
+                if ok_r:
+                    ok, d_f, r_f, gap = True, d_r, r_r, gap_r
+            if not ok:
+                rec = {"xy": (float(xa), float(ya)), "want": float(d), "fit": float(d_f),
+                       "reason": "clearance" if gap is not None else "corridor"}
+                if gap is not None:
+                    rec["clear"], rec["need"] = float(gap), need_clear
+                dropped.append(rec)
                 continue
             # --- HARD curvature limit -------------------------------------------------------
             # r_min is closed-form, so this costs no search. Widen first (free in curvature terms,
@@ -849,9 +918,16 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                         else:
                             hi_k = mid
                     d_f = math.copysign(lo_k, d_f)
-                    if abs(d_f) < max(0.03, _APEX_KEEP_FRAC * abs(d)):
-                        dropped.append({"xy": (float(xa), float(ya)), "want": float(d),
-                                        "fit": float(d_f), "reason": "curvature"})
+                    # No retry here: the amplitude was shaved BECAUSE the curvature bar was hit,
+                    # so asking for more of it at this reach only fails the same bar again. The
+                    # reach was already grown as far as the corridor allows above.
+                    ok, gap = _accepts(d_f, d, ob, u, r_f, r_f)
+                    if not ok:
+                        rec = {"xy": (float(xa), float(ya)), "want": float(d),
+                               "fit": float(d_f), "reason": "curvature"}
+                        if gap is not None:
+                            rec["clear"], rec["need"] = float(gap), need_clear
+                        dropped.append(rec)
                         continue
             # ENTRY/EXIT ramps may be stretched independently of the lap-time-optimal reach:
             # a longer ramp cuts the merge-zone curvature (the S-shaped inflection where the
@@ -885,12 +961,14 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             laid.append({"xy": (float(xa), float(ya)), "want": float(d), "laid": float(d_f),
                          "r_in": float(r_in), "r_out": float(r_out), "r_req": float(r_req),
                          "kappa_peak": 0.0,        # filled from the laid profile below
+                         "clear": float("nan"),    # ditto — measured on the WOVEN profile
+                         "_obs": ob,               # so the join below can re-measure it
                          "_u": float(u)})          # join key: `fitted` gets sorted, `laid` does not
         kn_u = sorted(fitted)
         if not kn_u:
             return d_global, 0, 0.0, dropped, laid
     else:
-        kn_u = [(u, d, ri, ro) for (u, d, ri, ro, _xa, _ya) in kn_u]   # no corridor: keep all
+        kn_u = [(u, d, ri, ro) for (u, d, ri, ro, _xa, _ya, _ob) in kn_u]   # no corridor: keep all
     n_ap = len(kn_u)
     breaks = [0.0]
     bd = [list(zero)]                                   # seam: raceline, C2
@@ -928,8 +1006,9 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
     # the caller logs what was really laid instead of inferring it from the reach.
     ent_k = 0.0
     by_u = {round(e["_u"], 6): e for e in laid if "_u" in e}
+    xy_laid = clean_xy + d_global[:, None] * nvec_rl
     try:
-        kap_laid = np.abs(_menger_kappa(clean_xy + d_global[:, None] * nvec_rl))
+        kap_laid = np.abs(_menger_kappa(xy_laid))
     except Exception:
         kap_laid = None
     for (u, d, ri, ro) in kn_u:
@@ -945,6 +1024,16 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             # node publishes reads ~45% low here (1.19 vs 2.11 on the ifac chicane hump), so a log
             # built on it would report a healthy line the car in fact cannot steer.
             rec["kappa_peak"] = float(np.max(kap_laid[m]))
+    # Clearance of the FINAL WOVEN profile per laid hump. The acceptance floor above judged each
+    # hump in isolation, but where two ramps overlap the BPoly weaves them and what gets published
+    # is not the single hump that was tested. Re-measure on the profile that is actually returned,
+    # so the number the node logs (and vetoes on) describes the line the car will follow.
+    for rec in laid:
+        ob = rec.pop("_obs", None)
+        if ob is None:
+            continue
+        rec["clear"] = float(np.min(np.hypot(xy_laid[:, 0] - ob[0],
+                                             xy_laid[:, 1] - ob[1]))) - float(ob[2])
     return d_global, len(kn_u), ent_k, dropped, laid
 
 
@@ -1177,6 +1266,7 @@ def _reopt_local_window_impl(
     reach_max: float = 10.0,
     clean_kappa: Optional[np.ndarray] = None,
     fit_tol: float = _FIT_TOL_DEFAULT,
+    apex_obstacles: Optional[List[Optional[Tuple[float, float, float]]]] = None,
 ) -> dict:
     """Fast ONLINE obstacle-aware raceline: reshape the REACTIVE avoidance spline into a global
     line. Each `apex` (map-frame (x,y) captured from the reactive spliner on the exploration lap)
@@ -1194,6 +1284,12 @@ def _reopt_local_window_impl(
       clean_dr/dl[N]   distance from each raceline point to the RIGHT/LEFT track bound.
       reftrack   [M,4] centerline `[x,y,w_tr_right,w_tr_left]` (only to reconstruct bound polylines).
       apexes           recorded reactive-spline apex points (map-frame (x,y)); empty -> clean line.
+      apex_obstacles   OPTIONAL map-frame (x, y, r) per apex, index-aligned (None entries allowed).
+                       Supplying them turns `params.obs_margin` into a HARD acceptance floor: a
+                       hump is laid only if the geometry it produces clears that obstacle's edge
+                       by obs_margin, else it is retried wider once and then honestly dropped for
+                       the reactive layer. Without them the amplitude-ratio proxy is used instead
+                       (see build_offset_profile) — offline sweeps have no box to measure against.
       input_path       config/<version> dir (veh_dyn_info + racecar_f110.ini) for the vel profile.
       w_veh            vehicle width [m]; with wall_margin sets the corridor the offset is clamped to.
       reach_time/min/max  ramp reach R = clip(reach_time * local_speed, reach_min, reach_max).
@@ -1263,7 +1359,8 @@ def _reopt_local_window_impl(
             clean_xy, s_loop, track_len, nvec_rl, apexes,
             clean_vx_arr, 0.0, r, r, hi_inc=hi_inc, lo_inc=lo_inc,
             entry_scale=e_scale, exit_scale=x_scale,
-            fit_tol=fit_tol, clean_kappa=clean_kappa, curvlim=curvlim)
+            fit_tol=fit_tol, clean_kappa=clean_kappa, curvlim=curvlim,
+            obstacles=apex_obstacles, obs_margin=params.obs_margin)
         if nn == 0:
             return dg, 0, float("inf"), ek, drp, lay
         return dg, nn, _offset_lap_time(dg, clean_xy, nvec_rl, el_cl, clean_kappa,

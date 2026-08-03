@@ -49,6 +49,12 @@ from gb_optimizer import static_reopt_core as core                   # noqa: E40
 # planner out by obstacle radius + keep-out (width_car/2 + safety_margin) + apex_bulge. With the
 # shipped static_avoidance_params.yaml that is 0.15 + 0.30 + 0.10 = 0.55 m.
 APEX_OFFSET_M = 0.55
+# ...and the obstacle it was driven around: a disk of this radius sitting ON the raceline.
+# Passing it to the core is what makes this sweep exercise the REAL acceptance rule (the laid line
+# must clear the box edge by obs_margin) instead of the amplitude-ratio proxy that applies only
+# when no box is known. OBS_MARGIN_M mirrors reopt_obs_margin in base_system/race.launch.xml.
+OBS_RADIUS_M = 0.15
+OBS_MARGIN_M = 0.35
 # The 0.5 mm regression. Obstacle just past the ifac start/finish straight, apex at the point the
 # published line actually passed through in the failing run (2026-07-30). The amplitude cap parks
 # the hump peak exactly on the corridor bound; with a zero fit tolerance the station 0.1 m away
@@ -77,11 +83,13 @@ def clean_metrics(m):
             float(np.max(m["vx"] ** 2 * kg)))
 
 
-def solve(m, apex, cfg_dir, wall_margin, fit_tol):
+def solve(m, apex, cfg_dir, wall_margin, fit_tol, obstacle=None):
     return core.reoptimize_local_window(
         m["xy"], m["dr"], m["dl"], m["reftrack"], [apex], cfg_dir,
+        params=core.ModulationParams(obs_margin=OBS_MARGIN_M),
         w_veh=0.30, clean_vx=m["vx"], wall_margin=wall_margin,
-        reach_time=0.0, reach_min=1.0, reach_max=6.0, clean_kappa=m["kappa"], fit_tol=fit_tol)
+        reach_time=0.0, reach_min=1.0, reach_max=6.0, clean_kappa=m["kappa"], fit_tol=fit_tol,
+        apex_obstacles=[obstacle] if obstacle is not None else None)
 
 
 def sweep(m, cfg_dir, wall_margin, fit_tol, step):
@@ -96,8 +104,9 @@ def sweep(m, cfg_dir, wall_margin, fit_tol, step):
     for i in range(0, n - 1, step):
         side = 1.0 if hi[i] >= -lo[i] else -1.0          # the reactive planner takes the roomier side
         apex = tuple(m["xy"][i] + side * APEX_OFFSET_M * nvec[i])
+        obstacle = (float(m["xy"][i][0]), float(m["xy"][i][1]), OBS_RADIUS_M)
         try:
-            res = solve(m, apex, cfg_dir, wall_margin, fit_tol)
+            res = solve(m, apex, cfg_dir, wall_margin, fit_tol, obstacle)
         except Exception as exc:                          # a solver failure is a result, not a stop
             dropped.append({"i": i, "reason": f"exception:{type(exc).__name__}"})
             continue
@@ -112,6 +121,7 @@ def sweep(m, cfg_dir, wall_margin, fit_tol, step):
             "i": i, "kappa": float(kg.max()), "ay": float(np.max(traj[:, 5] ** 2 * kg)),
             "lap": float(res["main"][3]), "laid": laid["laid"], "want": laid["want"],
             "r_in": laid["r_in"], "r_out": laid["r_out"], "r_req": laid["r_req"],
+            "clear": float(laid.get("clear", float("nan"))),
             "curvlim": float(res.get("curvlim", 0.0)),
         })
     return rows, dropped
@@ -182,12 +192,30 @@ def main() -> int:
                         print(f"    FAIL: implied lateral accel {ay.max():.2f} > ggv ay_max "
                               f"{ay_max:.2f}. The speed plan is outside the friction budget — check "
                               f"_cap_speed_to_published_curvature reads the real geometry.")
+                    # A LAID hump must clear the box by obs_margin. The core enforces this per
+                    # hump before accepting it; this re-checks it on the WOVEN + resampled profile
+                    # that is actually returned, which is the only place the two can disagree.
+                    short = [r for r in rows if r["clear"] == r["clear"]
+                             and r["clear"] < OBS_MARGIN_M - 1e-6]
+                    if short:
+                        ok = False
+                        w = min(short, key=lambda r: r["clear"])
+                        print(f"    FAIL: {len(short)} laid line(s) clear the box by less than "
+                              f"obs_margin {OBS_MARGIN_M:.2f} (worst {w['clear']:+.3f} m at "
+                              f"waypoint {w['i']}). The acceptance floor accepted a hump the final "
+                              f"profile does not deliver — the reactive layer will re-avoid it and "
+                              f"the SM will read the line as blocked.")
 
     # --- the 0.5 mm corridor-fit regression -------------------------------------------------
     if args.check:
         r = REGRESSION
         print(f"\n--- regression: {r['map']} apex {r['apex']} at wall_margin {r['wall_margin']} ---")
-        res = solve(load_map(r["map"]), r["apex"], cfg_dir, r["wall_margin"], core._FIT_TOL_DEFAULT)
+        mr = load_map(r["map"])
+        # The obstacle this apex was driven around sat on the raceline; recover it as the raceline
+        # point nearest the apex (the same projection build_offset_profile does).
+        j = int(np.argmin(np.hypot(mr["xy"][:, 0] - r["apex"][0], mr["xy"][:, 1] - r["apex"][1])))
+        obs = (float(mr["xy"][j][0]), float(mr["xy"][j][1]), OBS_RADIUS_M)
+        res = solve(mr, r["apex"], cfg_dir, r["wall_margin"], core._FIT_TOL_DEFAULT, obs)
         if res["n_windows"] == 0:
             ok = False
             why = res["apex_dropped"][0].get("reason", "?") if res["apex_dropped"] else "no-apex"
@@ -202,7 +230,8 @@ def main() -> int:
                       f"the +1.62 s/lap, curvlim-exceeding shape from 2026-07-30.")
             else:
                 print(f"OK: reach {a['r_in']:.2f}/{a['r_out']:.2f} m (>= {r['min_reach_m']:.2f}), "
-                      f"laid d={a['laid']:+.3f}, max|kappa| {a['kappa_peak']:.2f}")
+                      f"laid d={a['laid']:+.3f}, max|kappa| {a['kappa_peak']:.2f}, "
+                      f"clears {a['clear']:+.3f} m (floor {OBS_MARGIN_M:.2f})")
         print(f"\n{'ALL CHECKS PASSED' if ok else 'CHECKS FAILED'}")
     return 0 if ok else 1
 

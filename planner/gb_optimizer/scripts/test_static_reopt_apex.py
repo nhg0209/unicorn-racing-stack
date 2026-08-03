@@ -231,6 +231,74 @@ def test_orphan_apex_adopted_on_id_reissue():
     print("PASS orphaned apex adopted on track-id re-issue")
 
 
+def _straight_frame(n=400, step=0.1):
+    """Straight clean line along +x with unit normals toward -y (the '+d_right' side)."""
+    xy = np.column_stack([np.arange(n) * step, np.zeros(n)])
+    s = np.arange(n) * step
+    nvec = np.column_stack([np.zeros(n), -np.ones(n)])
+    return xy, s, float(n * step), nvec
+
+
+def test_clearance_floor_is_enforced_and_drops_honestly():
+    # The acceptance rule is "the laid geometry clears the box EDGE by obs_margin", not "the
+    # amplitude is >= 90% of the recorded apex". A 0.9 x 0.55 m apex leaves 0.345 m off a 0.15 m
+    # box -- under the 0.35 m every downstream consumer assumes -- so the ratio proxy accepted
+    # exactly the lines that then read as blocked to the SM.
+    xy, s, L, nvec = _straight_frame()
+    obs = (20.0, 0.0, 0.15)                       # box on the raceline at x=20
+    apex = [(20.0, -0.55)]                        # reactive apex: 0.55 m to the -y side
+    roomy = np.full(len(xy), 1.0)
+    d_glob, n, _ek, dropped, laid = core.build_offset_profile(
+        xy, s, L, nvec, apex, None, 0.0, 3.0, 3.0,
+        hi_inc=roomy, lo_inc=-roomy, obstacles=[obs], obs_margin=0.35)
+    assert n == 1 and laid, "a hump that CAN clear the box must be laid"
+    assert laid[0]["clear"] >= 0.35 - 1e-9, f"laid line clears only {laid[0]['clear']:.3f}"
+
+    # Same apex, corridor clamped to 0.40 m: the hump can never reach 0.35 m of edge clearance
+    # (0.40 - 0.15 = 0.25), so it must be DROPPED for the reactive layer, not laid short.
+    tight = np.full(len(xy), 0.40)
+    _d, n_t, _e, dropped_t, laid_t = core.build_offset_profile(
+        xy, s, L, nvec, apex, None, 0.0, 3.0, 3.0,
+        hi_inc=tight, lo_inc=-tight, obstacles=[obs], obs_margin=0.35)
+    assert n_t == 0 and not laid_t, "an unreachable clearance must not be laid"
+    assert dropped_t and dropped_t[0]["reason"] == "clearance", dropped_t
+    assert dropped_t[0]["clear"] < 0.35
+    print("PASS clearance floor accepts what clears and drops what cannot")
+
+
+def test_clearance_floor_grows_a_short_apex():
+    # The recorded apex is a LOWER bound on what the obstacle needs. A reactive apex driven at
+    # 0.30 m of edge clearance is 5 cm short of the floor -- the retry must ask the corridor for
+    # the missing amplitude instead of dropping the obstacle.
+    xy, s, L, nvec = _straight_frame()
+    obs = (20.0, 0.0, 0.15)
+    apex = [(20.0, -0.45)]                        # 0.45 - 0.15 = 0.30 m of edge clearance
+    roomy = np.full(len(xy), 1.0)
+    _d, n, _e, dropped, laid = core.build_offset_profile(
+        xy, s, L, nvec, apex, None, 0.0, 3.0, 3.0,
+        hi_inc=roomy, lo_inc=-roomy, obstacles=[obs], obs_margin=0.35)
+    assert n == 1 and not dropped, f"short apex must be grown, not dropped ({dropped})"
+    assert laid[0]["clear"] >= 0.35 - 1e-9
+    assert abs(laid[0]["laid"]) > abs(laid[0]["want"]), "the retry must widen the hump"
+    print("PASS a short recorded apex is grown to the floor")
+
+
+def test_line_clearance_veto():
+    # A line that does not clear an obstacle it CLAIMS to have reshaped must not be published;
+    # one that misses an obstacle no hump was laid for is fine (reactive layer's job).
+    n = make_node()
+    n.obs_margin = 0.35
+    traj = np.column_stack([np.arange(400) * 0.1, np.arange(400) * 0.1, np.zeros(400)])
+    close = core.Obstacle(20.0, 0.20, 0.15)       # line passes 0.05 m from the edge
+    far = core.Obstacle(30.0, 1.00, 0.15)
+    assert n._check_line_clearance(traj, [far], [{"xy": (30.0, 0.6)}]) is True
+    assert n._check_line_clearance(traj, [close], [{"xy": (20.0, 0.6)}]) is False, \
+        "a reshaped-but-not-cleared obstacle must veto the publish"
+    assert n._check_line_clearance(traj, [close], []) is True, \
+        "an obstacle with no hump laid for it is the reactive layer's job, not a veto"
+    print("PASS line clearance vetoes only lines that break their own promise")
+
+
 def test_breaker_refuses_poisoned_pending():
     n = make_node()
     sa = np.arange(0.0, 40.0, 0.1)
@@ -360,4 +428,7 @@ if __name__ == "__main__":
     test_commit_horizon_wrap()
     test_deadlock_breaker()
     test_breaker_refuses_poisoned_pending()
+    test_clearance_floor_is_enforced_and_drops_honestly()
+    test_clearance_floor_grows_a_short_apex()
+    test_line_clearance_veto()
     print("ALL PASS")
