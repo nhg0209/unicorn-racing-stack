@@ -189,13 +189,16 @@ class StateMachineParams:
         self.lateral_width_gb_m: float = node.get_parameter("lateral_width_gb_m").value
 
         self._declare(
-            "lateral_width_static_gb_m", 0.15,
+            "lateral_width_static_gb_m", 0.05,
             ParameterDescriptor(
                 description="GB_FREE margin vs STATIC obstacles, distance-independent [m]. The "
-                            "obstacle-aware line from static_reopt clears the box by keep-out + "
-                            "apex_bulge (~0.40 m); the requirement ego/2 + this must stay below "
-                            "that (checked by check_avoidance_margins.py) or the swapped line "
-                            "reads as blocked and the SM re-avoids it every lap.",
+                            "requirement gb_ego_width_m/2 + this must stay at or below the "
+                            "reactive planner's clear-gate STAY threshold (width_car/2 + "
+                            "clear_margin_m), which in turn stays below the enforced re-opt "
+                            "clearance floor (reopt_obs_margin) minus slack. Anything above the "
+                            "clear-gate threshold opens a dead band where the SM reads the "
+                            "swapped line as blocked while the planner idles -> TRAILING behind "
+                            "a cleared line. Checked by check_avoidance_margins.py.",
                 type=ParameterType.PARAMETER_DOUBLE,
                 floating_point_range=[FloatingPointRange(from_value=0.0, to_value=1.0, step=0.01)],
             ),

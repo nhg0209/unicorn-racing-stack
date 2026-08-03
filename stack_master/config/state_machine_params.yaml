@@ -31,11 +31,20 @@ state_machine:
     volt_threshold: 11.0
     # dynamic (replaces dyn_statemachine_tuner.cfg)
     lateral_width_gb_m: 0.3
-    # GB_FREE margin vs STATIC obstacles, distance-independent. Must satisfy
-    # gb_ego_width/2 + this + slack <= reactive keep-out + apex_bulge (~0.40 m; the clearance the
-    # obstacle-aware line actually has) or the swapped line reads blocked -> phantom TRAILING.
-    # Verified by stack_master/scripts/check_avoidance_margins.py.
-    lateral_width_static_gb_m: 0.15
+    # GB_FREE margin vs STATIC obstacles, distance-independent. The SM requirement it forms,
+    #     gb_ego_width_m/2 + lateral_width_static_gb_m   (= 0.20 + 0.05 = 0.25 m, line centre to
+    #                                                      obstacle EDGE)
+    # is ONE link of the margin chain and must sit at or below the next one:
+    #     SM requirement  <=  planner clear-gate STAY threshold (width_car/2 + clear_margin_m,
+    #                         static_avoidance_params.yaml = 0.25)
+    #                     <=  enforced re-opt clearance floor (reopt_obs_margin = 0.35) - slack
+    # Was 0.15 -> SM required 0.35 while the planner idled from 0.25 (0.28 to ENTER idle). In the
+    # [0.28, 0.35) band BOTH sides stood down: the SM read the swapped line as blocked and fell to
+    # TRAILING while the planner, correctly, published nothing to overtake with -- a deadlock
+    # behind a line that already cleared the obstacle. 0.05 closes that dead band exactly (SM
+    # requirement == clear-gate stay threshold). Verified by
+    # stack_master/scripts/check_avoidance_margins.py (ordering rule).
+    lateral_width_static_gb_m: 0.05
     lateral_width_ot_m: 0.3
     splini_hyst_timer_sec: 0.7
     splini_ttl: 2.0
