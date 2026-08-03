@@ -142,6 +142,17 @@ def _cyclic_smooth(a: np.ndarray, win: int = 7) -> np.ndarray:
 _HUMP_SPAN_FRAC = 0.28   # 0.20 -> 0.28: room for the entry/exit ramp stretching that shallows
                          # the merge-zone inflections (user-visible S-kinks where the hump
                          # rejoins the raceline); still keeps a hump under ~28% of the lap.
+# ...and the same bound over ALL humps together. The per-hump cap says nothing about the total, so
+# three obstacles at 0.28 each could put 84% of the lap off the racing line while every individual
+# hump remained "local" — which is what "the re-opt line is humped everywhere" looks like from the
+# car. Recovery order is the reverse of the order the span was bought in: the entry/exit stretch
+# (a <=0.08 s smoothness tiebreak) is given back first, then the reach.
+_HUMP_SPAN_TOTAL_FRAC = 0.40
+# Lap-time penalty [s per metre] charged to a candidate whose TOTAL span exceeds the budget. Steep
+# against the ~0.4 s spread between candidate reaches, so an in-budget candidate always wins if one
+# exists — while still preferring the least-overshooting when the track leaves no choice, rather
+# than failing outright.
+_SPAN_OVER_PENALTY_S_PER_M = 1.0
 # ALL-OR-NOTHING apex fit: a hump the corridor forces below this fraction of the recorded
 # reactive apex does NOT clear the obstacle (the apex |d| is the reactive-PROVEN clearance) —
 # laying the shrunken hump wastes lap time, still triggers the reactive layer every lap
@@ -1000,16 +1011,35 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
 
             r_in = _stretch(entry_scale, r_f, stretch_entry=True)
             r_out = _stretch(exit_scale, r_in, stretch_entry=False)
-            fitted.append((u, d_f, r_in, r_out))
+            fitted.append((u, d_f, r_in, r_out, r_f))    # r_f = pre-stretch reach (budget recovery)
             laid.append({"xy": (float(xa), float(ya)), "want": float(d), "laid": float(d_f),
                          "r_in": float(r_in), "r_out": float(r_out), "r_req": float(r_req),
                          "kappa_peak": 0.0,        # filled from the laid profile below
                          "clear": float("nan"),    # ditto — measured on the WOVEN profile
                          "_obs": ob,               # so the join below can re-measure it
                          "_u": float(u)})          # join key: `fitted` gets sorted, `laid` does not
-        kn_u = sorted(fitted)
-        if not kn_u:
+        if not fitted:
             return d_global, 0, 0.0, dropped, laid
+        # --- GLOBAL span budget, step 1: give back the STRETCH ---------------------------------
+        # _HUMP_SPAN_FRAC bounds ONE hump. With several obstacles nothing bounded the TOTAL, so
+        # three humps at the per-hump cap could put most of the lap off the racing line -- measured
+        # on ifac with 3 boxes and the stretch stages at their maximum: 19.5 m of span on a 36.6 m
+        # lap, 43% of stations off the racing line, while every individual hump was still "local".
+        # That is what "the re-opt line is humped everywhere" looks like from the car.
+        #
+        # Recovery order is the reverse of the order the span was bought in. The entry/exit stretch
+        # is a smoothness tiebreak the caller bought for at most 0.03 + 0.05 s of lap time, and
+        # r_f was verified in its own right, so handing it back is free and safe -- do it here.
+        # Reach beyond that is NOT recovered here: shrinking a fitted hump after the fact raises
+        # its curvature past what the fit accepted, and the joint verification below then drops it
+        # (measured: uniform scaling to the budget took the same 3-box case from 3 humps to ZERO).
+        # The reach is instead chosen inside the budget by the caller's search, which re-FITS at
+        # each candidate so every check runs at the reach that is actually laid.
+        span_budget = _HUMP_SPAN_TOTAL_FRAC * track_len
+        if sum(ri + ro for (_u, _d, ri, ro, _rf) in fitted) > span_budget:
+            fitted = [(u, d, min(ri, rf), min(ro, rf), rf) for (u, d, ri, ro, rf) in fitted]
+        # r_f has done its job; the weave and the verification below take 4-tuples.
+        kn_u = sorted((u, d, ri, ro) for (u, d, ri, ro, _rf) in fitted)
         verify_ctx = (hi_a, lo_a, kap_geo, floor_r)
     else:
         kn_u = [(u, d, ri, ro) for (u, d, ri, ro, _xa, _ya, _ob) in kn_u]   # no corridor: keep all
@@ -1134,6 +1164,10 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         h = float(np.median(np.abs(np.diff(u_stn[m])))) or 1.0
         ent_k = max(ent_k, float(np.abs(np.diff(seg, 2)).max() / max(h * h, 1e-9)))
         rec = by_u.get(round(float(u), 6))
+        if rec is not None:
+            # The reach can have been cut twice since it was recorded (global span budget, then
+            # the joint weave verification), so report what was LAID, not what was fitted.
+            rec["r_in"], rec["r_out"] = float(ri), float(ro)
         if rec is not None and kap_laid is not None:
             # Geometric, matching the verdict in _kappa_peak. The additive `kappa_clean + d''` the
             # node publishes reads ~45% low here (1.19 vs 2.11 on the ifac chicane hump), so a log
@@ -1478,8 +1512,17 @@ def _reopt_local_window_impl(
             obstacles=apex_obstacles, obs_margin=params.obs_margin)
         if nn == 0:
             return dg, 0, float("inf"), ek, drp, lay
-        return dg, nn, _offset_lap_time(dg, clean_xy, nvec_rl, el_cl, clean_kappa,
-                                        clean_vx_arr, lo_inc, hi_inc, veh, N), ek, drp, lay
+        est = _offset_lap_time(dg, clean_xy, nvec_rl, el_cl, clean_kappa,
+                               clean_vx_arr, lo_inc, hi_inc, veh, N)
+        # GLOBAL span budget, step 2: rank over-budget candidates out of the running. Enforcing it
+        # here rather than by shrinking a fitted profile is the whole point — each candidate reach
+        # is re-FITTED, so the corridor, curvature and clearance checks all run at the reach that
+        # would actually be laid. The penalty is steep enough (1 s/m against lap-time differences
+        # of ~0.4 s) that any in-budget candidate beats any over-budget one, and when NONE fits it
+        # still selects the least-overshooting rather than failing.
+        span = sum(a["r_in"] + a["r_out"] for a in lay)
+        over = max(0.0, span - _HUMP_SPAN_TOTAL_FRAC * track_len)
+        return dg, nn, est + _SPAN_OVER_PENALTY_S_PER_M * over, ek, drp, lay
 
     # STAGE 1 — symmetric reach, minimise lap time.
     d_global, n_solved, best_est, best_ek, best_r = None, 0, float("inf"), 0.0, cand_r[0]
