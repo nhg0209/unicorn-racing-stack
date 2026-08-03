@@ -106,7 +106,17 @@ static_avoidance_planner:
     # re-recording (which walked the re-opt line outward every lap), SM stays GB_TRACK.
     clear_gate_enable: true
     clear_hyst_m: 0.03      # [m] EXTRA clearance required to enter idle (leave only on a real violation)
-    clear_max_cur_d: 0.15   # [m] gate applies only with the car on the raceline (never abandons a maneuver)
+    clear_max_cur_d: 0.15   # [m] above this |cur_d| a stand-down CANCELS an excursion, so it must be
+                            #      earned at the full entry margin and may never ride on a latch. It no
+                            #      longer gates whether the clearance is EVALUATED: the steady-state
+                            #      tracking error is ~0.5 m, so gating evaluation on 0.15 meant the gate
+                            #      simply did not run after a line swap and every pass re-avoided a box
+                            #      the global line already cleared.
+    clear_latch_ttl_s: 10.0 # [s] how long a per-obstacle clear latch survives while that obstacle is
+                            #      outside the lookahead. The latch is per tracker id and deliberately
+                            #      OUTLIVES the lookahead -- a box leaves the horizon on every approach,
+                            #      and resetting there made it re-earn idle at the entry margin each lap
+                            #      (one re-triggered maneuver per pass). The TTL only bounds the dict.
     clear_margin_m: 0.10    # [m] extra beyond half_car(0.15) for the CLEAR trigger -> need = 0.25 m from
                             #      the box edge (+clear_hyst_m when entering idle). This is "does the car
                             #      fit past the box", NOT the clearance a new path is designed to

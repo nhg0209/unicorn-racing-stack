@@ -171,14 +171,30 @@ class ObstacleSpliner(Node):
         # this planner must stay IDLE. Planning anyway re-recorded apexes on top of the swapped
         # line (the re-opt then walked outward every lap) and made the SM commit pointless
         # OVERTAKEs. Hysteresis: going idle needs clear_hyst_m EXTRA clearance; once idle, only a
-        # genuine keep-out violation resumes planning. Gated on |cur_d| so a maneuver in progress
-        # is never abandoned mid-hump.
+        # genuine keep-out violation resumes planning.
+        #
+        # The clearance is EVALUATED every cycle, unconditionally. It used to be evaluated only
+        # while |cur_d| < clear_max_cur_d, on the reasoning that a maneuver in progress must not be
+        # abandoned mid-hump — but the documented steady-state tracking error is ~0.5 m, three
+        # times that threshold, so on the swapped line the gate simply never ran and the planner
+        # re-avoided an obstacle the global line already cleared. It also cost nothing to protect:
+        # by the time control reaches the gate the committed-path branch above has already
+        # returned, so there is no maneuver left to abandon, and the gate's own predicate says the
+        # FOLLOWED line clears every box ahead — returning to it is safe from anywhere.
+        # clear_max_cur_d now decides only whether standing down would CANCEL an excursion: off
+        # the raceline the full entry margin is required, so a cancel can never ride on a latch.
         self.clear_gate_enable = True
         self.clear_margin_m = 0.10   # [m] extra beyond half_car for the raceline-CLEAR trigger
         self.reframe_warn_m = 0.05   # [m] warn when incoming obstacle d must be re-anchored by more
         self.clear_hyst_m = 0.03     # [m] extra clearance required to ENTER the idle state
-        self.clear_max_cur_d = 0.15  # [m] gate only applies with the car ON the raceline
-        self._line_clear = False     # idle latch (hysteresis state)
+        self.clear_max_cur_d = 0.15  # [m] above this |cur_d| a stand-down CANCELS an excursion
+        self.clear_latch_ttl_s = 10.0  # [s] how long a per-obstacle clear latch survives unseen
+        self._line_clear = False     # aggregate idle state (logging / "all boxes ahead are clear")
+        # Per-OBSTACLE-ID clear latch: id -> wall time it last passed. Kept while the obstacle is
+        # out of the lookahead, so a box that leaves and re-enters the horizon does not have to
+        # re-earn idle at the entry margin every time — that reset is what let a cleared obstacle
+        # re-trigger a maneuver once per approach.
+        self._clear_latch = {}
 
         # --- path commitment (temporal consistency) ------------------------------------------
         # Once a feasible evasion path is chosen, COMMIT to it: keep republishing that SAME
@@ -221,6 +237,7 @@ class ObstacleSpliner(Node):
             'return_len', 'apex_bulge', 'max_weave', 'width_car', 'tail_m', 'w_d', 'w_k', 'w_c', 'w_obs', 'obs_sigma',
             'use_grid_check', 'trust_grid_bounds', 'grid_scan_max', 'grid_scan_step', 'bounds_warn_m',
             'clear_gate_enable', 'clear_hyst_m', 'clear_max_cur_d', 'clear_margin_m', 'reframe_warn_m',
+            'clear_latch_ttl_s',
             'commit_enable', 'commit_dev_max', 'commit_obs_ds', 'commit_obs_dd',
         ]))
         self.add_on_set_parameters_callback(self.dyn_param_cb)
@@ -314,7 +331,12 @@ class ObstacleSpliner(Node):
                                ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
                                                    description="Stay idle when the current raceline already clears every obstacle ahead"))
         self.declare_parameter('clear_hyst_m', 0.03, dbl(0.0, 0.5, "extra clearance to ENTER the idle state [m]"))
-        self.declare_parameter('clear_max_cur_d', 0.15, dbl(0.0, 1.0, "clear gate applies only when |cur_d| below this [m]"))
+        self.declare_parameter('clear_max_cur_d', 0.15,
+                               dbl(0.0, 1.0, "above this |cur_d| a stand-down cancels an excursion, "
+                                             "so it needs the full entry margin (never a latch) [m]"))
+        self.declare_parameter('clear_latch_ttl_s', 10.0,
+                               dbl(0.0, 120.0, "how long a per-obstacle clear latch survives while "
+                                               "that obstacle is out of the lookahead [s]"))
         self.declare_parameter('commit_enable', True,
                                ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
                                                    description="Commit to a chosen evasion path and reuse it (temporal consistency) instead of re-solving every cycle"))
@@ -400,6 +422,8 @@ class ObstacleSpliner(Node):
                 self.clear_hyst_m = float(p.value)
             elif n == 'clear_max_cur_d':
                 self.clear_max_cur_d = float(p.value)
+            elif n == 'clear_latch_ttl_s':
+                self.clear_latch_ttl_s = float(p.value)
             elif n == 'commit_enable':
                 self.commit_enable = bool(p.value)
                 if not self.commit_enable:
@@ -540,6 +564,57 @@ class ObstacleSpliner(Node):
         self.get_logger().info(f"[{self.name}] initialized FrenetConverter object")
         return converter
 
+    def _eval_clear_gate(self, obs_ahead, half_car: float) -> bool:
+        """Does the FOLLOWED global line clear every obstacle ahead? (updates the per-id latches)
+
+        The test per obstacle is "the keep-out interval around the box does not contain d = 0",
+        with `d` already re-anchored into this node's frenet frame, so d = 0 is the line the car
+        is on. Two thresholds, and which one applies is the whole point of this method:
+
+          stay  = half_car + clear_margin_m                  (already latched, car on the raceline)
+          entry = stay + clear_hyst_m                        (fresh, or standing down off-line)
+
+        Standing down while |cur_d| >= clear_max_cur_d CANCELS an excursion the car is already
+        committed to in the physical sense, so it must be earned at `entry` — never on a latch.
+        On the raceline a latched obstacle keeps `stay`, which is what stops the publish/empty
+        flapping as cur_d decays through the threshold with noise (the "duplicate path" symptom,
+        SM alternating OVERTAKE<->GB_TRACK at up to 20 Hz).
+
+        The latch is per tracker id and survives the obstacle leaving the lookahead; only a REAL
+        keep-out violation drops it.
+        """
+        now_s = self.get_clock().now().nanoseconds * 1e-9
+        base = half_car + self.clear_margin_m
+        cancelling = abs(self.cur_d) >= self.clear_max_cur_d
+        clear = True
+        for o in obs_ahead:
+            oid = int(o.id)
+            latched = (now_s - self._clear_latch.get(oid, -1e18)) < self.clear_latch_ttl_s
+            need = base if (latched and not cancelling) else base + self.clear_hyst_m
+            if ((min(o.d_right, o.d_left) - need) > 0.0
+                    or (max(o.d_right, o.d_left) + need) < 0.0):
+                self._clear_latch[oid] = now_s
+            else:
+                self._clear_latch.pop(oid, None)
+                clear = False
+        self._prune_clear_latch(now_s)
+        return clear
+
+    def _prune_clear_latch(self, now_s: float = None) -> None:
+        """Drop clear latches for obstacles not seen for clear_latch_ttl_s.
+
+        The latch deliberately survives an obstacle leaving the lookahead, so it cannot be keyed
+        off the live obstacle set; a TTL is what keeps tracker ids from accumulating over a
+        session. Anything this old is a track that is gone for good, and a re-detected box gets a
+        fresh id from the tracker anyway."""
+        if not self._clear_latch:
+            return
+        if now_s is None:
+            now_s = self.get_clock().now().nanoseconds * 1e-9
+        stale = [k for k, t in self._clear_latch.items() if (now_s - t) >= self.clear_latch_ttl_s]
+        for k in stale:
+            del self._clear_latch[k]
+
     def _gather_obstacles_ahead(self, obstacles, lookahead: float) -> List[Tuple[float, Obstacle]]:
         """Static / near-stationary obstacles ahead within [0, lookahead], as (gap, obs), sorted."""
         cands = []
@@ -631,23 +706,30 @@ class ObstacleSpliner(Node):
             cands_obs = self._gather_obstacles_ahead(self._mem_cands_obs, lookahead)
         obs_ahead = [o for _, o in cands_obs]
         if not obs_ahead:
-            # nothing to avoid -> no avoidance path (state machine stays on the raceline)
+            # nothing to avoid -> no avoidance path (state machine stays on the raceline).
+            # The AGGREGATE flag is a statement about the boxes ahead, so it resets with them --
+            # but the per-obstacle latches must NOT: an obstacle leaves the lookahead on every
+            # approach, and wiping its latch there made it re-earn idle at the entry margin each
+            # lap, which is one re-triggered maneuver per pass over an already-cleared box.
             self._line_clear = False
             self._committed = None
+            self._prune_clear_latch()
             return _empty()
 
         # --- raceline-clear gate: the current global line may ALREADY avoid everything ahead ---
         # (the obstacle-aware line static_reopt swapped in). Idle then: no path -> the SM stays
-        # GB_TRACK and no apex is re-recorded on top of the swapped line. Obstacle d values are in
-        # the SAME frenet frame as this planner (tracking re-projects on a line swap), so "the
+        # GB_TRACK and no apex is re-recorded on top of the swapped line. Obstacle d values are
+        # re-anchored into THIS node's frenet frame on arrival (_reframe_obstacles), so "the
         # keep-out interval does not contain d=0" IS the clearance test of the followed line.
-        # The |cur_d| condition guards ENTERING idle only (never abandon a maneuver mid-hump);
-        # once LATCHED idle it must not bypass the gate — during the post-swap merge cur_d decays
-        # through the threshold with noise, and re-planning on every excursion above it flapped
-        # publish/empty at up to 20 Hz -> the SM alternated OVERTAKE<->GB_TRACK and the controller
-        # received two different local paths in alternation (the "duplicate path" symptom; the L1
-        # point jumped between the two lines). The latch drops only on a REAL keep-out violation.
-        if self.clear_gate_enable and (self._line_clear or abs(self.cur_d) < self.clear_max_cur_d):
+        #
+        # EVALUATION IS UNCONDITIONAL. It used to be skipped unless |cur_d| < clear_max_cur_d or
+        # the aggregate latch was already set, to avoid abandoning a maneuver mid-hump. But the
+        # steady-state tracking error is ~0.5 m -- three times that threshold -- so after a line
+        # swap the gate mostly did not run at all, and every pass re-avoided a box the global line
+        # already cleared. Nothing was being protected either: the committed-path branch above has
+        # already returned by the time control gets here, so there is no maneuver in flight, and
+        # the predicate itself certifies the followed line clears every box ahead.
+        if self.clear_gate_enable:
             # The trigger threshold is NOT obs_margin. obs_margin (half_car + safety_margin = 0.30)
             # is what a NEW path is designed to, and reusing it here asks "is the current line
             # planned to my full design clearance?" instead of "does the car fit past this box?".
@@ -657,16 +739,12 @@ class ObstacleSpliner(Node):
             # then has to find a candidate at the full 0.30 in a corridor the line already used up,
             # rejects every one, publishes feasible=False, and the SM falls to TRAILING behind an
             # obstacle it had already solved.
-            need = half_car + self.clear_margin_m
-            if not self._line_clear:
-                need += self.clear_hyst_m
-            clear = all(
-                (min(o.d_right, o.d_left) - need) > 0.0 or (max(o.d_right, o.d_left) + need) < 0.0
-                for o in obs_ahead)
+            clear = self._eval_clear_gate(obs_ahead, half_car)
             if clear and not self._line_clear:
                 self.get_logger().info(
                     f"[{self.name}] raceline clears all {len(obs_ahead)} obstacle(s) ahead "
-                    f"(margin {need:.2f} m) -> planner idle")
+                    f"(margin {half_car + self.clear_margin_m:.2f} m, |cur_d|="
+                    f"{abs(self.cur_d):.2f}) -> planner idle")
             self._line_clear = clear
             if clear:
                 self._committed = None
