@@ -12,6 +12,7 @@ sustainability / prediction-aware free checks / velocity replanning / BehaviorSt
 trailing & overtaking targets). The race_stack ROS2 template was used only for the
 ament/rclpy structural idioms.
 """
+import copy
 import os
 import time
 import json
@@ -173,6 +174,11 @@ class StateMachine(Node):
         # obstacle id -> last time it was reported is_visible (STATIC obstacles only); see
         # obstacle_perception_cb's debounce.
         self._last_visible_t = {}
+        # Tolerances for "this is the same committed path, re-sliced further forward" (see
+        # _is_forward_reslice). Tight on purpose: the whole value of the rule is that adopting such
+        # a path moves the window's START without moving its GEOMETRY.
+        self.reslice_d_tol_m = 0.03
+        self.reslice_end_s_tol_m = 0.20
 
         self.cur_s = 0.0
         self.cur_d = 0.0
@@ -1007,13 +1013,21 @@ class StateMachine(Node):
         return False
 
     def _check_latest_wpnts(self, src_wpnts, wpnts_data: WaypointData):
+        """Is the planner publishing a fresh path AND is the car on the cached one?
+
+        PURE. This used to ADOPT the published path into the cache as a side effect, which made it
+        the second writer of a cache update_waypoints also writes -- with a different policy. The
+        two disagreed: update_waypoints deliberately KEEPS a committed path through small
+        cycle-to-cycle changes, while this adopted whatever arrived, from whichever gate happened
+        to run first that cycle. Which one won depended on the transition path taken, so the cached
+        geometry (and therefore the published window) could change without any of the rules that
+        are supposed to govern it firing. Adoption now lives only in update_waypoints.
+        """
         if src_wpnts is None or len(src_wpnts.wpnts) == 0:
             return False
-        elif (self.now_sec() - time_to_float(src_wpnts.header.stamp)) > wpnts_data.latest_threshold:
+        if (self.now_sec() - time_to_float(src_wpnts.header.stamp)) > wpnts_data.latest_threshold:
             return False
-        else:
-            wpnts_data.initialize_traj(src_wpnts)
-            return bool(self._check_on_spline(wpnts_data))
+        return bool(self._check_on_spline(wpnts_data))
 
     def _check_static_trailing_deadlock(self) -> bool:
         """TRAILING behind a STATIC obstacle is a dead end, and nothing said so.
@@ -1994,6 +2008,11 @@ class StateMachine(Node):
         # OVERTAKE while the car is on it, and letting the stamp age lets the availability timers expire
         # OVERTAKE normally once the obstacle is passed (bumping the stamp used to wedge OVERTAKE on so it
         # never exited / re-triggered).
+        # Freeze the obstacle set for this cycle BEFORE the adoption rules below: rule (iii) asks
+        # the free-check about the fresh path and must see the same obstacles every other consumer
+        # will see this cycle.
+        self.cur_obstacles_in_interest = self.obstacles_in_interest
+
         OT_REFRESH_D_THRESH = 0.15   # [m] peak-offset change that counts as a new path (not tracking jitter)
         for src, cur in ((self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts),
                          (self.avoidance_wpnts, self.cur_avoidance_wpnts)):
@@ -2010,10 +2029,67 @@ class StateMachine(Node):
                 refresh = abs(peak_src) - abs(peak_cur) > OT_REFRESH_D_THRESH   # only if it needs MORE offset
             else:                                     # opposite side -> a new obstacle the other way
                 refresh = abs(peak_src) > OT_REFRESH_D_THRESH
+            # (ii) A FORWARD RE-SLICE of the geometry already committed to. The planner freezes its
+            # path in the world and republishes the part still ahead of the car, so the shape does
+            # not change -- only where it starts. The rule above sees no NEW requirement in that and
+            # kept the cache, which froze the cached START while the car drove on: the published
+            # window then began metres behind the car and stayed there until the availability
+            # timers expired (up to hyst_timer_sec = 4 s). Adopting it every cycle is precisely
+            # what makes the window follow the car, and it cannot change the geometry, because
+            # agreeing with the cache everywhere they overlap is the test.
+            if not refresh and self._is_forward_reslice(src, cur):
+                refresh = True
+            # (iii) The cached path is BLOCKED and the fresh one is not. Without this the SM can
+            # sit on a cached path the free-check rejects while the planner is already publishing a
+            # good one, and every gate keyed on the cache says "not free" -- the planner re-plans,
+            # the SM refuses to look. A path that passes when the held one fails is never something
+            # to hold out against.
+            if not refresh and not self._check_free_frenet(cur):
+                probe = copy.copy(cur)
+                probe.initialize_traj(src)
+                if self._check_free_frenet(probe):
+                    refresh = True
+                    self.get_logger().info(
+                        f"[{self.name}] adopting fresh {cur.name} path: the cached one reads "
+                        f"NOT-free and this one is free", throttle_duration_sec=1.0)
             if refresh:
                 cur.initialize_traj(src)              # real new requirement -> follow the new path
-        self.cur_obstacles_in_interest = self.obstacles_in_interest
+
+        # RECOVERY has no committed-path semantics -- it exists to rejoin the raceline -- so it is
+        # adopted whenever it is fresh. It used to be adopted as a side effect of
+        # _check_latest_wpnts; now that that function is pure, this is its only writer.
+        if self.recovery_wpnts is not None and len(self.recovery_wpnts.wpnts) != 0:
+            if (self.now_sec() - time_to_float(self.recovery_wpnts.header.stamp)) \
+                    <= self.cur_recovery_wpnts.latest_threshold:
+                self.cur_recovery_wpnts.initialize_traj(self.recovery_wpnts)
         return
+
+    def _is_forward_reslice(self, src, cur) -> bool:
+        """Is `src` the same world-fixed path as `cur`, just re-sliced further forward?
+
+        Tested where the two OVERLAP in s, not by comparing peaks: once the car passes the apex the
+        fresh slice no longer contains it, so a peak comparison reads a large change and calls a
+        pure re-slice a new path -- exactly when keeping the window on the car matters most. The
+        end station is compared too, because that is what a genuinely NEW plan moves and a re-slice
+        does not.
+        """
+        try:
+            L = self.track_length if self.track_length else self.max_s
+            if not L:
+                return False
+            s_src = np.fromiter((w.s_m for w in src.wpnts), float, len(src.wpnts))
+            d_src = np.fromiter((w.d_m for w in src.wpnts), float, len(src.wpnts))
+            s_cur, d_cur = cur.array[:, 2], cur.array[:, 3]
+            if abs(((s_src[-1] - s_cur[-1] + L / 2.0) % L) - L / 2.0) > self.reslice_end_s_tol_m:
+                return False
+            ds = np.abs(((s_src[:, None] - s_cur[None, :] + L / 2.0) % L) - L / 2.0)
+            j = np.argmin(ds, axis=1)
+            near = ds[np.arange(len(s_src)), j] <= 0.5 * max(self.wpnt_dist, 1e-3) + 1e-6
+            if not near.any():
+                return False
+            return bool(np.max(np.abs(d_src[near] - d_cur[j[near]])) <= self.reslice_d_tol_m)
+        except Exception:
+            return False
 
     def get_overtaking_target(self):
         if self.cur_gb_wpnts.closest_target is not None:
