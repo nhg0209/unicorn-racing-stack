@@ -39,6 +39,7 @@ class StateMachineParams:
         "gb_horizon_m",
         "interest_horizon_m",
         "reframe_warn_m",
+        "squeeze_speed_cap_mps",
         "overtaking_horizon_m",
         "getting_closer_rel_vel_mps",
         "static_ot_distance_m",
@@ -178,6 +179,19 @@ class StateMachineParams:
             ),
         )
         self.reframe_warn_m: float = node.get_parameter("reframe_warn_m").value
+
+        self._declare(
+            "squeeze_speed_cap_mps", 2.5,
+            ParameterDescriptor(
+                description="Speed ceiling [m/s] applied to a static-avoidance path the planner "
+                            "marked ot_line='squeeze' -- one it could only solve by reducing its "
+                            "clearance margins. The geometry is legal but the error budget is "
+                            "spent, so it must not be driven at raceline pace.",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=0.5, to_value=10.0, step=0.1)],
+            ),
+        )
+        self.squeeze_speed_cap_mps: float = node.get_parameter("squeeze_speed_cap_mps").value
 
         self._declare(
             "overtaking_horizon_m", 6.9,

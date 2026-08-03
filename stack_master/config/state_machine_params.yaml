@@ -30,6 +30,11 @@ state_machine:
     # static_reopt line swap, and the free-check would have judged the swapped line against
     # lateral offsets measured on the OLD one.
     reframe_warn_m: 0.05
+    # [m/s] speed ceiling for a static-avoidance path the planner marked ot_line="squeeze" -- one
+    # it could only solve by reducing its clearance margins (static_avoidance_params.yaml
+    # squeeze_*). The geometry is legal but the error budget is spent, so it is driven slowly.
+    # This node owns the velocity profile of every path it receives, so the cap has to live here.
+    squeeze_speed_cap_mps: 2.5
     overtaking_horizon_m: 6.9
     emergency_break_horizon: 0.5
     # safety

@@ -201,6 +201,7 @@ class StateMachine(Node):
         self.gb_horizon_m = self.params.gb_horizon_m
         self.interest_horizon_m = self.params.interest_horizon_m
         self.reframe_warn_m = self.params.reframe_warn_m
+        self.squeeze_speed_cap_mps = self.params.squeeze_speed_cap_mps
         # Frenet frame of the line the car is ACTUALLY following (/global_waypoints), rebuilt
         # whenever static_reopt swaps it. Incoming obstacles are re-anchored through this; see
         # _reframe_obstacles. None until the first global line arrives -> obstacles pass through.
@@ -666,7 +667,14 @@ class StateMachine(Node):
 
     def static_avoidance_cb(self, data: OTWpntArray):
         if len(data.wpnts) != 0:
-            self.update_velocity(data, self.cur_static_avoidance_wpnts.vel_planner_safety_factor)
+            # ot_line == "squeeze": the planner found no candidate at its design margins and solved
+            # this one at reduced clearance instead (the alternative there being a TRAILING
+            # standstill). The geometry is legal but the error budget is spent, so it must not be
+            # driven at raceline pace -- the planner cannot enforce that itself because this node
+            # owns the velocity profile of every path it receives.
+            cap = self.squeeze_speed_cap_mps if data.ot_line == "squeeze" else None
+            self.update_velocity(data, self.cur_static_avoidance_wpnts.vel_planner_safety_factor,
+                                 v_cap=cap)
         self.static_avoidance_wpnts = data
 
     def start_wpnts_cb(self, data: OTWpntArray):
@@ -1455,7 +1463,7 @@ class StateMachine(Node):
     ################
     # HELPER FUNCS #
     ################
-    def update_velocity(self, wpnts_msg, safety_factor=1.0):
+    def update_velocity(self, wpnts_msg, safety_factor=1.0, v_cap=None):
         if self.ggv is None or self.gb_wpnts is None:
             return  # velocity replanning unavailable (no veh dyn info / no gb wpnts yet)
         wpnts = wpnts_msg.wpnts
@@ -1503,6 +1511,12 @@ class StateMachine(Node):
             v_start=self.cur_vs,
             v_end=v_end,
         )
+
+        # Applied AFTER the profile so ax below describes the speeds actually published. The
+        # solver's v_start is the current speed, so a cap below it yields a decelerating profile
+        # rather than a step -- which is what a reduced-clearance path wants.
+        if v_cap is not None and v_cap > 0.0:
+            vx_profile = np.minimum(vx_profile, float(v_cap))
 
         for i in range(len(vx_profile)):
             wpnts_msg.wpnts[i].vx_mps = vx_profile[i]

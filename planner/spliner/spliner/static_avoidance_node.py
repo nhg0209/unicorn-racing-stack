@@ -137,6 +137,21 @@ class ObstacleSpliner(Node):
                                      # obs_margin = half_car(0.15)+safety must cover the sim ego collision
                                      # radius (0.29 m = half car LENGTH); 0.16 -> 0.31 clears it (+0.02).
         self.wall_margin = 0.05      # [m] clearance to the wall the candidate may reach (corridor)
+        # SQUEEZE PASS. When every candidate is rejected at the full design margins, retry the same
+        # geometry at reduced ones before conceding TRAILING. This is not a loosening of the design
+        # margins -- it is the answer to sections where they are arithmetically unavailable: ifac
+        # narrows below 1.20 m, and a box in the middle of that needs half_car + safety_margin per
+        # side plus its own half-width, which does not fit. Without this the planner's only output
+        # there is feasible=False, and behind a STATIONARY box the trailing gap PID's fixed point is
+        # v = 0 -- so "stop forever, 1.5 m short" becomes the correct behaviour. Gated on speed
+        # because trading clearance for motion only makes sense where a mis-clearance is survivable,
+        # and marked on the published path (ot_line = "squeeze") so the SM caps the speed it is
+        # driven at rather than the planner silently issuing a normal-looking path.
+        self.squeeze_enable = True
+        self.squeeze_steps = 2            # reduced-margin attempts between the design value and the floor
+        self.squeeze_safety_floor_m = 0.05  # [m] tightest obstacle clearance the pass may ask for
+        self.squeeze_wall_floor_m = 0.05    # [m] tightest wall reserve the pass may ask for
+        self.squeeze_max_speed_mps = 3.0    # [m/s] above this, "no candidate" still means TRAILING
         self.shift_min = 1.0         # [m] min arc length over which the lateral maneuver completes
         self.shift_buffer = 0.5      # [m] finish the shift this far before the obstacle near-edge
         self.ramp_len = 4.0          # [m] gentle entry-ramp length (raceline -> apex)
@@ -237,7 +252,8 @@ class ObstacleSpliner(Node):
             'return_len', 'apex_bulge', 'max_weave', 'width_car', 'tail_m', 'w_d', 'w_k', 'w_c', 'w_obs', 'obs_sigma',
             'use_grid_check', 'trust_grid_bounds', 'grid_scan_max', 'grid_scan_step', 'bounds_warn_m',
             'clear_gate_enable', 'clear_hyst_m', 'clear_max_cur_d', 'clear_margin_m', 'reframe_warn_m',
-            'clear_latch_ttl_s',
+            'clear_latch_ttl_s', 'squeeze_enable', 'squeeze_steps', 'squeeze_safety_floor_m',
+            'squeeze_wall_floor_m', 'squeeze_max_speed_mps',
             'commit_enable', 'commit_dev_max', 'commit_obs_ds', 'commit_obs_dd',
         ]))
         self.add_on_set_parameters_callback(self.dyn_param_cb)
@@ -300,6 +316,17 @@ class ObstacleSpliner(Node):
         self.declare_parameter('static_demote_sec', 0.3,
                                dbl(0.0, 5.0, "how long that must hold before demoting [s]"))
         self.declare_parameter('wall_margin', 0.05, dbl(0.0, 1.0, "clearance to wall a candidate may reach [m]"))
+        self.declare_parameter('squeeze_enable', True,
+                               ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
+                                                   description="Retry an all-rejected plan at reduced margins before conceding TRAILING"))
+        self.declare_parameter('squeeze_steps', 2,
+                               intd(1, 5, "reduced-margin attempts between the design margin and the floor"))
+        self.declare_parameter('squeeze_safety_floor_m', 0.05,
+                               dbl(0.0, 0.5, "tightest obstacle clearance the squeeze pass may ask for [m]"))
+        self.declare_parameter('squeeze_wall_floor_m', 0.05,
+                               dbl(0.0, 0.5, "tightest wall reserve the squeeze pass may ask for [m]"))
+        self.declare_parameter('squeeze_max_speed_mps', 3.0,
+                               dbl(0.0, 10.0, "above this speed, no feasible candidate still means TRAILING [m/s]"))
         self.declare_parameter('shift_min', 1.0, dbl(0.3, 10.0, "min arc length for the lateral maneuver [m]"))
         self.declare_parameter('shift_buffer', 0.5, dbl(0.0, 5.0, "finish the shift this far before the obstacle [m]"))
         self.declare_parameter('ramp_len', 4.0, dbl(0.5, 15.0, "ramp length onto the offset [m]"))
@@ -412,6 +439,16 @@ class ObstacleSpliner(Node):
                 self.grid_scan_step = float(p.value)
             elif n == 'bounds_warn_m':
                 self.bounds_warn_m = float(p.value)
+            elif n == 'squeeze_enable':
+                self.squeeze_enable = bool(p.value)
+            elif n == 'squeeze_steps':
+                self.squeeze_steps = int(p.value)
+            elif n == 'squeeze_safety_floor_m':
+                self.squeeze_safety_floor_m = float(p.value)
+            elif n == 'squeeze_wall_floor_m':
+                self.squeeze_wall_floor_m = float(p.value)
+            elif n == 'squeeze_max_speed_mps':
+                self.squeeze_max_speed_mps = float(p.value)
             elif n == 'clear_gate_enable':
                 self.clear_gate_enable = bool(p.value)
             elif n == 'clear_margin_m':
@@ -564,6 +601,33 @@ class ObstacleSpliner(Node):
         self.get_logger().info(f"[{self.name}] initialized FrenetConverter object")
         return converter
 
+    def _squeeze_schedule(self):
+        """(safety_margin, wall_margin) pairs to retry an all-rejected plan with, widest first.
+
+        Empty means "do not squeeze", which is the normal answer at racing speed: trading clearance
+        for motion is only defensible where a mis-clearance is survivable, and above
+        squeeze_max_speed_mps the honest response to "no candidate" is still TRAILING. It is also
+        empty when the design margins are already at or below the floors -- there is nothing left to
+        give -- so the caller falls through to the existing diagnostic + feasible=False.
+
+        The schedule interpolates linearly to the floor in squeeze_steps attempts rather than
+        jumping straight to it, so a section that only needs a couple of centimetres is driven with
+        the couple of centimetres it needs.
+        """
+        if not self.squeeze_enable:
+            return []
+        v = abs(self.cur_vs) if self.cur_vs is not None else 0.0
+        if v >= self.squeeze_max_speed_mps:
+            return []
+        s0, w0 = self.safety_margin, self.wall_margin
+        s1 = min(self.squeeze_safety_floor_m, s0)
+        w1 = min(self.squeeze_wall_floor_m, w0)
+        if (s0 - s1) < 1e-6 and (w0 - w1) < 1e-6:
+            return []                          # already at (or below) the floor: nothing to give
+        steps = max(1, int(self.squeeze_steps))
+        return [(s0 + (i / steps) * (s1 - s0), w0 + (i / steps) * (w1 - w0))
+                for i in range(1, steps + 1)]
+
     def _eval_clear_gate(self, obs_ahead, half_car: float) -> bool:
         """Does the FOLLOWED global line clear every obstacle ahead? (updates the per-id latches)
 
@@ -655,10 +719,18 @@ class ObstacleSpliner(Node):
         cands.sort(key=lambda go: go[0])
         return cands
 
-    def do_spline(self, gb_wpnts) -> Tuple[OTWpntArray, MarkerArray]:
+    def do_spline(self, gb_wpnts, safety_margin: float = None, wall_margin: float = None,
+                  squeeze: bool = False) -> Tuple[OTWpntArray, MarkerArray]:
+        """Plan one static-avoidance path. `squeeze` marks a reduced-margin RETRY (see
+        _squeeze_schedule); such a call returns None instead of an empty result so the caller can
+        try the next step, and never publishes the feasibility verdict itself."""
+        safety_margin = self.safety_margin if safety_margin is None else safety_margin
+        wall_margin = self.wall_margin if wall_margin is None else wall_margin
         wpnts = OTWpntArray()
         wpnts.header.stamp = self.get_clock().now().to_msg()
         wpnts.header.frame_id = "map"
+        if squeeze:
+            wpnts.ot_line = "squeeze"
 
         def _empty():
             self._publish_feasible(False)
@@ -671,12 +743,12 @@ class ObstacleSpliner(Node):
             return wpnts, m
 
         if self.cur_s is None or self.gb_max_s is None or self.cur_d is None:
-            return _empty()
+            return None if squeeze else _empty()
 
         wpnt_dist = gb_wpnts[1].s_m - gb_wpnts[0].s_m
         half_car = self.width_car / 2.0
-        obs_margin = half_car + self.safety_margin      # keep-out half-width around obstacle boxes
-        sample_margin = half_car + self.wall_margin     # how close to the wall a candidate may reach
+        obs_margin = half_car + safety_margin           # keep-out half-width around obstacle boxes
+        sample_margin = half_car + wall_margin          # how close to the wall a candidate may reach
 
         # --- speed-proportional lookahead (capped at half the lap) ---
         cur_vs = self.cur_vs if self.cur_vs is not None else 0.0
@@ -690,7 +762,9 @@ class ObstacleSpliner(Node):
         # against the live obstacles and publishes feasible=False the instant the slice stops
         # clearing them. Runs BEFORE the obstacle gather so the committed exit ramp is still
         # followed once the box has dropped out of "ahead".
-        if self.commit_enable and self._committed is not None:
+        # A squeeze RETRY skips this: whether to reuse or re-plan was already decided by the
+        # full-margin call that is now retrying (and which left _committed None to get here).
+        if self.commit_enable and self._committed is not None and not squeeze:
             reuse = self._reuse_committed(gb_wpnts, wpnt_dist, obs_margin, half_car)
             if reuse is not None:
                 return reuse
@@ -705,6 +779,8 @@ class ObstacleSpliner(Node):
                 (now - self._mem_cands_time).nanoseconds * 1e-9 < self.obs_memory_sec:
             cands_obs = self._gather_obstacles_ahead(self._mem_cands_obs, lookahead)
         obs_ahead = [o for _, o in cands_obs]
+        if squeeze and not obs_ahead:
+            return None
         if not obs_ahead:
             # nothing to avoid -> no avoidance path (state machine stays on the raceline).
             # The AGGREGATE flag is a statement about the boxes ahead, so it resets with them --
@@ -729,7 +805,9 @@ class ObstacleSpliner(Node):
         # already cleared. Nothing was being protected either: the committed-path branch above has
         # already returned by the time control gets here, so there is no maneuver in flight, and
         # the predicate itself certifies the followed line clears every box ahead.
-        if self.clear_gate_enable:
+        # Skipped on a squeeze RETRY: the full-margin call already ran the gate this cycle and did
+        # not idle; re-running it would only re-latch on the same obstacles.
+        if self.clear_gate_enable and not squeeze:
             # The trigger threshold is NOT obs_margin. obs_margin (half_car + safety_margin = 0.30)
             # is what a NEW path is designed to, and reusing it here asks "is the current line
             # planned to my full design clearance?" instead of "does the car fit past this box?".
@@ -972,6 +1050,28 @@ class ObstacleSpliner(Node):
                 best_J, best_k, best = J, k, (xy, psi_, kappa_)
 
         if best is None:
+            if squeeze:
+                return None                     # caller tries the next margin step, then gives up
+            # SQUEEZE PASS. Every candidate was rejected at the FULL design margins, which is not
+            # the same as "impassable". On ifac the track narrows below 1.20 m, and a box in the
+            # middle of that needs width_car/2 + safety_margin = 0.30 m of clearance per side plus
+            # its own half-width -- arithmetically unavailable. Without a reduced-margin retry the
+            # only remaining behaviour is TRAILING, and behind a STATIONARY box the trailing gap
+            # PID's fixed point is v = 0: the "correct" answer becomes stopping forever. Trying the
+            # same section at a tighter margin is worse than a clean pass and better than a
+            # standstill, so it is offered -- but only slowly (see _squeeze_schedule) and marked, so
+            # the SM can cap the speed it is driven at.
+            for sm_try, wm_try in self._squeeze_schedule():
+                res = self.do_spline(gb_wpnts, safety_margin=sm_try, wall_margin=wm_try,
+                                     squeeze=True)
+                if res is not None and len(res[0].wpnts) > 0:
+                    self.get_logger().warn(
+                        f"[{self.name}] SQUEEZE: no candidate at safety_margin="
+                        f"{safety_margin:.2f}/wall_margin={wall_margin:.2f}; passing at "
+                        f"{sm_try:.2f}/{wm_try:.2f} instead (marked ot_line='squeeze', the state "
+                        f"machine caps the speed). The alternative here is a TRAILING standstill.",
+                        throttle_duration_sec=1.0)
+                    return res
             # Diagnostics: which stage killed every candidate? corridor@obs vs obstacle box vs grid
             # vs curvature, with the geometry so you can see if it's genuinely impassable or a knob.
             self.get_logger().warn(
@@ -1033,7 +1133,8 @@ class ObstacleSpliner(Node):
                                   kappa=kappa_[i], wpnts=wpnts))
 
         if self.commit_enable:
-            self._store_commit(obs_ahead, s_mod, d_sel, xy, v_arr, psi_pub, kappa_)
+            self._store_commit(obs_ahead, s_mod, d_sel, xy, v_arr, psi_pub, kappa_,
+                               obs_margin=obs_margin, squeeze=squeeze)
         self._publish_feasible(True)
         return wpnts, self._candidate_markers(xy_all, status, best_k)
 
@@ -1096,10 +1197,20 @@ class ObstacleSpliner(Node):
         uses to pick avoidance obstacles, factored out for the committed-path re-check."""
         return bool((o.is_static or self._near_zero_static(o)) and o.is_visible)
 
-    def _store_commit(self, obs_ahead, s_mod, d_sel, xy, v_arr, psi_pub, kappa_):
+    def _store_commit(self, obs_ahead, s_mod, d_sel, xy, v_arr, psi_pub, kappa_,
+                      obs_margin=None, squeeze=False):
         """Snapshot the freshly chosen path (+ the obstacles it was planned around) so later
-        cycles republish it verbatim instead of re-solving from the moving car."""
+        cycles republish it verbatim instead of re-solving from the moving car.
+
+        The MARGIN it was solved at is part of the snapshot. A squeeze path re-checked against the
+        full design margin fails its own safety re-check on the very next cycle, so the commit
+        would be dropped, feasible=False published, and the next cycle would squeeze again -- the
+        car flapping in and out of an avoidance it had already committed to. The re-check has to
+        ask the question the path was built to answer.
+        """
         self._committed = {
+            'obs_margin': obs_margin,
+            'squeeze': bool(squeeze),
             'obs': [(int(o.id), float(o.s_center), float(o.d_center)) for o in obs_ahead],
             's_mod': np.asarray(s_mod, dtype=float).copy(),
             'd':     np.asarray(d_sel, dtype=float).copy(),
@@ -1115,6 +1226,9 @@ class ObstacleSpliner(Node):
         plan is needed. Publishes the feasibility verdict itself in every path it returns from."""
         c = self._committed
         L = self.gb_max_s
+        # Re-check at the margin this path was SOLVED at, not the current design value -- see
+        # _store_commit. A squeeze path judged by the full margin fails on its first reuse.
+        obs_margin = c.get('obs_margin') or obs_margin
 
         # --- forward slice via path-local arc length (robust to the s=0 seam) ---
         # s_local is the committed path's own 0..span arc length -- its points are forward-ordered
@@ -1215,6 +1329,10 @@ class ObstacleSpliner(Node):
         wpnts = OTWpntArray()
         wpnts.header.stamp = self.get_clock().now().to_msg()
         wpnts.header.frame_id = "map"
+        # The squeeze marking must survive commitment: it is republished for the whole maneuver,
+        # and the SM's speed cap keys off it. Dropping it on reuse would cap only the first cycle.
+        if c.get('squeeze'):
+            wpnts.ot_line = "squeeze"
         xy = c['xy'][sel]
         s_mod = c['s_mod'][sel]
         d = c['d'][sel]
