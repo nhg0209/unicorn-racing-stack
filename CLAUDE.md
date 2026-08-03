@@ -19,6 +19,8 @@
 - hold_horizon_m (lane_change) > interest_horizon_m (SM); static planner lookahead ≥ global_tracking max_horizon.
 
 ## Verification (offline, no build)
-- Planner/SM: python3 stack_master/scripts/check_avoidance_margins.py; python3 stack_master/scripts/test_speed_continuity.py; pytest planner/lane_change_planner/test/
+- Planner/SM: python3 stack_master/scripts/check_avoidance_margins.py; python3 stack_master/scripts/test_speed_continuity.py
+- Unit tests: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest state_machine/test planner/spliner/test controller/test -q
+  (the env var is REQUIRED: launch_testing_ros's pytest entrypoint aborts collection in this env)
 - Reopt: python3 planner/gb_optimizer/scripts/sweep_static_reopt.py --check
 - Sim: stack_master/STATIC_AVOIDANCE_TEST_RUNBOOK.md (S1–S5). Never claim "verified" without running the gate; paste actual output.

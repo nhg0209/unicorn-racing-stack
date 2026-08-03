@@ -49,23 +49,42 @@ first two used to be false: `reopt_wall_margin` was 0.12 in `race.launch.xml` (t
 below) against 0.05 everywhere else, which shrank the avoidance humps, and `reopt_obs_margin` was
 not forwardable from here at all.
 
-## 0c. Planner / SM / re-opt unit gates (no sim, no build)
+## 0c. Planner / SM / controller unit gates (no sim, no build)
 
 ```bash
-python3 planner/spliner/test/test_clear_gate.py             # raceline-CLEAR gate + per-id latch
-python3 planner/spliner/test/test_squeeze_pass.py           # reduced-margin retry: schedule, speed
-                                                            # gate, relax override, commit marking
-python3 state_machine/test/test_static_ot_drop.py           # OVERTAKE-drop reference/target hold,
-                                                            # sustain debounce, re-entry cooldown,
-                                                            # is_visible debounce
-python3 state_machine/test/test_velocity_cache.py           # profile cache invalidation + ay_max
-python3 planner/gb_optimizer/scripts/test_static_reopt_apex.py   # apex bookkeeping, clearance floor,
-                                                                 # drift trigger, publish veto
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest \
+    state_machine/test planner/spliner/test controller/test -q
 ```
 
-Note: `planner/lane_change_planner/test/test_phase_machine.py` fails on `main` for an unrelated
-harness gap (its `Fake` object lacks `_beside_target`), and `pytest` cannot collect that directory
-at all because of a `launch_testing` plugin incompatibility — run these as scripts.
+**The env var is required.** Without it pytest aborts during collection with a
+`PluginValidationError` from `launch_testing_ros_pytest_entrypoint` — the ROS pytest entrypoint
+installed in this environment declares a hook the installed pytest does not have. It is not a
+problem with these tests; disabling plugin autoload sidesteps it and nothing here needs a pytest
+plugin. (`-p no:launch_testing` is NOT enough: the `_ros` entrypoint loads separately.)
+
+What each file pins down:
+
+| file | covers |
+|---|---|
+| `state_machine/test/test_splini_anchor.py` | where the published avoidance window starts (s-window + back margin, wrap) |
+| `state_machine/test/test_path_adoption.py` | the single adoption point and its three rules |
+| `state_machine/test/test_static_ot_drop.py` | OVERTAKE-drop reference/target hold, sustain debounce, re-entry cooldown, `is_visible` debounce |
+| `state_machine/test/test_velocity_cache.py` | profile-cache invalidation + `avoidance_ay_max` |
+| `planner/spliner/test/test_clear_gate.py` | raceline-CLEAR gate + per-obstacle latch |
+| `planner/spliner/test/test_squeeze_pass.py` | reduced-margin retry: schedule, speed gate, relax override, commit marking |
+| `planner/spliner/test/test_path_anchoring.py` | commit re-anchor, pre-ramp decay, grid-start anchoring |
+| `controller/test/test_aeb_threshold.py` | AEB threshold chosen by path offset, not state name |
+
+The gb_optimizer ones are scripts, not pytest:
+
+```bash
+python3 planner/gb_optimizer/scripts/test_static_reopt_apex.py       # apex bookkeeping, clearance
+                                                                     # floor, drift trigger, veto
+python3 planner/gb_optimizer/scripts/test_static_obstacle_layer.py   # confirm/unlatch/lap lifecycle
+```
+
+Note: `planner/lane_change_planner/test/test_phase_machine.py` still fails to collect for an
+unrelated harness gap (its `Fake` object lacks `_beside_target`) — that directory is excluded above.
 
 ## 0b. Re-opt line SHAPE gate (after ANY change to the re-optimizer)
 
