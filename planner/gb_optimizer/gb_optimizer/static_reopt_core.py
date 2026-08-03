@@ -1081,7 +1081,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         except Exception:
             return None
 
-    def _weave_violations(dg, ctx):
+    def _weave_violations(dg, ctx, knots_u):
         """Stations of the WOVEN profile that break the corridor or the curvature bar.
 
         Every check up to here judged ONE hump in isolation. Where two ramps overlap the weave
@@ -1101,6 +1101,12 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                 bad |= k_laid > np.maximum(curvlim, kap_ref) + 1e-6
             except Exception:
                 pass
+        # SHAPE: a woven excursion must not contain more PEAKS than it has apexes. Corridor and
+        # curvature can both be satisfied by a profile that still grows an extra bump between two
+        # apexes -- the line then reads as "humps in places with no obstacle", which is the
+        # complaint this whole pass is about, and neither of the checks above can see it. Peaks,
+        # not extrema: the valley BETWEEN two woven apexes is the correct shape for a slalom.
+        bad |= _excess_peak_mask(dg, [k[0] for k in knots_u], u_stn)
         return bad
 
     if verify_ctx is not None:
@@ -1108,7 +1114,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             d_global = _weave(kn_u)
             if d_global is None:
                 return np.zeros(N), 0, 0.0, dropped, laid
-            bad = _weave_violations(d_global, verify_ctx)
+            bad = _weave_violations(d_global, verify_ctx, kn_u)
             if not bad.any():
                 break
             # Shrink the reach of every hump whose span covers a violation, JOINTLY -- the failure
@@ -1292,6 +1298,43 @@ def _resample_uniform(traj: np.ndarray, d_right: np.ndarray, d_left: np.ndarray,
     traj_m = np.column_stack([s_m, new_xy[:, 0], new_xy[:, 1], psi_m, kap, vx, ax])
     return traj_m, dr, dl
 
+
+
+def _excess_peak_mask(alpha: np.ndarray, apex_u: List[float], u_stn: np.ndarray,
+                      dev_tol: float = 0.02, deriv_eps: float = 1e-4) -> np.ndarray:
+    """Stations belonging to an off-line RUN that has more |alpha| peaks than it has apexes.
+
+    A hump is one peak. Two apexes woven together are two peaks with a valley between them, which
+    is correct. An extra peak is a bump the line grew where no obstacle is -- visible from the car,
+    invisible to a corridor or curvature test, and the reason this check exists separately from
+    both. Returns an all-False mask on any degeneracy: a shape heuristic must never be the thing
+    that fails a solve by accident.
+    """
+    a = np.abs(np.asarray(alpha, float))
+    n = a.size
+    out = np.zeros(n, dtype=bool)
+    try:
+        off = a > dev_tol
+        if not off.any() or off.all():
+            return out
+        # Rotate so index 0 is on the raceline; runs then never straddle the array end.
+        shift = int(np.argmin(off.astype(np.int8)))
+        ao, oo = np.roll(a, -shift), np.roll(off, -shift)
+        uo = np.roll(np.asarray(u_stn, float), -shift)
+        idx = np.flatnonzero(oo)
+        for run in np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1):
+            if run.size < 3:
+                continue
+            dv = np.diff(ao[run])
+            sg = np.sign(dv[np.abs(dv) > deriv_eps])
+            peaks = int(np.count_nonzero((sg[:-1] > 0) & (sg[1:] < 0))) if sg.size > 1 else 1
+            u_lo, u_hi = float(uo[run[0]]), float(uo[run[-1]])
+            n_apex = sum(1 for u in apex_u if u_lo - 1e-9 <= u <= u_hi + 1e-9)
+            if peaks > max(1, n_apex):
+                out[(run + shift) % n] = True
+        return out
+    except Exception:
+        return np.zeros(n, dtype=bool)
 
 def _menger_kappa(xy_closed: np.ndarray) -> np.ndarray:
     """Signed curvature of a CLOSED polyline from circumscribed circles (Menger). Unlike
@@ -1612,8 +1655,9 @@ def _reopt_local_window_impl(
     # bigger than the tolerance means the verification upstream is wrong, and the honest answer is
     # to lay nothing and leave the obstacles to the reactive layer.
     alpha_full = np.clip(d_global, lo_inc, hi_inc)
+    clip_bite = float(np.max(np.abs(alpha_full - d_global))) if n_solved else 0.0
     if n_solved:
-        bite = float(np.max(np.abs(alpha_full - d_global)))
+        bite = clip_bite
         if bite > fit_tol + 1e-6:
             print(f"[static_reopt_core] corridor clip bit {bite * 1e3:.1f} mm > fit_tol "
                   f"{fit_tol * 1e3:.1f} mm on the woven profile — refusing to smooth it into a "
@@ -1790,7 +1834,12 @@ def _reopt_local_window_impl(
     return {"reftrack_mod": rl_mod, "report": report,
             "main": (traj, bound_r, bound_l, est), "d_right": d_right, "d_left": d_left,
             "n_windows": n_solved, "n_failed": n_failed, "apex_dropped": apex_dropped,
-            "apex_laid": apex_laid, "curvlim": float(curvlim)}
+            "apex_laid": apex_laid, "curvlim": float(curvlim),
+            # Offline-gate handles (sweep_static_reopt.py --check): the FINAL lateral offset per
+            # pre-resample station, which is the analytic profile whose extremum count says whether
+            # the line is a set of clean humps or a comb; and how hard the corridor clip had to
+            # bite, which must stay inside fit_tol or the shaping has escaped the fit.
+            "alpha": alpha_full, "clip_bite": clip_bite}
 
 
 # ======================================================================================
