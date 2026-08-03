@@ -201,6 +201,27 @@ def check_static_chain_ordering(sm_path, sm, cfg, yaml_path, args, launch_path) 
         print(f"OK: SM requirement ({required:.3f}) <= clear-gate stay ({clear_stay:.3f}) "
               f"<= enforced floor ({floor:.3f}); dead band {clear_stay - required:.3f} m.")
 
+    # (b2) HORIZON ordering. The SM declares the raceline not-free (-> TRAILING) at
+    # global_tracking's max_horizon; the static planner only starts considering an obstacle inside
+    # its own lookahead. If the planner's horizon is the shorter one there is a guaranteed window
+    # where the SM has given up on the raceline and no escape path exists yet -- and behind a
+    # STATIONARY box the trailing gap PID's only fixed point is v = 0, so the car creeps to a stop
+    # in it. This was 8.0 vs 15.0, i.e. 7 m of blind trailing on every static obstacle.
+    gt_path = STACK_MASTER.parent / "state_machine" / "config" / "planners" / "global_tracking.yaml"
+    if gt_path.is_file():
+        gt = yaml.safe_load(gt_path.read_text())
+        sm_free_horizon = float(gt["max_horizon"])
+        planner_horizon = float(cfg["lookahead_min"])
+        if planner_horizon < sm_free_horizon - 1e-9:
+            ok = False
+            print(f"FAIL: static planner lookahead_min ({planner_horizon:.1f}) < the SM's "
+                  f"free-check horizon max_horizon ({sm_free_horizon:.1f}, {gt_path.name}). The SM "
+                  f"drops to TRAILING on obstacles the planner is not planning around yet -> the "
+                  f"car creeps to a standstill behind a static box. Raise lookahead_min.")
+        else:
+            print(f"OK: static planner lookahead_min ({planner_horizon:.1f}) >= SM free-check "
+                  f"horizon ({sm_free_horizon:.1f}).")
+
     # (c) drift budget, applied to BOTH the launch value and the node's own default
     print(f"  headroom for drift = floor - SM requirement = {floor:.3f} - {required:.3f} = {headroom:.3f} m")
     for src, tol in (("launch", float(args["reopt_obs_change_tol"])),

@@ -3,9 +3,14 @@ is_closed: true
 lateral_width_m: 0.15
 latest_threshold: 0.1
 # Forward distance at which a STATIC obstacle on the raceline makes the GB path read "not free"
-# (= the TRAILING/OVERTAKE intent trigger). MUST be <= the spliner gen_horizon (17 m) so the
-# escape spline is already published when the SM decides the line is blocked -- otherwise the car
-# is forced into TRAILING and crawls up to the obstacle until the spline finally appears.
+# (= the TRAILING/OVERTAKE intent trigger). MUST be <= the static planner's own planning horizon,
+# `lookahead_min` in stack_master/config/static_avoidance_params.yaml, so the escape spline is
+# already published when the SM decides the line is blocked -- otherwise the car is forced into
+# TRAILING and crawls up to the obstacle until the spline finally appears. (The old note here said
+# "the spliner gen_horizon (17 m)"; that was the DORMANT spliner_node. The live static planner is
+# planner/spliner/spliner/static_avoidance_node.py, whose horizon was 8 m -- below this value, so
+# the invariant this comment asserts was in fact violated.) Checked by
+# stack_master/scripts/check_avoidance_margins.py.
 # Dynamic opponents are unaffected: their overtake gate is _check_getting_closer(10 m), which is
 # tighter than this anyway.
 max_horizon: 15.0

@@ -7,7 +7,14 @@ static_avoidance_planner:
     from_bag: false
 
     # --- planning horizon (bounds how far ahead an obstacle is considered) ---
-    lookahead_min: 8.0      # [m]  minimum planning distance ahead of the car
+    # MUST be >= global_tracking.yaml's max_horizon (15.0), which is the distance at which the SM
+    # declares the raceline not-free and drops to TRAILING. The escape path has to already exist at
+    # the moment that verdict is made; if the planner only starts considering the obstacle closer
+    # in, the car is forced into TRAILING and the gap PID -- whose only fixed point behind a
+    # STATIONARY box is v = 0 -- creeps it to a standstill before the spline ever appears.
+    # Was 8.0 against a 15 m free-check horizon, i.e. 7 m of guaranteed blind trailing. Verified by
+    # stack_master/scripts/check_avoidance_margins.py.
+    lookahead_min: 15.0     # [m]  minimum planning distance ahead of the car
     lookahead_k: 1.5        # [s]  lookahead = max(lookahead_min, lookahead_k * cur_vs)
 
     # --- terminal-offset sampling ---
