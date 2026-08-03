@@ -1339,7 +1339,7 @@ def _republish_kappa(traj: np.ndarray, clean_xy: np.ndarray, clean_kappa: Option
 
 
 def _offset_lap_time(d_global: np.ndarray, clean_xy: np.ndarray, nvec_rl: np.ndarray,
-                     el_cl: np.ndarray, clean_kappa: Optional[np.ndarray],
+                     el_cl: np.ndarray,
                      clean_vx: Optional[np.ndarray], lo_inc: np.ndarray, hi_inc: np.ndarray,
                      veh, N: int) -> float:
     """Estimated LAP TIME for a candidate offset profile — the objective the reach search minimises.
@@ -1357,14 +1357,15 @@ def _offset_lap_time(d_global: np.ndarray, clean_xy: np.ndarray, nvec_rl: np.nda
             stitch[-1] = stitch[0]
         sg = np.roll(stitch, -1, axis=0) - stitch
         elc = np.hypot(sg[:, 0], sg[:, 1])
-        h2 = np.maximum((0.5 * (elc + np.roll(elc, 1))) ** 2, 1e-9)
-        add = (np.roll(alpha, -1) - 2.0 * alpha + np.roll(alpha, 1)) / h2
-        if N > 3:
-            h0 = 0.5 * (elc[0] + elc[N - 2])
-            add[0] = (alpha[1] - 2.0 * alpha[0] + alpha[N - 2]) / max(h0 ** 2, 1e-9)
-            add[N - 1] = add[0]
-        kappa_full = (np.asarray(clean_kappa, float) if clean_kappa is not None
-                      else np.zeros(N)) + add
+        # GEOMETRIC curvature of the candidate, not `kappa_clean + alpha''`. That additive model is
+        # the small-(d, d', kappa) linearisation of the Frenet offset curvature and this file
+        # already rules it out for every VERDICT it makes (`_kappa_peak`: 1.19 modelled vs 2.11
+        # real on the ifac chicane, ~45% low) — yet the reach SEARCH still ranked candidates with
+        # it. A search that under-reads curvature under-reads the speed penalty of a sharp hump,
+        # so it systematically preferred reaches the acceptance checks then had to shave or drop.
+        # Menger is what the acceptance verdict, the published kappa and the friction cap all use,
+        # so the objective now agrees with the things that judge its answer.
+        kappa_full = _menger_kappa(stitch)
         dev = np.hypot(stitch[:, 0] - clean_xy[:, 0], stitch[:, 1] - clean_xy[:, 1])
         sig = dev > 0.02
         vx = np.asarray(clean_vx, float).copy()
@@ -1503,7 +1504,19 @@ def _reopt_local_window_impl(
               if r_lo - 1e-9 <= r <= min(reach_max, r_cap) + 1e-9]
     if not cand_r:
         cand_r = [float(np.clip(0.5 * (reach_min + reach_max), r_lo, min(reach_max, r_cap)))]
+    # Memoized on (reach, entry_scale, exit_scale): the three search stages revisit points of that
+    # grid, and each evaluation is now a full re-fit + weave + Menger curvature + velocity profile.
+    _try_memo = {}
+
     def _try(r, e_scale, x_scale=1.0):
+        key = (round(float(r), 6), round(float(e_scale), 6), round(float(x_scale), 6))
+        if key in _try_memo:
+            return _try_memo[key]
+        out = _try_uncached(r, e_scale, x_scale)
+        _try_memo[key] = out
+        return out
+
+    def _try_uncached(r, e_scale, x_scale=1.0):
         dg, nn, ek, drp, lay = build_offset_profile(
             clean_xy, s_loop, track_len, nvec_rl, apexes,
             clean_vx_arr, 0.0, r, r, hi_inc=hi_inc, lo_inc=lo_inc,
@@ -1512,7 +1525,7 @@ def _reopt_local_window_impl(
             obstacles=apex_obstacles, obs_margin=params.obs_margin)
         if nn == 0:
             return dg, 0, float("inf"), ek, drp, lay
-        est = _offset_lap_time(dg, clean_xy, nvec_rl, el_cl, clean_kappa,
+        est = _offset_lap_time(dg, clean_xy, nvec_rl, el_cl,
                                clean_vx_arr, lo_inc, hi_inc, veh, N)
         # GLOBAL span budget, step 2: rank over-budget candidates out of the running. Enforcing it
         # here rather than by shrinking a fitted profile is the whole point — each candidate reach
