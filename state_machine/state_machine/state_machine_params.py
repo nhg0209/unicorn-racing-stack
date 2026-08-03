@@ -49,8 +49,6 @@ class StateMachineParams:
         "free_check_predict_dynamic",
         "free_check_pass_speed",
         "free_check_dynamic_ot_slow",
-        "splice_from_path_start",
-        "splice_start_dist_m",
     }
 
     def __init__(self, node: "StateMachine") -> None:
@@ -427,31 +425,6 @@ class StateMachineParams:
             ),
         )
         self.free_check_dynamic_ot_slow: bool = node.get_parameter("free_check_dynamic_ot_slow").value
-
-        self._declare(
-            "splice_from_path_start", True,
-            ParameterDescriptor(
-                description="Static OVERTAKE splice: when the car is still near the avoidance "
-                            "path's FIRST point, feed the controller the path from its start "
-                            "(the reactive planner anchors it at the car with matched heading) "
-                            "instead of cutting at the interior nearest index — removes the "
-                            "lateral step the nearest-index cut introduces under SM lag.",
-                type=ParameterType.PARAMETER_BOOL,
-            ),
-        )
-        self.splice_from_path_start: bool = node.get_parameter("splice_from_path_start").value
-
-        self._declare(
-            "splice_start_dist_m", 0.8,
-            ParameterDescriptor(
-                description="Max distance [m] car -> path start for the from-start splice; "
-                            "farther than this (deep in the maneuver on a damped/stale path) "
-                            "falls back to the nearest-index cut.",
-                type=ParameterType.PARAMETER_DOUBLE,
-                floating_point_range=[FloatingPointRange(from_value=0.1, to_value=2.0, step=0.05)],
-            ),
-        )
-        self.splice_start_dist_m: float = node.get_parameter("splice_start_dist_m").value
 
         # Momentary rqt buttons (ROS1: served by dynamic_statemachine_server). When set
         # true they trigger an action and reset to false (done in the node timer, not

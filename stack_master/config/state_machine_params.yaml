@@ -117,8 +117,3 @@ state_machine:
     # NOT-free structurally and OVERTAKE can never commit against a slow opponent. Only affects
     # obstacles whose tracker is_static is already False. False restores the old routing.
     free_check_dynamic_ot_slow: true
-    # static OVERTAKE splice: keep the reactive path's car-anchored entry (splice from the path
-    # START while the car is within splice_start_dist_m of it) instead of the nearest-index cut,
-    # which steps the local window laterally under SM lag. Fallback deeper in the maneuver.
-    splice_from_path_start: true
-    splice_start_dist_m: 0.8

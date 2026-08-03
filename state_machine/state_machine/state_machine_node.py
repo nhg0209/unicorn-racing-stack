@@ -341,8 +341,6 @@ class StateMachine(Node):
         # switch to a NON-safe state. Switches toward the safe states bypass this. The counter/timer
         # live on the node (not in the pure transition functions).
         self.min_dwell_sec = self.params.min_dwell_sec
-        self.splice_from_path_start = self.params.splice_from_path_start
-        self.splice_start_dist_m = self.params.splice_start_dist_m
         self._last_transition_time = self.now_sec()
         self._committed_src = None
         # Targets that may be entered IMMEDIATELY (bypass min_dwell): the safe-direction states
@@ -1771,22 +1769,51 @@ class StateMachine(Node):
         s_ot %= self.num_ot_points
         return s_ot
 
+    def _splini_anchor_index(self, wpnts: WaypointData,
+                             search_m: float = 3.0, back_pts: int = 2) -> int:
+        """Index of the avoidance path to start the published window at.
+
+        Same idiom as anchor_gb_index: bound the search to an s-window around the car, then pick
+        the nearest point by POSITION inside it. Two failure modes are being avoided at once, and
+        the old code had one branch for each, which is why they fought.
+
+        A free XY argmin over the whole path snaps to the wrong branch wherever the path runs close
+        to itself -- and an avoidance path deliberately does, since its entry and exit ramps sit on
+        the same raceline a few metres apart. That is how the window came to start at a point the
+        car had already passed. The s-window makes that impossible.
+
+        The other branch spliced from index 0 whenever the car was within splice_start_dist_m of
+        the path start, to preserve the entry ramp. But the path is republished with its start
+        re-anchored at the car, and the SM adopts it 0.3-0.5 s late, so "near the start" stayed true
+        long after the car had driven past it -- pinning the window to a stale point behind the car
+        for the whole approach. What that branch actually needed is a small BACK MARGIN, which is
+        `back_pts` (2 points ~ 0.2 m): enough to keep the entry ramp continuous across a re-slice,
+        far too little to strand the window behind the car.
+        """
+        arr = wpnts.array
+        n = len(arr)
+        if n == 0:
+            return 0
+        L = self.track_length if self.track_length else self.max_s
+        cand = np.arange(n)
+        if L:
+            # signed, wrap-aware s offset of every path point from the car
+            ds = (arr[:, 2] - self.cur_s + L / 2.0) % L - L / 2.0
+            near = np.flatnonzero(np.abs(ds) <= search_m)
+            if near.size:
+                cand = near
+        d2 = ((arr[cand, 0] - self.current_position[0]) ** 2
+              + (arr[cand, 1] - self.current_position[1]) ** 2)
+        nearest = int(cand[int(np.argmin(d2))])
+        return max(0, nearest - int(back_pts))
+
     def get_splini_wpts(self) -> WpntArray:
         if self.static_overtaking_mode:
             wpnts = self.cur_static_avoidance_wpnts
         else:
             wpnts = self.cur_avoidance_wpnts
 
-        diff = np.linalg.norm(wpnts.array[:, 0:2] - self.current_position[:2], axis=1)
-        min_idx = int(np.argmin(diff))
-        # STATIC path: its entry ramp is anchored AT the car with matched heading, so while the
-        # car is still near the path's first point, splice from the start and keep that entry —
-        # the nearest-index cut throws it away and hands the controller a laterally-stepped
-        # window under SM lag. Deeper into the maneuver (damped/stale path, start left behind)
-        # the nearest-index cut remains correct.
-        if (self.static_overtaking_mode and self.splice_from_path_start
-                and diff[0] <= self.splice_start_dist_m):
-            min_idx = 0
+        min_idx = self._splini_anchor_index(wpnts)
         avoidance_wpnts = wpnts.list[min_idx:min_idx + self.n_loc_wpnts]
 
         if len(avoidance_wpnts) < self.n_loc_wpnts:
