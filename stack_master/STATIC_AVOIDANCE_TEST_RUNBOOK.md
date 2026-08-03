@@ -49,13 +49,23 @@ first two used to be false: `reopt_wall_margin` was 0.12 in `race.launch.xml` (t
 below) against 0.05 everywhere else, which shrank the avoidance humps, and `reopt_obs_margin` was
 not forwardable from here at all.
 
-## 0c. Planner / re-opt unit gates (no sim, no build)
+## 0c. Planner / SM / re-opt unit gates (no sim, no build)
 
 ```bash
 python3 planner/spliner/test/test_clear_gate.py             # raceline-CLEAR gate + per-id latch
+python3 planner/spliner/test/test_squeeze_pass.py           # reduced-margin retry: schedule, speed
+                                                            # gate, relax override, commit marking
+python3 state_machine/test/test_static_ot_drop.py           # OVERTAKE-drop reference/target hold,
+                                                            # sustain debounce, re-entry cooldown,
+                                                            # is_visible debounce
+python3 state_machine/test/test_velocity_cache.py           # profile cache invalidation + ay_max
 python3 planner/gb_optimizer/scripts/test_static_reopt_apex.py   # apex bookkeeping, clearance floor,
                                                                  # drift trigger, publish veto
 ```
+
+Note: `planner/lane_change_planner/test/test_phase_machine.py` fails on `main` for an unrelated
+harness gap (its `Fake` object lacks `_beside_target`), and `pytest` cannot collect that directory
+at all because of a `launch_testing` plugin incompatibility — run these as scripts.
 
 ## 0b. Re-opt line SHAPE gate (after ANY change to the re-optimizer)
 

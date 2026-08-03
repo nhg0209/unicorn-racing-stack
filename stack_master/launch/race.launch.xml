@@ -145,8 +145,11 @@
 
   <!-- Static avoidance (Frenet grid-sampling) -> /planner/avoidance/static_otwpnts
        + /planner/avoidance/static_feasible (Bool; SM gates OVERTAKE entry on it, treating a
-       stale/absent signal as INFEASIBLE). The feasible topic is published on the canonical name
-       by the node itself; only otwpnts still needs the namespace remap. -->
+       stale/absent signal as INFEASIBLE)
+       <- /planner/avoidance/relax        (Bool; the SM's static TRAILING deadlock asking for a
+                                           reduced-margin retry of the section it just failed).
+       Both Bools use canonical absolute names on both sides and are deliberately NOT remapped:
+       they are static-planner interlocks, not overtaking lanes. Only otwpnts needs the remap. -->
   <node pkg="spliner" exec="static_avoidance_node" name="static_avoidance_planner" output="screen">
     <param from="$(find-pkg-share stack_master)/config/static_avoidance_params.yaml"/>
     <remap from="/planner/avoidance/otwpnts" to="/planner/avoidance/static_otwpnts"/>
