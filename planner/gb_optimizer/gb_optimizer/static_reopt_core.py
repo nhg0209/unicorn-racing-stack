@@ -148,6 +148,20 @@ _HUMP_SPAN_FRAC = 0.28   # 0.20 -> 0.28: room for the entry/exit ramp stretching
 # (clear-gate never idles -> OVERTAKE<->GB_TRACK churn) and re-records apexes. Measured on
 # ifac: want -0.46 laid -0.28. Such apexes are DROPPED and reported instead.
 _APEX_KEEP_FRAC = 0.90
+# JOINT (post-weave) verification of the multi-apex profile. A single hump is verified against the
+# corridor and the curvature bar before it is accepted, but where two ramps OVERLAP the BPoly weaves
+# them apex-to-apex and the result is a shape neither was tested as. These bound the recovery:
+# shrink the reach of the humps covering a violation by _WEAVE_SHRINK, re-weave, up to
+# _WEAVE_MAX_PASSES times, then fail honestly. Shrinking separates the ramps, which is what
+# restores the per-hump verdicts.
+_WEAVE_SHRINK = 0.8
+_WEAVE_MAX_PASSES = 6
+# Tolerance on the clearance ACCEPTANCE comparison [m]. The obstacle-derived target amplitude is
+# d_obs + side*(r + obs_margin), so on a straight the laid line clears the box by EXACTLY
+# obs_margin and `gap >= need` is decided by the last bit of a float. Measured: 26 of 70 apexes on
+# map f dropped with reason 'clearance' at a reported clear of 0.350 inside a 1.0-1.9 m corridor,
+# purely on that comparison. A micrometre is far below anything the margin chain cares about.
+_CLEAR_EPS = 1e-6
 
 # Peak |d''| of the C2 quintic hump in closed form: for d(u) = A*(10t^3 - 15t^4 + 6t^5),
 # t = u/r, the extrema of d'' sit at t = (1 +- 1/sqrt(3))/2 and give |d''|max = (10/sqrt(3))*|A|/r^2.
@@ -870,7 +884,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             the `global` re-opt method, have no per-apex box to measure against)."""
             if need_clear > 0.0 and ob is not None:
                 gap = _clearance(u_c, d_now, r_i, r_o, ob)
-                return gap >= need_clear, gap
+                return gap >= need_clear - _CLEAR_EPS, gap
             return abs(d_now) >= max(0.03, _APEX_KEEP_FRAC * abs(d_want)), None
 
         def _kappa_allow(u_c, r):
@@ -889,11 +903,11 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                                              hi_a, lo_a, floor_r, fit_tol=fit_tol)
             ok, gap = _accepts(d_f, d, ob, u, r_f, r_f)
             if not ok and gap is not None:
-                # ONE retry, at the amplitude that WOULD reach the floor. The recorded reactive
-                # apex is a lower bound on what the obstacle needs, not an upper one: a hump that
-                # clears by 0.30 m where 0.35 is required is fixed by asking the corridor for 5 cm
-                # more, not by handing the obstacle back to the reactive layer. The reach is asked
-                # for at r_req again — a wider hump is gentler AND clears further out.
+                # ONE retry, at the amplitude that WOULD reach the floor. The obstacle-derived
+                # target is the LATERAL offset that clears the box; the floor is a 2-D distance, so
+                # on a curving line the first attempt can land just under it and asking for the
+                # deficit recovers it. The reach is asked for at r_req again — a wider hump is
+                # gentler AND keeps the line away from the box for longer, so it can only help.
                 d_want = math.copysign(abs(d_f) + (need_clear - gap), d)
                 d_r, r_r = _fit_hump_to_corridor(u_all, u, d_want, r_req, track_len,
                                                  hi_a, lo_a, floor_r, fit_tol=fit_tol)
@@ -996,38 +1010,110 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         kn_u = sorted(fitted)
         if not kn_u:
             return d_global, 0, 0.0, dropped, laid
+        verify_ctx = (hi_a, lo_a, kap_geo, floor_r)
     else:
         kn_u = [(u, d, ri, ro) for (u, d, ri, ro, _xa, _ya, _ob) in kn_u]   # no corridor: keep all
-    n_ap = len(kn_u)
-    breaks = [0.0]
-    bd = [list(zero)]                                   # seam: raceline, C2
-    for idx, (u, d, ri, ro) in enumerate(kn_u):
-        at_raceline = (bd[-1] == zero)
-        entry = u - ri
-        if at_raceline and entry > breaks[-1] + 2e-3:
-            breaks.append(entry)                        # open from the raceline before this hump
-            bd.append(list(zero))
-        u_adj = max(u, breaks[-1] + 1e-3)               # keep breakpoints strictly increasing
-        breaks.append(u_adj)
-        bd.append([float(d), 0.0, 0.0])                 # apex knot (peak, slope 0)
-        # close back to the raceline UNLESS the next apex's ramp overlaps this exit (-> weave)
-        exit_ = u + ro
-        next_entry = (kn_u[idx + 1][0] - kn_u[idx + 1][2]) if idx + 1 < n_ap else float("inf")
-        if next_entry > exit_ + 2e-3:
-            e = min(exit_, track_len - 1e-3)
-            if e > breaks[-1] + 1e-3:
-                breaks.append(e)
-                bd.append(list(zero))
-    if breaks[-1] < track_len - 1e-6:
-        breaks.append(track_len)                        # seam close (raceline, C2 across s=0)
-        bd.append(list(zero))
+        verify_ctx = None
 
-    try:
-        poly = BPoly.from_derivatives(np.asarray(breaks), bd)
-        u_stn = (s_loop - s_cut) % track_len
-        d_global = np.asarray(poly(u_stn), dtype=float)
-    except Exception:
-        return np.zeros(N), 0, 0.0, dropped, laid
+    u_stn = (s_loop - s_cut) % track_len
+
+    def _weave(knots):
+        """Lay `knots` as ONE C2 polynomial: raceline -> apex [-> apex ...] -> raceline.
+
+        Humps whose ramps overlap are woven straight apex-to-apex (no return-to-zero knot between
+        them), which is what keeps the line C2 through a slalom -- and also what makes the result
+        something no per-hump check ever looked at. Returns None on degenerate breakpoints."""
+        n_ap = len(knots)
+        breaks = [0.0]
+        bd = [list(zero)]                               # seam: raceline, C2
+        for idx, (u, d, ri, ro) in enumerate(knots):
+            at_raceline = (bd[-1] == zero)
+            entry = u - ri
+            if at_raceline and entry > breaks[-1] + 2e-3:
+                breaks.append(entry)                    # open from the raceline before this hump
+                bd.append(list(zero))
+            u_adj = max(u, breaks[-1] + 1e-3)           # keep breakpoints strictly increasing
+            breaks.append(u_adj)
+            bd.append([float(d), 0.0, 0.0])             # apex knot (peak, slope 0)
+            # close back to the raceline UNLESS the next apex's ramp overlaps this exit (-> weave)
+            exit_ = u + ro
+            next_entry = (knots[idx + 1][0] - knots[idx + 1][2]) if idx + 1 < n_ap else float("inf")
+            if next_entry > exit_ + 2e-3:
+                e = min(exit_, track_len - 1e-3)
+                if e > breaks[-1] + 1e-3:
+                    breaks.append(e)
+                    bd.append(list(zero))
+        if breaks[-1] < track_len - 1e-6:
+            breaks.append(track_len)                    # seam close (raceline, C2 across s=0)
+            bd.append(list(zero))
+        try:
+            return np.asarray(BPoly.from_derivatives(np.asarray(breaks), bd)(u_stn), dtype=float)
+        except Exception:
+            return None
+
+    def _weave_violations(dg, ctx):
+        """Stations of the WOVEN profile that break the corridor or the curvature bar.
+
+        Every check up to here judged ONE hump in isolation. Where two ramps overlap the weave
+        produces a shape neither of them was tested as, and the only thing standing behind that was
+        the clip + moving-average fallback downstream -- which this file documents as turning an
+        analytic 1-extremum hump into a 3-5 extremum comb. So re-ask both questions of what is
+        actually laid, with the SAME tolerance the per-hump fit used and the SAME geometric
+        curvature the verdict and the published speed cap use."""
+        hi_v, lo_v, kap_ref, _fl = ctx
+        bad = (dg > hi_v + fit_tol) | (dg < lo_v - fit_tol)
+        if curvlim > 0.0:
+            try:
+                k_laid = np.abs(_menger_kappa(clean_xy + dg[:, None] * nvec_rl))
+                # Same bar as the per-hump verdict: curvlim, but never stricter than the clean
+                # line's own geometry -- a corner the raceline already over-curves is not the
+                # hump's fault and dropping it would not fix it.
+                bad |= k_laid > np.maximum(curvlim, kap_ref) + 1e-6
+            except Exception:
+                pass
+        return bad
+
+    if verify_ctx is not None:
+        for _pass in range(_WEAVE_MAX_PASSES):
+            d_global = _weave(kn_u)
+            if d_global is None:
+                return np.zeros(N), 0, 0.0, dropped, laid
+            bad = _weave_violations(d_global, verify_ctx)
+            if not bad.any():
+                break
+            # Shrink the reach of every hump whose span covers a violation, JOINTLY -- the failure
+            # is an interaction, so the humps that produce it have to give ground together.
+            # Shrinking is the right lever even for a curvature violation: it separates the ramps,
+            # and once they no longer overlap each hump is again the single hump that already
+            # passed its own corridor and curvature tests.
+            floor_v = verify_ctx[3]
+            u_bad = u_stn[bad]
+            shrunk = []
+            changed_any = False
+            for (u, d, ri, ro) in kn_u:
+                touches = np.any((u_bad >= u - ri - 1e-9) & (u_bad <= u + ro + 1e-9))
+                if touches and max(ri, ro) > floor_v + 1e-6:
+                    ri = max(floor_v, ri * _WEAVE_SHRINK)
+                    ro = max(floor_v, ro * _WEAVE_SHRINK)
+                    changed_any = True
+                shrunk.append((u, d, ri, ro))
+            if not changed_any:
+                # Nothing left to give. Fail honestly instead of handing the profile to the clip:
+                # the reactive layer keeps these obstacles, which is strictly better than a comb.
+                for rec in laid:
+                    dropped.append({"xy": rec["xy"], "want": rec["want"], "fit": rec["laid"],
+                                    "reason": "weave"})
+                return np.zeros(N), 0, 0.0, dropped, []
+            kn_u = sorted(shrunk)
+        else:
+            for rec in laid:
+                dropped.append({"xy": rec["xy"], "want": rec["want"], "fit": rec["laid"],
+                                "reason": "weave"})
+            return np.zeros(N), 0, 0.0, dropped, []
+    else:
+        d_global = _weave(kn_u)
+        if d_global is None:
+            return np.zeros(N), 0, 0.0, dropped, laid
     # RAMP curvature: max |d''| over each hump's entry AND exit ramps — the merge-zone
     # inflections the driver feels joining/leaving the avoidance. It is the tiebreak the
     # reach/stretch search minimises once the lap time is settled. The same pass fills each
@@ -1430,18 +1516,25 @@ def _reopt_local_window_impl(
     if d_global is None:
         d_global, n_solved = np.zeros(N), 0
     n_failed = 0                                          # apexes with no offset are simply absent
-    # The hump was already FITTED to this corridor in build_offset_profile (reach + amplitude
-    # bisection), so the clip below is a guard that should barely bite — not the shaping mechanism.
-    # Clipping as the shaping mechanism is what produced the visible undulation: it turns the
-    # analytic 1-extremum hump into a 3-5 extremum comb (see _fit_hump_to_corridor).
+    # The profile was fitted per hump AND verified as woven inside build_offset_profile, both
+    # against this corridor with `fit_tol`. So the clip here is a pure guard: it may take back the
+    # tolerance the fit was allowed to spend (up to fit_tol), and nothing more.
+    #
+    # Anything beyond that used to fall through to clip + moving-average smoothing, described in
+    # this file as turning an analytic 1-extremum hump into a "3-5 extremum comb" -- i.e. the
+    # documented generator of the multi-hump undulation this line is judged on. A fallback that
+    # produces a shape the design explicitly rejects is not a fallback, so it is gone: a bite
+    # bigger than the tolerance means the verification upstream is wrong, and the honest answer is
+    # to lay nothing and leave the obstacles to the reactive layer.
     alpha_full = np.clip(d_global, lo_inc, hi_inc)
-    if n_solved and float(np.max(np.abs(alpha_full - d_global))) > 1e-6:
-        # The corridor fit could NOT make this profile feasible, so the clip had to shape it and
-        # left C0 corners -> round them. This is a FALLBACK, never the normal path: applied to an
-        # already-fitted (C2, feasible) hump the moving average would only blur the apex, and on a
-        # hump narrower than the window it rings. Measured on ifac with realistic 0.35 m apexes,
-        # fitting takes the clip-induced wobble from 38.9 mm median / 98.4 mm max down to 0.0.
-        alpha_full = np.clip(_cyclic_smooth(alpha_full, win=9), lo_inc, hi_inc)
+    if n_solved:
+        bite = float(np.max(np.abs(alpha_full - d_global)))
+        if bite > fit_tol + 1e-6:
+            print(f"[static_reopt_core] corridor clip bit {bite * 1e3:.1f} mm > fit_tol "
+                  f"{fit_tol * 1e3:.1f} mm on the woven profile — refusing to smooth it into a "
+                  f"comb; laying the clean line and leaving the obstacles to the reactive layer")
+            d_global, alpha_full, n_solved = np.zeros(N), np.zeros(N), 0
+            apex_laid = []
 
     # curvature contribution of the arc = alpha'' (2nd deriv wrt arc length), from the FINAL
     # smoothed+clamped offset: post-smoothing this is the real laid shape (no fake clamp-kink
