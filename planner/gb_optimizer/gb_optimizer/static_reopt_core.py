@@ -2263,8 +2263,25 @@ def _reopt_local_window_impl(
     # produces a shape the design explicitly rejects is not a fallback, so it is gone: a bite
     # bigger than the tolerance means the verification upstream is wrong, and the honest answer is
     # to lay nothing and leave the obstacles to the reactive layer.
-    alpha_full = np.clip(d_global, lo_inc, hi_inc)
-    clip_bite = float(np.max(np.abs(alpha_full - d_global))) if n_solved else 0.0
+    # ...and WITHIN that tolerance the clip is not applied at all. An element-wise clip is a
+    # lateral step at a single station, and a step is curvature: on the 0.1 m station grid, moving
+    # one station by the full fit_tol of 5 mm is 2*0.005/0.1^2 = 1.0 1/m of Menger curvature --
+    # measured on ifac (3 boxes 3 m apart at anchor 40, the one sweep case whose clip bites its
+    # full 5 mm) as a kappa that oscillates +-0.5 station to station while the offset profile, the
+    # clean line and the point spacing are all smooth. The clip was taking back a tolerance the fit
+    # was EXPLICITLY allowed to spend, and paying for those 5 mm with a visible kink.
+    #
+    # Nothing downstream assumes otherwise: check_avoidance_margins already computes the wall
+    # reserve as qp_veh_width/2 + wall_margin - fit_tol, i.e. the margin chain is dimensioned for a
+    # line that sits fit_tol outside this corridor, and the node's final wall gate measures the
+    # published points against the eroded map rather than against these bounds.
+    #
+    # A bite BEYOND the tolerance still refuses the line outright (below) -- that means the
+    # verification upstream is wrong, and the old fallback of clipping and smoothing it into a comb
+    # is a shape the design rejects.
+    clipped = np.clip(d_global, lo_inc, hi_inc)
+    clip_bite = float(np.max(np.abs(clipped - d_global))) if n_solved else 0.0
+    alpha_full = d_global.copy() if (n_solved and clip_bite <= fit_tol + 1e-6) else clipped
     if n_solved:
         bite = clip_bite
         if bite > fit_tol + 1e-6:
