@@ -78,6 +78,11 @@ def make_node():
     n._clearance_dirty_keys = set()
     n.apex_major_change_m = 0.10
     n.solve_min_interval_s = 1.0
+    n.swap_block_trailing = True
+    n.swap_min_obs_gap_m = 3.0
+    n.swap_state_stale_s = 1.0
+    n._sm_state = ""
+    n._sm_state_t = -1e9
     n._last_solve_t = -1e9
     n._solve_backoff_until = 0.0
     n._last_s = None
@@ -502,6 +507,37 @@ def drive_frenet(n, s, t):
     n.frenet_cb(msg)
 
 
+def test_swap_held_while_trailing_a_close_obstacle():
+    # Changing the reference under a car that is already braking for a box a couple of metres ahead
+    # is the worst moment there is: the controller's look-ahead lands on geometry it has never
+    # tracked and the reactive commit is still anchored to the OLD line. The real run's collision
+    # was 28 ms after a swap taken in exactly that state.
+    n = make_node()
+    n._clock.t = 100.0
+    bundle = straight_bundle()
+    n._pending, n._pending_dev = bundle, np.zeros(400)
+    n._pending_since = 0.0                      # long enough that the deadlock breaker would fire
+    n._last_vs = 0.5                            # ...and slow enough
+    n._reactive_active = False
+    n._reactive_idle_t = 0.0
+    n._publish_active = lambda b: None
+    n._publish_coverage = lambda b: None
+    n.pub_update_map = types.SimpleNamespace(publish=lambda m: None)
+    n._obstacles = [core.Obstacle(12.0, 0.0, 0.15)]
+    n.state_cb(types.SimpleNamespace(data="TRAILING"))
+    n._commit_pending(10.0)                     # obstacle 2 m ahead
+    assert n._pending is bundle, "a swap must not land while trailing a close obstacle"
+    # the gate is the COMBINATION: trailing far from anything is the opponent's doing
+    n._commit_pending(5.0)                      # obstacle 7 m ahead
+    assert n._pending is None, "a distant obstacle must not hold the swap"
+    # ...and a stale/absent state machine must not disable the feature (bag / headless)
+    n._pending, n._pending_dev = bundle, np.zeros(400)
+    n._clock.t = 110.0                          # the TRAILING message is now 10 s old
+    n._commit_pending(10.0)
+    assert n._pending is None, "a stale state must not block the swap forever"
+    print("PASS the swap is held while TRAILING a close obstacle")
+
+
 def test_solves_are_debounced():
     # The set-change and apex triggers can both fire several times a second while a track flaps or
     # an apex settles, and every solve REPLACES the queued bundle -- so the line kept being rebuilt
@@ -793,6 +829,7 @@ if __name__ == "__main__":
     test_raceline_already_clear_lays_nothing()
     test_clearance_drift_retriggers_once()
     test_minor_apex_refinement_keeps_the_pending()
+    test_swap_held_while_trailing_a_close_obstacle()
     test_solves_are_debounced()
     test_shrinking_set_keeps_the_queued_line()
     test_coverage_outranks_lap_time_in_the_reach_search()

@@ -367,6 +367,20 @@ class StaticReoptNode(Node):
         # second is short against the swap cadence (a lap) and long against the flap.
         self.declare_parameter("solve_min_interval_s", 1.0)
         self.solve_min_interval_s = float(self.get_parameter("solve_min_interval_s").value)
+        # SWAP SAFETY GATE. Changing the reference under a car that is already braking for an
+        # obstacle close ahead is the worst possible moment: the controller's look-ahead lands on
+        # geometry it has never tracked, and the reactive planner's own commit is anchored to the
+        # OLD line. On the real run the collision was 28 ms after a swap taken in exactly that
+        # state. Hold the commit while the state machine reports TRAILING and the nearest obstacle
+        # ahead is inside swap_min_obs_gap_m -- the pending is not discarded, only held.
+        self.declare_parameter("swap_block_trailing", True)
+        self.declare_parameter("swap_min_obs_gap_m", 3.0)
+        self.declare_parameter("swap_state_stale_s", 1.0)
+        self.swap_block_trailing = bool(self.get_parameter("swap_block_trailing").value)
+        self.swap_min_obs_gap_m = float(self.get_parameter("swap_min_obs_gap_m").value)
+        self.swap_state_stale_s = float(self.get_parameter("swap_state_stale_s").value)
+        self._sm_state = ""
+        self._sm_state_t = -1e9
         self._solve_backoff_until = 0.0
         self._last_solve_t = -1e9               # solve debounce, see solve_min_interval_s
 
@@ -405,6 +419,8 @@ class StaticReoptNode(Node):
         # Same pit/bench reset the layer listens to: drop the apex records right away instead of
         # letting them age out over apex_miss_frames publishes (the layer's empty set follows).
         self.create_subscription(Empty, "/static_reopt/clear_obstacles", self.clear_cb, 1)
+        # state machine state — read-only, for the swap safety gate (see _swap_blocked_by_state)
+        self.create_subscription(String, "/state_machine", self.state_cb, 1)
 
         self.create_timer(self.republish_period, self.republish_cb)
         self.create_timer(self.notify_period, self.notify_cb)
@@ -1366,6 +1382,43 @@ class StaticReoptNode(Node):
         cy = ay[None, :] + t * dy[None, :]
         return np.sqrt(((xa[:, None] - cx) ** 2 + (ya[:, None] - cy) ** 2).min(axis=1))
 
+    def state_cb(self, msg: String):
+        self._sm_state = str(msg.data)
+        self._sm_state_t = self.get_clock().now().nanoseconds * 1e-9
+
+    def _swap_blocked_by_state(self, car_x: float, car_y: float, s: float, now: float):
+        """Is this a moment where swapping the reference could hurt? Returns the gap [m] that
+        blocks it, or None.
+
+        TRAILING means the state machine has already decided something is in the way and is braking
+        for it. Swapping the global line there hands the controller a reference it has never
+        tracked, at the one station where the reactive layer's own commit is still anchored to the
+        OLD geometry. Only the combination blocks: TRAILING far from any obstacle is the opponent's
+        doing and no reason to hold a static re-opt.
+
+        Silent when the state machine is not publishing (bag / headless): a gate that cannot see
+        the state must not disable the feature outright -- the reactive-idle and line-agreement
+        gates still stand on their own.
+        """
+        if not self.swap_block_trailing or self._sm_state != "TRAILING":
+            return None
+        if (now - self._sm_state_t) > self.swap_state_stale_s:
+            return None
+        if not self._obstacles:
+            return None
+        try:
+            sb, xb, yb = self._bundle_xy(self.active)
+            L = float(sb[-1]) if len(sb) and sb[-1] > 0 else self._track_len
+            s_car = float(s) % L
+            gaps = []
+            for o in self._obstacles:
+                j = int(np.argmin(np.hypot(xb - o.x, yb - o.y)))
+                gaps.append((float(sb[j]) - s_car) % L)
+            gap = min(gaps)
+        except Exception:
+            return None
+        return gap if gap < self.swap_min_obs_gap_m else None
+
     def _commit_pending(self, s: float, force: bool = False):
         """Swap once BOTH hold: the reactive layer is idle (no obstacle in its horizon, so changing
         the global line cannot pull the rug from under an avoidance in progress), and the lines
@@ -1393,6 +1446,18 @@ class StaticReoptNode(Node):
             j0 = int(np.argmin(np.hypot(xa - car_x, ya - car_y)))
             # DEADLOCK BREAKER (see the parameter block): stuck trailing = the car sits inside
             # the pending hump at low speed; the normal gates can then never pass. Commit anyway.
+            blocked = self._swap_blocked_by_state(car_x, car_y, s, now)
+            if blocked is not None:
+                # Ahead of the deadlock breaker on purpose: "stuck, slow, waiting" IS what trailing
+                # a close obstacle looks like, so letting the breaker through here would leave the
+                # gate doing nothing in the one case it exists for. It cannot deadlock: the car
+                # either clears the obstacle (the gap opens) or the state leaves TRAILING, and
+                # holding the current line while nose-to-nose with a box costs nothing.
+                self.get_logger().info(
+                    f"[static_reopt] holding the swap: TRAILING with an obstacle {blocked:.2f} m "
+                    f"ahead (< {self.swap_min_obs_gap_m:.2f}) — the pending line stays queued",
+                    throttle_duration_sec=2.0)
+                return
             stuck = ((now - self._pending_since) > self.swap_deadlock_s
                      and abs(self._last_vs) < self.swap_deadlock_max_vs)
             if stuck:
