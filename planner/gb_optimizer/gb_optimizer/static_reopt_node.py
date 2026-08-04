@@ -371,7 +371,8 @@ class StaticReoptNode(Node):
         return [float(np.min(np.hypot(xy[:, 0] - o.x, xy[:, 1] - o.y))) - float(o.r)
                 for o in obstacles]
 
-    def _check_line_clearance(self, traj, obstacles: List[core.Obstacle], laid: List[dict]) -> bool:
+    def _check_line_clearance(self, traj, obstacles: List[core.Obstacle], laid: List[dict],
+                              apex_obs: List[core.Obstacle] = None) -> bool:
         """Measure what the line ACTUALLY clears, in the map frame, and VETO it if it does not.
 
         Everything upstream reports intent -- "2/2 obstacle apex(es) reshaped" is printed whether
@@ -390,7 +391,9 @@ class StaticReoptNode(Node):
 
         Obstacles with NO hump at all (never reactively avoided, or honestly dropped) are expected
         to read short — they are the reactive layer's job and must not veto the line that was built
-        for the others. Only apexes the core claims it LAID are held to the floor.
+        for the others. Only apexes the core claims it LAID are held to the floor, and which those
+        are is decided by IDENTITY (`apex_obs`, index-aligned with the apexes the core was given),
+        not by proximity.
 
         Returns True when the line may be published.
         """
@@ -399,16 +402,24 @@ class StaticReoptNode(Node):
                 return True
             gaps = self._line_clearances(traj, obstacles)
             bad = [(o, d) for o, d in zip(obstacles, gaps) if d < self.obs_margin]
+            apex_obs = apex_obs or []
+            laid_obs = [apex_obs[a["obs_i"]] for a in (laid or [])
+                        if a.get("obs_i") is not None and a["obs_i"] < len(apex_obs)]
             if not bad:
                 self.get_logger().info(
                     f"[static_reopt] line clearance OK: all {len(obstacles)} obstacle(s) cleared by "
                     f">= {self.obs_margin:.2f} m")
                 return True
-            # Which of the short ones did the core promise to have reshaped? Match by position:
-            # `apex_laid` carries the apex point, which sits within ~one clearance of its obstacle.
-            laid_xy = [a["xy"] for a in (laid or [])]
-            broken = [(o, d) for o, d in bad
-                      if any(np.hypot(ax - o.x, ay - o.y) < 1.5 for ax, ay in laid_xy)]
+            # Which of the short ones did the core promise to have reshaped? By IDENTITY: the core
+            # reports the index of the obstacle each hump belongs to, and `laid_obs` resolves those
+            # back to the obstacle objects.
+            #
+            # This used to match by position -- "some laid apex within 1.5 m of this box" -- which
+            # is not the same question. Two obstacles a metre apart are inside each other's radius,
+            # so a hump laid for one made its DROPPED neighbour count as broken, and the neighbour's
+            # (expected, by-design) short clearance then vetoed a line that was correct for
+            # everything it actually claimed. On a cluster that is every publish.
+            broken = [(o, d) for o, d in bad if any(o is lo for lo in laid_obs)]
             det = "; ".join(f"@({o.x:.2f},{o.y:.2f}) r={o.r:.2f} -> {d:+.2f} m" for o, d in bad)
             if not broken:
                 self.get_logger().info(
@@ -528,7 +539,8 @@ class StaticReoptNode(Node):
                 self.get_logger().warning(
                     f"[static_reopt] {n_no_apex} obstacle(s) had no recorded reactive apex yet — "
                     f"the reactive static-avoidance layer handles them until an apex is captured")
-            clearance_ok = self._check_line_clearance(traj, obstacles, res.get("apex_laid", []))
+            clearance_ok = self._check_line_clearance(traj, obstacles, res.get("apex_laid", []),
+                                                      apex_obs=[o for _xy, o in pairs])
             # Baseline for the drift trigger: what THIS line clears each box by, at the positions
             # it was built from. Travels with the bundle so the comparison is always against the
             # line that is actually active (a pending bundle may never commit).

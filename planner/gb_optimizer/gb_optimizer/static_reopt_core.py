@@ -782,7 +782,10 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         v = float(clean_vx[i]) if clean_vx is not None else 3.0
         R = float(np.clip(reach_time * v, reach_min, reach_max))
         R = min(R, 0.45 * track_len)                    # never span more than ~half the loop
-        knots.append((float(s_loop[i]), d_target, R, R, xa, ya, ob))  # symmetric ramps
+        # k_i is the index into `apexes`/`obstacles`: the caller's handle on WHICH obstacle
+        # this hump belongs to. Reported back in `laid`/`dropped` so the node can match by
+        # identity instead of by proximity -- see _check_line_clearance.
+        knots.append((float(s_loop[i]), d_target, R, R, xa, ya, ob, k_i))  # symmetric ramps
     if not knots:
         return d_global, 0, 0.0, [], []
 
@@ -801,8 +804,8 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
     # Between two apexes whose ramps OVERLAP we weave straight apex->apex (no return-to-0 knot);
     # otherwise each hump opens from and closes back to the raceline. `zero` = [d,d',d''] all 0.
     zero = [0.0, 0.0, 0.0]
-    kn_u = sorted((((c - s_cut) % track_len, d, ri, ro, xa, ya, ob)
-                   for (c, d, ri, ro, xa, ya, ob) in knots), key=lambda k: k[0])
+    kn_u = sorted((((c - s_cut) % track_len, d, ri, ro, xa, ya, ob, ki)
+                   for (c, d, ri, ro, xa, ya, ob, ki) in knots), key=lambda k: k[0])
     dropped: List[dict] = []
     laid: List[dict] = []
     # --- FIT each hump to the corridor (shrink reach, NEVER the clearance) BEFORE laying it ----
@@ -908,7 +911,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             return max(curvlim, kc)
 
         fitted = []
-        for (u, d, ri, ro, xa, ya, ob) in kn_u:
+        for (u, d, ri, ro, xa, ya, ob, k_i) in kn_u:
             r_req = max(ri, ro)
             d_f, r_f = _fit_hump_to_corridor(u_all, u, d, r_req, track_len,
                                              hi_a, lo_a, floor_r, fit_tol=fit_tol)
@@ -927,6 +930,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                     ok, d_f, r_f, gap = True, d_r, r_r, gap_r
             if not ok:
                 rec = {"xy": (float(xa), float(ya)), "want": float(d), "fit": float(d_f),
+                       "obs_i": k_i,
                        "reason": "clearance" if gap is not None else "corridor"}
                 if gap is not None:
                     rec["clear"], rec["need"] = float(gap), need_clear
@@ -978,7 +982,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                     ok, gap = _accepts(d_f, d, ob, u, r_f, r_f)
                     if not ok:
                         rec = {"xy": (float(xa), float(ya)), "want": float(d),
-                               "fit": float(d_f), "reason": "curvature"}
+                               "fit": float(d_f), "obs_i": k_i, "reason": "curvature"}
                         if gap is not None:
                             rec["clear"], rec["need"] = float(gap), need_clear
                         dropped.append(rec)
@@ -1013,6 +1017,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             r_out = _stretch(exit_scale, r_in, stretch_entry=False)
             fitted.append((u, d_f, r_in, r_out, r_f))    # r_f = pre-stretch reach (budget recovery)
             laid.append({"xy": (float(xa), float(ya)), "want": float(d), "laid": float(d_f),
+                         "obs_i": k_i,
                          "r_in": float(r_in), "r_out": float(r_out), "r_req": float(r_req),
                          "kappa_peak": 0.0,        # filled from the laid profile below
                          "clear": float("nan"),    # ditto — measured on the WOVEN profile
@@ -1042,7 +1047,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         kn_u = sorted((u, d, ri, ro) for (u, d, ri, ro, _rf) in fitted)
         verify_ctx = (hi_a, lo_a, kap_geo, floor_r)
     else:
-        kn_u = [(u, d, ri, ro) for (u, d, ri, ro, _xa, _ya, _ob) in kn_u]   # no corridor: keep all
+        kn_u = [(u, d, ri, ro) for (u, d, ri, ro, _xa, _ya, _ob, _ki) in kn_u]   # no corridor: keep all
         verify_ctx = None
 
     u_stn = (s_loop - s_cut) % track_len
@@ -1138,13 +1143,13 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                 # the reactive layer keeps these obstacles, which is strictly better than a comb.
                 for rec in laid:
                     dropped.append({"xy": rec["xy"], "want": rec["want"], "fit": rec["laid"],
-                                    "reason": "weave"})
+                                    "obs_i": rec.get("obs_i"), "reason": "weave"})
                 return np.zeros(N), 0, 0.0, dropped, []
             kn_u = sorted(shrunk)
         else:
             for rec in laid:
                 dropped.append({"xy": rec["xy"], "want": rec["want"], "fit": rec["laid"],
-                                "reason": "weave"})
+                                "obs_i": rec.get("obs_i"), "reason": "weave"})
             return np.zeros(N), 0, 0.0, dropped, []
     else:
         d_global = _weave(kn_u)

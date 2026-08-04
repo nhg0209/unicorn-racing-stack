@@ -368,17 +368,25 @@ def test_minor_apex_refinement_keeps_the_pending():
 
 def test_line_clearance_veto():
     # A line that does not clear an obstacle it CLAIMS to have reshaped must not be published;
-    # one that misses an obstacle no hump was laid for is fine (reactive layer's job).
+    # one that misses an obstacle no hump was laid for is fine (reactive layer's job). Which
+    # obstacles were claimed is decided by IDENTITY: `obs_i` indexes `apex_obs`.
     n = make_node()
     n.obs_margin = 0.35
     traj = np.column_stack([np.arange(400) * 0.1, np.arange(400) * 0.1, np.zeros(400)])
     close = core.Obstacle(20.0, 0.20, 0.15)       # line passes 0.05 m from the edge
     far = core.Obstacle(30.0, 1.00, 0.15)
-    assert n._check_line_clearance(traj, [far], [{"xy": (30.0, 0.6)}]) is True
-    assert n._check_line_clearance(traj, [close], [{"xy": (20.0, 0.6)}]) is False, \
+    assert n._check_line_clearance(traj, [far], [{"xy": (30.0, 0.6), "obs_i": 0}],
+                                   apex_obs=[far]) is True
+    assert n._check_line_clearance(traj, [close], [{"xy": (20.0, 0.6), "obs_i": 0}],
+                                   apex_obs=[close]) is False, \
         "a reshaped-but-not-cleared obstacle must veto the publish"
-    assert n._check_line_clearance(traj, [close], []) is True, \
+    assert n._check_line_clearance(traj, [close], [], apex_obs=[close]) is True, \
         "an obstacle with no hump laid for it is the reactive layer's job, not a veto"
+    # a DROPPED neighbour close enough to be inside the old 1.5 m proximity radius must not veto
+    laid_ok = core.Obstacle(20.0, 0.60, 0.15)
+    assert n._check_line_clearance(traj, [laid_ok, close], [{"xy": (20.0, 0.9), "obs_i": 0}],
+                                   apex_obs=[laid_ok, close]) is True, \
+        "a dropped neighbour must not veto a line that is correct for what it claimed"
     print("PASS line clearance vetoes only lines that break their own promise")
 
 
