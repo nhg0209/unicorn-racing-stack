@@ -44,6 +44,8 @@ import yaml
 SLACK = 0.03  # [m] margin the re-opt clearance must exceed the reactive keep-out by
 # Half the SIM car's width (gym_bridge f1tenth: 0.2032 m wide). The physical thing that has to fit
 # between the published line and the wall.
+MAP_RES_M = 0.05          # [m/px] the shipped maps' occupancy-grid resolution
+WIDTH_CAR_M = 0.30        # [m] car width; half of it is what a wall gate must reserve
 SIM_HALF_WIDTH_M = 0.1016
 # [m] the part of the controller's lateral error the GEOMETRY is asked to absorb next to a wall.
 # NOT the full steady-state error (~0.5 m -- no ifac corridor could hold that): the rest is covered
@@ -259,6 +261,31 @@ def check_static_chain_ordering(sm_path, sm, cfg, yaml_path, args, launch_path) 
     else:
         print(f"OK: wall reserve ({wall_reserve:.3f}) >= car half-width + tracking budget "
               f"({wall_need:.3f}).")
+
+    # (b2) THE TWO WALL GATES MUST AGREE. Both erode the same occupancy map and both judge a CAR
+    # CENTRE, so the global line the car follows for every lap after a swap must be held to at
+    # least what the reactive planner demands of a path it publishes for a few seconds. cv2.erode
+    # eats floor(k/2) cells, so the kernel IS the reserve at the map resolution.
+    reactive_k = int(cfg.get("body_kernel_size", 0) or 0)
+    reopt_k = int(float(args.get("reopt_wall_gate_kernel", 0) or 0))
+    if reactive_k and reopt_k:
+        r_res, o_res = (reactive_k // 2) * MAP_RES_M, (reopt_k // 2) * MAP_RES_M
+        print(f"  wall-gate erosion: reactive body k={reactive_k} -> {r_res:.2f} m | "
+              f"re-opt gate k={reopt_k} -> {o_res:.2f} m (at {MAP_RES_M:.2f} m/px)")
+        if o_res < r_res - 1e-9:
+            ok = False
+            print(f"FAIL: the re-opt wall gate reserves {o_res:.2f} m against the reactive body "
+                  f"gate's {r_res:.2f} m. The re-opt line is the one the car follows on EVERY lap "
+                  f"after the swap; holding it to less clearance than a reactive path that lives "
+                  f"for seconds is backwards. Raise reopt_wall_gate_kernel to >= "
+                  f"{reactive_k}.")
+        elif o_res < WIDTH_CAR_M / 2.0 - 1e-9:
+            ok = False
+            print(f"FAIL: both wall gates reserve {o_res:.2f} m, under half a car "
+                  f"({WIDTH_CAR_M / 2.0:.2f} m). A published point is a car CENTRE.")
+        else:
+            print(f"OK: the re-opt wall gate reserves {o_res:.2f} m >= the reactive body gate's "
+                  f"{r_res:.2f} m, and both cover half a car ({WIDTH_CAR_M / 2.0:.2f} m).")
 
     # (c) drift budget, applied to BOTH the launch value and the node's own default
     print(f"  headroom for drift = floor - SM requirement = {floor:.3f} - {required:.3f} = {headroom:.3f} m")

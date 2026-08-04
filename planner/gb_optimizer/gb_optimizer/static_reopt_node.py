@@ -133,7 +133,12 @@ class StaticReoptNode(Node):
         # waypoints' d_left/d_right, which are an estimate; the map is the only wall source that
         # cannot be mislabelled or smoothed. Same erosion kernel as the reactive planner so the two
         # agree on where a wall is. 0 disables the gate.
-        self.declare_parameter("wall_gate_kernel", 3)
+        # 3 -> 7. cv2.erode eats floor(k/2) cells, so 3 reserved ONE cell (0.05 m) around a point
+        # that is a CAR CENTRE: the global line the car follows for every lap after the swap was
+        # checked against a third of the clearance the reactive planner's own body gate demands
+        # (body_kernel_size 7 = 0.15 m = half a car). 7 makes the two agree, which is the whole
+        # premise of the comment below about "the same erosion kernel as the reactive planner".
+        self.declare_parameter("wall_gate_kernel", 7)
         # [m] apex spacing below which two obstacles are treated as ONE cluster: same side ->
         # merged into a single hump, opposite sides -> dropped as a pair when no reach can swing
         # between them inside the curvature budget. 0 disables the pre-pass.
@@ -573,11 +578,27 @@ class StaticReoptNode(Node):
             if free.all():
                 return True
             bad = np.flatnonzero(~free)
+            # Name the OBSTACLES whose humps are implicated, not just the coordinate: a refusal
+            # here means a hump the corridor accepted puts the car body into a wall, and the first
+            # question is always which box asked for it. The corridor comes from d_left/d_right,
+            # which some maps ship exchanged -- exactly the case where this gate is the only thing
+            # standing between the car and the wall, so it is never the thing to lower.
+            near = []
+            for o in self._obstacles:
+                d = float(np.min(np.hypot(xy[bad, 0] - o.x, xy[bad, 1] - o.y)))
+                if d < 6.0:
+                    near.append(f"@({o.x:.2f},{o.y:.2f}) r={o.r:.2f} [{d:.2f} m away]")
+            k_eff = (int(self.wall_gate_kernel) // 2) * float(f.resolution or 0.05)
             self.get_logger().error(
                 f"[static_reopt] REFUSING to publish: {bad.size} of {len(xy)} published points are "
-                f"outside the eroded free space (first @({xy[bad[0], 0]:.2f},{xy[bad[0], 1]:.2f})). "
-                f"The line would put the car into a wall — check reopt_wall_margin / "
-                f"reopt_qp_veh_width and the map's d_left/d_right")
+                f"outside the free space eroded by {k_eff:.2f} m "
+                f"(kernel {self.wall_gate_kernel}); first @"
+                f"({xy[bad[0], 0]:.2f},{xy[bad[0], 1]:.2f}), s={float(np.asarray(traj)[bad[0], 0]):.2f} m. "
+                + (f"Implicated obstacle(s): {'; '.join(near)}. " if near else "No obstacle within 6 m "
+                   "of the violation — this is the clean line's own geometry or a corridor error. ")
+                + f"The line would put the car BODY into a wall — this gate reserves half a car and "
+                f"is not the thing to lower; check reopt_wall_margin / reopt_qp_veh_width and the "
+                f"map's d_left/d_right (some maps ship them exchanged)")
             return False
         except Exception as e:                       # a gate must never crash the build
             self.get_logger().debug(f"[static_reopt] wall gate skipped: {e}")
