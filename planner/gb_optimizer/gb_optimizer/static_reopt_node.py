@@ -589,8 +589,17 @@ class StaticReoptNode(Node):
                 return True
             gaps = self._line_clearances(traj, obstacles)
             floors = floors or {}
+            # TOLERANCE. The floor is what the core's per-hump gate accepted, measured on the FITTED
+            # profile; what arrives here is that profile after weaving, resampling to uniform
+            # spacing and the corridor clip -- each of which may move a station by up to fit_tol,
+            # the slack the fit is explicitly permitted to spend. Comparing the two with a bare `<`
+            # therefore vetoes on sub-millimetre representation noise: a hump accepted at exactly
+            # its floor (the relax ladder lands on the floor by construction) measures a few tenths
+            # of a millimetre short here and the whole line is refused, leaving the car on a line
+            # that clears LESS. Allow exactly the slack the fit was allowed, and no more.
+            tol = self.fit_tol + 1e-6
             bad = [(o, d) for o, d in zip(obstacles, gaps)
-                   if d < floors.get(id(o), self.obs_margin)]
+                   if d < floors.get(id(o), self.obs_margin) - tol]
             apex_obs = apex_obs or []
             laid_obs = [apex_obs[a["obs_i"]] for a in (laid or [])
                         if a.get("obs_i") is not None and a["obs_i"] < len(apex_obs)]
@@ -616,8 +625,9 @@ class StaticReoptNode(Node):
                     f"line (need >= {self.obs_margin:.2f} m): {det}. No hump was laid for them — "
                     f"the reactive layer keeps handling those, as designed")
                 return True
-            det_b = "; ".join(f"@({o.x:.2f},{o.y:.2f}) r={o.r:.2f} -> {d:+.2f} m "
-                              f"(promised {floors.get(id(o), self.obs_margin):.2f})"
+            det_b = "; ".join(f"@({o.x:.2f},{o.y:.2f}) r={o.r:.3f} -> {d:+.3f} m "
+                              f"(promised {floors.get(id(o), self.obs_margin):.3f}, "
+                              f"veto below {floors.get(id(o), self.obs_margin) - tol:.3f})"
                               for o, d in broken)
             self.get_logger().error(
                 f"[static_reopt] REFUSING to publish: {len(broken)} obstacle(s) the re-opt claims "

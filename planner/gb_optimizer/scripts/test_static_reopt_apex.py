@@ -28,6 +28,9 @@ class _Logger:
     def info(self, *a, **k): pass
     def warning(self, *a, **k): pass
     def error(self, *a, **k): pass
+    # the node's gates swallow their own exceptions into debug(); without it a bug inside a gate
+    # surfaces as "no attribute 'debug'" and hides what actually failed
+    def debug(self, *a, **k): pass
     warn = warning
 
 
@@ -70,6 +73,7 @@ def make_node():
     n._notify_scaler_ticks = 0
     n.notify_ticks = 0
     n.obs_margin = 0.35
+    n.fit_tol = 0.005
     n.clearance_dirty_m = 0.30
     n._clearance_dirty_keys = set()
     n.apex_major_change_m = 0.10
@@ -546,6 +550,18 @@ def test_line_clearance_veto():
     assert n._check_line_clearance(traj, [laid_ok, close], [{"xy": (20.0, 0.9), "obs_i": 0}],
                                    apex_obs=[laid_ok, close]) is True, \
         "a dropped neighbour must not veto a line that is correct for what it claimed"
+    # ...and the comparison carries the slack the FIT was allowed to spend. A hump accepted at
+    # exactly its floor (the relax ladder lands on the floor by construction) reads back a fraction
+    # of a millimetre short after weaving/resampling; vetoing on that leaves the car on a line that
+    # clears LESS than the one refused.
+    grazing = core.Obstacle(20.0, 0.4998, 0.15)   # 0.3498 m of edge clearance vs a 0.35 floor
+    assert n._check_line_clearance(traj, [grazing], [{"xy": (20.0, 0.9), "obs_i": 0}],
+                                   apex_obs=[grazing], floors={id(grazing): 0.35}) is True, \
+        "a sub-fit_tol shortfall is representation noise, not a broken promise"
+    real_short = core.Obstacle(20.0, 0.48, 0.15)  # 0.33 m: 2 cm short, well past fit_tol
+    assert n._check_line_clearance(traj, [real_short], [{"xy": (20.0, 0.9), "obs_i": 0}],
+                                   apex_obs=[real_short], floors={id(real_short): 0.35}) is False, \
+        "a genuine shortfall must still veto"
     print("PASS line clearance vetoes only lines that break their own promise")
 
 
