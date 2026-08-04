@@ -61,7 +61,12 @@ static_avoidance_planner:
     squeeze_enable: true
     squeeze_steps: 2            # attempts between the design margin and the floor (linear)
     squeeze_safety_floor_m: 0.05  # [m] tightest obstacle clearance the pass may ask for
-    squeeze_wall_floor_m: 0.05    # [m] tightest wall reserve the pass may ask for
+    squeeze_wall_floor_m: 0.08    # [m] tightest wall reserve the pass may ask for. 0.05 -> 0.08:
+                                  #     the obstacle floor is a distance to a box the perception
+                                  #     pipeline has MEASURED; the wall reserve is a distance to a
+                                  #     map whose own error (localization + grid discretization)
+                                  #     is of the same order as the reserve itself, so 5 cm of it
+                                  #     is not a margin, it is a rounding.
     squeeze_max_speed_mps: 3.0    # [m/s] above this, "no feasible candidate" still means TRAILING.
                                   #       Trading clearance for motion is only defensible where a
                                   #       mis-clearance is survivable.

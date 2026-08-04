@@ -154,7 +154,7 @@ class ObstacleSpliner(Node):
         self.squeeze_enable = True
         self.squeeze_steps = 2            # reduced-margin attempts between the design value and the floor
         self.squeeze_safety_floor_m = 0.05  # [m] tightest obstacle clearance the pass may ask for
-        self.squeeze_wall_floor_m = 0.05    # [m] tightest wall reserve the pass may ask for
+        self.squeeze_wall_floor_m = 0.08    # [m] tightest wall reserve the pass may ask for
         self.squeeze_max_speed_mps = 3.0    # [m/s] above this, "no candidate" still means TRAILING
         self.relax_hold_s = 2.0             # [s] a deadlock relax request forces the pass this long
         self._relax_until = 0.0             # wall time the current relax request expires
@@ -346,7 +346,7 @@ class ObstacleSpliner(Node):
                                intd(1, 5, "reduced-margin attempts between the design margin and the floor"))
         self.declare_parameter('squeeze_safety_floor_m', 0.05,
                                dbl(0.0, 0.5, "tightest obstacle clearance the squeeze pass may ask for [m]"))
-        self.declare_parameter('squeeze_wall_floor_m', 0.05,
+        self.declare_parameter('squeeze_wall_floor_m', 0.08,
                                dbl(0.0, 0.5, "tightest wall reserve the squeeze pass may ask for [m]"))
         self.declare_parameter('squeeze_max_speed_mps', 3.0,
                                dbl(0.0, 10.0, "above this speed, no feasible candidate still means TRAILING [m/s]"))
