@@ -1178,6 +1178,40 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         bad |= _excess_peak_mask(dg, [k[0] for k in knots_u], u_stn)
         return bad
 
+    def _drop_touching_and_reweave(u_bad, knots_u, laid_recs, dropped_recs):
+        """Give up on the humps that overlap a violation, keep the rest.
+
+        Returns (d_global, surviving_knots, surviving_laid) or (None, ..., ...) when nothing
+        survives or the survivors still fail. The survivors are re-verified once: removing a hump
+        can only reduce the interaction, but "can only reduce" is not "is guaranteed to fix", and a
+        profile that still violates must not be published.
+        """
+        keep, gone = [], []
+        for (u, d, ri, ro) in knots_u:
+            if np.any((u_bad >= u - ri - 1e-9) & (u_bad <= u + ro + 1e-9)):
+                gone.append(u)
+            else:
+                keep.append((u, d, ri, ro))
+        if not gone:                       # violation outside every hump's span: keep nothing
+            keep, gone = [], [u for (u, _d, _ri, _ro) in knots_u]
+        gone_set = {round(g, 6) for g in gone}
+        surviving = []
+        for rec in laid_recs:
+            if round(float(rec.get("_u", -1e9)), 6) in gone_set:
+                dropped_recs.append({"xy": rec["xy"], "want": rec["want"], "fit": rec["laid"],
+                                     "obs_i": rec.get("obs_i"), "reason": "weave"})
+            else:
+                surviving.append(rec)
+        if not keep:
+            return None, [], []
+        dg = _weave(keep)
+        if dg is None or _weave_violations(dg, verify_ctx, keep).any():
+            for rec in surviving:
+                dropped_recs.append({"xy": rec["xy"], "want": rec["want"], "fit": rec["laid"],
+                                     "obs_i": rec.get("obs_i"), "reason": "weave"})
+            return None, [], []
+        return dg, keep, surviving
+
     if verify_ctx is not None:
         for _pass in range(_WEAVE_MAX_PASSES):
             d_global = _weave(kn_u)
@@ -1203,17 +1237,21 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                     changed_any = True
                 shrunk.append((u, d, ri, ro))
             if not changed_any:
-                # Nothing left to give. Fail honestly instead of handing the profile to the clip:
-                # the reactive layer keeps these obstacles, which is strictly better than a comb.
-                for rec in laid:
-                    dropped.append({"xy": rec["xy"], "want": rec["want"], "fit": rec["laid"],
-                                    "obs_i": rec.get("obs_i"), "reason": "weave"})
-                return np.zeros(N), 0, 0.0, dropped, []
+                # Nothing left to give by shrinking. Drop only the humps that actually TOUCH a
+                # violation and re-weave the rest once. Discarding the whole profile threw away
+                # humps that were never implicated -- an interaction between two obstacles at one
+                # end of the lap cost every other obstacle its coverage, and the fallback is not
+                # the clean line, it is whatever older (less covered) line is still active.
+                d_global, kn_u, laid = _drop_touching_and_reweave(u_bad, kn_u, laid, dropped)
+                break
             kn_u = sorted(shrunk)
         else:
-            for rec in laid:
-                dropped.append({"xy": rec["xy"], "want": rec["want"], "fit": rec["laid"],
-                                "obs_i": rec.get("obs_i"), "reason": "weave"})
+            # passes exhausted: the shrink is still converging but has run out of budget
+            dg_last = _weave(kn_u)
+            bad = (_weave_violations(dg_last, verify_ctx, kn_u) if dg_last is not None
+                   else np.ones(N, dtype=bool))
+            d_global, kn_u, laid = _drop_touching_and_reweave(u_stn[bad], kn_u, laid, dropped)
+        if d_global is None:
             return np.zeros(N), 0, 0.0, dropped, []
     else:
         d_global = _weave(kn_u)

@@ -366,6 +366,29 @@ def test_minor_apex_refinement_keeps_the_pending():
     print("PASS a minor apex refinement keeps the pending bundle, a major one drops it")
 
 
+def test_weave_failure_drops_only_the_implicated_humps():
+    # A weave violation is an INTERACTION between overlapping humps. Discarding the whole profile
+    # made an interaction at one end of the lap cost every other obstacle its coverage -- and the
+    # fallback is not the clean line, it is whatever older, less-covered line is still active.
+    n_st = 900
+    xy = np.column_stack([np.arange(n_st) * 0.1, np.zeros(n_st)])
+    s_l = np.arange(n_st) * 0.1
+    nv = np.column_stack([np.zeros(n_st), -np.ones(n_st)])
+    hi, lo = np.full(n_st, 1.2), np.full(n_st, -1.2)
+    # a close OPPOSITE-side pair (1.5 m apart) that cannot be woven, plus one easy hump far away
+    apex = [(19.0, -0.55), (20.5, 0.55), (60.0, -0.55)]
+    obs = [(19.0, 0.0, 0.15), (20.5, 0.0, 0.15), (60.0, 0.0, 0.15)]
+    _d, nn, _e, drp, lay = core.build_offset_profile(
+        xy, s_l, float(n_st * 0.1), nv, apex, None, 0.0, 3.0, 3.0, hi_inc=hi, lo_inc=lo,
+        obstacles=obs, obs_margin=0.35, relax_floor=0.30, curvlim=1.5,
+        clean_kappa=np.zeros(n_st))
+    assert nn == 1, f"the unimplicated hump must survive, got {nn} laid"
+    assert [a["obs_i"] for a in lay] == [2], [a["obs_i"] for a in lay]
+    assert sorted(d["obs_i"] for d in drp) == [0, 1]
+    assert all(d["reason"] == "weave" for d in drp)
+    print("PASS a weave failure drops only the humps that overlap the violation")
+
+
 def test_line_clearance_veto():
     # A line that does not clear an obstacle it CLAIMS to have reshaped must not be published;
     # one that misses an obstacle no hump was laid for is fine (reactive layer's job). Which
@@ -524,5 +547,6 @@ if __name__ == "__main__":
     test_raceline_already_clear_lays_nothing()
     test_clearance_drift_retriggers_once()
     test_minor_apex_refinement_keeps_the_pending()
+    test_weave_failure_drops_only_the_implicated_humps()
     test_line_clearance_veto()
     print("ALL PASS")
