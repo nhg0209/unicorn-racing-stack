@@ -612,6 +612,38 @@ def test_shrinking_set_keeps_the_queued_line():
     print("PASS a shrinking obstacle set keeps the queued line")
 
 
+def test_cluster_curvature_budget_is_local():
+    # The opposite-side "can we swing across at all?" test spends the curvature budget the RACELINE
+    # leaves. Taking max|kappa| over the whole track meant one tight corner anywhere set the budget
+    # everywhere, so a pair on a dead-flat straight was declared an impossible swing and both boxes
+    # were dropped.
+    s_loop = np.arange(0.0, 40.0, 0.1)
+    kap = np.zeros_like(s_loop)
+    kap[(s_loop > 30.0) & (s_loop < 33.0)] = 1.45     # one tight corner, far from the pair
+    assert core._kappa_local_max(kap, s_loop, 5.0, 7.0, 40.0, 3.0) == 0.0, \
+        "a straight must see none of a corner 20 m away"
+    assert core._kappa_local_max(kap, s_loop, 29.0, 31.0, 40.0, 3.0) > 1.0, \
+        "a pair ON the corner must still see it"
+    # wrapped spans are measured the same way
+    assert core._kappa_local_max(kap, s_loop, 38.0, 2.0, 40.0, 1.0) == 0.0
+    assert core._kappa_local_max(kap, s_loop, 34.0, 38.0, 40.0, 2.0) > 1.0, \
+        "the reach either side is part of the arc"
+    # end to end: an opposite-side pair 2.5 m apart on the straight survives the cluster stage
+    knots = [(5.0, -0.40, 3.0, 3.0, 5.0, -0.40, [(None, 0)], 0, -0.2),
+             (7.5, 0.40, 3.0, 3.0, 7.5, 0.40, [(None, 1)], 1, 0.2)]
+    dropped = []
+    kept = core._cluster_knots(knots, 40.0, 2.0, 1.5, kap, s_loop, dropped)
+    assert len(kept) == 2 and not dropped, \
+        f"a swing on a flat straight must not be pre-dropped (kept {len(kept)}, dropped {dropped})"
+    # ...while the same pair sitting ON the corner still is
+    knots_c = [(30.2, -0.40, 3.0, 3.0, 30.2, -0.40, [(None, 0)], 0, -0.2),
+               (30.7, 0.40, 3.0, 3.0, 30.7, 0.40, [(None, 1)], 1, 0.2)]
+    dropped_c = []
+    core._cluster_knots(knots_c, 40.0, 2.0, 1.5, kap, s_loop, dropped_c)
+    assert dropped_c, "a swing where the raceline already spends the budget must still be dropped"
+    print("PASS the cluster curvature budget is measured locally")
+
+
 def test_coverage_outranks_lap_time_in_the_reach_search():
     # The reach search ranked candidates on estimated lap time alone, and NOT laying a hump is
     # always faster than laying it. The real run: reach 1.0 m fitted one of three humps and scored
@@ -832,6 +864,7 @@ if __name__ == "__main__":
     test_swap_held_while_trailing_a_close_obstacle()
     test_solves_are_debounced()
     test_shrinking_set_keeps_the_queued_line()
+    test_cluster_curvature_budget_is_local()
     test_coverage_outranks_lap_time_in_the_reach_search()
     test_weave_failure_drops_only_the_implicated_humps()
     test_line_clearance_veto()

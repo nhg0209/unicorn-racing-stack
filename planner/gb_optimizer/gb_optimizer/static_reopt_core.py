@@ -231,6 +231,20 @@ _CLEAR_EPS = 1e-6
 _RELAX_STEP = 0.03
 
 
+def _kappa_local_max(kap: np.ndarray, s_loop: np.ndarray, s_a: float, s_b: float,
+                     track_len: float, reach: float) -> float:
+    """max |kappa_clean| over the arc a hump pair would actually occupy: [s_a, s_b] plus `reach`
+    on either end, wrapped. Empty/absent input -> 0.0 (the full budget)."""
+    if kap.size == 0 or s_loop is None or len(s_loop) != kap.size:
+        return 0.0
+    span = (float(s_b) - float(s_a)) % track_len
+    lo = (float(s_a) - reach) % track_len
+    length = min(span + 2.0 * reach, track_len)
+    rel = (np.asarray(s_loop, float) - lo) % track_len
+    mask = rel <= length
+    return float(np.max(kap[mask])) if mask.any() else 0.0
+
+
 def _cluster_knots(knots, track_len, merge_gap, curvlim, clean_kappa, s_loop, dropped_out):
     """Resolve CLUSTERS before any hump is fitted: merge what belongs together, drop what cannot
     physically be woven.
@@ -294,7 +308,15 @@ def _cluster_knots(knots, track_len, merge_gap, curvlim, clean_kappa, s_loop, dr
                 continue
             # opposite sides: is there room to swing across at all?
             dd = abs(cur[1] - nxt[1])
-            k_here = float(np.max(kap)) if kap.size else 0.0
+            # The curvature budget is LOCAL. This used to take max|kappa| over the whole track,
+            # which on any map with one tight corner is the corner's curvature -- so the budget
+            # collapsed to the floor everywhere, r_min came out at its largest, and two boxes on a
+            # STRAIGHT (where the raceline is dead flat and the entire budget is available) were
+            # dropped as an impossible swing. What the swing actually competes with is the raceline
+            # curvature over the arc it happens on: the pair's span plus the reach it would need on
+            # either end.
+            k_here = _kappa_local_max(kap, s_loop, cur[0], nxt[0], track_len,
+                                      max(cur[2], nxt[2], cur[3], nxt[3]))
             budget = max(curvlim - k_here, _KAPPA_BUDGET_FLOOR_FRAC * max(curvlim, 1e-6))
             r_min = math.sqrt(_KAPPA_QUINTIC_C * dd / max(budget, 1e-6))
             if gap < r_min:
