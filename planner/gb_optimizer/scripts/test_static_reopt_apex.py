@@ -77,6 +77,12 @@ def make_node():
     n.clearance_dirty_m = 0.30
     n._clearance_dirty_keys = set()
     n.apex_major_change_m = 0.10
+    n.solve_min_interval_s = 1.0
+    n._last_solve_t = -1e9
+    n._solve_backoff_until = 0.0
+    n._last_s = None
+    n._s_progressed = 0.0
+    n.obs_change_tol = 0.05
     n.apex_span_margin_m = 0.5
     n.apex_undershoot_m = 0.12
     n.apex_abeam_gap_m = 0.5
@@ -487,6 +493,89 @@ def test_minor_apex_refinement_keeps_the_pending():
     print("PASS a minor apex refinement keeps the pending bundle, a major one drops it")
 
 
+def drive_frenet(n, s, t):
+    """One /car_state/frenet/odom sample at wall time `t`."""
+    n._clock.t = t
+    msg = types.SimpleNamespace(
+        pose=types.SimpleNamespace(pose=types.SimpleNamespace(position=types.SimpleNamespace(x=s))),
+        twist=types.SimpleNamespace(twist=types.SimpleNamespace(linear=types.SimpleNamespace(x=3.0))))
+    n.frenet_cb(msg)
+
+
+def test_solves_are_debounced():
+    # The set-change and apex triggers can both fire several times a second while a track flaps or
+    # an apex settles, and every solve REPLACES the queued bundle -- so the line kept being rebuilt
+    # and the swap kept being pushed back past the obstacle it was built for.
+    n = make_node()
+    n._commit_pending = lambda s, force=False: None
+    solves = []
+
+    def fake_solve(reason):
+        solves.append((n._clock.t, reason))
+        n._last_solve_t = n._clock.t          # mirrors _rebuild_and_swap's stamp
+        n._obstacles_dirty = False
+    n._rebuild_and_swap = fake_solve
+    n._obstacles = [core.Obstacle(5.0, -0.2, 0.15)]
+    n._obs_ids = [7]
+    n._apex_by_obs = {("id", 7): (5.0, 0.4, 0.4)}
+
+    n._obstacles_dirty = True
+    drive_frenet(n, 1.0, 100.0)
+    assert len(solves) == 1, "the first trigger must solve immediately"
+    n._obstacles_dirty = True                 # a flap re-arms 200 ms later
+    drive_frenet(n, 1.6, 100.2)
+    assert len(solves) == 1, "a re-trigger inside the debounce window must wait"
+    n._obstacles_dirty = True
+    drive_frenet(n, 4.0, 101.5)
+    assert len(solves) == 2, "…and run once the window has passed"
+    # an EMPTY set is exempt: reverting to the clean line is the safe direction and free
+    n._obstacles, n._obs_ids, n._apex_by_obs = [], [], {}
+    n._obstacles_dirty = True
+    drive_frenet(n, 4.3, 101.6)
+    assert len(solves) == 3 and solves[-1][1] == "obstacles cleared", \
+        "the clean revert must not be debounced"
+    print("PASS solves are debounced to one per solve_min_interval_s")
+
+
+def test_shrinking_set_keeps_the_queued_line():
+    # An unlatch flap (item: the layer demotes a track for ~0.5 s) used to throw the queued bundle
+    # away, and the commit gates -- hardest to satisfy exactly where the obstacles are -- had to be
+    # re-earned from scratch. A line built for MORE obstacles is conservative, not stale.
+    from visualization_msgs.msg import Marker, MarkerArray
+
+    def markers(*specs):
+        msg = MarkerArray()
+        for mid, x, y in specs:
+            m = Marker(); m.action = Marker.ADD; m.id = mid
+            m.pose.position.x, m.pose.position.y = float(x), float(y)
+            m.scale.x = m.scale.y = 0.3
+            msg.markers.append(m)
+        return msg
+
+    n = make_node()
+    n.default_obs_radius = 0.15
+    n.apex_miss_frames = 20
+    n._obstacles = [core.Obstacle(5.0, -0.2, 0.15), core.Obstacle(12.0, 0.2, 0.15)]
+    n._obs_ids = [7, 8]
+    sentinel = object()
+    n._pending, n._pending_dev = sentinel, np.zeros(3)
+    n.obstacles_cb(markers((7, 5.0, -0.2)))            # obstacle 8 demoted away
+    assert n._obstacles_dirty, "a shrink still arms the rebuild"
+    assert n._pending is sentinel, "a line built for MORE obstacles must stay queued"
+    # ...but a set that GREW or MOVED discards it: those humps are missing or in the wrong place
+    n._pending, n._pending_dev = sentinel, np.zeros(3)
+    n.obstacles_cb(markers((7, 5.0, -0.2), (9, 20.0, 0.3)))
+    assert n._pending is None, "a new obstacle must discard the queued line"
+    # a swap (one gone, one new) is NOT a shrink even though the count can fall
+    n._obstacles = [core.Obstacle(5.0, -0.2, 0.15), core.Obstacle(12.0, 0.2, 0.15),
+                    core.Obstacle(20.0, 0.3, 0.15)]
+    n._obs_ids = [7, 8, 9]
+    n._pending, n._pending_dev = sentinel, np.zeros(3)
+    n.obstacles_cb(markers((7, 5.0, -0.2), (10, 30.0, 0.4)))
+    assert n._pending is None, "a set that lost one obstacle and gained another is not a shrink"
+    print("PASS a shrinking obstacle set keeps the queued line")
+
+
 def test_coverage_outranks_lap_time_in_the_reach_search():
     # The reach search ranked candidates on estimated lap time alone, and NOT laying a hump is
     # always faster than laying it. The real run: reach 1.0 m fitted one of three humps and scored
@@ -704,6 +793,8 @@ if __name__ == "__main__":
     test_raceline_already_clear_lays_nothing()
     test_clearance_drift_retriggers_once()
     test_minor_apex_refinement_keeps_the_pending()
+    test_solves_are_debounced()
+    test_shrinking_set_keeps_the_queued_line()
     test_coverage_outranks_lap_time_in_the_reach_search()
     test_weave_failure_drops_only_the_implicated_humps()
     test_line_clearance_veto()

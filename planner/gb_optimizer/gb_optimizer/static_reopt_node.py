@@ -361,7 +361,14 @@ class StaticReoptNode(Node):
         # infeasible corridor would re-solve every frame (~10 ms each) and starve the executor.
         self.declare_parameter("solve_retry_backoff_s", 1.0)
         self.solve_retry_backoff_s = float(self.get_parameter("solve_retry_backoff_s").value)
+        # Minimum wall time between two SUCCESSFUL solves. The set-change and apex triggers can fire
+        # a few times a second while a track flaps or an apex settles, and each solve replaces the
+        # queued bundle -- so the line kept being rebuilt and the swap kept being pushed back. One
+        # second is short against the swap cadence (a lap) and long against the flap.
+        self.declare_parameter("solve_min_interval_s", 1.0)
+        self.solve_min_interval_s = float(self.get_parameter("solve_min_interval_s").value)
         self._solve_backoff_until = 0.0
+        self._last_solve_t = -1e9               # solve debounce, see solve_min_interval_s
 
         # --- pub/sub ----------------------------------------------------------------------
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -824,12 +831,22 @@ class StaticReoptNode(Node):
             return
         # Just RECORD the confirmed set; do NOT solve here. The batch re-opt runs once at the next
         # start/finish crossing (frenet_cb) with ALL obstacles -> one consistent line, no mid-lap churn.
+        # A SHRINKING set keeps the queued bundle. The queued line was built for MORE obstacles
+        # than are now confirmed, so every hump it carries is still drivable and every obstacle it
+        # still knows about is still avoided -- it is conservative, not stale, and the fresh solve
+        # that removes the surplus hump lands right behind it. Discarding it is what turned each
+        # unlatch flap into a lost swap: the layer demotes a track for half a second, the pending is
+        # thrown away, the re-confirm arms another rebuild, and the commit gates -- hardest to
+        # satisfy exactly where the obstacles are -- have to be re-earned from scratch. A set that
+        # GREW or MOVED still discards it: those humps are genuinely missing or in the wrong place.
+        shrank = len(obs) < len(self._obstacles) and not self._obstacles_moved_or_grew(obs)
         self._obstacles = obs
         self._obs_ids = ids
         self._adopt_orphan_apexes()
-        self._mark_dirty()
+        self._mark_dirty(keep_pending=shrank)
         self.get_logger().info(
-            f"[static_reopt] obstacle set -> {len(obs)} obstacle(s); will batch re-opt at start/finish")
+            f"[static_reopt] obstacle set -> {len(obs)} obstacle(s); will batch re-opt at "
+            f"start/finish" + ("; queued line kept (set only shrank)" if shrank else ""))
         # RETRO association: an obstacle confirmed only AFTER the car passed it (layer confirm
         # latency, typical for obstacles right past the start line) missed its live apex — the
         # avoidance path that produced it is already empty. Replay the recent-path buffer so the
@@ -915,6 +932,20 @@ class StaticReoptNode(Node):
                 f"clearance {was:+.2f} -> {now:+.2f} m, under {thr:.2f} — re-optimizing before "
                 f"the state machine reads the line as blocked")
         return drifted
+
+    def _obstacles_moved_or_grew(self, new: List[core.Obstacle]) -> bool:
+        """Does `new` contain anything the current set does not already cover?
+
+        "Shrank" has to mean the new set is a SUBSET of the old one, not merely shorter: one
+        obstacle disappearing while another appears elsewhere leaves the count lower and the queued
+        line wrong about the new one.
+        """
+        tol = max(self.obs_change_tol, 1e-6)
+        for a in new:
+            if not any(abs(a.x - b.x) <= tol and abs(a.y - b.y) <= tol and a.r <= b.r + tol
+                       for b in self._obstacles):
+                return True
+        return False
 
     def _obstacles_changed(self, new: List[core.Obstacle]) -> bool:
         if len(new) != len(self._obstacles):
@@ -1251,7 +1282,8 @@ class StaticReoptNode(Node):
             return
         self._obstacles_dirty = False
         now = self.get_clock().now().nanoseconds * 1e-9
-        try:
+        self._last_solve_t = now                 # debounce clock: stamped for EVERY solve attempt,
+        try:                                     # including the fallback paths that skip the gate
             if obstacles:
                 with open(os.devnull, "w") as devnull, redirect_stdout(devnull):
                     bundle = self._build_obstacle_bundle(obstacles)
@@ -1442,7 +1474,11 @@ class StaticReoptNode(Node):
         # SOLVE as soon as the set is dirty AND at least one apex has been captured — no need to
         # wait for the lap boundary, the solve is the cheap part and the swap is gated separately.
         # The lap crossing stays as a retry tick for the case where no apex existed yet.
-        if (self._obstacles_dirty and self._pending is None
+        # DEBOUNCE. An empty set is exempt: reverting to the clean line is the safe direction and
+        # its bundle is precomputed, so making it wait would be pure cost.
+        debounced = (self._obstacles
+                     and (self._last_frenet_t - self._last_solve_t) < self.solve_min_interval_s)
+        if (self._obstacles_dirty and self._pending is None and not debounced
                 and self._last_frenet_t >= self._solve_backoff_until):
             # An EMPTY set must rebuild immediately: _apex_list([]) is falsy, so without the extra
             # clause the clean revert would wait for the next seam crossing — up to a full lap on
