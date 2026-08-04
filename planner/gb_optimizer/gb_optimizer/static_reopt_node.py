@@ -277,6 +277,7 @@ class StaticReoptNode(Node):
         self.apex_undershoot_m = float(self.get_parameter("apex_undershoot_m").value)
         self.apex_abeam_gap_m = float(self.get_parameter("apex_abeam_gap_m").value)
         self._apex_change_major = False
+        self._apex_dirty_pending = False   # an apex changed; arm the rebuild at idle
         # Obstacle keys whose clearance drift has already re-armed the solve against the CURRENTLY
         # active line. Without this latch the trigger re-fires every frame until the new line is
         # committed — and _mark_dirty discards the pending, so the very swap that would restore
@@ -941,9 +942,27 @@ class StaticReoptNode(Node):
         # one that never leaves the raceline, means idle.
         now = self.get_clock().now().nanoseconds * 1e-9
         active = bool(wps) and max((abs(w.d_m) for w in wps), default=0.0) >= self._apex_min_d
-        if self._reactive_active and not active:
+        went_idle = self._reactive_active and not active
+        if went_idle:
             self._reactive_idle_t = now
         self._reactive_active = active
+        # ARM THE REBUILD ONLY WHEN THE MANEUVER IS OVER. A new/better apex is a reason to
+        # rebuild -- without it an obstacle set collected BEFORE its apex existed leaves the solve
+        # gate permanently closed -- but arming it MID-MANEUVER is what made the trigger harmful.
+        # The reactive planner republishes at 20 Hz while the car is driving the avoidance, so a
+        # record that keeps refining armed _mark_dirty on nearly every message, and each call with
+        # a major change discarded the pending bundle: the very swap the records were being
+        # collected for could not land. Wait for the reactive layer to go idle, which is exactly
+        # "the maneuver this apex describes has finished", and rebuild once with the settled
+        # record. A MINOR refinement still keeps any pending bundle alive (see _mark_dirty).
+        # BEFORE the empty-message return below: an empty publish is the most common way the
+        # reactive layer goes idle, and returning first would swallow the trigger entirely.
+        if went_idle and self._apex_dirty_pending:
+            self._apex_dirty_pending = False
+            self.get_logger().info(
+                "[static_reopt] reactive layer went idle with a new/updated apex -> rebuilding",
+                throttle_duration_sec=2.0)
+            self._mark_dirty(keep_pending=not self._apex_change_major)
         if not wps:
             return
         wx = np.fromiter((w.x_m for w in wps), float, len(wps))
@@ -957,13 +976,7 @@ class StaticReoptNode(Node):
         if not self._obstacles:
             return
         if self._record_apexes(wx, wy, wd):
-            # A MINOR refinement keeps any pending bundle alive so the swap it is waiting for can
-            # still land; only a new/relocated apex is worth throwing that away. See _mark_dirty.
-            # A new/better apex is a REASON to rebuild. Without this, an obstacle set collected
-            # BEFORE its apex existed (near-start obstacle: confirmed only after the pass; the
-            # seam-crossing retry then built a 0-apex clean-equivalent and burned the flag) left
-            # the solve gate in frenet_cb permanently closed -> reactive re-avoidance every lap.
-            self._mark_dirty(keep_pending=not self._apex_change_major)
+            self._apex_dirty_pending = True
 
     def _adopt_orphan_apexes(self):
         """Re-key apex records whose track id vanished (the layer re-issues marker ids on an
@@ -1106,6 +1119,26 @@ class StaticReoptNode(Node):
             return True
         return False
 
+    def _apex_frozen(self, key, o) -> bool:
+        """Is this obstacle's apex settled, so further reactive paths must not touch it?
+
+        Once the ACTIVE line carries a hump for an obstacle and that hump still clears it by the
+        floor it was accepted at, the record has done its job. Re-recording from every subsequent
+        reactive publish can only move it -- and the reactive planner is still publishing while the
+        car drives the very hump the line already provides, so those publishes are the least
+        trustworthy ones there are. Released by the two triggers that mean the world changed: the
+        obstacle moving more than obs_change_tol, or the clearance-drift check.
+        """
+        floor = getattr(self.active, "floor_by_key", {}).get(key)
+        if floor is None:
+            return False
+        try:
+            _s, xa, ya = self._bundle_xy(self.active)
+            now = float(np.min(np.hypot(xa - o.x, ya - o.y))) - float(o.r)
+        except Exception:
+            return False
+        return now >= floor - 1e-9
+
     def _record_apexes(self, wx, wy, wd) -> bool:
         """Associate one reactive path with the confirmed obstacles and update the apex records.
         Returns True when any apex was newly recorded or MOVED by more than 5 cm in amplitude
@@ -1129,6 +1162,8 @@ class StaticReoptNode(Node):
         owner = np.argmin(np.hypot(wx[:, None] - ox[None, :], wy[:, None] - oy[None, :]), axis=1)
         changed = False
         for idx, (o, key) in enumerate(zip(self._obstacles, keys)):
+            if self._apex_frozen(key, o):
+                continue
             cand = self._apex_candidate(wx, wy, wd, owner, idx, o)
             if cand is None:
                 continue
@@ -1153,6 +1188,8 @@ class StaticReoptNode(Node):
         for (_t, wx, wy, wd) in paths:
             owner = np.argmin(np.hypot(wx[:, None] - ox[None, :], wy[:, None] - oy[None, :]), axis=1)
             for idx, (o, key) in enumerate(zip(self._obstacles, keys)):
+                if self._apex_frozen(key, o):
+                    continue
                 cand = self._apex_candidate(wx, wy, wd, owner, idx, o)
                 if cand is None:
                     continue

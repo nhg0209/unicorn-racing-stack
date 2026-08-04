@@ -86,6 +86,19 @@ def make_node():
     return n
 
 
+def idle_msg():
+    """The reactive layer publishing nothing = the maneuver is over. The apex-driven rebuild is
+    armed on that transition (see otwpnts_cb), so a test that records an apex must also deliver
+    the idle edge to see the trigger fire."""
+    return types.SimpleNamespace(wpnts=[])
+
+
+def drive(n, points):
+    """One avoidance maneuver: publish the path, then go idle."""
+    n.otwpnts_cb(path_msg(points))
+    n.otwpnts_cb(idle_msg())
+
+
 def path_msg(points):
     """OTWpntArray stand-in: list of (x, y, d)."""
     wps = [types.SimpleNamespace(x_m=x, y_m=y, d_m=d) for x, y, d in points]
@@ -107,9 +120,25 @@ def test_new_apex_sets_dirty():
     n = make_node()
     n._obstacles = [core.Obstacle(5.0, -0.2, 0.15)]
     n._obs_ids = [7]
-    n.otwpnts_cb(path_msg(HUMP))
+    drive(n, HUMP)
     assert ("id", 7) in n._apex_by_obs, "apex not recorded"
-    assert n._obstacles_dirty, "new apex must arm the rebuild trigger"
+    assert n._obstacles_dirty, "new apex must arm the rebuild trigger once the maneuver ends"
+    print("PASS new apex sets dirty")
+
+
+def test_apex_does_not_arm_the_rebuild_mid_maneuver():
+    # The reactive layer republishes at 20 Hz WHILE the car drives the avoidance. Arming the
+    # rebuild on each of those discards the pending bundle over and over, so the swap the records
+    # are being collected for can never land. The trigger waits for the maneuver to end.
+    n = make_node()
+    n._obstacles = [core.Obstacle(5.0, -0.2, 0.15)]
+    n._obs_ids = [7]
+    for _ in range(5):
+        n.otwpnts_cb(path_msg(HUMP))                   # still avoiding
+    assert ("id", 7) in n._apex_by_obs, "the record still updates live"
+    assert not n._obstacles_dirty, "no rebuild may be armed while the maneuver is running"
+    n.otwpnts_cb(idle_msg())                           # maneuver over
+    assert n._obstacles_dirty, "the deferred trigger must fire on the idle edge"
     print("PASS new apex sets dirty")
 
 
@@ -117,10 +146,10 @@ def test_small_growth_no_retrigger():
     n = make_node()
     n._obstacles = [core.Obstacle(5.0, -0.2, 0.15)]
     n._obs_ids = [7]
-    n.otwpnts_cb(path_msg(HUMP))
+    drive(n, HUMP)
     n._obstacles_dirty = False   # pretend the solve consumed it
     grown = [(x, y * 1.05, d * 1.05) for x, y, d in HUMP]   # apex 0.40 -> 0.42 (<5cm)
-    n.otwpnts_cb(path_msg(grown))
+    drive(n, grown)
     # 0.42 exceeds the obstacle-required clearance (0.40) -> clamped back; either way the
     # change is sub-5cm, so no re-solve is triggered.
     assert abs(n._apex_by_obs[("id", 7)][2] - 0.40) < 0.02, "record must stay at the clamp"
@@ -160,14 +189,14 @@ def test_newest_wins_shrink_within_the_undershoot_bound():
     n = make_node()
     n._obstacles = [core.Obstacle(5.0, -0.2, 0.15)]
     n._obs_ids = [7]
-    n.otwpnts_cb(path_msg(HUMP))                                   # apex 0.40 == the geometric need
+    drive(n, HUMP)                                   # apex 0.40 == the geometric need
     n._obstacles_dirty = False
     smaller = [(x, y * 0.8, d * 0.8) for x, y, d in HUMP]   # apex 0.32: 8 cm under, inside 0.12
-    n.otwpnts_cb(path_msg(smaller))
+    drive(n, smaller)
     assert abs(n._apex_by_obs[("id", 7)][2] - 0.32) < 0.03, "a real shrink must still be adopted"
     assert n._obstacles_dirty, ">5cm shrink is a rebuild-worthy change"
     tail = [(x, y * 0.5, d * 0.5) for x, y, d in HUMP]      # apex 0.20: 20 cm under -> a tail
-    n.otwpnts_cb(path_msg(tail))
+    drive(n, tail)
     assert abs(n._apex_by_obs[("id", 7)][2] - 0.32) < 0.03, \
         "a record that undershoots the geometric need must be rejected, not adopted"
     print("PASS newest path wins, but only within the undershoot bound")
@@ -223,6 +252,27 @@ def test_apex_undershoot_rejected():
     n.otwpnts_cb(path_msg([(x, y * 0.4, d * 0.4) for x, y, d in HUMP]))     # 0.16: 24 cm under
     assert ("id", 7) not in n._apex_by_obs, "a decaying tail must not become the record"
     print("PASS an apex that undershoots the geometric need is rejected")
+
+
+def test_apex_frozen_while_the_active_line_covers_it():
+    # Once the ACTIVE line carries a hump that still clears the box, further reactive publishes --
+    # made while the car is driving that very hump -- must not move the record.
+    n = make_node()
+    o = core.Obstacle(5.0, -0.2, 0.15)
+    n._obstacles = [o]
+    n._obs_ids = [7]
+    n.otwpnts_cb(path_msg(HUMP))
+    before = n._apex_by_obs[("id", 7)]
+    # the harness's active line is straight at y=0, so it clears this box by 0.20-0.15 = 0.05 m;
+    # a promise of 0.04 is one it keeps, i.e. the obstacle IS covered
+    n.active.floor_by_key = {("id", 7): 0.04}
+    n.otwpnts_cb(path_msg([(x, y * 0.8, d * 0.8) for x, y, d in HUMP]))
+    assert n._apex_by_obs[("id", 7)] == before, "a covered obstacle's apex must be frozen"
+    # ...and the freeze lifts once the line stops clearing it
+    n.active.floor_by_key = {("id", 7): 0.35}          # a promise it does NOT keep (0.05 < 0.35)
+    n.otwpnts_cb(path_msg([(x, y * 0.8, d * 0.8) for x, y, d in HUMP]))
+    assert n._apex_by_obs[("id", 7)] != before, "the freeze must lift when coverage is lost"
+    print("PASS the apex is frozen while the active line covers the obstacle")
 
 
 def test_implausible_apex_rejected():
@@ -407,7 +457,7 @@ def test_minor_apex_refinement_keeps_the_pending():
     n = make_node()
     n._obstacles = [core.Obstacle(5.0, -0.2, 0.15)]
     n._obs_ids = [7]
-    n.otwpnts_cb(path_msg(HUMP))                                     # first apex -> major, no pending yet
+    drive(n, HUMP)                                     # first apex -> major, no pending yet
     assert n._apex_change_major is True
 
     sentinel = object()
@@ -415,7 +465,7 @@ def test_minor_apex_refinement_keeps_the_pending():
     n._obstacles_dirty = False
     # shrink, not grow: growth is capped by the overshoot clamp at the obstacle's requirement
     nudged = [(x, y * 0.83, d * 0.83) for x, y, d in HUMP]     # 0.40 -> 0.33: >5 cm, <10 cm
-    n.otwpnts_cb(path_msg(nudged))
+    drive(n, nudged)
     assert n._obstacles_dirty, "a >5cm change must still arm the rebuild"
     assert n._apex_change_major is False, "…but 6 cm is not a major change"
     assert n._pending is sentinel, "the queued line must survive a minor refinement"
@@ -427,7 +477,7 @@ def test_minor_apex_refinement_keeps_the_pending():
     # falls more than apex_undershoot_m below what the obstacle geometrically requires.)
     n._apex_by_obs.clear()
     n._obstacles_dirty = False
-    n.otwpnts_cb(path_msg(HUMP))
+    drive(n, HUMP)
     assert n._obstacles_dirty and n._apex_change_major, "a new apex must read as a major change"
     assert n._pending is None, "a major apex change must discard the queued line"
     print("PASS a minor apex refinement keeps the pending bundle, a major one drops it")
@@ -597,12 +647,14 @@ def test_commit_horizon_wrap():
 
 if __name__ == "__main__":
     test_new_apex_sets_dirty()
+    test_apex_does_not_arm_the_rebuild_mid_maneuver()
     test_small_growth_no_retrigger()
     test_retro_association()
     test_newest_wins_shrink_within_the_undershoot_bound()
     test_apex_span_requirement()
     test_apex_is_anchored_abeam_not_where_the_path_was_widest()
     test_apex_undershoot_rejected()
+    test_apex_frozen_while_the_active_line_covers_it()
     test_implausible_apex_rejected()
     test_overshoot_apex_clamped()
     test_neighbor_ramp_does_not_overwrite()
