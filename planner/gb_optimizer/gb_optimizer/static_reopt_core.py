@@ -1124,7 +1124,14 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             d_target = d_obs + side * need
             if abs(d_target) < 0.03:
                 continue
-        v = float(clean_vx[i]) if clean_vx is not None else 3.0
+        # STATION FROM THE OBSTACLE. `i` is the station nearest the KNOT POINT, which is offset
+        # laterally from the box by half a metre -- on a curve the nearest clean station to that
+        # point is not the one abeam the box, and the hump then sits beside the obstacle instead of
+        # across from it. `j` is the station abeam the box itself, which is what the hump has to be
+        # centred on and what the clearance is measured against. Falls back to `i` only when there
+        # is no box (offline sweeps, the legacy `global` method).
+        i_c = j if (ob is not None and obs_margin > 0.0) else i
+        v = float(clean_vx[i_c]) if clean_vx is not None else 3.0
         R = float(np.clip(reach_time * v, reach_min, reach_max))
         R = min(R, 0.45 * track_len)                    # never span more than ~half the loop
         # k_i is the index into `apexes`/`obstacles`: the caller's handle on WHICH obstacle
@@ -1132,7 +1139,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         # identity instead of by proximity -- see _check_line_clearance.
         # `[(ob, k_i)]` not `ob`: a knot can absorb its neighbours (see _cluster_knots), and
         # every member has to be cleared by the one hump that replaces them.
-        knots.append((float(s_loop[i]), d_target, R, R, xa, ya, [(ob, k_i)], k_i, d_obs))
+        knots.append((float(s_loop[i_c]), d_target, R, R, xa, ya, [(ob, k_i)], k_i, d_obs))
     cluster_dropped: List[dict] = []
     if not knots:
         return d_global, 0, 0.0, [], []

@@ -93,6 +93,8 @@ def make_node():
     n.apex_span_margin_m = 0.5
     n.apex_undershoot_m = 0.12
     n.relax_floor = 0.30            # the bottom rung of the core's coverage ladder
+    n.side_hint_margin_m = 0.15
+    n.map_filter = None             # no map in the harness -> _grid_room falls back
     n._swap_block = {}
     n._swap_lap_t = 0.0
     n.apex_abeam_gap_m = 0.5
@@ -579,6 +581,70 @@ def test_swap_held_while_trailing_a_close_obstacle():
     n._commit_pending(10.0)
     assert n._pending is None, "a stale state must not block the swap forever"
     print("PASS the swap is held while TRAILING a close obstacle")
+
+
+class _FakeMap:
+    """Eroded-map stand-in: free everywhere except a wall band at a chosen lateral offset.
+
+    The harness clean line runs along +x with the left normal +y, so a wall at y = `wall_y` blocks
+    that side beyond it.
+    """
+
+    def __init__(self, wall_lo=-10.0, wall_hi=10.0, resolution=0.05):
+        self.resolution = resolution
+        self.origin = (-50.0, -50.0)
+        self.wall_lo, self.wall_hi = wall_lo, wall_hi
+        n = int(100.0 / resolution)
+        self.eroded_image = np.full((n, n), 255, dtype=np.uint8)
+        y = (np.arange(n) + 0.5) * resolution + self.origin[1]
+        self.eroded_image[(y < wall_lo) | (y > wall_hi), :] = 0
+
+
+def test_every_obstacle_gets_a_knot_even_with_no_reactive_apex():
+    # A hump's amplitude and station were already derived from the obstacle; its EXISTENCE was not.
+    # It needed a recorded reactive apex, so an obstacle the reactive layer never once avoided
+    # successfully got no knot, stayed reactive-only forever, and did so quietly -- the thing that
+    # would have fixed it was gated on the thing that was failing.
+    n = make_node()
+    o = core.Obstacle(5.0, -0.2, 0.15)
+    n._obstacles = [o]
+    n._obs_ids = [7]
+    assert not n._apex_by_obs, "this obstacle has never been reactively avoided"
+    pairs = n._apex_pairs([o])
+    assert len(pairs) == 1, "every confirmed obstacle must get a knot"
+    (kx, ky), po, from_apex = pairs[0]
+    assert po is o and from_apex is False, "…and it must be marked as obstacle-derived"
+    # the knot sits ABEAM the box, at the amplitude the box requires
+    d_k, i_k, left = n._clean_offset(kx, ky)
+    d_o, i_o, _ = n._clean_offset(o.x, o.y)
+    assert i_k == i_o, "the knot's station must be the obstacle's own"
+    assert abs(abs(d_k - d_o) - (o.r + n.obs_margin)) < 1e-6, \
+        f"amplitude must be r + obs_margin off the box, got {abs(d_k - d_o):.3f}"
+    print(f"PASS an obstacle with no reactive apex still gets a knot (d={d_k:+.2f} abeam)")
+
+
+def test_knot_side_comes_from_the_map_not_the_waypoint_bounds():
+    # d_left/d_right are labelled by one global decision in gb_optimizer and ship EXCHANGED on some
+    # maps (map f: 125 of 128 sampled waypoints), so a side chosen from them puts the hump into a
+    # wall. The eroded map cannot be mislabelled.
+    o = core.Obstacle(5.0, 0.0, 0.15)
+    for wall_lo, wall_hi, want, label in ((-0.35, 3.0, +1.0, "wall on the -d side"),
+                                          (-3.0, 0.35, -1.0, "wall on the +d side")):
+        n = make_node()
+        n._obstacles, n._obs_ids = [o], [7]
+        n.map_filter = _FakeMap(wall_lo, wall_hi)
+        (kx, ky), _po, from_apex = n._apex_pairs([o])[0]
+        d_k, _i, _l = n._clean_offset(kx, ky)
+        assert np.sign(d_k) == want, f"{label}: expected side {want:+.0f}, knot at d={d_k:+.2f}"
+        assert from_apex is False
+    # ...and a recorded apex still decides when the two sides are within the hint margin
+    n = make_node()
+    n._obstacles, n._obs_ids = [o], [7]
+    n.map_filter = _FakeMap(-3.0, 3.0)                  # symmetric: no measured preference
+    n._apex_by_obs = {("id", 7): (5.0, -0.5, 0.5)}      # the reactive pass went to -d
+    (kx, ky), _po, from_apex = n._apex_pairs([o])[0]
+    assert from_apex is True and ky < 0, "a symmetric corridor must defer to the recorded apex"
+    print("PASS the knot side is measured in the map, with the apex as the tie-break")
 
 
 def test_solve_runs_off_the_executor_and_is_collected_later():
@@ -1232,6 +1298,8 @@ if __name__ == "__main__":
     test_clearance_drift_retriggers_once()
     test_minor_apex_refinement_keeps_the_pending()
     test_swap_held_while_trailing_a_close_obstacle()
+    test_every_obstacle_gets_a_knot_even_with_no_reactive_apex()
+    test_knot_side_comes_from_the_map_not_the_waypoint_bounds()
     test_solve_runs_off_the_executor_and_is_collected_later()
     test_swap_gate_tally_names_the_gate_that_held_the_swap()
     test_solves_are_debounced()

@@ -145,6 +145,11 @@ class StaticReoptNode(Node):
         # [m] apex spacing below which two obstacles are treated as ONE cluster: same side ->
         # merged into a single hump, opposite sides -> dropped as a pair when no reach can swing
         # between them inside the curvature budget. 0 disables the pre-pass.
+        # [m] how much more room one side must have, measured in the ERODED MAP beside the box,
+        # before it overrules the side a recorded reactive apex proved. Within this band the apex
+        # wins: it knows something a corridor width does not, namely that the car actually got
+        # through there. 0 makes the map always decide.
+        self.declare_parameter("side_hint_margin_m", 0.15)
         self.declare_parameter("apex_merge_gap_m", 2.0)
         # HOLD BRIDGE. Two boxes on the SAME side, close together on a STRAIGHT, do not need the
         # line to come back to the raceline between them: returning costs two merge inflections and
@@ -213,6 +218,7 @@ class StaticReoptNode(Node):
         self.obs_margin = float(self.get_parameter("obs_margin").value)
         self.relax_floor = float(self.get_parameter("relax_floor").value)
         self.wall_gate_kernel = int(self.get_parameter("wall_gate_kernel").value)
+        self.side_hint_margin_m = float(self.get_parameter("side_hint_margin_m").value)
         self.apex_merge_gap_m = float(self.get_parameter("apex_merge_gap_m").value)
         self.hold_max_gap_m = float(self.get_parameter("hold_max_gap_m").value)
         self.hold_kappa_max = float(self.get_parameter("hold_kappa_max").value)
@@ -484,7 +490,8 @@ class StaticReoptNode(Node):
         can see, and it does not say WHICH obstacle is uncovered or why -- so a line that silently
         stopped covering one is indistinguishable from one that never could.
         """
-        apex_of = {id(o): i for i, (_xy, o) in enumerate(pairs)}
+        apex_of = {id(o): i for i, (_xy, o, _src) in enumerate(pairs)}
+        from_apex = {id(o): bool(src) for _xy, o, src in pairs}
         laid_by_i = {a["obs_i"]: a for a in res.get("apex_laid", []) if a.get("obs_i") is not None}
         drop_by_i = {d["obs_i"]: d for d in res.get("apex_dropped", []) if d.get("obs_i") is not None}
         gaps = (gaps_by_id if gaps_by_id is not None
@@ -500,7 +507,8 @@ class StaticReoptNode(Node):
                 # is involved, and calling that a missing apex is what the old arithmetic did.
                 status = "already_clear" if clr >= self.obs_margin else "no_apex"
             elif i_a in laid_by_i:
-                status = "laid"
+                # a hump exists either way; say whether it needed a reactive pass to be placed
+                status = "laid" if from_apex.get(id(o), True) else "laid:obstacle_derived"
             elif i_a in drop_by_i:
                 status = "dropped:" + str(drop_by_i[i_a].get("reason", "?"))
             else:
@@ -563,6 +571,50 @@ class StaticReoptNode(Node):
             m.text = f"id={c['id']} {c['status']} {c['clearance_m']:+.2f}m"
             arr.markers.append(m)
         self.pub_coverage.publish(arr)
+
+    def _map_free(self, xy) -> Optional[np.ndarray]:
+        """Vectorised eroded-map lookup: True where the point is in free space, None with no map.
+
+        Same pixel convention as GridFilter.is_point_inside (row = y, no vertical flip) and the
+        same eroded image the wall gate uses, so "free" means one thing in this node."""
+        f = self.map_filter
+        img = getattr(f, "eroded_image", None) if f is not None else None
+        if img is None or f.resolution is None or f.origin is None:
+            return None
+        xy = np.asarray(xy, float).reshape(-1, 2)
+        px = ((xy[:, 0] - f.origin[0]) / f.resolution).astype(int)
+        py = ((xy[:, 1] - f.origin[1]) / f.resolution).astype(int)
+        h, w = img.shape
+        inside = (px >= 0) & (py >= 0) & (px < w) & (py < h)
+        free = np.zeros(len(xy), dtype=bool)
+        free[inside] = img[py[inside], px[inside]] == 255
+        return free
+
+    def _grid_room(self, i: int, left: np.ndarray, d_obs: float, r: float):
+        """Free room beside the obstacle on each side, measured in the ERODED MAP: (left, right).
+
+        Walks outward from each box edge until the map stops being free. The map is used rather
+        than the waypoints' d_left/d_right deliberately: those are labelled by one global decision
+        in gb_optimizer and ship EXCHANGED on some maps (measured on map f: 125 of 128 sampled
+        waypoints), and a side chosen from exchanged bounds puts the hump into the wall. Returns
+        (None, None) when no map has arrived, so the caller can fall back.
+        """
+        free_all = self._map_free(self._clean_xy[i])
+        if free_all is None:
+            return None, None
+        step, reach = 0.05, 3.0
+        ds = np.arange(0.0, reach + 1e-9, step)
+        room = []
+        for sgn in (1.0, -1.0):
+            d0 = d_obs + sgn * float(r)                   # start at the box EDGE
+            pts = self._clean_xy[i] + np.outer(d0 + sgn * ds, left)
+            free = self._map_free(pts)
+            if free is None or not free[0]:
+                room.append(0.0)
+                continue
+            blocked = np.flatnonzero(~free)
+            room.append(float(ds[blocked[0] - 1]) if blocked.size else float(reach))
+        return room[0], room[1]
 
     def _wall_gate_ok(self, traj) -> bool:
         """Is every PUBLISHED point inside the eroded free space of the occupancy map?
@@ -726,8 +778,8 @@ class StaticReoptNode(Node):
             # reactive layer rather than laid short (which used to pass the amplitude-ratio test
             # at 0.90 x apex = ~0.345 m of edge clearance, under the 0.35 m everything downstream
             # assumes the line is built to).
-            apexes = [xy for xy, _o in pairs]
-            apex_obs = [(float(o.x), float(o.y), float(o.r)) for _xy, o in pairs]
+            apexes = [xy for xy, _o, _src in pairs]
+            apex_obs = [(float(o.x), float(o.y), float(o.r)) for _xy, o, _src in pairs]
             res = core.reoptimize_local_window(
                 self._clean_xy, self._clean_dr, self._clean_dl, self.reftrack,
                 apexes, self.input_path,
@@ -873,7 +925,7 @@ class StaticReoptNode(Node):
                 if k is not None:
                     floor_by_key[k] = floors_by_id[id(o_a)]
             clearance_ok = self._check_line_clearance(traj, obstacles, res.get("apex_laid", []),
-                                                      apex_obs=[o for _xy, o in pairs],
+                                                      apex_obs=[o for _xy, o, _src in pairs],
                                                       floors=floors_by_id)
             # ...and the wall, which no upstream check consults directly. Same refusal path.
             clearance_ok = self._wall_gate_ok(traj) and clearance_ok
@@ -1362,22 +1414,66 @@ class StaticReoptNode(Node):
         return changed
 
     def _apex_pairs(self, obstacles: List[core.Obstacle]) -> List[tuple]:
-        """((x, y) apex, obstacle) for every confirmed obstacle that has a recorded reactive apex.
+        """(knot (x, y), obstacle, came_from_a_recorded_apex) for EVERY confirmed obstacle.
 
-        The pairing is what lets the core enforce a clearance floor: an apex on its own is just a
-        point to interpolate through, while the obstacle it belongs to is the thing the laid hump
-        has to measurably miss. Obstacles never reactively avoided contribute nothing (clean line
-        kept there, reactive layer handles them)."""
+        The knot is what the core interpolates the hump through, and the obstacle beside it is what
+        the laid hump has to measurably miss. Both are now derived from the OBSTACLE:
+
+          station    abeam the box (the clean-line point nearest it)
+          amplitude  d_obs + side * (r + obs_margin)   -- computed in the core, from the box
+          side       the roomier side, MEASURED IN THE ERODED MAP
+
+        Only the SIDE ever needed evidence, and this used to take it exclusively from a recorded
+        reactive apex -- so an obstacle the reactive layer had never successfully avoided got no
+        knot at all, stayed reactive-only forever, and did so quietly: every lap the car swerved
+        around it by hand while the global line pretended the obstacle was not there. Nothing in
+        the pipeline could escalate, because the thing that would have fixed it was gated on the
+        thing that was failing.
+
+        The recorded apex keeps the two jobs it is good at, and loses the veto:
+          (i)  a SIDE HINT, decisive when the map says the two sides are within hint_margin of each
+               other -- there the apex knows something the corridor width does not (which side the
+               car could actually drive), and
+          (ii) standing evidence that a pass on that side is drivable.
+
+        Choosing the side wrong is recoverable, which is why a measured preference is enough: the
+        core's coverage ladder tries the MIRRORED side before giving up on an obstacle.
+        """
         out = []
         for o, key in zip(obstacles, self._keys_for(obstacles, self._obs_ids)):
             rec = self._apex_by_obs.get(key)
+            try:
+                d_obs, i_obs, left = self._clean_offset(float(o.x), float(o.y))
+            except Exception:
+                if rec is not None:
+                    out.append(((rec[0], rec[1]), o, True))
+                continue
+            room_l, room_r = self._grid_room(i_obs, left, d_obs, float(o.r))
+            side = None
             if rec is not None:
-                out.append(((rec[0], rec[1]), o))
+                d_rec = float((np.array([rec[0], rec[1]]) - self._clean_xy[i_obs]) @ left)
+                side = 1.0 if d_rec >= d_obs else -1.0
+            if room_l is not None:
+                need = float(o.r) + self.obs_margin
+                # the apex's side stands unless the map says it has materially less room
+                if side is None or abs(room_l - room_r) > self.side_hint_margin_m:
+                    side = 1.0 if room_l >= room_r else -1.0
+                elif (room_l if side > 0 else room_r) + 1e-9 < need - float(o.r):
+                    side = 1.0 if room_l >= room_r else -1.0
+            if side is None:
+                # no map and no apex: either side is a guess, and the ladder will try the other
+                side = 1.0 if self._clean_dl[i_obs] >= self._clean_dr[i_obs] else -1.0
+            if rec is not None:
+                out.append(((rec[0], rec[1]), o, True))
+                continue
+            d_t = d_obs + side * (float(o.r) + self.obs_margin)
+            xy = self._clean_xy[i_obs] + d_t * left
+            out.append(((float(xy[0]), float(xy[1])), o, False))
         return out
 
     def _apex_list(self, obstacles: List[core.Obstacle]) -> List[tuple]:
-        """Map-frame (x,y) apex points only — the trigger gates just need to know one exists."""
-        return [xy for xy, _o in self._apex_pairs(obstacles)]
+        """Map-frame (x,y) knot points only — the trigger gates just need to know one exists."""
+        return [xy for xy, _o, _src in self._apex_pairs(obstacles)]
 
     def _rebuild_and_swap(self, reason: str):
         """Solve ONE re-opt over the whole confirmed obstacle set. Called once a full exploration
@@ -1385,20 +1481,12 @@ class StaticReoptNode(Node):
         (see _commit_pending) — the offset seam sits in the largest apex-free gap, not at s=0, so
         swapping at s=0 can step the reference laterally. The solve is ~10 ms (BLAS-pinned)."""
         obstacles = list(self._obstacles)
-        # S3b (extended): with obstacles confirmed but 0 recorded apexes there is NOTHING to build —
-        # the core would lay no hump and return a bit-for-bit CLEAN line. Building it anyway (a)
-        # silently reverted a working obstacle-aware line, and (b) even from the clean line it
-        # BURNED the dirty flag: the apex captured on the NEXT avoidance then had no armed trigger
-        # left, so the obstacle-aware line was never built (near-start obstacles re-avoided
-        # reactively every lap). Keep the current line and stay armed; the apex-capture path in
-        # otwpnts_cb re-triggers the solve the moment an apex exists.
-        if obstacles and not self._apex_list(obstacles):
-            self.get_logger().warning(
-                f"[static_reopt] {len(obstacles)} obstacle(s) confirmed but 0 recorded apexes — "
-                f"keeping the current line, waiting for a reactive apex",
-                throttle_duration_sec=5.0)
-            self._obstacles_dirty = True         # re-arm; do NOT burn the flag
-            return
+        # There is no longer a "0 recorded apexes -> nothing to build" case: every confirmed
+        # obstacle gets a knot derived from its own geometry (see _apex_pairs), so a solve is
+        # always worth running once an obstacle exists. What used to stand here was a guard against
+        # building a bit-for-bit CLEAN line and burning the dirty flag on it -- that outcome is now
+        # only reachable when the CORRIDOR rejects every hump, which the n_apex == 0 guard in
+        # _finish_rebuild catches with the honest reason attached.
         if self._solve_future is not None and not self._solve_future.done():
             return                               # one solve at a time; the trigger stays armed
         self._obstacles_dirty = False
