@@ -63,6 +63,9 @@ APEX_OFFSET_M = 0.55
 # when no box is known. OBS_MARGIN_M mirrors reopt_obs_margin in base_system/race.launch.xml.
 OBS_RADIUS_M = 0.15
 OBS_MARGIN_M = 0.35
+# Slack the relax ladder may walk BELOW obs_margin before an obstacle is given up on
+# (static_reopt_node relax_floor 0.30 against obs_margin 0.35).
+RELAX_FLOOR_SLACK_M = 0.05
 # The 0.5 mm regression. Obstacle just past the ifac start/finish straight, apex at the point the
 # published line actually passed through in the failing run (2026-07-30). The amplitude cap parks
 # the hump peak exactly on the corridor bound; with a zero fit tolerance the station 0.1 m away
@@ -451,6 +454,95 @@ def check_kinks(maps, cfg_dir, wall_margin, fit_tol) -> bool:
     return ok
 
 
+# NO-APEX case. A hump's existence used to require a recorded reactive apex, so an obstacle the
+# reactive layer never once avoided successfully got no hump -- forever, and quietly. The knot is
+# now derived from the obstacle itself, which means the re-optimizer is asked about places the
+# reactive planner FAILS. This gate walks a box around the whole lap with NO apex supplied and
+# requires that each station ends in one of exactly two honest states:
+#
+#   laid     -- a hump that clears the box by the floor it was accepted at, and passes every shape
+#               gate the rest of the sweep enforces (curvature, one extremum, corridor clip); or
+#   dropped  -- with a reason. "corridor"/"curvature"/"clearance"/"cluster" are all fine; what is
+#               not fine is an exception, a silent zero-hump line, or a hump that fails a gate.
+#
+# The narrow ifac stations -- the ones where the reactive planner concedes TRAILING -- are exactly
+# the interesting ones, and they are in here by construction: the walk covers every station.
+NOAPEX_STRIDE = 17                 # ~1.7 m apart; covers the lap without re-solving 368 times
+
+
+def check_no_apex(maps, cfg_dir, wall_margin, fit_tol) -> bool:
+    ok = True
+    print("\n--- no-apex gate: a box with NO recorded reactive apex, walked around the lap ---")
+    print("  map   | solves | laid | dropped (by reason) | min clear | max|kappa| vs bar | over")
+    for name, m in maps.items():
+        xy = m["xy"]
+        nvec = core._wrap_normals(xy)
+        lap0, kappa0, _ay = clean_metrics(m)
+        n_laid = n_exc = 0
+        drops = {}
+        min_clear = float("inf")
+        k_max = 0.0
+        bar = None
+        for i in range(0, len(xy) - 1, NOAPEX_STRIDE):
+            obstacle = (float(xy[i][0]), float(xy[i][1]), OBS_RADIUS_M)
+            # THE KNOT THE NODE WOULD DERIVE: abeam the box, at r + obs_margin, on the roomier
+            # side of the measured corridor (the node reads the eroded map; here the smoothed
+            # corridor stands in, since the sweep has no occupancy grid loaded).
+            hi = max(float(m["dr"][i]) - 0.15 - wall_margin, 0.0)
+            lo = max(float(m["dl"][i]) - 0.15 - wall_margin, 0.0)
+            side = 1.0 if hi >= lo else -1.0
+            apex = tuple(xy[i] + side * (OBS_RADIUS_M + OBS_MARGIN_M) * nvec[i])
+            try:
+                res = solve(m, apex, cfg_dir, wall_margin, fit_tol, obstacle)
+            except Exception as exc:
+                ok = False
+                n_exc += 1
+                print(f"    FAIL: station {i} raised {type(exc).__name__}: {exc}")
+                continue
+            if res["n_windows"] == 0:
+                why = (res["apex_dropped"][0].get("reason", "?")
+                       if res["apex_dropped"] else "no-hump-no-reason")
+                drops[why] = drops.get(why, 0) + 1
+                if why == "no-hump-no-reason":
+                    ok = False
+                    print(f"    FAIL: station {i} laid nothing and gave no reason. A drop must be "
+                          f"attributable -- silence is what let obstacles stay reactive-only.")
+                continue
+            n_laid += 1
+            a = res["apex_laid"][0]
+            clear = float(a.get("clear", float("nan")))
+            if clear == clear:
+                min_clear = min(min_clear, clear)
+            traj = res["main"][0]
+            kg = np.abs(core._menger_kappa(traj[:, 1:3]))
+            k_max = max(k_max, float(kg.max()))
+            bar = max(float(res.get("curvlim", 0.0)), kappa0)
+            if clear == clear and clear < OBS_MARGIN_M - RELAX_FLOOR_SLACK_M - 1e-6:
+                ok = False
+                print(f"    FAIL: station {i} laid a hump clearing {clear:+.3f} m, under the "
+                      f"lowest floor the ladder may accept ({OBS_MARGIN_M - RELAX_FLOOR_SLACK_M:.2f}).")
+            if float(res.get("clip_bite", 0.0)) > fit_tol + 1e-6:
+                ok = False
+                print(f"    FAIL: station {i} needed a {res['clip_bite'] * 1e3:.1f} mm corridor "
+                      f"clip (> fit_tol) -- the profile was shaped by clipping.")
+            if _lat_peaks(res.get("alpha", np.zeros(len(xy)))) > 1:
+                ok = False
+                print(f"    FAIL: station {i} laid one hump with "
+                      f"{_lat_peaks(res['alpha'])} lateral extrema.")
+        det = ", ".join(f"{k}x{v}" for k, v in sorted(drops.items())) or "-"
+        over = int(bar is not None and k_max > bar + 1e-3)
+        print(f"  {name:5s} | {n_laid + sum(drops.values()) + n_exc:6d} | {n_laid:4d} | {det:19s} | "
+              f"{(min_clear if min_clear < float('inf') else float('nan')):9.3f} | "
+              f"{k_max:6.2f} vs {(bar or 0.0):.2f} | {over:4d}")
+        if bar is not None and k_max > bar + 1e-3:
+            ok = False
+            print(f"    FAIL: an obstacle-derived hump exceeds the curvature bar.")
+        if n_laid == 0:
+            ok = False
+            print(f"    FAIL: not one obstacle-derived hump was laid on {name}.")
+    return ok
+
+
 # SEAM case. Everything in this pipeline is indexed from s = 0, and a hump centred 0.6 m before
 # the seam has most of its body on the OTHER side of that index. The stationwise sweep above steps
 # past the seam by construction (step 11 -> the last visited waypoint is up to a metre short of it)
@@ -680,6 +772,8 @@ def main() -> int:
         if not check_hold(loaded, cfg_dir, args.wall_margin[0], args.fit_tol[0]):
             ok = False
         if not check_kinks(loaded, cfg_dir, args.wall_margin[0], args.fit_tol[0]):
+            ok = False
+        if not check_no_apex(loaded, cfg_dir, args.wall_margin[0], args.fit_tol[0]):
             ok = False
         if not args.enforce_laptime:
             print("\n  NOTE: the lap-loss budget above is REPORTED, not enforced (--enforce-laptime\n"
