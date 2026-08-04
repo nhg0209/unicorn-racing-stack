@@ -75,6 +75,7 @@ def make_node():
     n.apex_major_change_m = 0.10
     n._apex_change_major = False
     n.active = straight_bundle()      # real node always has one (clean bundle at startup)
+    n.pub_coverage = types.SimpleNamespace(publish=lambda m: None)
     # straight clean line along x with a 0.7 m corridor each side (apex plausibility check)
     n._clean_xy = np.column_stack([np.arange(0.0, 40.0, 0.1), np.zeros(400)])
     n._clean_dr = np.full(400, 0.7)

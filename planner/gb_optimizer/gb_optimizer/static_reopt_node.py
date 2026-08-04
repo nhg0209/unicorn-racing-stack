@@ -54,7 +54,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 from ament_index_python.packages import get_package_share_directory
 from std_msgs.msg import String, Float32, Bool, Empty
 from nav_msgs.msg import Odometry
-from visualization_msgs.msg import MarkerArray
+from visualization_msgs.msg import Marker, MarkerArray
 from f110_msgs.msg import WpntArray, OTWpntArray
 
 from grid_filter.grid_filter import GridFilter
@@ -72,11 +72,13 @@ class _Bundle:
         "glb_wpnts", "glb_markers",
         "sp_wpnts", "sp_markers",
         "trackbounds", "n_apex", "clearance_ok", "clearance_by_key", "floor_by_key",
+        "coverage",
     )
 
     def __init__(self, map_info, est_lap_time, cent_wpnts, cent_markers,
                  glb_wpnts, glb_markers, sp_wpnts, sp_markers, trackbounds, n_apex=0,
-                 clearance_ok=True, clearance_by_key=None, floor_by_key=None):
+                 clearance_ok=True, clearance_by_key=None, floor_by_key=None,
+                 coverage=None):
         # n_apex = humps ACTUALLY laid into this line. 0 means the geometry is the clean raceline
         # even if obstacles were passed in (no apex recorded, or the corridor could not hold it).
         self.n_apex = n_apex
@@ -91,6 +93,9 @@ class _Bundle:
         # floor_by_key = the clearance each LAID hump was accepted at (the coverage
         # ladder may settle below obs_margin). What the line promised for that box.
         self.floor_by_key = floor_by_key or {}
+        # coverage = one record per confirmed obstacle: what this line does about it and
+        # why. Published on /static_reopt/coverage and used to compare candidate lines.
+        self.coverage = coverage or []
         self.map_info = map_info
         self.est_lap_time = est_lap_time
         self.cent_wpnts = cent_wpnts
@@ -354,6 +359,10 @@ class StaticReoptNode(Node):
         # tells sector_tuner (and any consumer that caches the first global line) to re-take
         # the new geometry after a swap. Relative topic "update_map" == sector_tuner's sub.
         self.pub_update_map = self.create_publisher(Bool, "update_map", 10)
+        # Per-obstacle coverage of the line that is ACTUALLY driving. Latched: what this answers --
+        # "is that box covered by the global line, and if not why" -- is exactly the question asked
+        # after the fact, from a bag or a late subscriber.
+        self.pub_coverage = self.create_publisher(MarkerArray, "/static_reopt/coverage", latched)
 
         # Eroded occupancy map for the final wall gate (see _wall_gate_ok).
         self.map_filter = None
@@ -386,6 +395,101 @@ class StaticReoptNode(Node):
     def _load_clean_bundle(self, map_name: str) -> _Bundle:
         (map_info, est, cent_m, cent_w, glb_m, glb_w, sp_m, sp_w, bounds) = read_global_waypoints(map_name)
         return _Bundle(map_info, est, cent_w, cent_m, glb_w, glb_m, sp_w, sp_m, bounds)
+
+    # ORDER OF PREFERENCE for what a line does about one obstacle. Used to compare two candidate
+    # lines obstacle-by-obstacle so a rebuild can never quietly cover LESS than what is already
+    # driving -- see _coverage_regresses. "already_clear" ranks with "laid": the line needs no hump
+    # there and is not failing to provide one.
+    _COVER_RANK = {"laid": 2, "already_clear": 2, "no_apex": 1, "dropped": 0}
+
+    def _coverage(self, obstacles, pairs, res, gaps_by_id=None, traj=None) -> List[dict]:
+        """One record per confirmed obstacle: what this line does about it, and why.
+
+        Everything here already existed inside the build, scattered across `apex_laid`,
+        `apex_dropped` and a subtraction; what was missing was a single attributed answer per
+        obstacle. Without it "2/3 reshaped" is the only thing anyone downstream (or reading a bag)
+        can see, and it does not say WHICH obstacle is uncovered or why -- so a line that silently
+        stopped covering one is indistinguishable from one that never could.
+        """
+        apex_of = {id(o): i for i, (_xy, o) in enumerate(pairs)}
+        laid_by_i = {a["obs_i"]: a for a in res.get("apex_laid", []) if a.get("obs_i") is not None}
+        drop_by_i = {d["obs_i"]: d for d in res.get("apex_dropped", []) if d.get("obs_i") is not None}
+        gaps = (gaps_by_id if gaps_by_id is not None
+                else dict(zip((id(o) for o in obstacles), self._line_clearances(traj, obstacles)))
+                if traj is not None else {})
+        out = []
+        for o in obstacles:
+            i_a = apex_of.get(id(o))
+            clr = float(gaps.get(id(o), float("nan")))
+            if i_a is None:
+                # No recorded reactive apex. Distinguish "needs nothing" from "needs something we
+                # cannot place": the core skips an obstacle the line already clears BEFORE any apex
+                # is involved, and calling that a missing apex is what the old arithmetic did.
+                status = "already_clear" if clr >= self.obs_margin else "no_apex"
+            elif i_a in laid_by_i:
+                status = "laid"
+            elif i_a in drop_by_i:
+                status = "dropped:" + str(drop_by_i[i_a].get("reason", "?"))
+            else:
+                status = "already_clear" if clr >= self.obs_margin else "no_apex"
+            out.append({"id": int(getattr(o, "id", -1)) if hasattr(o, "id") else -1,
+                        "x": float(o.x), "y": float(o.y), "r": float(o.r),
+                        "status": status, "clearance_m": clr})
+        return out
+
+    def _coverage_regresses(self, new_cov, old_cov) -> Optional[str]:
+        """Does `new_cov` do WORSE than `old_cov` for any obstacle? Returns a reason, or None.
+
+        The policy this enforces is not "all or nothing". A line that covers two of three
+        obstacles is worth publishing -- the third is the reactive layer's, and it says so. What
+        must never happen is a REGRESSION, because the fallback is not the clean line, it is
+        whatever older line is still active: refusing to publish a line that covers less would
+        leave the car on a better one, and publishing it would take coverage away silently.
+        """
+        if not old_cov:
+            return None
+        old_rank = {}
+        for c in old_cov:
+            old_rank[(round(c["x"], 2), round(c["y"], 2))] = self._COVER_RANK.get(
+                c["status"].split(":")[0], 0)
+        for c in new_cov:
+            k = (round(c["x"], 2), round(c["y"], 2))
+            if k not in old_rank:
+                continue                     # a newly confirmed obstacle cannot be a regression
+            new_r = self._COVER_RANK.get(c["status"].split(":")[0], 0)
+            if new_r < old_rank[k]:
+                return (f"obstacle @({c['x']:.2f},{c['y']:.2f}) would go from covered to "
+                        f"'{c['status']}'")
+        return None
+
+    def _publish_coverage(self, bundle) -> None:
+        """/static_reopt/coverage — one marker per confirmed obstacle, coloured by status, with the
+        status and measured clearance in its text. Latched, so a late subscriber (or a bag opened
+        afterwards) sees what the line that is actually driving does about every obstacle."""
+        arr = MarkerArray()
+        clear_m = Marker()
+        clear_m.action = Marker.DELETEALL
+        arr.markers.append(clear_m)
+        for i, c in enumerate(getattr(bundle, "coverage", []) or []):
+            head = c["status"].split(":")[0]
+            m = Marker()
+            m.header.frame_id = "map"
+            m.header.stamp = self.get_clock().now().to_msg()
+            m.ns = "static_reopt_coverage"
+            m.id = i
+            m.type = Marker.TEXT_VIEW_FACING
+            m.action = Marker.ADD
+            m.pose.position.x, m.pose.position.y = c["x"], c["y"]
+            m.pose.position.z = 0.6
+            m.pose.orientation.w = 1.0
+            m.scale.z = 0.25
+            m.color.a = 1.0
+            # green = the line handles it, amber = waiting on an apex, red = the reactive layer's
+            m.color.r = 0.0 if head in ("laid", "already_clear") else 1.0
+            m.color.g = 1.0 if head in ("laid", "already_clear", "no_apex") else 0.0
+            m.text = f"id={c['id']} {c['status']} {c['clearance_m']:+.2f}m"
+            arr.markers.append(m)
+        self.pub_coverage.publish(arr)
 
     def _wall_gate_ok(self, traj) -> bool:
         """Is every PUBLISHED point inside the eroded free space of the occupancy map?
@@ -554,14 +658,21 @@ class StaticReoptNode(Node):
         clearance_ok = True                 # `global` method: no per-apex geometry to check
         clearance_by_key = {}
         floor_by_key = {}
+        coverage = []
         if self.reopt_method == "local_window":
             n_ap = res.get("n_windows", 0)
             dropped = res.get("apex_dropped", [])
             n_obs = len(obstacles)
-            n_no_apex = max(0, n_obs - n_ap - len(dropped))
+            # PER-OBSTACLE STATUS, by identity. n_no_apex used to be inferred arithmetically
+            # (n_obs - laid - dropped), which counted every obstacle the core skipped as
+            # already-clear as if its apex were missing -- exactly backwards, since those are the
+            # ones needing nothing. Attribute each obstacle instead.
+            coverage = self._coverage(obstacles, pairs, res, gaps_by_id=None, traj=traj)
+            n_no_apex = sum(1 for c in coverage if c["status"] == "no_apex")
+            n_clear = sum(1 for c in coverage if c["status"] == "already_clear")
             info.data = (f"[static_reopt] obstacle-aware (apex reshape) est {est:.3f}s; "
-                         f"{n_ap}/{n_obs} obstacle apex(es) reshaped, {len(dropped)} corridor-"
-                         f"rejected, {n_no_apex} without a recorded reactive apex")
+                         f"{n_ap}/{n_obs} obstacle apex(es) reshaped, {len(dropped)} rejected, "
+                         f"{n_clear} already clear, {n_no_apex} without a recorded reactive apex")
             # PER-APEX shape log. Without this a collapsed reach is invisible: the summary above
             # reports the hump as "reshaped" whether it was laid at the 5 m reach the search asked
             # for or bisected down to 1.2 m by the corridor fit — and the sharp one costs >1 s/lap
@@ -645,7 +756,8 @@ class StaticReoptNode(Node):
                        self.clean_bundle.cent_wpnts, self.clean_bundle.cent_markers,
                        glb_w, glb_m, sp_w, sp_m, self.clean_bundle.trackbounds,
                        n_apex=int(res.get("n_windows", 0)), clearance_ok=clearance_ok,
-                       clearance_by_key=clearance_by_key, floor_by_key=floor_by_key)
+                       clearance_by_key=clearance_by_key, floor_by_key=floor_by_key,
+                       coverage=coverage)
 
     # ----------------------------------------------------------------------------------
     # obstacle input: COLLECT only (batch re-opt happens at the start/finish crossing)
@@ -1041,6 +1153,18 @@ class StaticReoptNode(Node):
                 f"REJECTED log for the per-apex reason). "
                 f"Keeping the current line; those obstacles stay reactive-only")
             return
+        # COVERAGE POLICY. Publish the best coverage available, never a regression. A line that
+        # covers two of three obstacles is worth swapping to -- the third stays the reactive
+        # layer's and the coverage topic says so -- but a line that covers LESS than what is
+        # already driving must not be installed, because the fallback here is not the clean line,
+        # it is the older, better-covered line the car is on.
+        regress = self._coverage_regresses(getattr(bundle, "coverage", []),
+                                           getattr(self.active, "coverage", []))
+        if regress:
+            self.get_logger().warning(
+                f"[static_reopt] rebuild REFUSED: it would reduce coverage — {regress}. Keeping "
+                f"the active line; see /static_reopt/coverage", throttle_duration_sec=5.0)
+            return
         self._pending = bundle
         self._pending_dev = self._line_dev(bundle, self.active)
         self._pending_since = now
@@ -1141,6 +1265,7 @@ class StaticReoptNode(Node):
         kind = "CLEAN" if bundle is self.clean_bundle else "OBSTACLE-AWARE"
         self.get_logger().info(f"[static_reopt] swapped to {kind} at s={s:.2f} m")
         self._publish_active(bundle)             # publish now, don't wait for the republish tick
+        self._publish_coverage(bundle)
         self.pub_update_map.publish(Bool(data=True))   # /global_waypoints already latched above
 
     def _publish_active(self, active: "_Bundle"):
