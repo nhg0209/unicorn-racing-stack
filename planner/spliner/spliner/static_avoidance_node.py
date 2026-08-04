@@ -1240,16 +1240,28 @@ class ObstacleSpliner(Node):
             # Decay it to the raceline with a quintic (C2 at both ends) inside min(preramp_len_m,
             # s_entry0), then hold zero until the hump opens. When s_entry0 == 0 the maneuver starts
             # AT the car and the car-anchored entry is kept, heading and all.
-            d_start = self.cur_d if s_entry0 <= 0.0 else 0.0
+            # The decay runs at its DESIGNED rate (preramp_len_m) and no faster. Clipping the
+            # length to s_entry0 instead -- "finish the decay before the hump opens, whatever it
+            # takes" -- demands the impossible when the hump opens close to the car: with a 0.5 m
+            # tracking error and 0.5 m of room it asked for the whole offset to be given back in
+            # half a metre, and every candidate then died on curvature and on the grid (measured:
+            # 74 curvature rejections where there had been none). If there is no room to finish,
+            # the hump simply starts from whatever offset is left -- which is what the car is
+            # actually at, and what the s_entry0 <= 0 branch below already does.
             dv = np.zeros(n)
-            if s_entry0 > 0.0 and abs(self.cur_d) > 1e-9:
-                pre = min(self.preramp_len_m, s_entry0)
-                if pre > 1e-6:
-                    t = np.clip(s_local / pre, 0.0, 1.0)
-                    w = 1.0 - t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
+            pre = max(self.preramp_len_m, 1e-6)
+
+            def _decay(x):                                    # 1 at the car, 0 after `pre`
+                t = np.clip(np.asarray(x, float) / pre, 0.0, 1.0)
+                return 1.0 - t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
+
+            if s_entry0 > 0.0:
+                d_start = float(self.cur_d * _decay(s_entry0))
+                if abs(self.cur_d) > 1e-9:
                     m_pre = s_local <= s_entry0
-                    dv[m_pre] = self.cur_d * w[m_pre]
-            elif s_entry0 <= 0.0:
+                    dv[m_pre] = self.cur_d * _decay(s_local[m_pre])
+            else:
+                d_start = self.cur_d
                 dv[:] = self.cur_d
             if span_ok and m_span.any():
                 # One knot per obstacle centre -> a single smooth quintic hump (raceline -> apex ->
@@ -1312,6 +1324,31 @@ class ObstacleSpliner(Node):
         resp = self.converter.get_cartesian(np.tile(s_mod, N), d_cands.reshape(-1))
         xy_all = (resp.T if resp.ndim == 2 else resp).reshape(N, n, 2)
 
+        # THE PREFIX IS NOT A CANDIDATE'S FAULT. Everything before s_entry0 is the decay of the
+        # car's CURRENT lateral offset back to the raceline (see the pre-ramp above) plus the car's
+        # own position. It is identical in every candidate and the planner cannot change it, so
+        # rejecting candidates for a violation there rejects ALL of them and leaves TRAILING as the
+        # only output -- with no alternative that would have been better. Measured on ifac with a
+        # 0.5 m tracking error and a box 12 m ahead: 310 of 437 grid rejections and 8 of 13 body
+        # rejections lie in the prefix; at 0.3 m it is 107 of 115 body rejections. With the box 2 m
+        # ahead there is no prefix at all (s_entry0 clamps to 0), which is precisely why the
+        # feasibility cliff only appears at distance and only with a tracking error.
+        #
+        # So the geometry checks start where the planner's own geometry starts. The prefix is not
+        # ignored -- a violation there is REPORTED, because it means the car is being tracked into
+        # a wall and that is worth knowing; it is just not a reason to discard the escape route.
+        i_entry = int(np.searchsorted(s_local, s_entry0)) if span_ok else 0
+        i_entry = int(np.clip(i_entry, 0, max(n - 3, 0)))
+        if i_entry > 0 and self.use_grid_check:
+            pre_xy = xy_all[0][:i_entry]
+            if self._path_off_track(pre_xy) or self._path_body_unsafe(pre_xy):
+                self.get_logger().warn(
+                    f"[{self.name}] the path PREFIX (the car at d={self.cur_d:+.2f} decaying to "
+                    f"the raceline over {min(self.preramp_len_m, s_entry0):.1f} m) leaves the "
+                    f"drivable area. Not a candidate rejection -- every candidate shares it and "
+                    f"none can change it -- but the car is being tracked close to a wall.",
+                    throttle_duration_sec=2.0)
+
         # --- heavy checks (grid, curvature, cost) only on geometric survivors ---
         obs_xy = np.array([[o.x_m, o.y_m] for o in obs_ahead], dtype=float)
         best_k, best_J, best = -1, np.inf, None
@@ -1326,7 +1363,8 @@ class ObstacleSpliner(Node):
                 n_obs += 1
                 continue
             xy = xy_all[k]
-            if self.use_grid_check and self._path_off_track(xy):
+            xy_own = xy[i_entry:]                 # the part of the path this candidate decides
+            if self.use_grid_check and self._path_off_track(xy_own):
                 n_grid += 1
                 continue
             # BODY floor, deliberately NOT gated on use_grid_check: the check above asks whether the
@@ -1334,7 +1372,7 @@ class ObstacleSpliner(Node):
             # trust_grid_bounds nothing else asks that question -- the waypoint corridor test, which
             # reserves half_car + wall_margin, is skipped as redundant with the per-point grid test,
             # and the per-point grid test reserves 0.05 m.
-            if self._path_body_unsafe(xy):
+            if self._path_body_unsafe(xy_own):
                 n_body += 1
                 continue
             psi_, kappa_ = tph.calc_head_curv_num.calc_head_curv_num(
@@ -1450,7 +1488,7 @@ class ObstacleSpliner(Node):
 
         if self.commit_enable:
             self._store_commit(obs_ahead, s_mod, d_sel, xy, v_arr, psi_pub, kappa_,
-                               obs_margin=obs_margin, squeeze=squeeze)
+                               obs_margin=obs_margin, squeeze=squeeze, s_entry0=s_entry0)
         self._publish_feasible(True)
         return wpnts, self._candidate_markers(xy_all, status, best_k)
 
@@ -1514,7 +1552,7 @@ class ObstacleSpliner(Node):
         return bool((o.is_static or self._near_zero_static(o)) and o.is_visible)
 
     def _store_commit(self, obs_ahead, s_mod, d_sel, xy, v_arr, psi_pub, kappa_,
-                      obs_margin=None, squeeze=False):
+                      obs_margin=None, squeeze=False, s_entry0=0.0):
         """Snapshot the freshly chosen path (+ the obstacles it was planned around) so later
         cycles republish it verbatim instead of re-solving from the moving car.
 
@@ -1527,6 +1565,10 @@ class ObstacleSpliner(Node):
         self._committed = {
             'obs_margin': obs_margin,
             'squeeze': bool(squeeze),
+            # path-local arc length at which this path's OWN geometry starts (see the prefix note
+            # in do_spline). The re-check has to skip the same prefix the candidate check did, or
+            # a path accepted here is rejected on its first reuse and the car flaps back out.
+            's_entry0': float(s_entry0),
             'obs': [(int(o.id), float(o.s_center), float(o.d_center)) for o in obs_ahead],
             's_mod': np.asarray(s_mod, dtype=float).copy(),
             'd':     np.asarray(d_sel, dtype=float).copy(),
@@ -1700,8 +1742,17 @@ class ObstacleSpliner(Node):
         # Corridor: the eroded map when it is the authority (the waypoint bounds can ship with
         # d_left/d_right exchanged, which would drop a perfectly good committed path every cycle),
         # otherwise the waypoint corridor.
+        # Skip this path's PREFIX, exactly as the candidate check does (see do_spline): it is the
+        # decay of the car's own lateral offset, the planner cannot change it, and re-rejecting it
+        # here would drop -- on its very first reuse -- a path that was accepted a cycle ago.
+        s0 = c['s_mod'][0]
+        s_loc_all = (c['s_mod'] - s0) % L
+        own_mask = s_loc_all >= float(c.get('s_entry0', 0.0))
+        own = np.flatnonzero(own_mask[sel]) + (sel.start or 0)
+        if own.size < 3:
+            own = np.arange(sel.start or 0, len(c['xy']))
         if self._grid_is_authority():
-            if self._path_off_track(c['xy'][sel]):
+            if self._path_off_track(c['xy'][own]):
                 return False
         else:
             idxs = (s_mod / wpnt_dist).astype(int) % self.gb_max_idx
@@ -1713,7 +1764,7 @@ class ObstacleSpliner(Node):
         # check covers the whole commitment path: the forward slice is re-derived here every cycle,
         # and _reanchor_commit's blend runs immediately before it -- a bent entry that pushes the
         # car's own displacement into a wall is caught here rather than published.
-        if self._path_body_unsafe(c['xy'][sel]):
+        if self._path_body_unsafe(c['xy'][own]):
             return False
         gap_wp = (s_mod - self.cur_s) % L
         for o in self.obstacles:
