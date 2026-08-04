@@ -1248,8 +1248,19 @@ class ObstacleSpliner(Node):
                 # from the obstacle (wider swing); the feasibility filter verifies box clearance.
                 bp_s = [s_entry0]
                 bp_d = [[d_start, dp0, 0.0]]
-                for (s_c, _o, _cor), da in zip(knots, d_apex):
-                    d_peak = da + self._bulge_away_from(da, _o)
+                for i_k, ((s_c, _o, _cor), da) in enumerate(zip(knots, d_apex)):
+                    # CLIP the bulge to this knot's corridor instead of letting it push the peak
+                    # out of the track. The pass offset `da` is already inside the corridor (the
+                    # terminal offsets are sampled from it and _pass_offset picks a corridor-tested
+                    # side), so only the bulge can leave it -- and it did: on a section narrower
+                    # than the design margins the peak landed at the sampling limit + 0.10 m, with
+                    # zero terminal reserve, and under squeeze the reserve was NEGATIVE. Clipping
+                    # keeps the candidate instead of rejecting it, which is what preserves
+                    # feasibility exactly where feasibility is scarce; the box-clearance test
+                    # (obs_ok) still decides whether the clipped peak actually passes the obstacle.
+                    lo_k, hi_k = knot_cor[i_k]
+                    d_peak = float(np.clip(da + self._bulge_away_from(da, _o),
+                                           min(lo_k, hi_k), max(lo_k, hi_k)))
                     bp_s.append(s_c)
                     bp_d.append([d_peak, 0.0, 0.0])
                 bp_s.append(s_exit_end)

@@ -56,9 +56,9 @@ class _Converter:
         return 0.0
 
 
-def gb_wpnts():
+def gb_wpnts(half_width=HALF_WIDTH):
     return [types.SimpleNamespace(x_m=i * WPNT_DIST, y_m=0.0, s_m=i * WPNT_DIST,
-                                  d_left=HALF_WIDTH, d_right=HALF_WIDTH,
+                                  d_left=half_width, d_right=half_width,
                                   vx_mps=4.0, kappa_radpm=0.0)
             for i in range(int(TRACK_LEN / WPNT_DIST))]
 
@@ -114,8 +114,8 @@ def planner(obstacles, cur_d=0.0, cur_s=0.0):
     return n
 
 
-def plan(n):
-    wpnts, _m = n.do_spline(gb_wpnts())
+def plan(n, half_width=HALF_WIDTH):
+    wpnts, _m = n.do_spline(gb_wpnts(half_width))
     return wpnts
 
 
@@ -199,6 +199,40 @@ def test_bulge_rule_is_relative_to_the_obstacle():
     print("PASS the bulge is measured from the obstacle, not from d = 0")
 
 
+def test_apex_bulge_is_clipped_to_the_corridor():
+    # apex_bulge pushes the peak FURTHER from the box than the pass offset needs -- a deliberate
+    # extra swing. On a wide track that is free; on a narrow one it put the peak at the sampling
+    # limit + apex_bulge, i.e. past the corridor with ZERO terminal reserve (and NEGATIVE under
+    # squeeze, which lowers the limit the bulge is measured from). The corridor test then killed
+    # the candidate outright, so the bulge cost the pass exactly where the pass was scarcest.
+    # Clipped, the candidate survives at the corridor edge and the box-clearance test still has
+    # the final say.
+    half_car, wall = 0.15, 0.05
+    o = box(9.0, -0.20, oid=1)                   # keep-out [-0.65, +0.25] at obs_margin 0.30
+    # ROOMY: the clip must be inert. The peak is the pass offset plus the full bulge.
+    n = planner([o]); n.wall_margin = wall
+    w = plan(n, 1.20)
+    peak_wide = max(abs(x.d_m) for x in w.wpnts)
+    assert w.wpnts and clears_all(w, [o])
+    assert peak_wide > 0.25 + 1e-3, "on a wide track the bulge must still be applied in full"
+    # NARROW: 0.48 m half-width leaves a car-centre corridor of +-0.28 m, and the unclipped peak
+    # (pass offset 0.25 + bulge 0.10 = 0.35) is past even the waypoint-bounds limit of 0.33 --
+    # every candidate was rejected and the planner conceded TRAILING on a box it can pass.
+    n2 = planner([o]); n2.wall_margin = wall
+    w2 = plan(n2, 0.48)
+    limit = 0.48 - half_car - wall               # 0.28 m, the corridor limit for a car CENTRE
+    unclipped = 0.25 + n2.apex_bulge
+    assert unclipped > 0.48 - half_car, "the harness must reproduce the over-bulge"
+    assert w2.wpnts, "the clipped candidate must survive where the unclipped one was rejected"
+    assert n2.feasible and n2.feasible[-1] is True
+    peak = max(abs(x.d_m) for x in w2.wpnts)
+    assert peak <= limit + 1e-6, f"peak |d| {peak:.3f} exceeds the corridor limit {limit:.3f}"
+    assert peak > limit - 0.02, f"the clip must bite here, peak {peak:.3f} vs limit {limit:.3f}"
+    assert clears_all(w2, [o]), "…and the clipped path must still clear the box"
+    print(f"PASS bulge clip: wide peak {peak_wide:.2f} (bulge intact), narrow peak {peak:.2f} "
+          f"= corridor limit {limit:.2f} (unclipped {unclipped:.2f} was rejected)")
+
+
 def test_already_cleared_box_does_not_spend_a_knot():
     # A box the line already clears must not consume one of the three knot slots, or a genuinely
     # blocking fourth box goes un-knotted and obs_ok rejects everything.
@@ -216,5 +250,6 @@ if __name__ == "__main__":
     test_three_boxes_2_to_4m_apart_is_feasible()
     test_offcentre_box_bulges_away_from_it()
     test_bulge_rule_is_relative_to_the_obstacle()
+    test_apex_bulge_is_clipped_to_the_corridor()
     test_already_cleared_box_does_not_spend_a_knot()
     print("ALL PASS")
