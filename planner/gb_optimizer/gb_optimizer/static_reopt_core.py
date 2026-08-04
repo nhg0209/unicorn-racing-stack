@@ -227,6 +227,10 @@ _KAPPA_QUINTIC_C = 10.0 / math.sqrt(3.0)          # = 5.7735
 # ~curvlim, so `curvlim - max|kappa_clean|` alone goes to zero and demands an infinite reach. The
 # floor keeps r_min finite; the honest all-or-nothing drop then handles the truly impossible ones.
 _KAPPA_BUDGET_FLOOR_FRAC = 0.25
+# Fraction of curvlim a HUMP may use. The remainder is reserved for the controller's own
+# tracking error, which the vehicle limit has to cover as well as the geometry -- and which
+# is spent against a wall precisely at the hump, where the line is closest to one.
+_KAPPA_HUMP_FRAC = 0.9
 # Default corridor-fit tolerance [m]. The corridor bounds are a `_cyclic_smooth`ed ESTIMATE that
 # ripples ~2 mm between adjacent stations, and the amplitude cap parks the hump peak exactly on
 # that bound — so a zero-tolerance test rejects reaches over a SUB-MILLIMETRE violation at the
@@ -947,13 +951,20 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             return abs(d_now) >= max(0.03, _APEX_KEEP_FRAC * abs(d_want)), None
 
         def _kappa_allow(u_c, r):
-            """The bar the laid hump must clear. `curvlim` normally, but never stricter than the
-            clean raceline's OWN geometric curvature there: if the clean line already exceeds
-            curvlim at this corner that is a property of the raceline, and dropping the apex would
-            not fix it."""
+            """The bar the laid hump must clear.
+
+            `_KAPPA_HUMP_FRAC * curvlim`, not curvlim: the limit is what the CAR can steer, and the
+            car also has to absorb its own tracking error on top of whatever the line asks for. A
+            hump laid exactly at curvlim leaves nothing for that, and the error shows up as wall
+            proximity because the hump is where the line is closest to one. Reserving a tenth of
+            the budget for the controller costs a slightly wider hump and buys back the margin.
+
+            Never stricter than the clean raceline's OWN geometric curvature there: if the clean
+            line already exceeds the bar at this corner that is a property of the raceline, and
+            dropping the apex would not fix it."""
             m = (u_all >= u_c - r) & (u_all <= u_c + r)
             kc = float(np.max(np.abs(kap_geo[m]))) if np.any(m) else 0.0
-            return max(curvlim, kc)
+            return max(_KAPPA_HUMP_FRAC * curvlim, kc)
 
         fitted = []
         for (u, d, ri, ro, xa, ya, ob, k_i, d_obs) in kn_u:
@@ -1675,8 +1686,17 @@ def _reopt_local_window_impl(
     # never pushed off the clean line at a narrow spot). SMOOTH the bounds first: the optimizer
     # corridor widths are bumpy at the 0.1 m scale near tight corners, and forcing a decaying ramp
     # to track a ±cm-jittery wall makes the merge zigzag. The wall_margin buffer keeps it safe.
-    hi_off = _cyclic_smooth(clean_dr - 0.5 * w_veh - wall_margin, win=7)
-    lo_off = _cyclic_smooth(-(clean_dl - 0.5 * w_veh - wall_margin), win=7)
+    # ONE-SIDED smoothing. Averaging a bound is only safe in the direction that TIGHTENS it: at a
+    # pinch the window pulls in metres of wider neighbours and lifts the bound OUTWARD, past the
+    # wall it is describing (measured: +27 mm at the tightest ifac stations). The smoothing exists
+    # to stop a decaying ramp chasing a cm-jittery wall, and clamping the result back to the raw
+    # bound keeps exactly that benefit while making the error one-signed -- the fit may be more
+    # conservative than the raw corridor, never less. fit_tol is allowed on top because that is the
+    # tolerance the fit is already permitted to spend.
+    hi_raw = clean_dr - 0.5 * w_veh - wall_margin
+    lo_raw = -(clean_dl - 0.5 * w_veh - wall_margin)
+    hi_off = np.minimum(_cyclic_smooth(hi_raw, win=7), hi_raw + fit_tol)
+    lo_off = np.maximum(_cyclic_smooth(lo_raw, win=7), lo_raw - fit_tol)
     lo_inc = np.minimum(lo_off, 0.0)
     hi_inc = np.maximum(hi_off, 0.0)
 

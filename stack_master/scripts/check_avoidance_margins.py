@@ -42,6 +42,15 @@ from pathlib import Path
 import yaml
 
 SLACK = 0.03  # [m] margin the re-opt clearance must exceed the reactive keep-out by
+# Half the SIM car's width (gym_bridge f1tenth: 0.2032 m wide). The physical thing that has to fit
+# between the published line and the wall.
+SIM_HALF_WIDTH_M = 0.1016
+# [m] the part of the controller's lateral error the GEOMETRY is asked to absorb next to a wall.
+# NOT the full steady-state error (~0.5 m -- no ifac corridor could hold that): the rest is covered
+# by the hump curvature reserve (_KAPPA_HUMP_FRAC in static_reopt_core) and by the final
+# occupancy-map gate in static_reopt_node, which checks the published points against the eroded
+# map before any swap. Named so that lowering the wall reserve has to argue with a number.
+TRACKING_BUDGET_M = 0.08
 
 STACK_MASTER = Path(__file__).resolve().parents[1]
 
@@ -221,6 +230,35 @@ def check_static_chain_ordering(sm_path, sm, cfg, yaml_path, args, launch_path) 
         else:
             print(f"OK: static planner lookahead_min ({planner_horizon:.1f}) >= SM free-check "
                   f"horizon ({sm_free_horizon:.1f}).")
+
+    # (b3) WALL reserve. The re-opt line is the one thing on the track that deliberately drives
+    # OFF the raceline, so it is the one thing that spends the wall reserve -- and that reserve has
+    # been quietly lowered twice (reopt_wall_margin 0.12 -> 0.05, and fit_tol is spent out of it).
+    # What has to survive is the car itself plus enough room for the controller to miss by:
+    #
+    #     reopt_qp_veh_width/2 + reopt_wall_margin - reopt_fit_tol
+    #         >= sim half-width (SIM_HALF_WIDTH_M) + TRACKING_BUDGET_M
+    #
+    # The tracking budget is not a guess at the controller's error -- that is ~0.5 m and no corridor
+    # on ifac could hold it. It is the part of the error the GEOMETRY is asked to absorb, with the
+    # rest covered by the curvature reserve (_KAPPA_HUMP_FRAC) and the final occupancy-map gate in
+    # static_reopt_node. Named so that lowering the wall reserve again has to argue with a number.
+    qp_half = float(args.get("reopt_qp_veh_width", 0.0)) / 2.0
+    wall_m = float(args.get("reopt_wall_margin", 0.0))
+    fit_t = float(args.get("reopt_fit_tol", 0.0))
+    wall_reserve = qp_half + wall_m - fit_t
+    wall_need = SIM_HALF_WIDTH_M + TRACKING_BUDGET_M
+    print(f"  wall reserve = qp_veh_width/2 + wall_margin - fit_tol = {qp_half:.3f} + "
+          f"{wall_m:.3f} - {fit_t:.4f} = {wall_reserve:.3f} m")
+    if wall_reserve < wall_need - 1e-9:
+        ok = False
+        print(f"FAIL: wall reserve ({wall_reserve:.3f}) < sim half-width + tracking budget "
+              f"({SIM_HALF_WIDTH_M:.4f} + {TRACKING_BUDGET_M:.2f} = {wall_need:.3f}). The re-opt "
+              f"line is the one thing that deliberately leaves the raceline, so it is the one that "
+              f"spends this. Raise reopt_wall_margin or reopt_qp_veh_width.")
+    else:
+        print(f"OK: wall reserve ({wall_reserve:.3f}) >= car half-width + tracking budget "
+              f"({wall_need:.3f}).")
 
     # (c) drift budget, applied to BOTH the launch value and the node's own default
     print(f"  headroom for drift = floor - SM requirement = {floor:.3f} - {required:.3f} = {headroom:.3f} m")

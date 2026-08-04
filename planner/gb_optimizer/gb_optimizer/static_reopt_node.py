@@ -57,6 +57,8 @@ from nav_msgs.msg import Odometry
 from visualization_msgs.msg import MarkerArray
 from f110_msgs.msg import WpntArray, OTWpntArray
 
+from grid_filter.grid_filter import GridFilter
+
 from .readwrite_global_waypoints import read_global_waypoints
 from . import static_reopt_core as core
 
@@ -121,6 +123,12 @@ class StaticReoptNode(Node):
         # reactive planner would itself have driven -- strictly better than not covering it. Set
         # equal to obs_margin to disable the ladder.
         self.declare_parameter("relax_floor", 0.30)
+        # FINAL wall gate: every published point is checked against the eroded occupancy map before
+        # the line is allowed to swap in. The corridor the fit works in is derived from the
+        # waypoints' d_left/d_right, which are an estimate; the map is the only wall source that
+        # cannot be mislabelled or smoothed. Same erosion kernel as the reactive planner so the two
+        # agree on where a wall is. 0 disables the gate.
+        self.declare_parameter("wall_gate_kernel", 3)
         self.declare_parameter("default_obs_radius", 0.15)
         self.declare_parameter("republish_period", 1.0)     # [s] keep-alive republish
         # `update_map` re-notify period. MUST stay below sector_tuner's 0.5 s scale timer so a
@@ -177,6 +185,7 @@ class StaticReoptNode(Node):
         self.safety_width_sp = float(self.get_parameter("safety_width_sp").value)
         self.obs_margin = float(self.get_parameter("obs_margin").value)
         self.relax_floor = float(self.get_parameter("relax_floor").value)
+        self.wall_gate_kernel = int(self.get_parameter("wall_gate_kernel").value)
         self.default_obs_radius = float(self.get_parameter("default_obs_radius").value)
         self.republish_period = float(self.get_parameter("republish_period").value)
         self.notify_period = float(self.get_parameter("notify_period").value)
@@ -346,6 +355,12 @@ class StaticReoptNode(Node):
         # the new geometry after a swap. Relative topic "update_map" == sector_tuner's sub.
         self.pub_update_map = self.create_publisher(Bool, "update_map", 10)
 
+        # Eroded occupancy map for the final wall gate (see _wall_gate_ok).
+        self.map_filter = None
+        if self.wall_gate_kernel > 0:
+            self.map_filter = GridFilter(node=self, map_topic="/map", debug=False)
+            self.map_filter.set_erosion_kernel_size(self.wall_gate_kernel)
+
         self.create_subscription(MarkerArray, "/static_reopt/obstacles", self.obstacles_cb, 10)
         self.create_subscription(Odometry, "/car_state/odom_frenet", self.frenet_cb, 10)
         # reactive STATIC avoidance path (exploration lap) — records each obstacle's apex for the
@@ -371,6 +386,44 @@ class StaticReoptNode(Node):
     def _load_clean_bundle(self, map_name: str) -> _Bundle:
         (map_info, est, cent_m, cent_w, glb_m, glb_w, sp_m, sp_w, bounds) = read_global_waypoints(map_name)
         return _Bundle(map_info, est, cent_w, cent_m, glb_w, glb_m, sp_w, sp_m, bounds)
+
+    def _wall_gate_ok(self, traj) -> bool:
+        """Is every PUBLISHED point inside the eroded free space of the occupancy map?
+
+        The last gate before a swap, and the only one that consults the map rather than a model of
+        it. Everything upstream reasons about the corridor derived from the waypoints' d_left /
+        d_right, which is an estimate: it is smoothed, it is offset by a wall_margin someone can
+        lower, and on some maps the two sides ship exchanged. The map cannot be any of those.
+
+        Vectorised `GridFilter.is_point_inside` -- same pixel convention (row = y, no vertical
+        flip) and the same erosion kernel as the reactive planner, so the two agree on where a wall
+        is. Returns True when no map has arrived (bench/bag runs): a missing map must not silently
+        block every swap, and the corridor checks upstream still apply.
+        """
+        f = self.map_filter
+        img = getattr(f, "eroded_image", None) if f is not None else None
+        if img is None or f.resolution is None or f.origin is None:
+            return True
+        try:
+            xy = np.asarray(traj)[:, 1:3]
+            px = ((xy[:, 0] - f.origin[0]) / f.resolution).astype(int)
+            py = ((xy[:, 1] - f.origin[1]) / f.resolution).astype(int)
+            h, w = img.shape
+            inside = (px >= 0) & (py >= 0) & (px < w) & (py < h)
+            free = np.zeros(len(xy), dtype=bool)
+            free[inside] = img[py[inside], px[inside]] == 255
+            if free.all():
+                return True
+            bad = np.flatnonzero(~free)
+            self.get_logger().error(
+                f"[static_reopt] REFUSING to publish: {bad.size} of {len(xy)} published points are "
+                f"outside the eroded free space (first @({xy[bad[0], 0]:.2f},{xy[bad[0], 1]:.2f})). "
+                f"The line would put the car into a wall — check reopt_wall_margin / "
+                f"reopt_qp_veh_width and the map's d_left/d_right")
+            return False
+        except Exception as e:                       # a gate must never crash the build
+            self.get_logger().debug(f"[static_reopt] wall gate skipped: {e}")
+            return True
 
     def _line_clearances(self, traj, obstacles: List[core.Obstacle]) -> List[float]:
         """Distance from the line to each obstacle's EDGE [m], index-aligned with `obstacles`.
@@ -574,6 +627,8 @@ class StaticReoptNode(Node):
             clearance_ok = self._check_line_clearance(traj, obstacles, res.get("apex_laid", []),
                                                       apex_obs=[o for _xy, o in pairs],
                                                       floors=floors_by_id)
+            # ...and the wall, which no upstream check consults directly. Same refusal path.
+            clearance_ok = self._wall_gate_ok(traj) and clearance_ok
             # Baseline for the drift trigger: what THIS line clears each box by, at the positions
             # it was built from. Travels with the bundle so the comparison is always against the
             # line that is actually active (a pending bundle may never commit).
