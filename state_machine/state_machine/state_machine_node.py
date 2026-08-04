@@ -1747,6 +1747,21 @@ class StateMachine(Node):
             )
             self._vel_cache[cache_key] = (key, vx_profile, ax_profile)
 
+        # THE OUTPUT IS CHECKED TOO. The inputs are validated above, but the solver can still
+        # return a non-finite profile (a zero el_length, a degenerate kappa run), and writing NaN
+        # into vx_mps poisons everything downstream at once: the controller's lookahead, the
+        # marker array (RViz drops the WHOLE array on one bad pose, which is what "the local
+        # waypoints disappeared" looks like), and the SM's own speed logic. Keeping the planner's
+        # own speeds is the fail-closed answer -- they are a real profile, just not re-fitted to
+        # this node's dynamics.
+        if not (np.all(np.isfinite(vx_profile)) and np.all(np.isfinite(ax_profile))):
+            self.get_logger().warn(
+                f"[{self.name}] velocity re-profile produced non-finite values "
+                f"({int(np.count_nonzero(~np.isfinite(vx_profile)))} of {len(vx_profile)} vx); "
+                f"keeping the planner's own speeds for this path",
+                throttle_duration_sec=1.0)
+            self._vel_cache.pop(cache_key, None)          # never serve it from the cache
+            return
         for i in range(len(vx_profile)):
             wpnts_msg.wpnts[i].vx_mps = vx_profile[i]
         for i in range(len(ax_profile)):
@@ -1966,6 +1981,9 @@ class StateMachine(Node):
         loc_markers = MarkerArray()
         del_mrk = Marker()
         del_mrk.header.stamp = self.get_clock().now().to_msg()
+        # set always, so RViz does not drop the DELETEALL for an empty frame and leave the previous
+        # markers on screen -- the same reason it is set on the trailing/overtaking targets below
+        del_mrk.header.frame_id = "map"
         del_mrk.action = Marker.DELETEALL
         loc_markers.markers.append(del_mrk)
 
@@ -1976,6 +1994,14 @@ class StateMachine(Node):
 
         v_ref = max(float(getattr(self, "max_speed", 0.0) or 0.0), 1e-3)
         for i, wpnt in enumerate(loc_wpnts.wpnts):
+            # ONE bad pose makes RViz drop the WHOLE MarkerArray, which is indistinguishable from
+            # "the local waypoints vanished". Skip the point instead of losing the path.
+            if not (np.isfinite(wpnt.x_m) and np.isfinite(wpnt.y_m)):
+                self.get_logger().warn(
+                    f"[{self.name}] local waypoint {i} has a non-finite position; skipping it in "
+                    f"the marker array so the rest of the path still draws",
+                    throttle_duration_sec=2.0)
+                continue
             mrk = Marker()
             mrk.header.frame_id = "map"
             mrk.type = mrk.SPHERE
@@ -1991,7 +2017,7 @@ class StateMachine(Node):
             # exactly where the path slows, the trail appeared to switch off. The speed is still
             # there, as COLOUR: green = fast, red = slow, against the configured maximum.
             mrk.pose.position.z = 0.0
-            v = float(wpnt.vx_mps)
+            v = float(wpnt.vx_mps) if np.isfinite(wpnt.vx_mps) else 0.0
             f = float(np.clip(v / v_ref, 0.0, 1.0))
             mrk.color.g = f
             mrk.color.r = 1.0 - f
