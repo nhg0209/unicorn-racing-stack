@@ -332,6 +332,125 @@ def check_hold(maps, cfg_dir, wall_margin, fit_tol) -> bool:
     return ok
 
 
+# KINK gate. The offset profile d(s) is C2 by construction; the published line is d(s) laid on a
+# LATERAL BASIS, and an error in that basis is a kink nothing upstream can see. Two levels:
+#
+#  (1) THE BASIS ITSELF, which needs no solve. A correct normal field rotates at exactly the rate
+#      the line's own curvature demands: angle(n[i] -> n[i+1]) == kappa_clean * el. The residual is
+#      the artifact, in radians of basis error per station, and under half a metre of offset a
+#      milliradian is half a millimetre of lateral step.
+#  (2) THE PUBLISHED LINE, as a SPIKE: a one-station curvature outlier, i.e. kappa jumps and comes
+#      straight back (adjacent differences of opposite sign). A steep ramp -- however short its
+#      reach -- has consecutive differences of the SAME sign, so it scores zero here; that is the
+#      point, because a raw adjacent |dkappa| threshold cannot tell a 1.35 m-reach hump (which
+#      legitimately swings kappa by 0.47 per station) from a defect.
+#
+# Thresholds differ by case type, and deliberately:
+#   HOLD  -- one same-side excursion on a straight. Any spike there is a defect. Legitimate values
+#            measured at 0.022; the seam artifact measured 0.151.
+#   MULTI -- opposite-side slaloms whose humps sit in ifac's corners. A hump APEX there is a
+#            genuine symmetric dip in kappa (measured 0.31 at ifac 3x3.0/anchor 260, and it moves
+#            in BOTH directions with the basis because it is real geometry, not an artifact). So
+#            the MULTI bound only catches gross breakage; the basis check above is what actually
+#            guards these cases.
+KINK_BASIS_MAX_MRAD = 20.0     # per-station basis error [mrad]; pre-fix ifac 64.3, f 44.5
+KINK_SPIKE_HOLD = 0.05         # [1/m] one-station kappa outlier on a held line
+KINK_SPIKE_MULTI = 0.40        # [1/m] ...on a corner slalom, where an apex dip is real
+KINK_OFF_TOL_M = 0.02          # [m] deviation from the clean line that counts as "off-line"
+
+
+def _basis_residual(xy):
+    """|angle(n[i] -> n[i+1]) - kappa*el| per station [rad], for the basis the core lays on."""
+    nv = core._wrap_normals(xy)
+    dup = bool(np.allclose(xy[-1], xy[0]))
+    n = len(xy) - 1 if dup else len(xy)
+    a, b = nv[:n], np.roll(nv[:n], -1, axis=0)
+    rot = np.arctan2(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0], np.einsum("ij,ij->i", a, b))
+    u = xy[:n]
+    el = np.hypot(*(np.roll(u, -1, axis=0) - u).T)
+    return np.abs(rot - core._menger_kappa(u) * el)
+
+
+def _kappa_spike(traj, clean_xy):
+    """Worst one-station kappa outlier of the published line over its OFF-LINE stretch, in excess
+    of the nearest clean station's own. Returns (spike, n_off)."""
+    xy = np.asarray(traj)[:, 1:3]
+    j = np.argmin(((xy[:, None, :] - clean_xy[None, :, :]) ** 2).sum(-1), axis=1)
+    off = np.hypot(xy[:, 0] - clean_xy[j, 0], xy[:, 1] - clean_xy[j, 1]) > KINK_OFF_TOL_M
+    if not off.any():
+        return 0.0, 0
+
+    def sp(a):
+        dp = a - np.roll(a, 1)
+        dn = np.roll(a, -1) - a
+        return np.where((dp * dn) < 0, np.minimum(np.abs(dp), np.abs(dn)), 0.0)
+
+    ex = np.maximum(sp(core._menger_kappa(xy)) - sp(core._menger_kappa(clean_xy))[j], 0.0)
+    return float(ex[off].max()), int(off.sum())
+
+
+def _kink_solve(m, cfg_dir, wall_margin, fit_tol, anchor, n_obs, gap_m, same_side):
+    """One case, built exactly as the multi/hold gates build theirs."""
+    xy = m["xy"]
+    nvec = core._wrap_normals(xy)
+    hi = np.maximum(core._cyclic_smooth(m["dr"] - 0.15 - wall_margin, 7), 0.0)
+    lo = np.minimum(core._cyclic_smooth(-(m["dl"] - 0.15 - wall_margin), 7), 0.0)
+    seg = np.roll(xy, -1, axis=0) - xy
+    el = np.hypot(seg[:, 0], seg[:, 1])
+    step = int(round(gap_m / max(float(np.mean(el)), 1e-6)))
+    side0 = 1.0 if hi[anchor] >= -lo[anchor] else -1.0
+    apexes, obstacles = [], []
+    for k in range(n_obs):
+        i = (anchor + k * step) % (len(xy) - 1)
+        side = side0 if same_side else (1.0 if hi[i] >= -lo[i] else -1.0)
+        apexes.append(tuple(xy[i] + side * APEX_OFFSET_M * nvec[i]))
+        obstacles.append((float(xy[i][0]), float(xy[i][1]), OBS_RADIUS_M))
+    return core.reoptimize_local_window(
+        xy, m["dr"], m["dl"], m["reftrack"], apexes, cfg_dir,
+        params=core.ModulationParams(obs_margin=OBS_MARGIN_M),
+        w_veh=0.30, clean_vx=m["vx"], wall_margin=wall_margin,
+        reach_time=0.0, reach_min=1.0, reach_max=6.0, clean_kappa=m["kappa"],
+        fit_tol=fit_tol, apex_obstacles=obstacles)
+
+
+def check_kinks(maps, cfg_dir, wall_margin, fit_tol) -> bool:
+    ok = True
+    print("\n--- kink gate: lateral basis, and one-station curvature outliers on the laid line ---")
+    print("  basis residual |rot(n) - kappa*el| per station [mrad]")
+    for name, m in maps.items():
+        r = _basis_residual(m["xy"]) * 1e3
+        print(f"    {name:5s} | med {np.median(r):6.2f} | p99 {np.percentile(r, 99):7.2f} | "
+              f"MAX {r.max():7.2f} | bar {KINK_BASIS_MAX_MRAD:.1f}")
+        if r.max() > KINK_BASIS_MAX_MRAD:
+            ok = False
+            print(f"    FAIL: the lateral basis is off by {r.max():.1f} mrad at one station. The "
+                  f"offset is laid in this coordinate and every downstream check is measured in "
+                  f"it, so under half a metre of offset that is a {0.5 * r.max():.1f} mm lateral "
+                  f"step -- a kink in a line whose d(s) is perfectly C2.")
+    print("  laid-line spikes (one-station kappa outlier over the off-line stretch)")
+    print("    case                  | laid | spike  | bar   | n_off")
+    cases = [("MULTI", "ifac", MULTI_ANCHORS[0], c["n"], c["gap_m"], False)
+             for c in MULTI_CASES if c["map"] == "ifac"]
+    cases += [("MULTI", "f", MULTI_ANCHORS[0], c["n"], c["gap_m"], False)
+              for c in MULTI_CASES if c["map"] == "f"]
+    cases += [("HOLD", "ifac", HOLD_ANCHOR, 2, g, True) for g in HOLD_GAPS_M]
+    for kind, name, anchor, n_obs, gap_m, same in cases:
+        m = maps.get(name)
+        if m is None:
+            continue
+        res = _kink_solve(m, cfg_dir, wall_margin, fit_tol, anchor, n_obs, gap_m, same)
+        spike, n_off = _kappa_spike(res["main"][0], m["xy"])
+        bar = KINK_SPIKE_HOLD if kind == "HOLD" else KINK_SPIKE_MULTI
+        label = f"{kind} {name} {n_obs}x{gap_m:.1f}@{anchor}"
+        print(f"    {label:21s} | {res['n_windows']:4d} | {spike:6.3f} | {bar:5.2f} | {n_off:5d}")
+        if spike > bar:
+            ok = False
+            print(f"    FAIL: kappa jumps by {spike:.3f} 1/m at ONE station and comes straight "
+                  f"back. A ramp -- however short its reach -- moves kappa monotonically; an "
+                  f"outlier is the lateral basis stepping, not the line turning.")
+    return ok
+
+
 # SEAM case. Everything in this pipeline is indexed from s = 0, and a hump centred 0.6 m before
 # the seam has most of its body on the OTHER side of that index. The stationwise sweep above steps
 # past the seam by construction (step 11 -> the last visited waypoint is up to a metre short of it)
@@ -559,6 +678,8 @@ def main() -> int:
         if not check_seam(loaded, cfg_dir, args.wall_margin[0], args.fit_tol[0]):
             ok = False
         if not check_hold(loaded, cfg_dir, args.wall_margin[0], args.fit_tol[0]):
+            ok = False
+        if not check_kinks(loaded, cfg_dir, args.wall_margin[0], args.fit_tol[0]):
             ok = False
         if not args.enforce_laptime:
             print("\n  NOTE: the lap-loss budget above is REPORTED, not enforced (--enforce-laptime\n"
