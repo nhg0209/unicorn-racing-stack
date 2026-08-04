@@ -173,6 +173,29 @@ _WEAVE_MAX_PASSES = 6
 # map f dropped with reason 'clearance' at a reported clear of 0.350 inside a 1.0-1.9 m corridor,
 # purely on that comparison. A micrometre is far below anything the margin chain cares about.
 _CLEAR_EPS = 1e-6
+# Step of the clearance RELAX LADDER. When a hump cannot be laid at obs_margin on either side, the
+# floor is walked down to `relax_floor` (the reactive keep-out) in steps of this size before the
+# obstacle is given up on. Below obs_margin the global line stops RELIEVING the reactive layer of
+# that box, but it still clears it by what the reactive planner would itself have driven -- which
+# is strictly better than not covering it at all, and the floor actually achieved travels with the
+# hump so the publish veto and the drift trigger judge it by what it promised rather than by what
+# was originally asked for.
+_RELAX_STEP = 0.03
+
+
+def _relax_ladder(need: float, floor: float, step: float = _RELAX_STEP) -> List[float]:
+    """Descending clearance floors from `need` down to `floor`, inclusive."""
+    need, floor = float(need), float(floor)
+    # floor <= 0 means the caller did not ask for a ladder at all (the default), not "relax to
+    # nothing" -- walking down to zero clearance would be the opposite of the intent.
+    if floor <= 0.0 or not (floor < need - 1e-9):
+        return [need]
+    out, v = [need], need
+    while v - step > floor + 1e-9:
+        v -= step
+        out.append(v)
+    out.append(floor)
+    return out
 
 # Peak |d''| of the C2 quintic hump in closed form: for d(u) = A*(10t^3 - 15t^4 + 6t^5),
 # t = u/r, the extrema of d'' sit at t = (1 +- 1/sqrt(3))/2 and give |d''|max = (10/sqrt(3))*|A|/r^2.
@@ -678,7 +701,8 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                          clean_kappa: Optional[np.ndarray] = None,
                          curvlim: float = 0.0,
                          obstacles: Optional[List[Optional[Tuple[float, float, float]]]] = None,
-                         obs_margin: float = 0.0
+                         obs_margin: float = 0.0,
+                         relax_floor: float = 0.0
                          ) -> Tuple[np.ndarray, int, float, list, list]:
     """Lateral offset d(s) on the CLOSED clean loop that PRESERVES each recorded reactive apex
     but re-grows long, gentle entry/exit ramps — the "keep the apex, press the secondary apexes"
@@ -766,7 +790,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         # The recorded apex keeps two jobs it is uniquely good at: it says which SIDE the obstacle
         # was passed on (a decision that needs the corridor and the grid, which this function does
         # not have), and it is standing evidence that a path on that side is drivable.
-        d_target = d_star
+        d_target, d_obs = d_star, None
         if ob is not None and obs_margin > 0.0:
             j = int(np.argmin(np.hypot(clean_xy[:, 0] - ob[0], clean_xy[:, 1] - ob[1])))
             d_obs = float((np.array([ob[0], ob[1]], float) - clean_xy[j]) @ nvec_rl[j])
@@ -785,7 +809,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         # k_i is the index into `apexes`/`obstacles`: the caller's handle on WHICH obstacle
         # this hump belongs to. Reported back in `laid`/`dropped` so the node can match by
         # identity instead of by proximity -- see _check_line_clearance.
-        knots.append((float(s_loop[i]), d_target, R, R, xa, ya, ob, k_i))  # symmetric ramps
+        knots.append((float(s_loop[i]), d_target, R, R, xa, ya, ob, k_i, d_obs))  # symmetric
     if not knots:
         return d_global, 0, 0.0, [], []
 
@@ -804,8 +828,8 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
     # Between two apexes whose ramps OVERLAP we weave straight apex->apex (no return-to-0 knot);
     # otherwise each hump opens from and closes back to the raceline. `zero` = [d,d',d''] all 0.
     zero = [0.0, 0.0, 0.0]
-    kn_u = sorted((((c - s_cut) % track_len, d, ri, ro, xa, ya, ob, ki)
-                   for (c, d, ri, ro, xa, ya, ob, ki) in knots), key=lambda k: k[0])
+    kn_u = sorted((((c - s_cut) % track_len, d, ri, ro, xa, ya, ob, ki, dob)
+                   for (c, d, ri, ro, xa, ya, ob, ki, dob) in knots), key=lambda k: k[0])
     dropped: List[dict] = []
     laid: List[dict] = []
     # --- FIT each hump to the corridor (shrink reach, NEVER the clearance) BEFORE laying it ----
@@ -890,15 +914,16 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             pts = clean_xy + v[:, None] * nvec_rl
             return float(np.min(np.hypot(pts[:, 0] - ob[0], pts[:, 1] - ob[1]))) - float(ob[2])
 
-        def _accepts(d_now, d_want, ob, u_c, r_i, r_o):
+        def _accepts(d_now, d_want, ob, u_c, r_i, r_o, need=None):
             """Is this hump good enough to lay? (ok, clearance_or_None).
 
             With obstacle geometry the bar is ABSOLUTE: the laid line must clear the box edge by
             obs_margin. Without it, fall back to the amplitude-ratio proxy (offline sweeps, and
             the `global` re-opt method, have no per-apex box to measure against)."""
-            if need_clear > 0.0 and ob is not None:
+            need = need_clear if need is None else float(need)
+            if need > 0.0 and ob is not None:
                 gap = _clearance(u_c, d_now, r_i, r_o, ob)
-                return gap >= need_clear - _CLEAR_EPS, gap
+                return gap >= need - _CLEAR_EPS, gap
             return abs(d_now) >= max(0.03, _APEX_KEEP_FRAC * abs(d_want)), None
 
         def _kappa_allow(u_c, r):
@@ -911,82 +936,119 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             return max(curvlim, kc)
 
         fitted = []
-        for (u, d, ri, ro, xa, ya, ob, k_i) in kn_u:
+        for (u, d, ri, ro, xa, ya, ob, k_i, d_obs) in kn_u:
             r_req = max(ri, ro)
-            d_f, r_f = _fit_hump_to_corridor(u_all, u, d, r_req, track_len,
-                                             hi_a, lo_a, floor_r, fit_tol=fit_tol)
-            ok, gap = _accepts(d_f, d, ob, u, r_f, r_f)
-            if not ok and gap is not None:
-                # ONE retry, at the amplitude that WOULD reach the floor. The obstacle-derived
-                # target is the LATERAL offset that clears the box; the floor is a 2-D distance, so
-                # on a curving line the first attempt can land just under it and asking for the
-                # deficit recovers it. The reach is asked for at r_req again — a wider hump is
-                # gentler AND keeps the line away from the box for longer, so it can only help.
-                d_want = math.copysign(abs(d_f) + (need_clear - gap), d)
-                d_r, r_r = _fit_hump_to_corridor(u_all, u, d_want, r_req, track_len,
+
+            def _attempt(d_aim, need_try):
+                """Fit and judge ONE (side, clearance floor) combination.
+
+                Returns (accepted_or_None, last_amplitude, last_gap, reason). Everything the old
+                straight-line body did -- corridor fit, widen-once, curvature grow/shave -- happens
+                here, so every rung of the ladder below is judged by exactly the same rules."""
+                d_f, r_f = _fit_hump_to_corridor(u_all, u, d_aim, r_req, track_len,
                                                  hi_a, lo_a, floor_r, fit_tol=fit_tol)
-                ok_r, gap_r = _accepts(d_r, d, ob, u, r_r, r_r)
-                if ok_r:
-                    ok, d_f, r_f, gap = True, d_r, r_r, gap_r
-            if not ok:
-                rec = {"xy": (float(xa), float(ya)), "want": float(d), "fit": float(d_f),
-                       "obs_i": k_i,
-                       "reason": "clearance" if gap is not None else "corridor"}
-                if gap is not None:
-                    rec["clear"], rec["need"] = float(gap), need_clear
+                ok, gap = _accepts(d_f, d_aim, ob, u, r_f, r_f, need_try)
+                if not ok and gap is not None:
+                    # ONE widen retry, at the amplitude that WOULD reach the floor. The
+                    # obstacle-derived target is a LATERAL offset while the floor is a 2-D distance,
+                    # so on a curving line the first attempt lands just under it by construction.
+                    d_want = math.copysign(abs(d_f) + (need_try - gap), d_aim)
+                    d_r, r_r = _fit_hump_to_corridor(u_all, u, d_want, r_req, track_len,
+                                                     hi_a, lo_a, floor_r, fit_tol=fit_tol)
+                    ok_r, gap_r = _accepts(d_r, d_aim, ob, u, r_r, r_r, need_try)
+                    if ok_r:
+                        ok, d_f, r_f, gap = True, d_r, r_r, gap_r
+                if not ok:
+                    return None, d_f, gap, ("clearance" if gap is not None else "corridor")
+                # --- HARD curvature limit ---------------------------------------------------
+                # r_min is closed-form, so this costs no search. Widen first (free in curvature
+                # terms, ~0.08 m of extra arc), and only shave the proven clearance if the
+                # corridor refuses.
+                if curvlim > 0.0 and abs(d_f) > 1e-9:
+                    for _ in range(3):              # budget depends on the span -> re-converge
+                        budget = _kappa_budget(u, r_f)
+                        r_min = math.sqrt(_KAPPA_QUINTIC_C * abs(d_f) / budget)
+                        if r_min <= r_f + 1e-6:
+                            break
+                        # The corridor fit already returned the LARGEST feasible reach <= r_req, so
+                        # growing is only possible when it did not bite (r_f == r_req).
+                        r_top = min(r_min, r_grow_cap)
+                        if r_f >= r_req - 1e-9 and r_top > r_f:
+                            if _fits(u, r_top, d_f):
+                                r_f = r_top
+                            else:                    # largest feasible reach in (r_f, r_top]
+                                lo_g, hi_g = r_f, r_top
+                                for _ in range(20):
+                                    mid = 0.5 * (lo_g + hi_g)
+                                    if _fits(u, mid, d_f):
+                                        lo_g = mid
+                                    else:
+                                        hi_g = mid
+                                r_f = lo_g
+                        else:
+                            break
+                    # VERDICT on the actual laid curvature (the floor above may have let r_f through).
+                    allow = _kappa_allow(u, r_f)
+                    if _kappa_peak(u, d_f, r_f, r_f) > allow:
+                        # Shave the amplitude to whatever the curvature bar admits at this reach.
+                        # Bisection, not the closed form: with the signed sum the peak is not
+                        # exactly C*|A|/r^2 near a corner, and this lands on the true boundary.
+                        lo_k, hi_k = 0.0, abs(d_f)
+                        for _ in range(20):
+                            mid = 0.5 * (lo_k + hi_k)
+                            if _kappa_peak(u, math.copysign(mid, d_f), r_f, r_f) <= allow:
+                                lo_k = mid
+                            else:
+                                hi_k = mid
+                        d_f = math.copysign(lo_k, d_f)
+                        # No widen retry here: the amplitude was shaved BECAUSE the curvature bar
+                        # was hit, so asking for more at this reach fails the same bar again.
+                        ok, gap = _accepts(d_f, d_aim, ob, u, r_f, r_f, need_try)
+                        if not ok:
+                            return None, d_f, gap, "curvature"
+                return (d_f, r_f), d_f, gap, None
+
+            # --- COVERAGE LADDER --------------------------------------------------------------
+            # One geometry used to get one chance, and a hump that missed it was handed to the
+            # reactive layer. Two cheap alternatives are tried first, in the order that gives up
+            # the least:
+            #   1. the OTHER SIDE of the same box. The side comes from the recorded reactive apex,
+            #      which is evidence that a side is drivable -- not evidence that it is the only
+            #      one, and not evidence about THIS line's corridor, which the re-opt hump lives in
+            #      and the reactive path did not. Measured on ifac: the apex side alone is feasible
+            #      at 43-49% of stations, either side at 85%.
+            #   2. a REDUCED clearance floor, down to the reactive keep-out. Below obs_margin the
+            #      global line no longer relieves the reactive layer of that box, but it still
+            #      clears it by what the reactive planner itself would have driven -- strictly
+            #      better than dropping the obstacle, and the floor actually achieved is recorded
+            #      so the publish veto and the drift trigger judge it by what it promised.
+            # Only reached when the primary attempt fails, so the common path costs nothing.
+            aims = [d]
+            if ob is not None and d_obs is not None:
+                d_opp = 2.0 * float(d_obs) - d          # mirror of the target about the box centre
+                if abs(d_opp) >= 0.03:
+                    aims.append(d_opp)
+            needs = (_relax_ladder(need_clear, relax_floor)
+                     if (need_clear > 0.0 and ob is not None) else [need_clear])
+            chosen, last_d, last_gap, last_why = None, 0.0, None, "corridor"
+            for need_try in needs:
+                for d_aim in aims:
+                    res, last_d, last_gap, why = _attempt(d_aim, need_try)
+                    if res is not None:
+                        chosen = (res[0], res[1], last_gap, need_try, d_aim)
+                        break
+                    last_why = why
+                if chosen is not None:
+                    break
+            if chosen is None:
+                rec = {"xy": (float(xa), float(ya)), "want": float(d), "fit": float(last_d),
+                       "obs_i": k_i, "reason": last_why}
+                if last_gap is not None:
+                    rec["clear"], rec["need"] = float(last_gap), need_clear
                 dropped.append(rec)
                 continue
-            # --- HARD curvature limit -------------------------------------------------------
-            # r_min is closed-form, so this costs no search. Widen first (free in curvature terms,
-            # ~0.08 m of extra arc), and only shave the proven clearance if the corridor refuses.
-            if curvlim > 0.0 and abs(d_f) > 1e-9:
-                for _ in range(3):                      # budget depends on the span -> re-converge
-                    budget = _kappa_budget(u, r_f)
-                    r_min = math.sqrt(_KAPPA_QUINTIC_C * abs(d_f) / budget)
-                    if r_min <= r_f + 1e-6:
-                        break
-                    # The corridor fit already returned the LARGEST feasible reach <= r_req, so
-                    # growing is only possible when it did not bite (r_f == r_req).
-                    r_top = min(r_min, r_grow_cap)
-                    if r_f >= r_req - 1e-9 and r_top > r_f:
-                        if _fits(u, r_top, d_f):
-                            r_f = r_top
-                        else:                            # largest feasible reach in (r_f, r_top]
-                            lo_g, hi_g = r_f, r_top
-                            for _ in range(20):
-                                mid = 0.5 * (lo_g + hi_g)
-                                if _fits(u, mid, d_f):
-                                    lo_g = mid
-                                else:
-                                    hi_g = mid
-                            r_f = lo_g
-                    else:
-                        break
-                # VERDICT on the actual laid curvature (the floor above may have let r_f through).
-                allow = _kappa_allow(u, r_f)
-                if _kappa_peak(u, d_f, r_f, r_f) > allow:
-                    # Shave the amplitude to whatever the curvature bar admits at this reach.
-                    # Bisection, not the closed form: with the signed sum the peak is not exactly
-                    # C*|A|/r^2 near a corner, and this lands on the true boundary either way.
-                    lo_k, hi_k = 0.0, abs(d_f)
-                    for _ in range(20):
-                        mid = 0.5 * (lo_k + hi_k)
-                        if _kappa_peak(u, math.copysign(mid, d_f), r_f, r_f) <= allow:
-                            lo_k = mid
-                        else:
-                            hi_k = mid
-                    d_f = math.copysign(lo_k, d_f)
-                    # No retry here: the amplitude was shaved BECAUSE the curvature bar was hit,
-                    # so asking for more of it at this reach only fails the same bar again. The
-                    # reach was already grown as far as the corridor allows above.
-                    ok, gap = _accepts(d_f, d, ob, u, r_f, r_f)
-                    if not ok:
-                        rec = {"xy": (float(xa), float(ya)), "want": float(d),
-                               "fit": float(d_f), "obs_i": k_i, "reason": "curvature"}
-                        if gap is not None:
-                            rec["clear"], rec["need"] = float(gap), need_clear
-                        dropped.append(rec)
-                        continue
+            d_f, r_f, gap_used, floor_used, d_used = chosen
+
             # ENTRY/EXIT ramps may be stretched independently of the lap-time-optimal reach:
             # a longer ramp cuts the merge-zone curvature (the S-shaped inflection where the
             # hump joins the raceline — it cannot be removed, only made shallower).
@@ -1018,6 +1080,8 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             fitted.append((u, d_f, r_in, r_out, r_f))    # r_f = pre-stretch reach (budget recovery)
             laid.append({"xy": (float(xa), float(ya)), "want": float(d), "laid": float(d_f),
                          "obs_i": k_i,
+                         "floor": float(floor_used),   # the clearance this hump was ACCEPTED at
+                         "flipped": bool(d_used is not d and abs(d_used - d) > 1e-9),
                          "r_in": float(r_in), "r_out": float(r_out), "r_req": float(r_req),
                          "kappa_peak": 0.0,        # filled from the laid profile below
                          "clear": float("nan"),    # ditto — measured on the WOVEN profile
@@ -1047,7 +1111,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         kn_u = sorted((u, d, ri, ro) for (u, d, ri, ro, _rf) in fitted)
         verify_ctx = (hi_a, lo_a, kap_geo, floor_r)
     else:
-        kn_u = [(u, d, ri, ro) for (u, d, ri, ro, _xa, _ya, _ob, _ki) in kn_u]   # no corridor: keep all
+        kn_u = [(u, d, ri, ro) for (u, d, ri, ro, _xa, _ya, _ob, _ki, _do) in kn_u]  # no corridor
         verify_ctx = None
 
     u_stn = (s_loop - s_cut) % track_len
@@ -1494,6 +1558,7 @@ def _reopt_local_window_impl(
     clean_kappa: Optional[np.ndarray] = None,
     fit_tol: float = _FIT_TOL_DEFAULT,
     apex_obstacles: Optional[List[Optional[Tuple[float, float, float]]]] = None,
+    relax_floor: float = 0.0,
 ) -> dict:
     """Fast ONLINE obstacle-aware raceline: reshape the REACTIVE avoidance spline into a global
     line. Each `apex` (map-frame (x,y) captured from the reactive spliner on the exploration lap)
@@ -1599,7 +1664,8 @@ def _reopt_local_window_impl(
             clean_vx_arr, 0.0, r, r, hi_inc=hi_inc, lo_inc=lo_inc,
             entry_scale=e_scale, exit_scale=x_scale,
             fit_tol=fit_tol, clean_kappa=clean_kappa, curvlim=curvlim,
-            obstacles=apex_obstacles, obs_margin=params.obs_margin)
+            obstacles=apex_obstacles, obs_margin=params.obs_margin,
+            relax_floor=relax_floor)
         if nn == 0:
             return dg, 0, float("inf"), ek, drp, lay
         est = _offset_lap_time(dg, clean_xy, nvec_rl, el_cl,

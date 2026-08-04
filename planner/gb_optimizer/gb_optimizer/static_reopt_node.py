@@ -69,12 +69,12 @@ class _Bundle:
         "cent_wpnts", "cent_markers",
         "glb_wpnts", "glb_markers",
         "sp_wpnts", "sp_markers",
-        "trackbounds", "n_apex", "clearance_ok", "clearance_by_key",
+        "trackbounds", "n_apex", "clearance_ok", "clearance_by_key", "floor_by_key",
     )
 
     def __init__(self, map_info, est_lap_time, cent_wpnts, cent_markers,
                  glb_wpnts, glb_markers, sp_wpnts, sp_markers, trackbounds, n_apex=0,
-                 clearance_ok=True, clearance_by_key=None):
+                 clearance_ok=True, clearance_by_key=None, floor_by_key=None):
         # n_apex = humps ACTUALLY laid into this line. 0 means the geometry is the clean raceline
         # even if obstacles were passed in (no apex recorded, or the corridor could not hold it).
         self.n_apex = n_apex
@@ -86,6 +86,9 @@ class _Bundle:
         # built from. The baseline the drift trigger compares live positions against, so it must
         # travel with the line rather than with the node (see _clearance_drifted).
         self.clearance_by_key = clearance_by_key or {}
+        # floor_by_key = the clearance each LAID hump was accepted at (the coverage
+        # ladder may settle below obs_margin). What the line promised for that box.
+        self.floor_by_key = floor_by_key or {}
         self.map_info = map_info
         self.est_lap_time = est_lap_time
         self.cent_wpnts = cent_wpnts
@@ -111,6 +114,13 @@ class StaticReoptNode(Node):
         # inside the reactive planner's own keep-out and gets re-avoided every lap. Verify with
         # stack_master/scripts/check_avoidance_margins.py after tuning either side.
         self.declare_parameter("obs_margin", 0.35)
+        # [m] lowest clearance a hump may be ACCEPTED at when obs_margin is unreachable on either
+        # side (see the coverage ladder in static_reopt_core.build_offset_profile). Set at the
+        # REACTIVE keep-out (width_car/2 + safety_margin): below obs_margin the global line stops
+        # relieving the reactive layer of that box, but down to here it still clears it by what the
+        # reactive planner would itself have driven -- strictly better than not covering it. Set
+        # equal to obs_margin to disable the ladder.
+        self.declare_parameter("relax_floor", 0.30)
         self.declare_parameter("default_obs_radius", 0.15)
         self.declare_parameter("republish_period", 1.0)     # [s] keep-alive republish
         # `update_map` re-notify period. MUST stay below sector_tuner's 0.5 s scale timer so a
@@ -166,6 +176,7 @@ class StaticReoptNode(Node):
         self.safety_width = float(self.get_parameter("safety_width").value)
         self.safety_width_sp = float(self.get_parameter("safety_width_sp").value)
         self.obs_margin = float(self.get_parameter("obs_margin").value)
+        self.relax_floor = float(self.get_parameter("relax_floor").value)
         self.default_obs_radius = float(self.get_parameter("default_obs_radius").value)
         self.republish_period = float(self.get_parameter("republish_period").value)
         self.notify_period = float(self.get_parameter("notify_period").value)
@@ -372,7 +383,7 @@ class StaticReoptNode(Node):
                 for o in obstacles]
 
     def _check_line_clearance(self, traj, obstacles: List[core.Obstacle], laid: List[dict],
-                              apex_obs: List[core.Obstacle] = None) -> bool:
+                              apex_obs: List[core.Obstacle] = None, floors: dict = None) -> bool:
         """Measure what the line ACTUALLY clears, in the map frame, and VETO it if it does not.
 
         Everything upstream reports intent -- "2/2 obstacle apex(es) reshaped" is printed whether
@@ -401,7 +412,9 @@ class StaticReoptNode(Node):
             if traj is None or len(traj) == 0 or not obstacles:
                 return True
             gaps = self._line_clearances(traj, obstacles)
-            bad = [(o, d) for o, d in zip(obstacles, gaps) if d < self.obs_margin]
+            floors = floors or {}
+            bad = [(o, d) for o, d in zip(obstacles, gaps)
+                   if d < floors.get(id(o), self.obs_margin)]
             apex_obs = apex_obs or []
             laid_obs = [apex_obs[a["obs_i"]] for a in (laid or [])
                         if a.get("obs_i") is not None and a["obs_i"] < len(apex_obs)]
@@ -427,10 +440,12 @@ class StaticReoptNode(Node):
                     f"line (need >= {self.obs_margin:.2f} m): {det}. No hump was laid for them — "
                     f"the reactive layer keeps handling those, as designed")
                 return True
-            det_b = "; ".join(f"@({o.x:.2f},{o.y:.2f}) r={o.r:.2f} -> {d:+.2f} m" for o, d in broken)
+            det_b = "; ".join(f"@({o.x:.2f},{o.y:.2f}) r={o.r:.2f} -> {d:+.2f} m "
+                              f"(promised {floors.get(id(o), self.obs_margin):.2f})"
+                              for o, d in broken)
             self.get_logger().error(
                 f"[static_reopt] REFUSING to publish: {len(broken)} obstacle(s) the re-opt claims "
-                f"to have reshaped are cleared by less than obs_margin {self.obs_margin:.2f} m: "
+                f"to have reshaped are cleared by less than the floor they were accepted at: "
                 f"{det_b}. Keeping the previous line — check the recorded apex and "
                 f"reopt_wall_margin / reopt_fit_tol")
             return False
@@ -458,7 +473,7 @@ class StaticReoptNode(Node):
                 w_veh=self.qp_veh_width, clean_vx=self._clean_vx, wall_margin=self.wall_margin,
                 reach_time=self.reach_time, reach_min=self.reach_min, reach_max=self.reach_max,
                 clean_kappa=self._clean_kappa, fit_tol=self.fit_tol,
-                apex_obstacles=apex_obs)
+                apex_obstacles=apex_obs, relax_floor=self.relax_floor)
         else:
             # Legacy whole-track mincurv_iqp (offline-grade; minutes/solve).
             res = core.reoptimize_with_obstacles(
@@ -485,6 +500,7 @@ class StaticReoptNode(Node):
         info = String()
         clearance_ok = True                 # `global` method: no per-apex geometry to check
         clearance_by_key = {}
+        floor_by_key = {}
         if self.reopt_method == "local_window":
             n_ap = res.get("n_windows", 0)
             dropped = res.get("apex_dropped", [])
@@ -539,8 +555,25 @@ class StaticReoptNode(Node):
                 self.get_logger().warning(
                     f"[static_reopt] {n_no_apex} obstacle(s) had no recorded reactive apex yet — "
                     f"the reactive static-avoidance layer handles them until an apex is captured")
+            # The floor each hump was ACCEPTED at travels with the bundle: the coverage ladder can
+            # settle below obs_margin, and judging such a hump against obs_margin afterwards would
+            # veto exactly the coverage the ladder just bought. Built BEFORE the veto so the veto
+            # holds every hump to what it actually promised.
+            obs_key = {id(o): k for o, k in zip(obstacles,
+                                                self._keys_for(obstacles, self._obs_ids))}
+            floors_by_id = {}
+            for a in res.get("apex_laid", []):
+                i_a = a.get("obs_i")
+                if i_a is None or i_a >= len(pairs):
+                    continue
+                o_a = pairs[i_a][1]
+                floors_by_id[id(o_a)] = float(a.get("floor", self.obs_margin))
+                k = obs_key.get(id(o_a))
+                if k is not None:
+                    floor_by_key[k] = floors_by_id[id(o_a)]
             clearance_ok = self._check_line_clearance(traj, obstacles, res.get("apex_laid", []),
-                                                      apex_obs=[o for _xy, o in pairs])
+                                                      apex_obs=[o for _xy, o in pairs],
+                                                      floors=floors_by_id)
             # Baseline for the drift trigger: what THIS line clears each box by, at the positions
             # it was built from. Travels with the bundle so the comparison is always against the
             # line that is actually active (a pending bundle may never commit).
@@ -557,7 +590,7 @@ class StaticReoptNode(Node):
                        self.clean_bundle.cent_wpnts, self.clean_bundle.cent_markers,
                        glb_w, glb_m, sp_w, sp_m, self.clean_bundle.trackbounds,
                        n_apex=int(res.get("n_windows", 0)), clearance_ok=clearance_ok,
-                       clearance_by_key=clearance_by_key)
+                       clearance_by_key=clearance_by_key, floor_by_key=floor_by_key)
 
     # ----------------------------------------------------------------------------------
     # obstacle input: COLLECT only (batch re-opt happens at the start/finish crossing)
