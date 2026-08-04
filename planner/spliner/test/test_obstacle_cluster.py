@@ -199,6 +199,52 @@ def test_bulge_rule_is_relative_to_the_obstacle():
     print("PASS the bulge is measured from the obstacle, not from d = 0")
 
 
+class BodyGrid:
+    """A GridFilter-shaped body image for this synthetic track: free only where |y| <= limit.
+
+    The harness converter maps (s, d) -> (x = s, y = d), so this is "the car body fits only within
+    +-limit of the raceline" — the same question _path_body_unsafe asks of the real eroded map.
+    """
+
+    def __init__(self, limit, res=0.05):
+        self.resolution = res
+        self.origin = (-1.0, -3.0)
+        w = int((TRACK_LEN + 2.0) / res)
+        h = int(6.0 / res)
+        y = (np.arange(h) + 0.5) * res + self.origin[1]
+        self.eroded_image = np.where(np.abs(y)[:, None] <= limit, 255, 0).astype(np.uint8) \
+            * np.ones((1, w), dtype=np.uint8)
+
+
+def test_squeeze_cannot_relax_the_body_floor():
+    # The squeeze pass gives up safety_margin and wall_margin -- clearance ON TOP of the car's own
+    # width. The body floor IS that width, so relaxing it would not buy a tighter pass, it would
+    # buy a collision. This pins that the squeeze retry is checked against the same body image as
+    # the full-margin pass: the section below is passable ONLY at reduced margins, and stops being
+    # passable at all once the body floor says the car does not fit there.
+    o = box(9.0, -0.20, oid=1)                   # keep-out [-0.65, +0.25] at the design margin
+    def narrow_planner():
+        n = planner([o])
+        n.wall_margin, n.squeeze_enable, n.cur_vs = 0.10, True, 1.0
+        return n
+    n = narrow_planner()
+    w = plan(n, 0.45)                            # too tight at the design margins
+    assert w.wpnts and w.ot_line == "squeeze", \
+        "the harness must reproduce a section that only the squeeze pass can pass"
+    peak = max(abs(x.d_m) for x in w.wpnts)
+    n2 = narrow_planner()
+    n2.body_filter = BodyGrid(limit=peak - 0.02)  # the squeezed line does not fit the body floor
+    w2 = plan(n2, 0.45)
+    assert not w2.wpnts and n2.feasible[-1] is False, \
+        "the squeeze pass must NOT be able to publish a path the car body does not fit on"
+    # ...and the floor is what did it: widen the floor past the squeezed line and it returns
+    n3 = narrow_planner()
+    n3.body_filter = BodyGrid(limit=peak + 0.10)
+    w3 = plan(n3, 0.45)
+    assert w3.wpnts and w3.ot_line == "squeeze", "a body floor with room must not block the pass"
+    print(f"PASS the squeeze pass cannot relax the body floor (squeezed peak {peak:.2f} m)")
+
+
 def test_apex_bulge_is_clipped_to_the_corridor():
     # apex_bulge pushes the peak FURTHER from the box than the pass offset needs -- a deliberate
     # extra swing. On a wide track that is free; on a narrow one it put the peak at the sampling
@@ -251,5 +297,6 @@ if __name__ == "__main__":
     test_offcentre_box_bulges_away_from_it()
     test_bulge_rule_is_relative_to_the_obstacle()
     test_apex_bulge_is_clipped_to_the_corridor()
+    test_squeeze_cannot_relax_the_body_floor()
     test_already_cleared_box_does_not_spend_a_knot()
     print("ALL PASS")

@@ -58,6 +58,12 @@ static_avoidance_planner:
     # The result is MARKED (ot_line = "squeeze") and the state machine caps its speed at
     # squeeze_speed_cap_mps -- the planner cannot enforce that itself, the SM owns the velocity
     # profile of every path it receives.
+    # The squeeze may give up the two clearances below -- reserve ON TOP of the car's own width --
+    # and NOTHING else. In particular it cannot relax the body floor (body_kernel_size): that floor
+    # IS the car's width, so relaxing it would not buy a tighter pass, it would buy a collision.
+    # Structurally it cannot: a squeeze retry re-enters the planner with new safety_margin /
+    # wall_margin scalars only, and every candidate of every pass is checked against the same body
+    # image. A section too narrow for the body floor has no answer here and TRAILING is the right one.
     squeeze_enable: true
     squeeze_steps: 2            # attempts between the design margin and the floor (linear)
     squeeze_safety_floor_m: 0.05  # [m] tightest obstacle clearance the pass may ask for

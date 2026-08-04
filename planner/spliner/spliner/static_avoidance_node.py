@@ -167,6 +167,15 @@ class ObstacleSpliner(Node):
         # because trading clearance for motion only makes sense where a mis-clearance is survivable,
         # and marked on the published path (ot_line = "squeeze") so the SM caps the speed it is
         # driven at rather than the planner silently issuing a normal-looking path.
+        #
+        # WHAT THE SQUEEZE MAY NOT TOUCH: the BODY floor (body_kernel_size / _path_body_unsafe).
+        # The two numbers below are clearances the car could give up and still fit -- reserve on top
+        # of its own width. The body floor is the width itself, so relaxing it does not buy a
+        # tighter pass, it buys a collision. Structurally it cannot be relaxed either: the squeeze
+        # re-enters do_spline with new safety_margin/wall_margin scalars and nothing else, while the
+        # body image is eroded once from body_kernel_size and read by the same check on every
+        # candidate of every pass. A section too narrow for the body floor has no answer here, and
+        # TRAILING is the correct one.
         self.squeeze_enable = True
         self.squeeze_steps = 2            # reduced-margin attempts between the design value and the floor
         self.squeeze_safety_floor_m = 0.05  # [m] tightest obstacle clearance the pass may ask for
