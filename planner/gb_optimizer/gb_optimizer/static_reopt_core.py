@@ -171,6 +171,27 @@ _SPAN_OVER_PENALTY_S_PER_M = 1.0
 _DROP_PENALTY_S = 10.0
 
 
+def _offline_arc(dg: np.ndarray, clean_xy: np.ndarray, nvec: np.ndarray,
+                 el_cl: np.ndarray, tol: float = 0.02) -> float:
+    """Arc length the OFFSET line spends off the racing line [m].
+
+    Measured on the offset polyline itself (clean_xy + dg*nvec), not on the clean line underneath
+    it, because that is the quantity the locality gate reports and the two must not disagree about
+    what "local" means. The difference is not bookkeeping: a detour is longer than the arc it
+    shadows on the outside of a corner and shorter on the inside, and on the shipped maps the two
+    forms differ by up to 1.4 m in BOTH directions -- enough to sit either side of the budget.
+    Against sweep_static_reopt's _off_line_arc on nine multi-obstacle cases this form agrees to
+    within 1.5% (worst 0.24 m on a 15.6 m excursion), the clean-line form to within 1.4 m.
+    """
+    n = len(dg)
+    off = np.abs(np.asarray(dg, float)) > tol
+    if not off.any():
+        return 0.0
+    xy_off = np.asarray(clean_xy, float)[:n] + np.asarray(dg, float)[:, None] * np.asarray(nvec, float)[:n]
+    seg = np.roll(xy_off, -1, axis=0) - xy_off
+    return float(np.sum(np.hypot(seg[:, 0], seg[:, 1])[off]))
+
+
 def _rank_cost(est_s: float, span_over_m: float, n_dropped: int) -> float:
     """Ranking cost for one candidate offset profile [s]. NOT a lap time.
 
@@ -1306,6 +1327,11 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         # (measured: uniform scaling to the budget took the same 3-box case from 3 humps to ZERO).
         # The reach is instead chosen inside the budget by the caller's search, which re-FITS at
         # each candidate so every check runs at the reach that is actually laid.
+        # Step 1 still reasons in REACHES, deliberately: it runs before anything is woven, so the
+        # occupied arc does not exist yet, and all it does is hand back the entry/exit stretch --
+        # a tiebreak the caller bought for <=0.08 s. Over-estimating the span here therefore only
+        # gives back something cheap and re-buyable. The ranking penalty in the caller, which is
+        # what actually chooses the reach, measures the occupied arc instead (see _rank_cost).
         span_budget = _span_budget(track_len, len(fitted))
         if sum(ri + ro for (_u, _d, ri, ro, _rf) in fitted) > span_budget:
             fitted = [(u, d, min(ri, rf), min(ro, rf), rf) for (u, d, ri, ro, rf) in fitted]
@@ -1927,7 +1953,18 @@ def _reopt_local_window_impl(
         # would actually be laid. The penalty is steep enough (1 s/m against lap-time differences
         # of ~0.4 s) that any in-budget candidate beats any over-budget one, and when NONE fits it
         # still selects the least-overshooting rather than failing.
-        span = sum(a["r_in"] + a["r_out"] for a in lay)
+        # The span is the arc the line actually spends OFF the racing line, measured on the
+        # profile that would be published -- not sum(r_in + r_out), which is a sum of REQUESTS.
+        # Where two ramps overlap (the weave, i.e. every cluster) that sum charged the shared arc
+        # once per hump, so a pair 6 m apart at a 4 m reach was billed 16 m for the 14 m it
+        # occupies. The over-billing is not cosmetic: it is what pinned the reach at the largest
+        # value whose DOUBLED span still fitted the budget, and at that reach the two humps stop
+        # overlapping by centimetres, the weave inserts a return-to-zero between them, and the
+        # published line becomes the W the car actually drove -- 0.4 s slower than the held line
+        # the same knots produce one reach step up. Measuring what is occupied also makes this the
+        # same quantity as the sweep's locality gate, so the search and the gate can no longer
+        # disagree about what "local" means (see _offline_arc).
+        span = _offline_arc(dg, clean_xy, nvec_rl, el_cl)
         over = max(0.0, span - _span_budget(track_len, len(lay)))
         # COVERAGE first (see _DROP_PENALTY_S): the returned figure is the RANKING cost, not a lap
         # time. Charged here rather than in the stage-1 loop so the ramp-stretching stages 2 and 3,
