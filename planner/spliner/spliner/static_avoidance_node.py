@@ -1296,7 +1296,7 @@ class ObstacleSpliner(Node):
         obs_xy = np.array([[o.x_m, o.y_m] for o in obs_ahead], dtype=float)
         best_k, best_J, best = -1, np.inf, None
         status = ["reject"] * N
-        n_bounds = n_obs = n_grid = n_curv = 0   # per-stage reject counters (diagnostics)
+        n_bounds = n_obs = n_grid = n_curv = n_body = 0   # per-stage reject counters (diagnostics)
         n_feas_left = n_feas_right = 0            # feasible candidates per side (which side has room)
         for k in range(N):
             if not bound_ok[k]:
@@ -1308,6 +1308,14 @@ class ObstacleSpliner(Node):
             xy = xy_all[k]
             if self.use_grid_check and self._path_off_track(xy):
                 n_grid += 1
+                continue
+            # BODY floor, deliberately NOT gated on use_grid_check: the check above asks whether the
+            # path point is on a free CELL, this one asks whether the whole car fits there. Under
+            # trust_grid_bounds nothing else asks that question -- the waypoint corridor test, which
+            # reserves half_car + wall_margin, is skipped as redundant with the per-point grid test,
+            # and the per-point grid test reserves 0.05 m.
+            if self._path_body_unsafe(xy):
+                n_body += 1
                 continue
             psi_, kappa_ = tph.calc_head_curv_num.calc_head_curv_num(
                 path=xy, el_lengths=wpnt_dist * np.ones(len(xy) - 1), is_closed=False)
@@ -1386,7 +1394,8 @@ class ObstacleSpliner(Node):
         sel_side = "LEFT" if sel_d > 1e-6 else ("RIGHT" if sel_d < -1e-6 else "RACELINE")
         self.get_logger().info(
             f"[{self.name}] avoid {sel_side} d_end={sel_d:+.2f} | feasible L={n_feas_left} R={n_feas_right} | "
-            f"sampled {n_left}L+{n_right}R of {N} | reject bounds={n_bounds} obs={n_obs} grid={n_grid} curv={n_curv} | "
+            f"sampled {n_left}L+{n_right}R of {N} | reject bounds={n_bounds} obs={n_obs} "
+            f"grid={n_grid} body={n_body} curv={n_curv} | "
             f"corridor d=[{d_lo:.2f},{d_hi:.2f}] ({cor_src}) obs keep-out d=[{obox_lo:.2f},{obox_hi:.2f}]",
             throttle_duration_sec=2.0)
 
@@ -1679,6 +1688,12 @@ class ObstacleSpliner(Node):
             d_right = np.array([gb_wpnts[j].d_right for j in idxs])
             if np.any(d > (d_left - half_car)) or np.any(d < -(d_right - half_car)):
                 return False
+        # BODY floor on the geometry actually being republished, under either authority. This one
+        # check covers the whole commitment path: the forward slice is re-derived here every cycle,
+        # and _reanchor_commit's blend runs immediately before it -- a bent entry that pushes the
+        # car's own displacement into a wall is caught here rather than published.
+        if self._path_body_unsafe(c['xy'][sel]):
+            return False
         gap_wp = (s_mod - self.cur_s) % L
         for o in self.obstacles:
             if not self._obs_qualifies(o):
@@ -1753,13 +1768,15 @@ class ObstacleSpliner(Node):
         mrks.markers.append(mrk)
         return mrks
 
-    def _free_mask(self, xy: np.ndarray) -> Optional[np.ndarray]:
+    def _free_mask(self, xy: np.ndarray, filt=None) -> Optional[np.ndarray]:
         """Vectorised GridFilter.is_point_inside(): True where the point is in the eroded free area.
 
         Same pixel convention as GridFilter.world_to_pixel()/is_point_inside() (row index = y, no
         vertical flip). Returns None when no map has been received yet, so callers can fall back.
+        `filt` selects which eroded view to read: the sampling image by default, the body-safety
+        image (body_filter) for the publish-side floor.
         """
-        f = self.map_filter
+        f = self.map_filter if filt is None else filt
         img = getattr(f, "eroded_image", None)
         if img is None or f.resolution is None or f.origin is None:
             return None
@@ -1830,6 +1847,29 @@ class ObstacleSpliner(Node):
             if not self.map_filter.is_point_inside(float(x), float(y)):
                 return True
         return False
+
+    def _path_body_unsafe(self, xy: np.ndarray) -> bool:
+        """True if any path point puts the CAR BODY into a wall (body-safety floor).
+
+        Same question as _path_off_track, asked of the image eroded by half a car instead of by one
+        cell (see body_kernel_size). The distinction is the whole point of having two images: the
+        sampling image decides what may be CONSIDERED, and being generous there is what keeps a
+        narrow section passable at all; this one decides what may be PUBLISHED, and being strict
+        here is what keeps the published line off the wall. A candidate rejected here is rejected
+        outright -- the squeeze pass lowers safety_margin and wall_margin, never this.
+
+        Vectorised (one array lookup for the whole path) because it runs on every candidate that
+        survives the cheaper filters and again on every committed slice.
+
+        Silent when no map has arrived: the sampling-side checks are all there is then, exactly as
+        _path_off_track already assumes, and vetoing everything on a bench without a map would
+        disable the planner instead of protecting it.
+        """
+        f = getattr(self, "body_filter", None)
+        if f is None or getattr(f, "eroded_image", None) is None:
+            return False
+        free = self._free_mask(np.asarray(xy, dtype=float), f)
+        return free is not None and not bool(np.all(free))
 
     def _publish_feasible(self, feasible: bool):
         # TRANSITIONS are logged UNTHROTTLED. The state machine acts on the edge -- feasible False
