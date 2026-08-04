@@ -1735,12 +1735,25 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         kap_laid = np.abs(_menger_kappa(xy_laid))
     except Exception:
         kap_laid = None
+    dup_end = bool(N > 1 and np.allclose(clean_xy[-1], clean_xy[0]))
     for (u, d, ri, ro) in kn_u:
         m = (u_stn >= u - ri) & (u_stn <= u + ro)
         if int(np.count_nonzero(m)) < 3:
             continue
-        seg = d_global[m]
-        h = float(np.median(np.abs(np.diff(u_stn[m])))) or 1.0
+        # IN u ORDER, and without the duplicated closing station. A boolean mask yields values in
+        # ARRAY INDEX order; a hump whose u-span wraps index 0 -- the map's start/finish, where the
+        # closing point repeats station 0 -- therefore produced a sequence with a jump in it, and
+        # the second difference of a jump is not a curvature. Measured on such a hump, ent_k came
+        # out 50.2721 instead of 0.1152. Since the ONLY acceptance test in the two ramp-stretching
+        # stages is `ek_try < best_ek`, that value made every stretch on that line fail outright.
+        idx = np.flatnonzero(m)
+        if dup_end and idx.size and idx[-1] == N - 1:
+            idx = idx[:-1]
+        if idx.size < 3:
+            continue
+        idx = idx[np.argsort(u_stn[idx])]
+        seg = d_global[idx]
+        h = float(np.median(np.abs(np.diff(u_stn[idx])))) or 1.0
         ent_k = max(ent_k, float(np.abs(np.diff(seg, 2)).max() / max(h * h, 1e-9)))
         rec = by_u.get(round(float(u), 6))
         if rec is not None:
