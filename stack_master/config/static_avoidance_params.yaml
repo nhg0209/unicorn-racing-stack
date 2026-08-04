@@ -129,9 +129,31 @@ static_avoidance_planner:
     # there is room the full 4.5 m is kept, because a quintic's peak curvature goes as A/L^2 and
     # these lengths were raised to carry speed. Below this floor that trade stops paying.
     ramp_len_min_m: 2.5     # [m]
-    apex_bulge: 0.10        # [m] extra offset at the box CENTRE beyond the clearance value: the path peaks
-                            #      here (widest, furthest from the obstacle). higher = swing WIDER around the
-                            #      obstacle; 0 = flat hold. Limited by corridor (bulge past the wall -> reject).
+    # [m] extra offset at the box CENTRE beyond the clearance value: the path peaks here (widest,
+    # furthest from the obstacle). Limited by the corridor (a bulge past the wall is clipped to it).
+    #
+    # 0.10 -> 0.05. The design clearance to a box EDGE was width_car/2 + safety_margin + apex_bulge
+    # = 0.40 m, and measured over 123 ifac stations the paths averaged more than that. The bulge is
+    # the only one of the three that can move: safety_margin is pinned from three directions at
+    # once (obs_margin also inflates the s-window, which must cover half the car's LENGTH, 0.29 m;
+    # the SM's overtake free-check wants 0.30; the clear-gate entry 0.28), so the reserve comes
+    # out of the comfort term or not at all.
+    #
+    # Measured, one box walked around the lap, mean over the feasible stations:
+    #                       bulge 0.10   bulge 0.05
+    #   mean peak |d|          0.570        0.507   m
+    #   mean edge clearance    0.420        0.357   m
+    #   feasible @ 12 m gap      78           80    of 123 stations
+    #   feasible @  8 m gap      69           70
+    #   feasible @  4 m gap      63           64
+    #   mean min speed         2.155        2.164   m/s
+    # A tighter line is also a slightly more feasible one, because the peak is what the corridor
+    # and the body gate reject.
+    #
+    # DO NOT set 0. obs_ok's keep-out test is INCLUSIVE at the boundary, so a candidate sitting
+    # exactly on the edge is rejected and the choice falls to the next sample further out: measured
+    # mean peak 0.596 m and only 75 feasible stations -- wider AND less feasible than 0.05.
+    apex_bulge: 0.05
     # 2 -> 3. The node already supported 3; the yaml was the binding limit, and it does not merely
     # cost coverage of the third box -- it makes the whole plan infeasible. The feasibility filter
     # (obs_ok) tests EVERY obstacle inside the 15 m lookahead, while only max_weave of them get a

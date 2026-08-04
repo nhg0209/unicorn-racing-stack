@@ -200,7 +200,7 @@ class ObstacleSpliner(Node):
         # only where the corridor will not accept the offset over its full length; below this the
         # curvature cost (A/L^2) stops being worth the feasibility it buys.
         self.ramp_len_min_m = 2.5    # [m]
-        self.apex_bulge = 0.10       # [m] extra offset at the box CENTRE (apex) beyond the clearance
+        self.apex_bulge = 0.05       # [m] extra offset at the box CENTRE (apex) beyond the clearance
                                      # value: higher = car swings WIDER around the obstacle. 0 = flat hold.
         self.max_weave = 3           # max obstacles woven into one path (slalom); 1 = single-apex only
         self.width_car = 0.30        # [m]
@@ -412,7 +412,7 @@ class ObstacleSpliner(Node):
         self.declare_parameter('return_len', 4.5, dbl(0.5, 10.0, "ramp length back to the raceline [m]"))
         self.declare_parameter('ramp_len_min_m', 2.5,
                                dbl(0.5, 10.0, "floor for the adaptive ramp shortening [m]"))
-        self.declare_parameter('apex_bulge', 0.10, dbl(0.0, 1.0, "extra apex offset beyond clearance: higher=wider avoidance [m]"))
+        self.declare_parameter('apex_bulge', 0.05, dbl(0.0, 1.0, "extra apex offset beyond clearance: higher=wider avoidance [m]"))
         self.declare_parameter('max_weave', 3, intd(1, 5, "max obstacles woven into one path (slalom); 1=single-apex"))
         self.declare_parameter('width_car', 0.30, dbl(0.1, 1.0, "car width [m]"))
         self.declare_parameter('tail_m', 1.0, dbl(0.0, 20.0, "short raceline tail after the return [m]"))
