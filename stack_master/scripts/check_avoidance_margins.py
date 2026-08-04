@@ -574,15 +574,55 @@ def main() -> int:
     else:
         print(f"OK: enforced laid floor ({laid_floor:.3f}) >= SM static GB requirement + slack "
               f"({required + SLACK:.3f}).")
-    # The RECORDED reactive apex is the hump's starting amplitude. If the reactive layer drives
-    # narrower than the floor, no hump reaches it on its own and every one depends on the core's
-    # widen-once retry finding corridor room -- which a tight track may not have.
-    reactive_reach = keepout + apex_bulge
-    if reactive_reach < laid_floor:
-        print(f"NOTE: the recorded reactive apex only reaches keep-out + apex_bulge = "
-              f"{reactive_reach:.3f} m, under the {laid_floor:.3f} m floor. Every hump then relies "
-              f"on the core widening it; on a tight corridor those apexes get dropped instead. "
-              f"Raise apex_bulge or lower reopt_obs_margin.")
+    # (The old NOTE here said the recorded reactive apex is the hump's STARTING AMPLITUDE and
+    # warned when keep-out + apex_bulge fell under the floor. That has not been true since the knot
+    # became obstacle-derived: the amplitude is d_obs + side * (r + obs_margin), computed from the
+    # box, and the recorded apex only ever contributes a SIDE PREFERENCE. A reactive pass narrower
+    # than the floor no longer makes the hump narrower, so the warning would fire on a condition
+    # that costs nothing.)
+
+    # --- (a) the reactive path must satisfy the SM that ACCEPTS it -------------------------
+    # The SM judges a published avoidance path by gb_ego_width_m/2 + lateral_width_m. The planner
+    # builds one to width_car/2 + safety_margin + apex_bulge. If the build is under the accept
+    # line, the planner's own best path reads NOT-free the moment it is published: the SM stays in
+    # TRAILING while a perfectly good spline is on the wire, and nothing in either node says why.
+    # It is the real floor under apex_bulge, which is otherwise pure comfort.
+    build_reach = keepout + apex_bulge
+    _dp, dynpl = load_dynamic_planner_params()
+    lat_w = float(dynpl.get("lateral_width_m", 0.0))
+    sm_ot_accept = gb_ego_half + lat_w
+    print(f"\nreactive build vs the SM's accept line for a published avoidance path:")
+    print(f"  build = width_car/2 + safety_margin + apex_bulge = {width_car/2:.3f} + "
+          f"{safety_margin:.3f} + {apex_bulge:.3f} = {build_reach:.3f} m")
+    print(f"  SM accepts at gb_ego_width_m/2 + lateral_width_m = {gb_ego_half:.3f} + "
+          f"{lat_w:.3f} = {sm_ot_accept:.3f} m")
+    if build_reach < sm_ot_accept - 1e-9:
+        ok = False
+        print(f"FAIL: the reactive planner builds to {build_reach:.3f} m but the SM only accepts a "
+              f"published avoidance path at {sm_ot_accept:.3f} m. Its own best path reads NOT-free "
+              f"on arrival -> TRAILING with a good spline on the wire. Raise apex_bulge or "
+              f"safety_margin, or lower lateral_width_m.")
+    else:
+        print(f"OK: the build ({build_reach:.3f}) clears the SM accept line ({sm_ot_accept:.3f}) "
+              f"by {build_reach - sm_ot_accept:.3f} m.")
+
+    # --- (b) obs_margin is also an S-WINDOW, so it must cover half the car's LENGTH ---------
+    # The keep-out is inflated by obs_margin in s as well as in d (obs_ok widens the box's
+    # s-interval by it). A car whose nose is level with the box edge is still one half-length from
+    # having passed it, so a margin under length/2 lets a path clip the box longitudinally while
+    # reading clear laterally. This is why safety_margin cannot simply be lowered to buy back
+    # lateral room -- a constraint that lived only in a comment until now.
+    dyn_cfg = STACK_MASTER / "config" / "SIM" / "dynamics.yaml"
+    veh_len = float(yaml.safe_load(dyn_cfg.read_text()).get("length", 0.0))
+    print(f"  obs_margin as an s-window = width_car/2 + safety_margin = {keepout:.3f} m vs "
+          f"half the car's length = {veh_len/2:.3f} m ({dyn_cfg.name})")
+    if veh_len > 0.0 and keepout < veh_len / 2.0 - 1e-9:
+        ok = False
+        print(f"FAIL: the keep-out ({keepout:.3f}) is under half the car's length "
+              f"({veh_len/2:.3f}). obs_margin inflates the box's S-interval too, so a path can "
+              f"clip the box lengthwise while reading clear across. Raise safety_margin.")
+    else:
+        print(f"OK: the keep-out ({keepout:.3f}) covers half the car's length ({veh_len/2:.3f}).")
 
     if not check_static_chain_ordering(sm_path, sm, cfg, yaml_path, args, launch_path):
         ok = False
