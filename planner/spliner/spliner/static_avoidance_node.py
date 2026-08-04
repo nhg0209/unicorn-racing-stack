@@ -1489,6 +1489,9 @@ class ObstacleSpliner(Node):
         car_prog = (self.cur_s - s0) % L
         ahead = s_local >= (car_prog - 0.30)
         if int(ahead.sum()) < 3:
+            self.get_logger().info(
+                "[static_avoidance] commit released: the car is past its end (maneuver finished)",
+                throttle_duration_sec=1.0)
             self._committed = None                            # maneuver finished -> replan (idle next)
             return None
         i0 = int(np.argmax(ahead))                            # first point at/ahead of the car
@@ -1505,9 +1508,22 @@ class ObstacleSpliner(Node):
         # (apex included) untouched.
         d_car = float(np.interp(car_prog, s_local, c['d']))   # committed d at the car
         if abs(self.cur_d - d_car) > self.commit_dev_max:
+            dev = float(self.cur_d) - d_car
             if not self._reanchor_commit(c, car_prog, s_local):
+                # Visible on purpose: a dropped commit is a full re-plan from the displaced car,
+                # which is the entry to the oscillation loop the re-anchor exists to break. When
+                # this appears repeatedly, commit_reanchor_max_m is the number to look at.
+                self.get_logger().warn(
+                    f"[static_avoidance] commit DROPPED: car is {dev:+.2f} m off the committed "
+                    f"path (max {self.commit_dev_max:.2f}, re-anchor limit "
+                    f"{self.commit_reanchor_max_m:.2f}) — re-planning from the car",
+                    throttle_duration_sec=1.0)
                 self._committed = None                        # blend impossible -> full re-plan
                 return None
+            self.get_logger().info(
+                f"[static_avoidance] commit RE-ANCHORED: entry bent {dev:+.2f} m onto the car over "
+                f"{self.commit_reanchor_len_m:.2f} m; apex and exit untouched",
+                throttle_duration_sec=1.0)
             d_car = float(np.interp(car_prog, s_local, c['d']))
 
         # --- freshness: did a triggering box move a lot (while still ahead) ? ---
@@ -1524,6 +1540,12 @@ class ObstacleSpliner(Node):
                 continue                                      # briefly untracked static box
             ds = abs(((match.s_center - os0 + L / 2.0) % L) - L / 2.0)
             if ds > self.commit_obs_ds or abs(match.d_center - od0) > self.commit_obs_dd:
+                self.get_logger().info(
+                    f"[static_avoidance] commit released: box {oid} moved ds={ds:.2f} m "
+                    f"(tol {self.commit_obs_ds:.2f}) / dd="
+                    f"{abs(match.d_center - od0):.2f} m (tol {self.commit_obs_dd:.2f}) — "
+                    f"re-planning the apex",
+                    throttle_duration_sec=1.0)
                 self._committed = None                        # box moved enough -> re-plan the apex
                 return None
 
@@ -1531,6 +1553,11 @@ class ObstacleSpliner(Node):
         # This is the sole interlock the SM has during static sustain, so it is re-derived here
         # against live obstacles every cycle: geometry frozen, verdict live.
         if not self._commit_slice_clear(c, sel, gb_wpnts, wpnt_dist, obs_margin, half_car):
+            self.get_logger().warn(
+                f"[static_avoidance] commit released: the frozen slice no longer clears the live "
+                f"obstacles/corridor at the margin it was solved with ({obs_margin:.2f} m) — "
+                f"publishing feasible=False",
+                throttle_duration_sec=1.0)
             self._committed = None
             self._publish_feasible(False)                     # tell the SM to abandon the OVERTAKE
             wpnts = OTWpntArray()
@@ -1758,8 +1785,19 @@ class ObstacleSpliner(Node):
         return False
 
     def _publish_feasible(self, feasible: bool):
-        self._last_feasible = bool(feasible)
-        self.feasible_pub.publish(Bool(data=bool(feasible)))
+        # TRANSITIONS are logged UNTHROTTLED. The state machine acts on the edge -- feasible False
+        # is what drops it out of the avoidance -- so an edge suppressed by a throttle window is
+        # exactly the line missing from the bag when the question is "why did it go TRAILING
+        # there?". The steady state is not logged at all, so this stays quiet: two lines per
+        # maneuver, not 40 Hz.
+        prev = getattr(self, "_last_feasible", None)
+        feasible = bool(feasible)
+        if prev is not feasible:
+            self.get_logger().info(
+                f"[static_avoidance] static_feasible {prev} -> {feasible}"
+                + (f" @ s={self.cur_s:.2f} m" if self.cur_s is not None else ""))
+        self._last_feasible = feasible
+        self.feasible_pub.publish(Bool(data=feasible))
 
     ######################
     # VIZ + MSG WRAPPING #

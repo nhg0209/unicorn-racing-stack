@@ -1205,9 +1205,19 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             needs = (_relax_ladder(need_clear, relax_floor)
                      if (need_clear > 0.0 and ob) else [need_clear])
             chosen, last_d, last_gap, last_why = None, 0.0, None, "corridor"
+            # Per-(side, floor) outcomes, kept so a rejection can be read back honestly. The record
+            # used to carry `want` from the PRIMARY side, `fit`/`clear` from whichever attempt ran
+            # LAST (the mirrored side at the lowest rung) and `need` as the ORIGINAL requirement --
+            # three different attempts printed as one, saying the hump was rejected at a floor the
+            # ladder had already walked away from. Report what was actually tried.
+            tried = []
             for need_try in needs:
                 for d_aim in aims:
                     res, last_d, last_gap, why = _attempt(d_aim, need_try)
+                    tried.append({"aim": float(d_aim), "floor": float(need_try),
+                                  "fit": float(last_d),
+                                  "clear": None if last_gap is None else float(last_gap),
+                                  "why": None if res is not None else why})
                     if res is not None:
                         chosen = (res[0], res[1], last_gap, need_try, d_aim)
                         break
@@ -1215,11 +1225,24 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                 if chosen is not None:
                     break
             if chosen is None:
+                # The BEST attempt per side: the one that got closest to clearing the box, not the
+                # one that happened to run last.
+                best_by_aim = {}
+                for t in tried:
+                    k = round(t["aim"], 4)
+                    cur_b = best_by_aim.get(k)
+                    if cur_b is None or (t["clear"] or -9e9) > (cur_b["clear"] or -9e9):
+                        best_by_aim[k] = t
+                sides = sorted(best_by_aim.values(), key=lambda t: -abs(t["aim"]))
+                floor_min = min((t["floor"] for t in tried), default=need_clear)
                 for _ob_m, _ki_m in (ob or [(None, k_i)]):
                     rec = {"xy": (float(xa), float(ya)), "want": float(d), "fit": float(last_d),
-                           "obs_i": _ki_m, "reason": last_why}
+                           "obs_i": _ki_m, "reason": last_why, "sides": sides,
+                           "floor_min": float(floor_min), "floor_asked": float(need_clear)}
                     if last_gap is not None:
-                        rec["clear"], rec["need"] = float(last_gap), need_clear
+                        # `need` is the LOWEST rung the ladder actually reached, which is what the
+                        # hump was finally rejected against.
+                        rec["clear"], rec["need"] = float(last_gap), float(floor_min)
                     dropped.append(rec)
                 continue
             d_f, r_f, gap_used, floor_used, d_used = chosen
@@ -1260,6 +1283,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                          "obs_i": _ki_m,
                          "floor": float(floor_used),   # the clearance this hump was ACCEPTED at
                          "flipped": bool(d_used is not d and abs(d_used - d) > 1e-9),
+                         "d_used": float(d_used),      # the aim that was accepted (mirrored or not)
                          "r_in": float(r_in), "r_out": float(r_out), "r_req": float(r_req),
                          "kappa_peak": 0.0,        # filled from the laid profile below
                          "clear": float("nan"),    # ditto — measured on the WOVEN profile

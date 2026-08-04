@@ -741,11 +741,24 @@ class StaticReoptNode(Node):
                 # Clearance of the WOVEN profile — the number the acceptance floor is about, and
                 # the one the reactive planner and the SM will independently re-derive downstream.
                 gap = float(a.get("clear", float("nan")))
-                cmsg = "" if gap != gap else f"; clears {gap:+.3f} m (floor {self.obs_margin:.2f})"
+                # The floor this hump was ACCEPTED at, which the coverage ladder may have walked
+                # below obs_margin -- printing the design margin there claimed a clearance the hump
+                # never promised, and the publish veto and drift trigger both judge it by the
+                # accepted floor, not by the design one.
+                floor = float(a.get("floor", self.obs_margin))
+                fmsg = f" (floor {floor:.2f}"
+                fmsg += ")" if abs(floor - self.obs_margin) < 1e-9 else \
+                    f", RELAXED from {self.obs_margin:.2f})"
+                cmsg = "" if gap != gap else f"; clears {gap:+.3f} m{fmsg}"
+                # Which SIDE was actually used. The recorded apex only proposes one; the ladder is
+                # free to take the mirror, and a hump on the opposite side of the box from the one
+                # the car drove reactively is the single most surprising thing this line can do.
+                smsg = (f"; SIDE FLIPPED to d={a['d_used']:+.3f} (apex proposed {a['want']:+.3f})"
+                        if a.get("flipped") else "")
                 line = (f"[static_reopt] apex @({a['xy'][0]:.2f},{a['xy'][1]:.2f}) "
                         f"laid d={a['laid']:+.3f} (want {a['want']:+.3f}) "
                         f"reach {a['r_in']:.2f}/{a['r_out']:.2f} m of {r_req:.2f} requested "
-                        f"({shrink:.0%}); max|kappa| {kp:.2f}{kmsg}{cmsg}")
+                        f"({shrink:.0%}); max|kappa| {kp:.2f}{kmsg}{cmsg}{smsg}")
                 if shrink < 0.5 or (curvlim > 0.0 and kp > 0.9 * curvlim):
                     self.get_logger().warning(
                         line + " <- SHARP: the corridor fit shrank this hump. Check "
@@ -758,10 +771,24 @@ class StaticReoptNode(Node):
                 # obstacles stay reactive-only, and this says so per apex, with the measured
                 # clearance where the acceptance floor is what rejected it.
                 def _det(d):
-                    s = (f"@({d['xy'][0]:.2f},{d['xy'][1]:.2f}) want {d['want']:+.2f} "
-                         f"max {d['fit']:+.2f} [{d.get('reason', 'corridor')}]")
+                    # Per SIDE, and at the LOWEST rung the ladder actually reached. The old line
+                    # mixed three different attempts into one sentence -- `want` from the primary
+                    # side, `max` from whichever attempt ran last (usually the mirrored side), and
+                    # a floor the ladder had already walked away from -- so it read as a rejection
+                    # at a clearance nobody was still asking for.
+                    s = f"@({d['xy'][0]:.2f},{d['xy'][1]:.2f}) [{d.get('reason', 'corridor')}]"
+                    sides = d.get("sides") or []
+                    if sides:
+                        s += " tried " + " | ".join(
+                            f"d={t['aim']:+.2f} -> {t['fit']:+.2f}"
+                            + ("" if t.get("clear") is None else f" clears {t['clear']:+.3f}")
+                            + (f" [{t['why']}]" if t.get("why") else "")
+                            for t in sides)
+                    else:
+                        s += f" want {d['want']:+.2f} max {d['fit']:+.2f}"
                     if "clear" in d:
-                        s += f" clears {d['clear']:+.2f} of {d['need']:.2f} needed"
+                        s += (f"; floor walked {d.get('floor_asked', self.obs_margin):.2f} -> "
+                              f"{d['need']:.2f} and still short")
                     return s
                 self.get_logger().warning(
                     f"[static_reopt] {len(dropped)} apex(es) REJECTED (reason 'corridor' = track "
