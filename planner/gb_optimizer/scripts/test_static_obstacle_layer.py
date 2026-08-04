@@ -62,10 +62,76 @@ def test_confirm_and_unlatch():
     t = confirm_obstacle(node, s=10.0)
     node.frenet_cb(odom(7.0))                       # gap = 3.0, inside [1.0, 4.0]
     for i in range(node.unlatch_clear_msgs):
-        assert node._tracks, f"unlatched too early at clear msg {i}"
+        assert node._tracks[0].confirmed, f"unlatched too early at clear msg {i}"
         node.obstacles_cb(arr())                    # clear view, no detection
-    assert not node._tracks, "track should be unlatched after unlatch_clear_msgs clear views"
+    assert not node._tracks[0].confirmed, \
+        "track should be unlatched after unlatch_clear_msgs clear views"
     print("PASS confirm + sighting-based unlatch")
+
+
+def test_unlatch_demotes_and_keeps_the_identity():
+    # ~0.5 s of clear views is enough to stop PUBLISHING an obstacle and nowhere near enough to
+    # forget it. Deleting the track threw away its marker_id, so a re-detection a moment later
+    # arrived as a NEW obstacle with a NEW id -- which every consumer reads as a set change. On the
+    # real run one detection gap produced a demote, a re-promote under a fresh id, two consecutive
+    # /global_waypoints swaps and a discarded pending bundle, with the collision 28 ms after the
+    # second swap.
+    node = make_node()
+    t = confirm_obstacle(node, s=10.0)
+    mid = t.marker_id
+    node.frenet_cb(odom(7.0))
+    for _ in range(node.unlatch_clear_msgs):
+        node.obstacles_cb(arr())
+    assert node._tracks, "an unlatched track must be KEPT, not deleted"
+    assert not node._tracks[0].confirmed, "…but must stop being published"
+    assert node._tracks[0].marker_id == mid, "the identity must survive the demotion"
+    assert node._tracks[0].hits == 0, "re-detection must earn confirm_hits again"
+    # re-detection inside the match gate re-promotes THE SAME track under THE SAME id
+    for _ in range(node.confirm_hits):
+        node.obstacles_cb(arr(det(3.0, 0.0, 10.0)))
+    assert len(node._tracks) == 1, "re-detection must not create a second track"
+    assert node._tracks[0].confirmed and node._tracks[0].marker_id == mid, \
+        "the re-confirmed obstacle must come back under its original id"
+    print("PASS unlatch demotes and keeps the marker id")
+
+
+def test_demoted_track_decays_at_the_lap_boundary():
+    # Deletion belongs to the lap accounting, which is the evidence that can support it.
+    node = make_node()
+    confirm_obstacle(node, s=10.0)
+    node.frenet_cb(odom(7.0))
+    for _ in range(node.unlatch_clear_msgs):
+        node.obstacles_cb(arr())
+    assert node._tracks and not node._tracks[0].confirmed
+    # the lap it was demoted on is a lap it WAS seen on, so it survives that boundary
+    node._on_lap_complete()
+    assert node._tracks, "the demotion lap itself is not evidence of removal"
+    node._tracks[0].opportunity_this_lap = True     # next lap: drove past its spot, saw nothing
+    node._on_lap_complete()
+    assert not node._tracks, "a demoted track never seen again must decay at the lap boundary"
+    print("PASS a demoted track decays at the lap boundary")
+
+
+def test_line_swap_suspends_the_streak():
+    # After a swap, s is re-anchored here, ego_s comes from the republisher on the NEW line and the
+    # tracker's own conversion follows a message later -- "no detection at that spot" is not a
+    # judgment worth making from that snapshot.
+    node = make_node()
+    confirm_obstacle(node, s=10.0)
+    node.frenet_cb(odom(7.0))
+    for _ in range(node.unlatch_clear_msgs - 1):
+        node.obstacles_cb(arr())
+    assert node._tracks[0].clear_streak > 0
+    wp = WpntArray()                                 # a DIFFERENT line arrives
+    for s_m, x_m in ((0.0, 0.0), (TRACK_LEN, 1.0)):
+        w = Wpnt(); w.s_m = s_m; w.x_m = x_m
+        wp.wpnts.append(w)
+    node.glb_cb(wp)
+    for _ in range(3 * node.unlatch_clear_msgs):
+        node.obstacles_cb(arr())
+    assert node._tracks[0].confirmed, "the streak must be suspended right after a swap"
+    assert node._tracks[0].clear_streak == 0
+    print("PASS a line swap suspends the unlatch streak")
 
 
 def test_ego_offline_suspends_streak():
@@ -76,11 +142,11 @@ def test_ego_offline_suspends_streak():
     node.frenet_cb(odom(7.0, d=0.4))                # in window, but ego is OFF the line
     for _ in range(3 * node.unlatch_clear_msgs):
         node.obstacles_cb(arr())                    # no detection at all
-    assert node._tracks, "off-line ego must SUSPEND the unlatch streak"
+    assert node._tracks[0].confirmed, "off-line ego must SUSPEND the unlatch streak"
     node.frenet_cb(odom(7.0, d=0.0))                # back on the raceline
     for _ in range(node.unlatch_clear_msgs):
         node.obstacles_cb(arr())
-    assert not node._tracks, "back on the line the streak must run to unlatch"
+    assert not node._tracks[0].confirmed, "back on the line the streak must run to unlatch"
     print("PASS off-line ego suspends unlatch streak")
 
 
@@ -101,7 +167,8 @@ def test_memory_detection_does_not_reset():
     node.frenet_cb(odom(7.0))
     for _ in range(node.unlatch_clear_msgs):
         node.obstacles_cb(arr(det(3.0, 0.0, 10.0, visible=False)))  # tracker memory, not a view
-    assert not node._tracks, "is_visible=False detections must not defeat the unlatch streak"
+    assert not node._tracks[0].confirmed, \
+        "is_visible=False detections must not defeat the unlatch streak"
     print("PASS remembered (is_visible=False) detection does not reset streak")
 
 
@@ -112,7 +179,7 @@ def test_occlusion_suspends():
     opponent = det(1.0, 0.0, 8.5, vs=2.0)           # dynamic, gap 1.5 < track gap 3.0
     for _ in range(3 * node.unlatch_clear_msgs):
         node.obstacles_cb(arr(opponent))
-    assert node._tracks, "streak must be suspended while the opponent occludes the spot"
+    assert node._tracks[0].confirmed, "streak must be suspended while the opponent occludes the spot"
     assert node._tracks[0].clear_streak == 0
     print("PASS occlusion suspends streak")
 
@@ -166,7 +233,7 @@ def test_unlatch_streak_scales_with_speed():
     node.frenet_cb(odom(7.0, vs=16.0))            # gap 3.0 m -> inside [1, 5]
     for _ in range(node._clear_msgs_needed()):
         node.obstacles_cb(arr())
-    assert not node._tracks, "a clear-view streak must be completable at racing speed"
+    assert not node._tracks[0].confirmed, "a clear-view streak must be completable at racing speed"
     print("PASS unlatch streak requirement scales with speed")
 
 
@@ -227,7 +294,9 @@ def test_track_s_reanchors_on_a_line_swap():
 def main():
     rclpy.init()
     try:
-        for fn in (test_confirm_and_unlatch, test_ego_offline_suspends_streak,
+        for fn in (test_confirm_and_unlatch, test_unlatch_demotes_and_keeps_the_identity,
+                   test_demoted_track_decays_at_the_lap_boundary,
+                   test_line_swap_suspends_the_streak, test_ego_offline_suspends_streak,
                    test_sighting_resets_streak, test_memory_detection_does_not_reset,
                    test_occlusion_suspends, test_window_exit_resets, test_lap_guard,
                    test_unlatch_streak_scales_with_speed,

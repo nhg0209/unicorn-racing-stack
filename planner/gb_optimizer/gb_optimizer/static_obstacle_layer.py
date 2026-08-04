@@ -96,6 +96,7 @@ class StaticObstacleLayer(Node):
         # flicker under detect's boundary inflation at those angles) — observed: a live obstacle
         # was unlatched DURING its own avoidance, then re-confirmed 0.2 s later (set flap 1->0->1).
         self.declare_parameter("unlatch_max_ego_d", 0.20)    # [m] suspend streak when |ego d| exceeds
+        self.declare_parameter("unlatch_swap_suspend_s", 1.0)  # [s] suspend the streak after a line swap
 
         self.static_vel_thresh = float(self.get_parameter("static_vel_thresh").value)
         self.require_is_static = bool(self.get_parameter("require_is_static").value)
@@ -114,10 +115,12 @@ class StaticObstacleLayer(Node):
         self.unlatch_msg_rate_hz = float(self.get_parameter("unlatch_msg_rate_hz").value)
         self.unlatch_clear_msgs_min = int(self.get_parameter("unlatch_clear_msgs_min").value)
         self.unlatch_max_ego_d = float(self.get_parameter("unlatch_max_ego_d").value)
+        self.unlatch_swap_suspend_s = float(self.get_parameter("unlatch_swap_suspend_s").value)
 
         self._ego_d: Optional[float] = None
         self._ego_vs: Optional[float] = None
         self._line_xy = None                  # geometry the tracks' `s` values are expressed in
+        self._glb_change_t = 0.0              # wall time of the last /global_waypoints swap
         self._tracks: List[_Track] = []
         self._next_marker_id = 0
         self._ego_s: Optional[float] = None
@@ -164,6 +167,14 @@ class StaticObstacleLayer(Node):
                 self.get_logger().info(
                     f"[static_obs_layer] global line changed — re-anchored s for "
                     f"{len(self._tracks)} track(s)")
+            if self._line_xy is not None:
+                # A SWAP (not the initial load) is the one moment every geometric input this node
+                # uses is in flux at once: s is re-anchored here, ego_s comes from the frenet
+                # republisher on the new line, and the tracker's own frenet conversion follows a
+                # message later. Judging "no detection at that spot" from that snapshot is what
+                # produced the demote-then-re-promote flap on the real run. Suspend the streak for a
+                # beat and let the frames settle.
+                self._glb_change_t = self.get_clock().now().nanoseconds * 1e-9
             self._line_xy = xy
         except Exception as e:                            # never let bookkeeping kill the callback
             self.get_logger().warn(f"[static_obs_layer] s re-anchor failed: {e}")
@@ -297,6 +308,11 @@ class StaticObstacleLayer(Node):
         if not self.unlatch_enable or self._ego_s is None or not self._track_length:
             return
         L = self._track_length
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if (now - self._glb_change_t) < self.unlatch_swap_suspend_s:
+            for t in self._tracks:
+                t.clear_streak = 0            # see glb_cb: the geometry under this test just moved
+            return
         # forward gaps of dynamic obstacles (the opponent) — occlusion guard input
         dyn_gaps = [(o.s_center - self._ego_s) % L
                     for o in msg.obstacles
@@ -323,10 +339,24 @@ class StaticObstacleLayer(Node):
                 continue
             t.clear_streak += 1
             if t.clear_streak >= self._clear_msgs_needed():
+                # DEMOTE, do not delete. The streak is ~0.5 s of clear views: strong enough to stop
+                # publishing the obstacle, nowhere near strong enough to forget it. Deleting the
+                # track threw away its marker_id, so a re-detection a moment later came back as a
+                # NEW obstacle with a NEW id -- and every consumer reads that as a set change. On the
+                # real run one 0.5 s detection gap produced a demote, a re-promote under a fresh id,
+                # two consecutive /global_waypoints swaps and a discarded pending bundle, with the
+                # collision 28 ms after the second swap. Keeping the track (unconfirmed, hits reset)
+                # means a re-detection inside the match gate re-promotes THE SAME id: the consumers
+                # see the same obstacle return, the recorded apex still keys to it, and no identity
+                # is invented. Actual removal stays with the lap accounting, which is the evidence
+                # that can support it -- a demoted track that is never seen again decays there.
                 self.get_logger().info(
-                    f"[static_obs_layer] UNLATCHED static obstacle @({t.x:.2f},{t.y:.2f}) — "
-                    f"{t.clear_streak} consecutive clear views of its spot, no detection")
-                continue                      # drop it now; no waiting for the lap accounting
+                    f"[static_obs_layer] UNLATCHED (demoted, id kept) static obstacle "
+                    f"@({t.x:.2f},{t.y:.2f}) — {t.clear_streak} consecutive clear views of its "
+                    f"spot, no detection. Re-detection re-confirms the same track")
+                t.confirmed = False
+                t.hits = 0                    # re-detection must earn confirm_hits again
+                t.clear_streak = 0
             survivors.append(t)
         self._tracks = survivors
 
