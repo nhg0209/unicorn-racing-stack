@@ -252,6 +252,90 @@ def multi_case(m, cfg_dir, wall_margin, fit_tol, anchor, n_obs, gap_m):
     }
 
 
+# HOLD case. Two SAME-SIDE boxes on a straight. The line has no business returning to the racing
+# line between them -- returning costs two merge inflections and a speed dip, and buys a stretch of
+# racing line the car leaves again immediately. Nothing in the gate above could see this: the
+# multi-obstacle cases put each box on whichever side is roomier there, and count PEAKS of the
+# offset profile, which a W and a held line can both satisfy. What separates them is the number of
+# EXCURSIONS -- times the line leaves the raceline and comes back.
+#
+# Anchor 290 on ifac is the straight the W was measured on. The requested gaps are quantized to the
+# waypoint spacing (0.0995 m), and the exact station matters here: 5.98 m (step 60) was already a
+# single excursion before this work, 6.08 m (step 61) was the W -- 2 excursions and 12.063 s
+# against 11.648 s at the NARROWER 5.98 m, i.e. slower for a wider gap, which is the signature. So
+# the gate is placed on 6.1 -> step 61, the case that actually failed, with 4.1 -> step 41 (which
+# passed before, 11.820 s) as the control that must not regress.
+HOLD_ANCHOR = 290
+HOLD_GAPS_M = (4.1, 6.1)
+HOLD_MAX_EXCURSIONS = 1
+
+
+def _excursions(alpha, tol=0.02):
+    """Contiguous off-line runs of the CYCLIC offset profile. Rotated so index 0 is ON the line,
+    or a hump straddling the seam would be counted twice."""
+    off = np.abs(np.asarray(alpha, float)) > tol
+    if not off.any():
+        return 0
+    if off.all():
+        return 1
+    off = np.roll(off, -int(np.argmin(off)))
+    return int(np.count_nonzero(off[1:] & ~off[:-1])) + int(off[0])
+
+
+def check_hold(maps, cfg_dir, wall_margin, fit_tol) -> bool:
+    ok = True
+    print(f"\n--- hold gate: two SAME-SIDE boxes on the ifac straight (anchor {HOLD_ANCHOR}) ---")
+    print("  gap_m | laid | excursions | min clear | lap loss | off-line arc")
+    m = maps.get("ifac")
+    if m is None:
+        return ok
+    xy = m["xy"]
+    lap0 = clean_metrics(m)[0]
+    rl = np.column_stack([xy[:, 0], xy[:, 1], m["dr"], m["dl"]])
+    _, nvec, _ = core.centerline_frame(rl)
+    nvec[-1] = nvec[0]
+    hi = np.maximum(core._cyclic_smooth(m["dr"] - 0.15 - wall_margin, 7), 0.0)
+    lo = np.minimum(core._cyclic_smooth(-(m["dl"] - 0.15 - wall_margin), 7), 0.0)
+    seg = np.roll(xy, -1, axis=0) - xy
+    el = np.hypot(seg[:, 0], seg[:, 1])
+    side = 1.0 if hi[HOLD_ANCHOR] >= -lo[HOLD_ANCHOR] else -1.0    # ONE side for the whole pair
+    for gap_m in HOLD_GAPS_M:
+        step = int(round(gap_m / max(float(np.mean(el)), 1e-6)))
+        apexes, obstacles = [], []
+        for k in range(2):
+            i = (HOLD_ANCHOR + k * step) % (len(xy) - 1)
+            apexes.append(tuple(xy[i] + side * APEX_OFFSET_M * nvec[i]))
+            obstacles.append((float(xy[i][0]), float(xy[i][1]), OBS_RADIUS_M))
+        real_gap = float(np.sum(el[HOLD_ANCHOR:HOLD_ANCHOR + step]))
+        res = core.reoptimize_local_window(
+            xy, m["dr"], m["dl"], m["reftrack"], apexes, cfg_dir,
+            params=core.ModulationParams(obs_margin=OBS_MARGIN_M),
+            w_veh=0.30, clean_vx=m["vx"], wall_margin=wall_margin,
+            reach_time=0.0, reach_min=1.0, reach_max=6.0, clean_kappa=m["kappa"],
+            fit_tol=fit_tol, apex_obstacles=obstacles)
+        exc = _excursions(res["alpha"])
+        laid = res["apex_laid"]
+        clears = [float(a.get("clear", float("nan"))) for a in laid]
+        tot, _longest = _off_line_arc(res["main"][0], xy)
+        print(f"  {real_gap:5.2f} | {res['n_windows']:4d} | {exc:10d} | "
+              f"{(min(clears) if clears else float('nan')):9.3f} | "
+              f"{res['main'][3] - lap0:+8.3f} | {tot:6.1f} m")
+        if res["n_windows"] != 2:
+            ok = False
+            print(f"    FAIL: both boxes must get a hump, got {res['n_windows']}.")
+            continue
+        if exc > HOLD_MAX_EXCURSIONS:
+            ok = False
+            print(f"    FAIL: the line leaves the raceline {exc} times for a same-side pair "
+                  f"{real_gap:.2f} m apart on a STRAIGHT. Returning between them costs two merge "
+                  f"inflections and a speed dip and buys a stretch of racing line the car leaves "
+                  f"again immediately -- this is the W.")
+        if clears and min(clears) < OBS_MARGIN_M - 1e-6:
+            ok = False
+            print(f"    FAIL: a held line still owes each box obs_margin; got {min(clears):+.3f}.")
+    return ok
+
+
 # SEAM case. Everything in this pipeline is indexed from s = 0, and a hump centred 0.6 m before
 # the seam has most of its body on the OTHER side of that index. The stationwise sweep above steps
 # past the seam by construction (step 11 -> the last visited waypoint is up to a metre short of it)
@@ -479,6 +563,8 @@ def main() -> int:
                            args.lap_loss_per_apex, enforce_laptime=args.enforce_laptime):
             ok = False
         if not check_seam(loaded, cfg_dir, args.wall_margin[0], args.fit_tol[0]):
+            ok = False
+        if not check_hold(loaded, cfg_dir, args.wall_margin[0], args.fit_tol[0]):
             ok = False
         if not args.enforce_laptime:
             print("\n  NOTE: the lap-loss budget above is REPORTED, not enforced (--enforce-laptime\n"
