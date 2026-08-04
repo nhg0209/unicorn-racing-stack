@@ -115,6 +115,22 @@ class ObstacleSpliner(Node):
                                      # cv2.erode eats floor(k/2) cells, so 3 reserves ONE cell
                                      # (0.05 m at the maps' resolution). 8 ate ~0.2 m and rejected
                                      # the raceline. See _grid_corridor.
+        # TWO IMAGES, TWO JOBS. The kernel above is the SAMPLING image: it reserves one cell, which
+        # is what keeps narrow sections samplable at all -- raise it and the corridor collapses and
+        # the planner concedes TRAILING where it could still pass. But one cell is 0.05 m, and a
+        # path point is a CAR CENTRE: with trust_grid_bounds the waypoint corridor test is skipped
+        # entirely (bound_ok = ones, see do_spline) and every published point is then vetted only
+        # against that 0.05 m reserve. A 0.30 m car driven down such a path has 0.10 m of itself
+        # inside the wall.
+        #
+        # So keep sampling generous and make PUBLISHING body-safe with a second image eroded by
+        # half a car: floor(7/2) = 3 cells = 0.15 m = width_car/2. A point free in this image is a
+        # centre the whole car fits at (L-inf, so diagonals get 0.21 m -- conservative, never less).
+        # Measured on the shipped maps: the raceline is free at k=7 at 368/368 stations on ifac and
+        # 766/766 on f, and the narrowest k=7 free span on ifac is 0.45 m, so this floor does not
+        # take away a line the car can actually drive. See _path_body_unsafe.
+        self.body_kernel_size = 7    # [cells] erosion of the BODY-SAFETY image; floor(k/2)*0.05 m
+                                     # must stay >= width_car/2. 1 = no erosion = floor disabled.
         self.lookahead_min = 8.0     # [m]
         self.lookahead_k = 1.5       # [s]  lookahead = max(lookahead_min, k * cur_vs)
         self.n_d_samples = 13        # terminal offsets sampled across the width
@@ -258,11 +274,17 @@ class ObstacleSpliner(Node):
 
         self.map_filter = GridFilter(node=self, map_topic="/map", debug=False)
         self.map_filter.set_erosion_kernel_size(self.kernel_size)
+        # Second, more strongly eroded view of the SAME map — the body-safety floor (see
+        # body_kernel_size). Its own subscription because GridFilter owns the erosion: one image
+        # cannot serve two kernels, and the two are deliberately different.
+        self.body_filter = GridFilter(node=self, map_topic="/map", debug=False)
+        self.body_filter.set_erosion_kernel_size(self.body_kernel_size)
 
         self.declare_all_parameters()
         # Sync members from loaded params (yaml/defaults), then register live-reconfigure callback.
         self.dyn_param_cb(self.get_parameters([
-            'kernel_size', 'lookahead_min', 'lookahead_k', 'n_d_samples', 'sample_gaps', 'kappa_max',
+            'kernel_size', 'body_kernel_size',
+            'lookahead_min', 'lookahead_k', 'n_d_samples', 'sample_gaps', 'kappa_max',
             'kappa_add_max', 'kappa_abs_max', 'a_lat_max', 'a_long_max', 'a_long_accel',
             'safety_margin', 'static_near_zero_mps', 'static_promote_sec',
             'static_demote_mps', 'static_demote_sec',
@@ -317,6 +339,9 @@ class ObstacleSpliner(Node):
                 integer_range=[IntegerRange(from_value=int(min_v), to_value=int(max_v), step=1)])
 
         self.declare_parameter('kernel_size', 3, intd(1, 20, "GridFilter erosion kernel [cells]"))
+        self.declare_parameter('body_kernel_size', 7,
+                               intd(1, 31, "erosion kernel of the BODY-SAFETY image [cells]: "
+                                           "floor(k/2)*resolution must cover width_car/2. 1 = off"))
         self.declare_parameter('lookahead_min', 8.0, dbl(1.0, 20.0, "min planning lookahead [m]"))
         self.declare_parameter('lookahead_k', 1.5, dbl(0.0, 5.0, "lookahead = max(min, k*cur_vs) [s]"))
         self.declare_parameter('n_d_samples', 13, intd(3, 41, "terminal lateral offsets sampled"))
@@ -405,6 +430,17 @@ class ObstacleSpliner(Node):
             if n == 'kernel_size':
                 self.kernel_size = int(p.value)
                 self.map_filter.set_erosion_kernel_size(self.kernel_size)
+            elif n == 'body_kernel_size':
+                self.body_kernel_size = int(p.value)
+                self.body_filter.set_erosion_kernel_size(self.body_kernel_size)
+                res = getattr(self.body_filter, "resolution", None) or 0.05
+                reserve = (self.body_kernel_size // 2) * res
+                if reserve + 1e-9 < 0.5 * self.width_car:
+                    self.get_logger().warn(
+                        f"[{self.name}] body_kernel_size={self.body_kernel_size} reserves "
+                        f"{reserve:.3f} m at {res:.3f} m/cell, under half a car "
+                        f"({0.5 * self.width_car:.3f} m): published paths may put the car body "
+                        f"into a wall. Needs k >= {int(2 * (0.5 * self.width_car / res)) + 1}.")
             elif n == 'lookahead_min':
                 self.lookahead_min = float(p.value)
             elif n == 'lookahead_k':

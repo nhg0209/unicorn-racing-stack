@@ -136,6 +136,19 @@ static_avoidance_planner:
                             #      car and nothing more, against 0.25 m (half_car + wall_margin) on
                             #      the waypoint-corridor path. Corrected as a comment only -- raising
                             #      the kernel changes feasibility and is a tuning decision.
+    # --- body-safety floor: a SECOND view of the same map, eroded by half a car ---
+    # kernel_size above is the SAMPLING image and must stay generous, or narrow sections stop being
+    # samplable at all and the planner concedes TRAILING where it could still pass. But it reserves
+    # one cell = 0.05 m, and a path point is a CAR CENTRE: with trust_grid_bounds the waypoint
+    # corridor test is skipped entirely, so every published point used to be vetted against that
+    # 0.05 m alone -- a 0.30 m car on such a path has 0.10 m of itself inside the wall.
+    # This image erodes floor(7/2) = 3 cells = 0.15 m = width_car/2, and a path point that is not
+    # free in it is rejected outright (candidate loop AND committed-slice re-check). It is a FLOOR:
+    # the squeeze pass lowers safety_margin and wall_margin, never this.
+    # Measured on the shipped maps: the raceline is free at k=7 at 368/368 stations on ifac and
+    # 766/766 on f, and ifac's narrowest k=7 free span is 0.45 m -- the floor does not take away a
+    # line the car can actually drive.  1 = no erosion = floor disabled (not recommended).
+    body_kernel_size: 7     # [cells] floor(k/2) * resolution must cover width_car/2 (0.15 m @ 0.05)
 
     # --- corridor source: measure the drivable width from the MAP, not from the waypoints ---
     # d_left/d_right come from gb_optimizer, which labels the two track contours left/right with ONE
