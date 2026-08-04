@@ -456,6 +456,18 @@ def _cluster_knots(knots, track_len, merge_gap, curvlim, clean_kappa, s_loop, dr
     return out
 
 
+def _fitted_span(fitted, u_all: np.ndarray, el_stn: np.ndarray) -> float:
+    """Arc length the fitted humps actually OCCUPY [m], counting shared arc once.
+
+    sum(r_in + r_out) charges an overlap twice, and an overlap is exactly what a merge is."""
+    if not len(fitted):
+        return 0.0
+    covered = np.zeros(len(u_all), dtype=bool)
+    for (u, _d, ri, ro, _rf) in fitted:
+        covered |= (u_all >= u - ri) & (u_all <= u + ro)
+    return float(np.sum(np.asarray(el_stn, float)[covered]))
+
+
 def _relax_ladder(need: float, floor: float, step: float = _RELAX_STEP) -> List[float]:
     """Descending clearance floors from `need` down to `floor`, inclusive."""
     need, floor = float(need), float(floor)
@@ -1493,13 +1505,18 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         # (measured: uniform scaling to the budget took the same 3-box case from 3 humps to ZERO).
         # The reach is instead chosen inside the budget by the caller's search, which re-FITS at
         # each candidate so every check runs at the reach that is actually laid.
-        # Step 1 still reasons in REACHES, deliberately: it runs before anything is woven, so the
-        # occupied arc does not exist yet, and all it does is hand back the entry/exit stretch --
-        # a tiebreak the caller bought for <=0.08 s. Over-estimating the span here therefore only
-        # gives back something cheap and re-buyable. The ranking penalty in the caller, which is
-        # what actually chooses the reach, measures the occupied arc instead (see _rank_cost).
+        # Measured on the ARC ACTUALLY OCCUPIED, not on sum(r_in + r_out). That sum is a sum of
+        # REQUESTS: where two ramps overlap -- which is what a merge IS -- the shared arc is
+        # charged once per hump, and the budget is spent on metres the line never leaves the
+        # raceline for. Measured on a same-side pair: 20.0 m charged against 13.95 m occupied, so
+        # the stretch was handed back over a 6 m overdraft that did not exist. The caller's ranking
+        # penalty already measures the occupied arc (see _rank_cost / _offline_arc); this makes
+        # step 1 agree with it instead of contradicting it.
         span_budget = _span_budget(track_len, len(fitted))
-        if sum(ri + ro for (_u, _d, ri, ro, _rf) in fitted) > span_budget:
+        seg_stn = np.roll(clean_xy, -1, axis=0) - clean_xy
+        el_stn = np.hypot(seg_stn[:, 0], seg_stn[:, 1])
+        occupied = _fitted_span(fitted, u_all, el_stn)
+        if occupied > span_budget:
             fitted = [(u, d, min(ri, rf), min(ro, rf), rf) for (u, d, ri, ro, rf) in fitted]
         # r_f has done its job; the weave and the verification below take 4-tuples.
         kn_u = sorted((u, d, ri, ro) for (u, d, ri, ro, _rf) in fitted)
