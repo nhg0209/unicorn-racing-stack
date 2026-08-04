@@ -134,6 +134,10 @@ class StaticReoptNode(Node):
         # cannot be mislabelled or smoothed. Same erosion kernel as the reactive planner so the two
         # agree on where a wall is. 0 disables the gate.
         self.declare_parameter("wall_gate_kernel", 3)
+        # [m] apex spacing below which two obstacles are treated as ONE cluster: same side ->
+        # merged into a single hump, opposite sides -> dropped as a pair when no reach can swing
+        # between them inside the curvature budget. 0 disables the pre-pass.
+        self.declare_parameter("apex_merge_gap_m", 2.0)
         self.declare_parameter("default_obs_radius", 0.15)
         self.declare_parameter("republish_period", 1.0)     # [s] keep-alive republish
         # `update_map` re-notify period. MUST stay below sector_tuner's 0.5 s scale timer so a
@@ -191,6 +195,7 @@ class StaticReoptNode(Node):
         self.obs_margin = float(self.get_parameter("obs_margin").value)
         self.relax_floor = float(self.get_parameter("relax_floor").value)
         self.wall_gate_kernel = int(self.get_parameter("wall_gate_kernel").value)
+        self.apex_merge_gap_m = float(self.get_parameter("apex_merge_gap_m").value)
         self.default_obs_radius = float(self.get_parameter("default_obs_radius").value)
         self.republish_period = float(self.get_parameter("republish_period").value)
         self.notify_period = float(self.get_parameter("notify_period").value)
@@ -630,7 +635,8 @@ class StaticReoptNode(Node):
                 w_veh=self.qp_veh_width, clean_vx=self._clean_vx, wall_margin=self.wall_margin,
                 reach_time=self.reach_time, reach_min=self.reach_min, reach_max=self.reach_max,
                 clean_kappa=self._clean_kappa, fit_tol=self.fit_tol,
-                apex_obstacles=apex_obs, relax_floor=self.relax_floor)
+                apex_obstacles=apex_obs, relax_floor=self.relax_floor,
+                apex_merge_gap_m=self.apex_merge_gap_m)
         else:
             # Legacy whole-track mincurv_iqp (offline-grade; minutes/solve).
             res = core.reoptimize_with_obstacles(

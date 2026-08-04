@@ -203,6 +203,86 @@ _CLEAR_EPS = 1e-6
 _RELAX_STEP = 0.03
 
 
+def _cluster_knots(knots, track_len, merge_gap, curvlim, clean_kappa, s_loop, dropped_out):
+    """Resolve CLUSTERS before any hump is fitted: merge what belongs together, drop what cannot
+    physically be woven.
+
+    Two obstacles a couple of metres apart are not two independent avoidances. Fitted separately
+    they produce two humps whose ramps overlap, and the weave then has to reconcile them after the
+    fact -- if it can. Deciding it here is both cheaper and better informed, because the knots
+    still carry which SIDE each hump would take.
+
+      SAME SIDE, closer than merge_gap: one hump. Amplitude = the larger of the two (it has to
+      clear both), position = midway, reach = the wider request. Weaving back to the raceline
+      between two boxes 2 m apart is wasted motion the corridor has to pay for twice.
+
+      OPPOSITE SIDES, too close to swing between: dropped as a PAIR, reason 'cluster'. The
+      quintic's peak curvature is C*|A|/r^2, so crossing |dd| between two apexes needs at least
+      r_min = sqrt(C*|dd| / budget) of arc. If the gap is under that, no reach exists that both
+      clears the boxes and stays inside the curvature budget -- the weave would spend passes
+      discovering it, and the honest answer is the reactive layer, which can steer harder than the
+      global line is allowed to.
+    """
+    if len(knots) < 2:
+        return knots
+    ks = sorted(knots, key=lambda k: k[0])
+    kap = (np.abs(np.asarray(clean_kappa, float)) if clean_kappa is not None
+           else np.zeros(len(s_loop)))
+    out, i = [], 0
+    while i < len(ks):
+        cur = list(ks[i])
+        j = i + 1
+        while j < len(ks):
+            nxt = ks[j]
+            gap = (nxt[0] - cur[0]) % track_len
+            if gap > merge_gap:
+                break
+            if cur[1] * nxt[1] > 0.0:                 # same side -> ONE hump
+                # Position = midway, reach = the wider request, and BOTH obstacles come along: the
+                # single hump that replaces them is judged against every member, so the acceptance
+                # floor still means what it says.
+                #
+                # The AMPLITUDE is not max(members). The merged peak sits BETWEEN the boxes, and a
+                # quintic decays away from its peak -- at the midpoint of a 1.5 m pair with a 3 m
+                # reach each box only sees 90% of the peak, so max(members) leaves both of them
+                # ~5 cm short and the whole merge is rejected. Back-project instead: ask each
+                # member what peak WOULD give it its own offset at its own distance, and take the
+                # largest. The factor is floored so a member far out on the ramp cannot demand an
+                # unbounded peak -- the fit and the acceptance floor still have the final say.
+                s_new = (cur[0] + 0.5 * gap) % track_len
+                r_new = max(cur[2], nxt[2], cur[3], nxt[3])
+                members = [(cur[0], cur[1]), (nxt[0], nxt[1])]
+                amp = 0.0
+                for s_m, d_m in members:
+                    ds = abs(((s_m - s_new + track_len / 2.0) % track_len) - track_len / 2.0)
+                    t = min(max(1.0 - ds / max(r_new, 1e-6), 0.0), 1.0)
+                    f = t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
+                    amp = max(amp, abs(d_m) / max(f, 0.35))
+                amp = math.copysign(amp, cur[1])
+                cur = [s_new, amp, r_new, r_new,
+                       cur[4], cur[5], list(cur[6]) + list(nxt[6]), cur[7],
+                       cur[8] if abs(cur[8] or 0.0) >= abs(nxt[8] or 0.0) else nxt[8]]
+                j += 1
+                continue
+            # opposite sides: is there room to swing across at all?
+            dd = abs(cur[1] - nxt[1])
+            k_here = float(np.max(kap)) if kap.size else 0.0
+            budget = max(curvlim - k_here, _KAPPA_BUDGET_FLOOR_FRAC * max(curvlim, 1e-6))
+            r_min = math.sqrt(_KAPPA_QUINTIC_C * dd / max(budget, 1e-6))
+            if gap < r_min:
+                for k in (cur, ks[j]):
+                    for _ob, _ki in k[6]:
+                        dropped_out.append({"xy": (float(k[4]), float(k[5])), "want": float(k[1]),
+                                            "fit": 0.0, "obs_i": _ki, "reason": "cluster"})
+                cur = None
+                j += 1
+            break
+        if cur is not None:
+            out.append(tuple(cur))
+        i = j if j > i + 1 else i + 1
+    return out
+
+
 def _relax_ladder(need: float, floor: float, step: float = _RELAX_STEP) -> List[float]:
     """Descending clearance floors from `need` down to `floor`, inclusive."""
     need, floor = float(need), float(floor)
@@ -726,7 +806,8 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                          curvlim: float = 0.0,
                          obstacles: Optional[List[Optional[Tuple[float, float, float]]]] = None,
                          obs_margin: float = 0.0,
-                         relax_floor: float = 0.0
+                         relax_floor: float = 0.0,
+                         apex_merge_gap_m: float = 0.0
                          ) -> Tuple[np.ndarray, int, float, list, list]:
     """Lateral offset d(s) on the CLOSED clean loop that PRESERVES each recorded reactive apex
     but re-grows long, gentle entry/exit ramps — the "keep the apex, press the secondary apexes"
@@ -833,9 +914,18 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         # k_i is the index into `apexes`/`obstacles`: the caller's handle on WHICH obstacle
         # this hump belongs to. Reported back in `laid`/`dropped` so the node can match by
         # identity instead of by proximity -- see _check_line_clearance.
-        knots.append((float(s_loop[i]), d_target, R, R, xa, ya, ob, k_i, d_obs))  # symmetric
+        # `[(ob, k_i)]` not `ob`: a knot can absorb its neighbours (see _cluster_knots), and
+        # every member has to be cleared by the one hump that replaces them.
+        knots.append((float(s_loop[i]), d_target, R, R, xa, ya, [(ob, k_i)], k_i, d_obs))
+    cluster_dropped: List[dict] = []
     if not knots:
         return d_global, 0, 0.0, [], []
+
+    # --- CLUSTER pre-pass: merge what belongs together, drop what cannot be woven -------------
+    knots = _cluster_knots(knots, track_len, apex_merge_gap_m, curvlim,
+                           clean_kappa, s_loop, dropped_out=cluster_dropped)
+    if not knots:
+        return d_global, 0, 0.0, cluster_dropped, []
 
     # --- cut the loop in the largest gap between apex centres (seam falls on d=0) -------------
     knots.sort(key=lambda k: k[0])
@@ -854,7 +944,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
     zero = [0.0, 0.0, 0.0]
     kn_u = sorted((((c - s_cut) % track_len, d, ri, ro, xa, ya, ob, ki, dob)
                    for (c, d, ri, ro, xa, ya, ob, ki, dob) in knots), key=lambda k: k[0])
-    dropped: List[dict] = []
+    dropped: List[dict] = list(cluster_dropped)
     laid: List[dict] = []
     # --- FIT each hump to the corridor (shrink reach, NEVER the clearance) BEFORE laying it ----
     # Without this the downstream element-wise clip does the shaping and combs the hump; see
@@ -930,13 +1020,16 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
 
             +inf when this apex has no obstacle attached (nothing to enforce); -inf on degenerate
             knots so a hump that cannot even be evaluated can never be accepted."""
-            if ob is None:
+            members = [m for m in (ob or []) if m[0] is not None]
+            if not members:
                 return float("inf")
             v = _hump_values(u_all, u_c, amp, r_i, r_o)
             if v is None:
                 return float("-inf")
             pts = clean_xy + v[:, None] * nvec_rl
-            return float(np.min(np.hypot(pts[:, 0] - ob[0], pts[:, 1] - ob[1]))) - float(ob[2])
+            # WORST member: a merged hump has to clear every obstacle it absorbed.
+            return min(float(np.min(np.hypot(pts[:, 0] - o[0], pts[:, 1] - o[1]))) - float(o[2])
+                       for o, _ki in members)
 
         def _accepts(d_now, d_want, ob, u_c, r_i, r_o, need=None):
             """Is this hump good enough to lay? (ok, clearance_or_None).
@@ -945,7 +1038,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             obs_margin. Without it, fall back to the amplitude-ratio proxy (offline sweeps, and
             the `global` re-opt method, have no per-apex box to measure against)."""
             need = need_clear if need is None else float(need)
-            if need > 0.0 and ob is not None:
+            if need > 0.0 and ob:
                 gap = _clearance(u_c, d_now, r_i, r_o, ob)
                 return gap >= need - _CLEAR_EPS, gap
             return abs(d_now) >= max(0.03, _APEX_KEEP_FRAC * abs(d_want)), None
@@ -1055,12 +1148,12 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             #      so the publish veto and the drift trigger judge it by what it promised.
             # Only reached when the primary attempt fails, so the common path costs nothing.
             aims = [d]
-            if ob is not None and d_obs is not None:
+            if ob and d_obs is not None:
                 d_opp = 2.0 * float(d_obs) - d          # mirror of the target about the box centre
                 if abs(d_opp) >= 0.03:
                     aims.append(d_opp)
             needs = (_relax_ladder(need_clear, relax_floor)
-                     if (need_clear > 0.0 and ob is not None) else [need_clear])
+                     if (need_clear > 0.0 and ob) else [need_clear])
             chosen, last_d, last_gap, last_why = None, 0.0, None, "corridor"
             for need_try in needs:
                 for d_aim in aims:
@@ -1072,11 +1165,12 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                 if chosen is not None:
                     break
             if chosen is None:
-                rec = {"xy": (float(xa), float(ya)), "want": float(d), "fit": float(last_d),
-                       "obs_i": k_i, "reason": last_why}
-                if last_gap is not None:
-                    rec["clear"], rec["need"] = float(last_gap), need_clear
-                dropped.append(rec)
+                for _ob_m, _ki_m in (ob or [(None, k_i)]):
+                    rec = {"xy": (float(xa), float(ya)), "want": float(d), "fit": float(last_d),
+                           "obs_i": _ki_m, "reason": last_why}
+                    if last_gap is not None:
+                        rec["clear"], rec["need"] = float(last_gap), need_clear
+                    dropped.append(rec)
                 continue
             d_f, r_f, gap_used, floor_used, d_used = chosen
 
@@ -1109,8 +1203,11 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             r_in = _stretch(entry_scale, r_f, stretch_entry=True)
             r_out = _stretch(exit_scale, r_in, stretch_entry=False)
             fitted.append((u, d_f, r_in, r_out, r_f))    # r_f = pre-stretch reach (budget recovery)
-            laid.append({"xy": (float(xa), float(ya)), "want": float(d), "laid": float(d_f),
-                         "obs_i": k_i,
+            # one record per MEMBER: a merged hump covers every obstacle it absorbed, and the
+            # coverage report attributes each of them separately.
+            for _ob_m, _ki_m in (ob or [(None, k_i)]):
+                laid.append({"xy": (float(xa), float(ya)), "want": float(d), "laid": float(d_f),
+                         "obs_i": _ki_m,
                          "floor": float(floor_used),   # the clearance this hump was ACCEPTED at
                          "flipped": bool(d_used is not d and abs(d_used - d) > 1e-9),
                          "r_in": float(r_in), "r_out": float(r_out), "r_req": float(r_req),
@@ -1322,11 +1419,12 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
     # is not the single hump that was tested. Re-measure on the profile that is actually returned,
     # so the number the node logs (and vetoes on) describes the line the car will follow.
     for rec in laid:
-        ob = rec.pop("_obs", None)
-        if ob is None:
+        members = [m for m in (rec.pop("_obs", None) or []) if m[0] is not None]
+        if not members:
             continue
-        rec["clear"] = float(np.min(np.hypot(xy_laid[:, 0] - ob[0],
-                                             xy_laid[:, 1] - ob[1]))) - float(ob[2])
+        rec["clear"] = min(
+            float(np.min(np.hypot(xy_laid[:, 0] - o[0], xy_laid[:, 1] - o[1]))) - float(o[2])
+            for o, _ki in members)
     return d_global, len(kn_u), ent_k, dropped, laid
 
 
@@ -1628,6 +1726,7 @@ def _reopt_local_window_impl(
     fit_tol: float = _FIT_TOL_DEFAULT,
     apex_obstacles: Optional[List[Optional[Tuple[float, float, float]]]] = None,
     relax_floor: float = 0.0,
+    apex_merge_gap_m: float = 0.0,
 ) -> dict:
     """Fast ONLINE obstacle-aware raceline: reshape the REACTIVE avoidance spline into a global
     line. Each `apex` (map-frame (x,y) captured from the reactive spliner on the exploration lap)
@@ -1743,7 +1842,7 @@ def _reopt_local_window_impl(
             entry_scale=e_scale, exit_scale=x_scale,
             fit_tol=fit_tol, clean_kappa=clean_kappa, curvlim=curvlim,
             obstacles=apex_obstacles, obs_margin=params.obs_margin,
-            relax_floor=relax_floor)
+            relax_floor=relax_floor, apex_merge_gap_m=apex_merge_gap_m)
         if nn == 0:
             return dg, 0, float("inf"), ek, drp, lay
         est = _offset_lap_time(dg, clean_xy, nvec_rl, el_cl,
