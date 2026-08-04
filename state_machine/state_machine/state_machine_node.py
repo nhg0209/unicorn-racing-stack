@@ -1936,6 +1936,7 @@ class StateMachine(Node):
         loc_wpnts.header.stamp = self.get_clock().now().to_msg()
         loc_wpnts.header.frame_id = "map"
 
+        v_ref = max(float(getattr(self, "max_speed", 0.0) or 0.0), 1e-3)
         for i, wpnt in enumerate(loc_wpnts.wpnts):
             mrk = Marker()
             mrk.header.frame_id = "map"
@@ -1944,11 +1945,18 @@ class StateMachine(Node):
             mrk.scale.y = 0.15
             mrk.scale.z = 0.15
             mrk.color.a = 1.0
-            mrk.color.g = 1.0
             mrk.id = i + 1  # 0 reserved for the DELETEALL marker (avoid duplicate id in the array)
             mrk.pose.position.x = wpnt.x_m
             mrk.pose.position.y = wpnt.y_m
-            mrk.pose.position.z = wpnt.vx_mps
+            # z = 0.0, NOT the speed. Drawing the beads at "speed height" lifted them metres off
+            # the ground and dropped them again through every braking zone -- so beside an obstacle,
+            # exactly where the path slows, the trail appeared to switch off. The speed is still
+            # there, as COLOUR: green = fast, red = slow, against the configured maximum.
+            mrk.pose.position.z = 0.0
+            v = float(wpnt.vx_mps)
+            f = float(np.clip(v / v_ref, 0.0, 1.0))
+            mrk.color.g = f
+            mrk.color.r = 1.0 - f
             mrk.pose.orientation.w = 1.0
             loc_markers.markers.append(mrk)
 
