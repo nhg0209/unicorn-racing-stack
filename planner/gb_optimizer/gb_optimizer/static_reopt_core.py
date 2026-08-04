@@ -153,6 +153,26 @@ _HUMP_SPAN_TOTAL_FRAC = 0.40
 # exists — while still preferring the least-overshooting when the track leaves no choice, rather
 # than failing outright.
 _SPAN_OVER_PENALTY_S_PER_M = 1.0
+
+
+def _reach_floor(track_len: float) -> float:
+    """Smallest reach the corridor fit may bisect down to [m]. Well BELOW reach_min: on a tight
+    track the corridor often admits only a ~1-2 m ramp, and a floor at reach_min would make the fit
+    give up and hand an infeasible hump to the clip."""
+    return max(0.5, min(1.0, 0.05 * float(track_len)))
+
+
+def _span_budget(track_len: float, n_humps: int) -> float:
+    """Total arc length all humps together may occupy [m].
+
+    A flat fraction of the lap is the right bound for ONE or TWO obstacles and the wrong one for
+    several: three boxes cannot share 0.40 of a 36 m lap without each being squeezed below the
+    reach its own corridor and curvature checks already accepted, and the search then prefers
+    candidates that cover fewer obstacles. So the budget also scales with how many humps there
+    are -- each needs at least its floor reach on both sides, plus half again for the ramps that
+    make it drivable -- and the larger of the two bounds wins."""
+    return max(_HUMP_SPAN_TOTAL_FRAC * float(track_len),
+               max(0, int(n_humps)) * 2.0 * _reach_floor(track_len) * 1.5)
 # ALL-OR-NOTHING apex fit: a hump the corridor forces below this fraction of the recorded
 # reactive apex does NOT clear the obstacle (the apex |d| is the reactive-PROVEN clearance) —
 # laying the shrunken hump wastes lap time, still triggers the reactive layer every lap
@@ -843,7 +863,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         # line leaves zero headroom over 59/355 stations) the corridor often admits only a ~1-2 m
         # ramp — comparable to the reactive spliner's own return_len (2.5 m). A floor at reach_min
         # would make the fit give up and hand an infeasible hump to the clip, i.e. the comb again.
-        floor_r = max(0.5, min(1.0, 0.05 * track_len))
+        floor_r = _reach_floor(track_len)
         hi_a = np.asarray(hi_inc, float)
         lo_a = np.asarray(lo_inc, float)
         kap_a = (np.abs(np.asarray(clean_kappa, float))
@@ -1104,7 +1124,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         # (measured: uniform scaling to the budget took the same 3-box case from 3 humps to ZERO).
         # The reach is instead chosen inside the budget by the caller's search, which re-FITS at
         # each candidate so every check runs at the reach that is actually laid.
-        span_budget = _HUMP_SPAN_TOTAL_FRAC * track_len
+        span_budget = _span_budget(track_len, len(fitted))
         if sum(ri + ro for (_u, _d, ri, ro, _rf) in fitted) > span_budget:
             fitted = [(u, d, min(ri, rf), min(ro, rf), rf) for (u, d, ri, ro, rf) in fitted]
         # r_f has done its job; the weave and the verification below take 4-tuples.
@@ -1715,7 +1735,7 @@ def _reopt_local_window_impl(
         # of ~0.4 s) that any in-budget candidate beats any over-budget one, and when NONE fits it
         # still selects the least-overshooting rather than failing.
         span = sum(a["r_in"] + a["r_out"] for a in lay)
-        over = max(0.0, span - _HUMP_SPAN_TOTAL_FRAC * track_len)
+        over = max(0.0, span - _span_budget(track_len, len(lay)))
         return dg, nn, est + _SPAN_OVER_PENALTY_S_PER_M * over, ek, drp, lay
 
     # STAGE 1 — symmetric reach, minimise lap time.
