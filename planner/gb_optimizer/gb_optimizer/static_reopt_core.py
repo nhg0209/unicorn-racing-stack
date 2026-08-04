@@ -878,7 +878,10 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                          obstacles: Optional[List[Optional[Tuple[float, float, float]]]] = None,
                          obs_margin: float = 0.0,
                          relax_floor: float = 0.0,
-                         apex_merge_gap_m: float = 0.0
+                         apex_merge_gap_m: float = 0.0,
+                         hold_bridge: bool = False,
+                         hold_max_gap_m: float = 0.0,
+                         hold_kappa_max: float = 0.0
                          ) -> Tuple[np.ndarray, int, float, list, list]:
     """Lateral offset d(s) on the CLOSED clean loop that PRESERVES each recorded reactive apex
     but re-grows long, gentle entry/exit ramps — the "keep the apex, press the secondary apexes"
@@ -1344,13 +1347,19 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
 
     u_stn = (s_loop - s_cut) % track_len
 
-    def _weave(knots):
+    def _weave(knots, bridge=()):
         """Lay `knots` as ONE C2 polynomial: raceline -> apex [-> apex ...] -> raceline.
 
         Humps whose ramps overlap are woven straight apex-to-apex (no return-to-zero knot between
         them), which is what keeps the line C2 through a slalom -- and also what makes the result
-        something no per-hump check ever looked at. Returns None on degenerate breakpoints."""
+        something no per-hump check ever looked at. Returns None on degenerate breakpoints.
+
+        `bridge` holds the indices whose close-back to the raceline is SUPPRESSED even though the
+        ramps do not overlap: the line stays out and runs apex-to-apex, i.e. it HOLDS the offset
+        across the pair instead of returning to the racing line between two boxes it is going to
+        leave again immediately. Which pairs qualify is decided by _hold_pairs, not here."""
         n_ap = len(knots)
+        bridge = set(bridge)
         breaks = [0.0]
         bd = [list(zero)]                               # seam: raceline, C2
         for idx, (u, d, ri, ro) in enumerate(knots):
@@ -1365,7 +1374,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             # close back to the raceline UNLESS the next apex's ramp overlaps this exit (-> weave)
             exit_ = u + ro
             next_entry = (knots[idx + 1][0] - knots[idx + 1][2]) if idx + 1 < n_ap else float("inf")
-            if next_entry > exit_ + 2e-3:
+            if next_entry > exit_ + 2e-3 and idx not in bridge:
                 e = min(exit_, track_len - 1e-3)
                 if e > breaks[-1] + 1e-3:
                     breaks.append(e)
@@ -1377,6 +1386,55 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             return np.asarray(BPoly.from_derivatives(np.asarray(breaks), bd)(u_stn), dtype=float)
         except Exception:
             return None
+
+    def _hold_pairs(knots):
+        """Indices whose return-to-zero may be suppressed, i.e. where HOLDING the offset across the
+        pair is the honest line rather than a shortcut.
+
+        Weaving back to the racing line between two boxes the car is about to leave it for again
+        costs twice: two merge inflections instead of none, and a speed dip at each. But holding is
+        only right where the racing line has nothing to offer in between, so all three gates must
+        hold:
+
+          SAME SIDE      -- opposite sides is a slalom; the crossing IS the maneuver.
+          CLOSE ENOUGH   -- within hold_max_gap_m. Beyond that the raceline stretch between the
+                            boxes is long enough to be worth taking, and holding would be a
+                            deliberate detour rather than the absence of a pointless one.
+          STRAIGHT       -- the clean line's own |kappa| over the span stays under hold_kappa_max.
+                            In a corner the racing line between two boxes is the whole point of the
+                            corner, and holding an offset across it gives away the apex.
+          IN CORRIDOR    -- the held plateau fits. Between two apex knots with zero slope at both
+                            the quintic is monotone, so the bridge stays within [min, max] of the
+                            two amplitudes and testing those two bounds over the span is exact.
+
+        Returns a set of indices into `knots`, empty when bridging is off or nothing qualifies.
+        """
+        if not hold_bridge or hold_max_gap_m <= 0.0 or len(knots) < 2:
+            return set()
+        out = set()
+        for i in range(len(knots) - 1):
+            u0, d0, _ri0, ro0 = knots[i]
+            u1, d1, ri1, _ro1 = knots[i + 1]
+            if d0 * d1 <= 0.0:
+                continue
+            gap = u1 - u0
+            if not (0.0 < gap <= hold_max_gap_m):
+                continue
+            if (u1 - ri1) <= (u0 + ro0) + 2e-3:
+                continue                       # the ramps already overlap: _weave holds it anyway
+            span = (u_stn >= u0) & (u_stn <= u1)
+            if not span.any():
+                continue
+            if verify_ctx is not None:
+                _hi, _lo, kg, _fl = verify_ctx
+                if float(np.max(np.abs(kg[span]))) >= hold_kappa_max:
+                    continue
+                d_lo_b, d_hi_b = min(d0, d1), max(d0, d1)
+                if (d_hi_b > float(np.min(_hi[span])) + fit_tol
+                        or d_lo_b < float(np.max(_lo[span])) - fit_tol):
+                    continue                   # the plateau does not fit between the walls
+            out.add(i)
+        return out
 
     def _weave_violations(dg, ctx, knots_u):
         """Stations of the WOVEN profile that break the corridor or the curvature bar.
@@ -1432,7 +1490,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                 surviving.append(rec)
         if not keep:
             return None, [], []
-        dg = _weave(keep)
+        dg = _weave(keep, _hold_pairs(keep))
         if dg is None or _weave_violations(dg, verify_ctx, keep).any():
             for rec in surviving:
                 dropped_recs.append({"xy": rec["xy"], "want": rec["want"], "fit": rec["laid"],
@@ -1442,7 +1500,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
 
     if verify_ctx is not None:
         for _pass in range(_WEAVE_MAX_PASSES):
-            d_global = _weave(kn_u)
+            d_global = _weave(kn_u, _hold_pairs(kn_u))
             if d_global is None:
                 return np.zeros(N), 0, 0.0, dropped, laid
             bad = _weave_violations(d_global, verify_ctx, kn_u)
@@ -1475,14 +1533,14 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             kn_u = sorted(shrunk)
         else:
             # passes exhausted: the shrink is still converging but has run out of budget
-            dg_last = _weave(kn_u)
+            dg_last = _weave(kn_u, _hold_pairs(kn_u))
             bad = (_weave_violations(dg_last, verify_ctx, kn_u) if dg_last is not None
                    else np.ones(N, dtype=bool))
             d_global, kn_u, laid = _drop_touching_and_reweave(u_stn[bad], kn_u, laid, dropped)
         if d_global is None:
             return np.zeros(N), 0, 0.0, dropped, []
     else:
-        d_global = _weave(kn_u)
+        d_global = _weave(kn_u, _hold_pairs(kn_u))
         if d_global is None:
             return np.zeros(N), 0, 0.0, dropped, laid
     # RAMP curvature: max |d''| over each hump's entry AND exit ramps — the merge-zone
@@ -1827,6 +1885,8 @@ def _reopt_local_window_impl(
     apex_obstacles: Optional[List[Optional[Tuple[float, float, float]]]] = None,
     relax_floor: float = 0.0,
     apex_merge_gap_m: float = 0.0,
+    hold_max_gap_m: float = 8.0,
+    hold_kappa_max: float = 0.3,
 ) -> dict:
     """Fast ONLINE obstacle-aware raceline: reshape the REACTIVE avoidance spline into a global
     line. Each `apex` (map-frame (x,y) captured from the reactive spliner on the exploration lap)
@@ -1927,22 +1987,24 @@ def _reopt_local_window_impl(
     # grid, and each evaluation is now a full re-fit + weave + Menger curvature + velocity profile.
     _try_memo = {}
 
-    def _try(r, e_scale, x_scale=1.0):
-        key = (round(float(r), 6), round(float(e_scale), 6), round(float(x_scale), 6))
+    def _try(r, e_scale, x_scale=1.0, hold=False):
+        key = (round(float(r), 6), round(float(e_scale), 6), round(float(x_scale), 6), bool(hold))
         if key in _try_memo:
             return _try_memo[key]
-        out = _try_uncached(r, e_scale, x_scale)
+        out = _try_uncached(r, e_scale, x_scale, hold)
         _try_memo[key] = out
         return out
 
-    def _try_uncached(r, e_scale, x_scale=1.0):
+    def _try_uncached(r, e_scale, x_scale=1.0, hold=False):
         dg, nn, ek, drp, lay = build_offset_profile(
             clean_xy, s_loop, track_len, nvec_rl, apexes,
             clean_vx_arr, 0.0, r, r, hi_inc=hi_inc, lo_inc=lo_inc,
             entry_scale=e_scale, exit_scale=x_scale,
             fit_tol=fit_tol, clean_kappa=clean_kappa, curvlim=curvlim,
             obstacles=apex_obstacles, obs_margin=params.obs_margin,
-            relax_floor=relax_floor, apex_merge_gap_m=apex_merge_gap_m)
+            relax_floor=relax_floor, apex_merge_gap_m=apex_merge_gap_m,
+            hold_bridge=hold, hold_max_gap_m=hold_max_gap_m,
+            hold_kappa_max=hold_kappa_max)
         if nn == 0:
             return dg, 0, float("inf"), ek, drp, lay
         est = _offset_lap_time(dg, clean_xy, nvec_rl, el_cl,
@@ -1972,38 +2034,65 @@ def _reopt_local_window_impl(
         # dropping a hump either.
         return dg, nn, _rank_cost(est, over, len(drp)), ek, drp, lay
 
-    # STAGE 1 — symmetric reach, minimise the ranking cost (coverage, then span, then lap time).
-    d_global, n_solved, best_est, best_ek, best_r = None, 0, float("inf"), 0.0, cand_r[0]
-    apex_dropped: List[dict] = []
-    apex_laid: List[dict] = []
-    for r_try in cand_r:
-        d_try, n_try, est_try, ek_try, drp_try, lay_try = _try(r_try, 1.0)
-        if n_try == 0:
-            if d_global is None:
-                d_global, n_solved, apex_dropped, apex_laid = d_try, 0, drp_try, lay_try
-            continue
-        if est_try < best_est:
-            d_global, n_solved, best_est, best_ek, best_r = d_try, n_try, est_try, ek_try, r_try
-            apex_dropped, apex_laid = drp_try, lay_try
-    # STAGE 2 — stretch the ENTRY ramp (gradual turn-in), then STAGE 3 — stretch the EXIT ramp
-    # too: the merge-back inflection (curvature sign flip where the hump rejoins the raceline)
-    # cannot be removed, but a longer return ramp makes it shallow instead of a visible S-kink.
-    # Each stage keeps the longest stretch that costs at most `tol` of lap time and lowers the
-    # ramp curvature tiebreak.
-    if n_solved:
-        tol = 0.03                                        # [s] lap-time budget for a softer turn-in
-        best_e = 1.0
-        for e_scale in (1.5, 2.0, 3.0):
-            d_try, n_try, est_try, ek_try, drp_try, lay_try = _try(best_r, e_scale)
-            if n_try and est_try <= best_est + tol and ek_try < best_ek:
-                d_global, n_solved, best_ek, best_e = d_try, n_try, ek_try, e_scale
-                apex_dropped, apex_laid = drp_try, lay_try
-        tol_exit = 0.05                                   # [s] merge smoothness is worth a bit more
-        for x_scale in (1.5, 2.0, 3.0):
-            d_try, n_try, est_try, ek_try, drp_try, lay_try = _try(best_r, best_e, x_scale)
-            if n_try and est_try <= best_est + tol_exit and ek_try < best_ek:
-                d_global, n_solved, best_ek = d_try, n_try, ek_try
-                apex_dropped, apex_laid = drp_try, lay_try
+    def _run_stages(hold):
+        """The three-stage reach search, for one weave MODE. Returns everything the caller needs
+        plus the ranking cost of the profile it ended on, so two modes can be compared on the same
+        footing. `hold` selects whether the return-to-zero between qualifying same-side neighbours
+        is suppressed (see _hold_pairs)."""
+        # STAGE 1 — symmetric reach, minimise the ranking cost (coverage, span, lap time).
+        d_g, n_s, best_est, best_ek, best_r = None, 0, float("inf"), 0.0, cand_r[0]
+        drp_b: List[dict] = []
+        lay_b: List[dict] = []
+        for r_try in cand_r:
+            d_try, n_try, est_try, ek_try, drp_try, lay_try = _try(r_try, 1.0, hold=hold)
+            if n_try == 0:
+                if d_g is None:
+                    d_g, n_s, drp_b, lay_b = d_try, 0, drp_try, lay_try
+                continue
+            if est_try < best_est:
+                d_g, n_s, best_est, best_ek, best_r = d_try, n_try, est_try, ek_try, r_try
+                drp_b, lay_b = drp_try, lay_try
+        # STAGE 2 — stretch the ENTRY ramp (gradual turn-in), then STAGE 3 — stretch the EXIT ramp
+        # too: the merge-back inflection (curvature sign flip where the hump rejoins the raceline)
+        # cannot be removed, but a longer return ramp makes it shallow instead of a visible S-kink.
+        # Each stage keeps the longest stretch that costs at most `tol` of lap time and lowers the
+        # ramp curvature tiebreak. `cost_fin` follows the profile actually kept -- the stages spend
+        # lap time to buy smoothness, so where they land is not best_est.
+        cost_fin = best_est
+        if n_s:
+            tol = 0.03                                    # [s] lap-time budget for a softer turn-in
+            best_e = 1.0
+            for e_scale in (1.5, 2.0, 3.0):
+                d_try, n_try, est_try, ek_try, drp_try, lay_try = _try(best_r, e_scale, hold=hold)
+                if n_try and est_try <= best_est + tol and ek_try < best_ek:
+                    d_g, n_s, best_ek, best_e, cost_fin = d_try, n_try, ek_try, e_scale, est_try
+                    drp_b, lay_b = drp_try, lay_try
+            tol_exit = 0.05                               # [s] merge smoothness is worth a bit more
+            for x_scale in (1.5, 2.0, 3.0):
+                d_try, n_try, est_try, ek_try, drp_try, lay_try = _try(best_r, best_e, x_scale,
+                                                                       hold=hold)
+                if n_try and est_try <= best_est + tol_exit and ek_try < best_ek:
+                    d_g, n_s, best_ek, cost_fin = d_try, n_try, ek_try, est_try
+                    drp_b, lay_b = drp_try, lay_try
+        return d_g, n_s, cost_fin, drp_b, lay_b
+
+    # THE HELD VARIANT IS A PARALLEL CANDIDATE, not a preference: the same estimator that ranks
+    # everything else decides, and on the ifac straight it says the held line is ~0.2-0.4 s faster.
+    # Adding a ranking term for it would be the wrong tool -- nothing is wrong with the ranking,
+    # the shape was simply never generated.
+    #
+    # Compared after ALL THREE stages, not at stage 1. The ramp-stretching stages routinely move a
+    # candidate by more than the gap between the two modes (measured on map f: a stage-1 gap of
+    # 0.02 s against a stretch worth 0.40 s), so choosing the mode on the un-stretched profile and
+    # then stretching only the winner picks the branch that looked better before the largest term
+    # was applied -- and it demonstrably ships the worse final line. Whole searches are compared,
+    # so the loser's stretching cannot be the thing that decides it. Off entirely when no pair
+    # could qualify, which is every single-obstacle solve.
+    runs = [_run_stages(False)]
+    if hold_max_gap_m > 0.0 and len(apexes) > 1:
+        runs.append(_run_stages(True))
+    d_global, n_solved, _cost, apex_dropped, apex_laid = min(
+        runs, key=lambda t: (t[2] if t[1] else float("inf")))
     if d_global is None:
         d_global, n_solved = np.zeros(N), 0
     n_failed = 0                                          # apexes with no offset are simply absent

@@ -138,6 +138,16 @@ class StaticReoptNode(Node):
         # merged into a single hump, opposite sides -> dropped as a pair when no reach can swing
         # between them inside the curvature budget. 0 disables the pre-pass.
         self.declare_parameter("apex_merge_gap_m", 2.0)
+        # HOLD BRIDGE. Two boxes on the SAME side, close together on a STRAIGHT, do not need the
+        # line to come back to the raceline between them: returning costs two merge inflections and
+        # a speed dip, and buys a stretch of racing line the car is about to leave again. Where
+        # both gates hold, the search additionally evaluates a variant that holds the offset across
+        # the pair, and the ordinary ranking picks the winner. 0 disables it entirely.
+        self.declare_parameter("hold_max_gap_m", 8.0)     # [m] widest pair that may be held across
+        # [1/m] and only where the RACELINE is straight: in a corner the line between two boxes is
+        # the apex, and holding an offset across it gives that away. Bounds |kappa_clean| over the
+        # bridged span.
+        self.declare_parameter("hold_kappa_max", 0.3)
         self.declare_parameter("default_obs_radius", 0.15)
         self.declare_parameter("republish_period", 1.0)     # [s] keep-alive republish
         # `update_map` re-notify period. MUST stay below sector_tuner's 0.5 s scale timer so a
@@ -196,6 +206,8 @@ class StaticReoptNode(Node):
         self.relax_floor = float(self.get_parameter("relax_floor").value)
         self.wall_gate_kernel = int(self.get_parameter("wall_gate_kernel").value)
         self.apex_merge_gap_m = float(self.get_parameter("apex_merge_gap_m").value)
+        self.hold_max_gap_m = float(self.get_parameter("hold_max_gap_m").value)
+        self.hold_kappa_max = float(self.get_parameter("hold_kappa_max").value)
         self.default_obs_radius = float(self.get_parameter("default_obs_radius").value)
         self.republish_period = float(self.get_parameter("republish_period").value)
         self.notify_period = float(self.get_parameter("notify_period").value)
@@ -683,7 +695,8 @@ class StaticReoptNode(Node):
                 reach_time=self.reach_time, reach_min=self.reach_min, reach_max=self.reach_max,
                 clean_kappa=self._clean_kappa, fit_tol=self.fit_tol,
                 apex_obstacles=apex_obs, relax_floor=self.relax_floor,
-                apex_merge_gap_m=self.apex_merge_gap_m)
+                apex_merge_gap_m=self.apex_merge_gap_m,
+                hold_max_gap_m=self.hold_max_gap_m, hold_kappa_max=self.hold_kappa_max)
         else:
             # Legacy whole-track mincurv_iqp (offline-grade; minutes/solve).
             res = core.reoptimize_with_obstacles(

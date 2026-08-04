@@ -686,6 +686,111 @@ def test_weave_failure_drops_only_the_implicated_humps():
     print("PASS a weave failure drops only the humps that overlap the violation")
 
 
+def _excursions(alpha, tol=0.02):
+    """Contiguous off-line runs of a CYCLIC profile. One = the line left the raceline once and
+    came back once; two over a same-side pair is the W."""
+    off = np.abs(np.asarray(alpha, float)) > tol
+    if not off.any():
+        return 0
+    if off.all():
+        return 1
+    off = np.roll(off, -int(np.argmin(off)))      # rotate so index 0 is ON the line
+    return int(np.count_nonzero(off[1:] & ~off[:-1])) + int(off[0])
+
+
+def _hold_case(gap_m, kappa=0.0, hold_gap=8.0, hold_kappa=0.3, n_st=900, half=1.2, pinch=None):
+    """One same-side pair `gap_m` apart on a synthetic straight; returns the offset profile.
+
+    `pinch` = (x_lo, x_hi, limit) narrows the corridor over a band that lies BETWEEN the two humps'
+    reaches, i.e. exactly where only a held plateau would go. Narrowing the whole corridor instead
+    would shrink both humps and prove nothing about the bridge."""
+    xy = np.column_stack([np.arange(n_st) * 0.1, np.zeros(n_st)])
+    s_l = np.arange(n_st) * 0.1
+    nv = np.column_stack([np.zeros(n_st), -np.ones(n_st)])
+    hi, lo = np.full(n_st, half), np.full(n_st, -half)
+    if pinch is not None:
+        x_lo, x_hi, lim = pinch
+        hi[(s_l >= x_lo) & (s_l <= x_hi)] = lim
+    x0 = 30.0
+    apex = [(x0, -0.55), (x0 + gap_m, -0.55)]                     # SAME side
+    obs = [(x0, 0.0, 0.15), (x0 + gap_m, 0.0, 0.15)]
+    d, nn, _e, drp, lay = core.build_offset_profile(
+        xy, s_l, float(n_st * 0.1), nv, apex, None, 0.0, 2.0, 2.0, hi_inc=hi, lo_inc=lo,
+        obstacles=obs, obs_margin=0.35, relax_floor=0.30, curvlim=1.5,
+        clean_kappa=np.full(n_st, kappa), apex_merge_gap_m=0.0,
+        hold_bridge=hold_gap > 0.0, hold_max_gap_m=hold_gap, hold_kappa_max=hold_kappa)
+    return d, nn, lay
+
+
+def _hold_case_arc(gap_m, radius, hold_gap=8.0, hold_kappa=0.3, half=1.2):
+    """The same pair, on a CIRCLE of the given radius -- so |kappa_clean| = 1/radius is real
+    GEOMETRY. The core judges curvature with Menger on the clean line (never an additive model),
+    so a corner has to be built, not declared."""
+    n_st = int(2.0 * np.pi * radius / 0.1)
+    th = np.arange(n_st) * (2.0 * np.pi / n_st)
+    xy = radius * np.column_stack([np.cos(th), np.sin(th)])
+    nv = -np.column_stack([np.cos(th), np.sin(th)])               # +d points at the centre
+    s_l = np.arange(n_st) * (2.0 * np.pi * radius / n_st)
+    hi, lo = np.full(n_st, half), np.full(n_st, -half)
+    i0 = n_st // 4
+    i1 = (i0 + int(round(gap_m / (s_l[1] - s_l[0])))) % n_st
+    apex, obs = [], []
+    for i in (i0, i1):
+        apex.append(tuple(xy[i] - 0.55 * nv[i]))                  # SAME side (outside), both
+        obs.append((float(xy[i][0]), float(xy[i][1]), 0.15))
+    d, nn, _e, _drp, lay = core.build_offset_profile(
+        xy, s_l, float(s_l[-1] + (s_l[1] - s_l[0])), nv, apex, None, 0.0, 2.0, 2.0,
+        hi_inc=hi, lo_inc=lo, obstacles=obs, obs_margin=0.35, relax_floor=0.30, curvlim=1.5,
+        clean_kappa=None, apex_merge_gap_m=0.0,
+        hold_bridge=hold_gap > 0.0, hold_max_gap_m=hold_gap, hold_kappa_max=hold_kappa)
+    return d, nn, lay
+
+
+def test_hold_bridge_holds_a_same_side_pair_on_a_straight():
+    # Two boxes on the same side, 6 m apart on a straight, with a reach too short for the ramps to
+    # overlap. Weaving back to the raceline between them costs two merge inflections and a speed
+    # dip, and buys a stretch of racing line the car leaves again immediately.
+    d_w, nn_w, lay_w = _hold_case(6.0, hold_gap=0.0)              # bridging OFF
+    d_h, nn_h, lay_h = _hold_case(6.0, hold_gap=8.0)              # bridging ON
+    assert nn_w == 2 and nn_h == 2, "both humps must be laid either way"
+    assert _excursions(d_w) == 2, "without the bridge this is the W (two excursions)"
+    assert _excursions(d_h) == 1, "with it the line must HOLD across the pair"
+    # holding means the profile never returns to the raceline BETWEEN the two apexes
+    mid = (np.arange(900) * 0.1 > 30.5) & (np.arange(900) * 0.1 < 35.5)
+    assert np.min(np.abs(d_h[mid])) > 0.05, "the offset must be held, not merely smoothed"
+    assert np.min(np.abs(d_w[mid])) < 0.02, "…and the un-bridged one does return to the line"
+    # the plateau stays on ONE side and never exceeds the amplitudes it connects
+    assert np.all(d_h[mid] * lay_h[0]["laid"] > 0), "the held plateau must stay on the apex side"
+    amp = max(abs(a["laid"]) for a in lay_h)
+    assert np.max(np.abs(d_h)) <= amp + 1e-6, "a bridge must not swing wider than its apexes"
+    print(f"PASS a same-side pair 6 m apart is held (excursions {_excursions(d_w)} -> "
+          f"{_excursions(d_h)})")
+
+
+def test_hold_bridge_gates():
+    # It is offered only where holding is the absence of a pointless detour, never a detour itself.
+    # TOO FAR APART: the raceline stretch between the boxes is worth taking.
+    d_far, nn_far, _l = _hold_case(6.0, hold_gap=4.0)
+    assert nn_far == 2 and _excursions(d_far) == 2, "a pair wider than hold_max_gap_m must not hold"
+    # IN A CORNER: the line between two boxes IS the apex; holding an offset gives it away.
+    # Built as real geometry (a circle of radius 3 m -> |kappa| = 0.33), because the core judges
+    # curvature with Menger on the clean line and rightly ignores a declared clean_kappa array.
+    d_cor, nn_cor, _l = _hold_case_arc(6.0, radius=3.0, hold_kappa=0.3)
+    assert nn_cor == 2 and _excursions(d_cor) == 2, "a bridge must not be laid through a corner"
+    assert _excursions(_hold_case_arc(6.0, radius=3.0, hold_kappa=1.0)[0]) == 1, \
+        "…and raising the bar past the corner's curvature re-enables it (the gate is what bit)"
+    # a GENTLE curve (radius 30 m -> 0.033) is still a straight as far as this rule is concerned
+    assert _excursions(_hold_case_arc(6.0, radius=30.0, hold_kappa=0.3)[0]) == 1
+    # NO CORRIDOR for the plateau: the held offset has to fit between the walls the whole way. The
+    # wall pinches in the 1 m band between the two humps' reaches -- each hump still fits at full
+    # amplitude, only a plateau across the pair would hit it.
+    d_pin, nn_pin, lay_pin = _hold_case(6.0, pinch=(32.5, 33.5, 0.30))
+    assert nn_pin == 2 and abs(lay_pin[0]["laid"]) > 0.45, "the pinch must not shrink the humps"
+    assert _excursions(d_pin) == 2, "a plateau that does not fit the corridor must not be laid"
+    assert _excursions(_hold_case(6.0)[0]) == 1, "…without the pinch, the same pair holds"
+    print("PASS the hold bridge is gated on gap, straightness and corridor room")
+
+
 def test_line_clearance_veto():
     # A line that does not clear an obstacle it CLAIMS to have reshaped must not be published;
     # one that misses an obstacle no hump was laid for is fine (reactive layer's job). Which
@@ -867,5 +972,7 @@ if __name__ == "__main__":
     test_cluster_curvature_budget_is_local()
     test_coverage_outranks_lap_time_in_the_reach_search()
     test_weave_failure_drops_only_the_implicated_humps()
+    test_hold_bridge_holds_a_same_side_pair_on_a_straight()
+    test_hold_bridge_gates()
     test_line_clearance_veto()
     print("ALL PASS")
