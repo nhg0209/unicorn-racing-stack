@@ -85,6 +85,7 @@ def planner(obstacles, cur_d=0.0, cur_s=0.0):
     n.lookahead_min, n.lookahead_k = 15.0, 1.5
     n.n_d_samples, n.sample_gaps = 10, True
     n.max_weave = 3
+    n.knot_merge_s_m = 0.4       # merge a second apex closer than this in s
     n.ramp_len, n.return_len, n.tail_m = 4.5, 4.5, 0.0
     n.ramp_len_min_m = 2.5       # adaptive-ramp floor; == ramp_len would disable the shortening
     n.apex_bulge, n.preramp_len_m = 0.10, 3.0

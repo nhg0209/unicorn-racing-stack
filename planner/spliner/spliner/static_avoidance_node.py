@@ -183,6 +183,10 @@ class ObstacleSpliner(Node):
         self.squeeze_max_speed_mps = 3.0    # [m/s] above this, "no candidate" still means TRAILING
         self.relax_hold_s = 2.0             # [s] a deadlock relax request forces the pass this long
         self._relax_until = 0.0             # wall time the current relax request expires
+        # [m] how close in s two apexes may be before the second is merged into the first. It was
+        # a literal 0.4; promoted because it interacts with how far ahead the first knot can sit,
+        # and that combination is what emptied the path beside a box (see the knot loop).
+        self.knot_merge_s_m = 0.4
         self.shift_min = 1.0         # [m] min arc length over which the lateral maneuver completes
         self.shift_buffer = 0.5      # [m] finish the shift this far before the obstacle near-edge
         # Peak curvature of the maneuver scales as amplitude/length^2 and the speed it can be
@@ -306,7 +310,7 @@ class ObstacleSpliner(Node):
             'kappa_add_max', 'kappa_abs_max', 'a_lat_max', 'a_long_max', 'a_long_accel',
             'safety_margin', 'static_near_zero_mps', 'static_promote_sec',
             'static_demote_mps', 'static_demote_sec',
-            'wall_margin', 'shift_min', 'shift_buffer', 'ramp_len', 'hold_after',
+            'wall_margin', 'knot_merge_s_m', 'shift_min', 'shift_buffer', 'ramp_len', 'hold_after',
             'return_len', 'ramp_len_min_m',
             'apex_bulge', 'max_weave', 'width_car', 'tail_m', 'w_d', 'w_k', 'w_c', 'w_obs', 'obs_sigma',
             'use_grid_check', 'trust_grid_bounds', 'grid_scan_max', 'grid_scan_step', 'bounds_warn_m',
@@ -399,6 +403,8 @@ class ObstacleSpliner(Node):
                                dbl(0.0, 10.0, "above this speed, no feasible candidate still means TRAILING [m/s]"))
         self.declare_parameter('relax_hold_s', 2.0,
                                dbl(0.0, 30.0, "how long a deadlock relax request forces the squeeze pass [s]"))
+        self.declare_parameter('knot_merge_s_m', 0.4,
+                               dbl(0.0, 5.0, "merge a second apex closer than this in s [m]"))
         self.declare_parameter('shift_min', 1.0, dbl(0.3, 10.0, "min arc length for the lateral maneuver [m]"))
         self.declare_parameter('shift_buffer', 0.5, dbl(0.0, 5.0, "finish the shift this far before the obstacle [m]"))
         self.declare_parameter('ramp_len', 4.5, dbl(0.5, 15.0, "ramp length onto the offset [m]"))
@@ -489,6 +495,8 @@ class ObstacleSpliner(Node):
                 self.safety_margin = float(p.value)
             elif n == 'wall_margin':
                 self.wall_margin = float(p.value)
+            elif n == 'knot_merge_s_m':
+                self.knot_merge_s_m = float(p.value)
             elif n == 'shift_min':
                 self.shift_min = float(p.value)
             elif n == 'shift_buffer':
@@ -1135,8 +1143,25 @@ class ObstacleSpliner(Node):
             if self._clears_obstacle(o, obs_margin):
                 n_already_clear += 1
                 continue
-            s_c = float(np.clip((o.s_center - self.cur_s) % self.gb_max_s, 0.3, lookahead))
-            if knots and s_c <= knots[-1][0] + 0.4:
+            # A box the car is already BESIDE gets no knot. Its s_center is a fraction of a metre
+            # ahead (or behind, mod L), and the old floor of 0.3 m pinned its knot there -- so the
+            # 0.4 m merge window that follows swallowed the NEXT box's knot while obs_ok went on
+            # rejecting that box, and every candidate died. With the two boxes 0.5 m apart there
+            # was no recovery at all: the car sat beside the first one publishing nothing.
+            #
+            # Dropping the knot is not dropping the obstacle. obs_ok still enforces the keep-out of
+            # EVERY box in the lookahead, knot or no knot, so this stays fail-closed: the path is
+            # not shaped around a box it has already passed, and it is still not allowed to hit it.
+            #
+            # The gap has to be SIGNED. `(s_center - cur_s) % L` for a centre a hand's breadth
+            # BEHIND the car is L - 0.1, which the old clip turned into `lookahead` -- a knot
+            # fifteen metres ahead for a box beside the mirror.
+            L = self.gb_max_s
+            gap_c = ((o.s_center - self.cur_s + L / 2.0) % L) - L / 2.0     # SIGNED
+            if gap_c <= 0.0:
+                continue                                   # centre level with or behind the car
+            s_c = float(min(gap_c, lookahead))
+            if knots and s_c <= knots[-1][0] + self.knot_merge_s_m:
                 continue                                   # too close in s to the previous apex -> merge
             knots.append((s_c, o, int(o.s_center / wpnt_dist) % self.gb_max_idx))
             if len(knots) >= self.max_weave:
@@ -1410,6 +1435,8 @@ class ObstacleSpliner(Node):
                 # One knot per obstacle centre -> a single smooth quintic hump (raceline -> apex ->
                 # raceline). d'=0 at each apex makes it the peak. apex_bulge pushes the peak FURTHER
                 # from the obstacle (wider swing); the feasibility filter verifies box clearance.
+                # Breakpoints must be STRICTLY increasing (BPoly raises otherwise). A knot can now
+                # sit arbitrarily close to the car, so the entry and the first apex can coincide.
                 bp_s = [s_entry0]
                 bp_d = [[d_start, dp0, 0.0]]
                 for i_k, ((s_c, _o, _cor), da) in enumerate(zip(knots, d_apex)):
@@ -1425,9 +1452,9 @@ class ObstacleSpliner(Node):
                     lo_k, hi_k = knot_cor[i_k]
                     d_peak = float(np.clip(da + self._bulge_away_from(da, _o),
                                            min(lo_k, hi_k), max(lo_k, hi_k)))
-                    bp_s.append(s_c)
+                    bp_s.append(max(s_c, bp_s[-1] + 1e-3))
                     bp_d.append([d_peak, 0.0, 0.0])
-                bp_s.append(s_exit_end)
+                bp_s.append(max(s_exit_end, bp_s[-1] + 1e-3))
                 bp_d.append([0.0, 0.0, 0.0])
                 dv[m_span] = BPoly.from_derivatives(bp_s, bp_d)(s_local[m_span])
             dv[s_local > s_exit_end] = 0.0

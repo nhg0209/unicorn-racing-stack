@@ -102,6 +102,13 @@ static_avoidance_planner:
     # Two quintics meet at the apex; outer ends are tangent to the raceline (d''=0) so entry/exit are
     # gentle and the sharpest bend sits right beside the obstacle. Must still return to the raceline
     # (a held offset violates the narrow corridor downstream -> all-red). Slalom handled by replanning.
+    # [m] how close in s two apexes may be before the second is MERGED into the first. Interacts
+    # with how far ahead the first knot may sit: while the car was beside a box, that box's knot was
+    # pinned 0.3 m ahead and this window then swallowed the NEXT box's knot -- which obs_ok went on
+    # rejecting, so every candidate died and the path went empty. A box the car is already past no
+    # longer takes a knot at all (it still keeps its keep-out), so this window only ever merges
+    # boxes genuinely ahead.
+    knot_merge_s_m: 0.4
     shift_min: 1.0          # [m]  min apex arc length (keeps the apex ahead of the car when very close)
     shift_buffer: 1.0       # [m]  (unused in apex-loaded profile; kept for param compatibility)
     # Ramp lengths 3.0 -> 4.5. The maneuver's peak curvature scales as amplitude/length^2, so
