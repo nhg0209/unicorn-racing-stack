@@ -218,6 +218,36 @@ class BodyGrid:
             * np.ones((1, w), dtype=np.uint8)
 
 
+def test_squeeze_relaxes_the_MEASURED_corridor_but_never_the_body_floor():
+    # The corridor is measured in the eroded grid when trust_grid_bounds is on (the shipped
+    # setting), and it took the DESIGN wall_margin rather than the one the squeeze solved at -- so
+    # the squeeze's wall relaxation had no effect there and the retry could only ever give up
+    # obstacle clearance.
+    n = planner([])
+    n.trust_grid_bounds = True
+    n.grid_scan_max, n.grid_scan_step = 3.0, 0.05
+    n.gb_max_s = TRACK_LEN
+
+    class G:                                  # free within +-1.0 m of the raceline
+        resolution = 0.05
+        origin = (-1.0, -3.0)
+        def __init__(self):
+            h = int(6.0 / self.resolution); w = int((TRACK_LEN + 2.0) / self.resolution)
+            y = (np.arange(h) + 0.5) * self.resolution + self.origin[1]
+            self.eroded_image = (np.where(np.abs(y) <= 1.0, 255, 0).astype(np.uint8)[:, None]
+                                 * np.ones((1, w), dtype=np.uint8))
+    n.map_filter = G()
+    wide = n._grid_corridor(9.0, wall_margin=0.10)
+    tight = n._grid_corridor(9.0, wall_margin=0.02)
+    assert wide is not None and tight is not None
+    assert (tight[1] - tight[0]) > (wide[1] - wide[0]) + 0.10, \
+        f"a reduced wall margin must widen the measured corridor: {wide} vs {tight}"
+    assert abs((tight[1] - wide[1]) - 0.08) < 1e-6, "and by exactly the difference it gave up"
+    # ...and the default is still the design value when nothing is passed
+    assert n._grid_corridor(9.0) == wide or abs(n._grid_corridor(9.0)[1] - (1.0 - n.wall_margin)) < 1e-6
+    print("PASS the squeeze's wall margin reaches the measured corridor")
+
+
 def test_squeeze_cannot_relax_the_body_floor():
     # The squeeze pass gives up safety_margin and wall_margin -- clearance ON TOP of the car's own
     # width. The body floor IS that width, so relaxing it would not buy a tighter pass, it would
@@ -299,6 +329,7 @@ if __name__ == "__main__":
     test_offcentre_box_bulges_away_from_it()
     test_bulge_rule_is_relative_to_the_obstacle()
     test_apex_bulge_is_clipped_to_the_corridor()
+    test_squeeze_relaxes_the_MEASURED_corridor_but_never_the_body_floor()
     test_squeeze_cannot_relax_the_body_floor()
     test_already_cleared_box_does_not_spend_a_knot()
     print("ALL PASS")

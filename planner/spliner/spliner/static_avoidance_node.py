@@ -1235,7 +1235,13 @@ class ObstacleSpliner(Node):
         # Prefer the corridor MEASURED in the occupancy grid: d_left/d_right are labelled left/right
         # by one global decision in gb_optimizer and ship exchanged on some maps (see the
         # trust_grid_bounds note in __init__), which puts every sample into the wall on the wrong side.
-        grid_cor = self._grid_corridor(nearest.s_center) if self.trust_grid_bounds else None
+        # `wall_margin`, not self.wall_margin: on a SQUEEZE retry the caller solved this path at a
+        # reduced wall reserve, and measuring the corridor at the design value threw that reduction
+        # away -- under trust_grid_bounds (the shipped setting) the squeeze's wall relaxation had no
+        # effect at all, so the retry could only ever give up obstacle clearance. The body gate
+        # (body_kernel_size, half a car against the eroded map) is unaffected and stays the floor.
+        grid_cor = (self._grid_corridor(nearest.s_center, wall_margin=wall_margin)
+                    if self.trust_grid_bounds else None)
         if grid_cor is not None:
             d_lo, d_hi = grid_cor
             if abs(d_hi - d_hi_wp) > self.bounds_warn_m or abs(d_lo - d_lo_wp) > self.bounds_warn_m:
@@ -1299,7 +1305,8 @@ class ObstacleSpliner(Node):
         # Corridor per woven obstacle, measured once (not per candidate): grid first, waypoint bounds
         # as the fallback -- same authority order as the sampled terminal offset above.
         def _corridor_at(cor_idx, s_c):
-            g = self._grid_corridor(s_c) if self.trust_grid_bounds else None
+            g = (self._grid_corridor(s_c, wall_margin=wall_margin)
+                 if self.trust_grid_bounds else None)
             if g is not None:
                 return g
             return (-(gb_wpnts[cor_idx].d_right - sample_margin),
@@ -1334,7 +1341,8 @@ class ObstacleSpliner(Node):
             # only as wide as the path can go: the sampled offsets plus the bulge and a cell
             scan_d_max = float(np.max(np.abs(d_ends))) + self.apex_bulge + 0.10
             scan_lo, scan_hi = self._grid_corridor_batch(
-                scan_s, d_max=max(scan_d_max, 0.5), d_step=max(self.grid_scan_step, 0.10))
+                scan_s, d_max=max(scan_d_max, 0.5), d_step=max(self.grid_scan_step, 0.10),
+                wall_margin=wall_margin)
         if scan_lo is None:
             scan_lo = np.empty(len(scan_s)); scan_hi = np.empty(len(scan_s))
             scan_lo[:] = np.nan; scan_hi[:] = np.nan
@@ -2029,7 +2037,7 @@ class ObstacleSpliner(Node):
         free[ok] = img[py[ok], px[ok]] == 255
         return free
 
-    def _grid_corridor(self, s_query: float) -> Optional[Tuple[float, float]]:
+    def _grid_corridor(self, s_query: float, wall_margin: float = None) -> Optional[Tuple[float, float]]:
         """Free lateral extent [d_lo, d_hi] (car-centre limits) at arc length s, MEASURED in the
         eroded occupancy grid rather than read from the waypoints' d_left/d_right.
 
@@ -2063,13 +2071,15 @@ class ObstacleSpliner(Node):
             lo_i -= 1
         while hi_i < free.size - 1 and free[hi_i + 1]:
             hi_i += 1
-        d_lo = float(d_scan[lo_i]) + self.wall_margin
-        d_hi = float(d_scan[hi_i]) - self.wall_margin
+        wm = self.wall_margin if wall_margin is None else float(wall_margin)
+        d_lo = float(d_scan[lo_i]) + wm
+        d_hi = float(d_scan[hi_i]) - wm
         if d_hi < d_lo:                        # narrower than 2*wall_margin -> collapse to its middle
             d_lo = d_hi = 0.5 * (float(d_scan[lo_i]) + float(d_scan[hi_i]))
         return d_lo, d_hi
 
-    def _grid_corridor_batch(self, s_query: np.ndarray, d_max: float = None, d_step: float = None):
+    def _grid_corridor_batch(self, s_query: np.ndarray, d_max: float = None, d_step: float = None,
+                             wall_margin: float = None):
         """_grid_corridor for MANY stations at once: (lo[n], hi[n]), NaN where unmeasurable.
 
         One converter call and one image lookup for the whole set. The per-station version costs
@@ -2087,6 +2097,7 @@ class ObstacleSpliner(Node):
             return None, None
         d_lim = float(self.grid_scan_max if d_max is None else d_max)
         d_res = float(self.grid_scan_step if d_step is None else d_step)
+        wm = self.wall_margin if wall_margin is None else float(wall_margin)
         d_scan = np.arange(-d_lim, d_lim + 1e-9, d_res)
         n_d = len(d_scan)
         ss = np.repeat(np.asarray(s_query, float) % self.gb_max_s, n_d)
@@ -2113,7 +2124,7 @@ class ObstacleSpliner(Node):
                 a_i -= 1
             while b_i < n_d - 1 and fr[b_i + 1]:
                 b_i += 1
-            l, h = float(d_scan[a_i]) + self.wall_margin, float(d_scan[b_i]) - self.wall_margin
+            l, h = float(d_scan[a_i]) + wm, float(d_scan[b_i]) - wm
             if h < l:
                 l = h = 0.5 * (float(d_scan[a_i]) + float(d_scan[b_i]))
             lo[r], hi[r] = l, h
