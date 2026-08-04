@@ -61,9 +61,61 @@ def gate_node(cur_d=0.0):
     return n
 
 
-def box(oid, edge):
+def box(oid, edge, x_m=None, y_m=None):
     """Obstacle whose NEAR edge sits `edge` metres to the +d side of the followed line."""
-    return types.SimpleNamespace(id=oid, d_right=edge, d_left=edge + 0.30)
+    return types.SimpleNamespace(id=oid, d_right=edge, d_left=edge + 0.30,
+                                 x_m=(0.0 if x_m is None else x_m),
+                                 y_m=(0.0 if y_m is None else y_m))
+
+
+def feed(n, entries, age_s=0.0):
+    """Publish /static_reopt/clearance: [(x, y, r, clearance), ...], received `age_s` ago."""
+    d = []
+    for e in entries:
+        d.extend(list(e))
+    n.clearance_cb(types.SimpleNamespace(data=d))
+    n._clr_feed_t = n._clock.t - age_s
+
+
+def test_clear_uses_the_published_clearance_when_it_is_fresh():
+    # THE definition of "clear" is static_reopt's 2-D line-to-obstacle-EDGE distance, published on
+    # /static_reopt/clearance. This node used to derive its own LATERAL distance in its own frenet
+    # frame and the state machine a third in ITS frame; the three agree on a straight and diverge
+    # on a curve, while being compared against thresholds 2 cm apart -- enough for one layer to
+    # call a line clear that another calls blocked, which a fail-closed chain turns into a
+    # permanent TRAILING.
+    n = gate_node()
+    n.clearance_feed_ttl_s, n.clearance_match_m = 3.0, 0.50
+    # the LATERAL test would say this box is on the line (near edge at +0.05), the published
+    # measurement says the line passes it by 0.40 m -- the measurement decides
+    b = box(1, 0.05, x_m=3.0, y_m=1.0)
+    feed(n, [(3.0, 1.0, 0.15, 0.40)])
+    assert n._eval_clear_gate([b], HALF_CAR) is True, "a fresh measurement must decide"
+    # ...and the reverse: the lateral test would call it clear, the measurement says 0.10 m
+    n2 = gate_node()
+    n2.clearance_feed_ttl_s, n2.clearance_match_m = 3.0, 0.50
+    b2 = box(2, 0.60, x_m=9.0, y_m=-2.0)
+    feed(n2, [(9.0, -2.0, 0.15, 0.10)])
+    assert n2._eval_clear_gate([b2], HALF_CAR) is False, "a measurement below the need blocks"
+    print("PASS a fresh published clearance is what 'clear' means")
+
+
+def test_clear_falls_back_when_the_feed_is_stale_or_absent():
+    # The feed may only ever REPLACE a measurement, never remove one: no feed, a stale one, or one
+    # with no entry near this box all fall back to the lateral test this node has always used.
+    b = box(3, 0.05, x_m=3.0, y_m=1.0)          # lateral test: NOT clear
+    n = gate_node()
+    n.clearance_feed_ttl_s, n.clearance_match_m = 3.0, 0.50
+    assert n._eval_clear_gate([b], HALF_CAR) is False, "no feed -> the lateral test stands"
+    n2 = gate_node()
+    n2.clearance_feed_ttl_s, n2.clearance_match_m = 3.0, 0.50
+    feed(n2, [(3.0, 1.0, 0.15, 0.40)], age_s=10.0)
+    assert n2._eval_clear_gate([b], HALF_CAR) is False, "a stale measurement must not be used"
+    n3 = gate_node()
+    n3.clearance_feed_ttl_s, n3.clearance_match_m = 0.50, 0.50
+    feed(n3, [(30.0, 30.0, 0.15, 0.40)])        # a measurement, but for a different box
+    assert n3._eval_clear_gate([b], HALF_CAR) is False, "no entry near this box -> fall back"
+    print("PASS the gate falls back to its own test when no fresh measurement covers the box")
 
 
 def test_evaluation_is_not_gated_on_cur_d():

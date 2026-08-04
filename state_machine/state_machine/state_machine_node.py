@@ -217,6 +217,12 @@ class StateMachine(Node):
         self.recovery_entry_d_m = self.params.recovery_entry_d_m
         self.lateral_width_gb_m = self.params.lateral_width_gb_m
         self.lateral_width_static_gb_m = self.params.lateral_width_static_gb_m
+        # THE clearance feed (see _published_clearance). Not parameters: a staleness window and a
+        # position-match radius are properties of the feed, not knobs to tune per track.
+        self._clr_feed = []
+        self._clr_feed_t = -1e18
+        self.clearance_feed_ttl_s = 3.0
+        self.clearance_match_m = 0.50
         self.gb_horizon_m = self.params.gb_horizon_m
         self.interest_horizon_m = self.params.interest_horizon_m
         self.reframe_warn_m = self.params.reframe_warn_m
@@ -403,6 +409,11 @@ class StateMachine(Node):
 
         self.create_subscription(Odometry, "/car_state/odom_frenet", self.frenet_pose_cb, qos)
         self.create_subscription(WpntArray, "/global_waypoints", self.glb_wpnts_og_cb, qos)
+        # THE clearance definition: how far the line static_reopt publishes passes each confirmed
+        # static obstacle. Consumed in the static free-check instead of re-deriving a lateral
+        # distance in this node's frame -- see the note there.
+        self.create_subscription(Float32MultiArray, "/static_reopt/clearance",
+                                 self.static_clearance_cb, 1)
 
         self.create_subscription(ObstacleArray, "/tracking/obstacles", self.obstacle_perception_cb, qos)
         self.create_subscription(
@@ -878,6 +889,29 @@ class StateMachine(Node):
         else:
             self.obstacles_prediction = []
 
+    def static_clearance_cb(self, msg: Float32MultiArray):
+        d = list(msg.data)
+        self._clr_feed = [tuple(d[i:i + 4]) for i in range(0, len(d) - 3, 4)]
+        self._clr_feed_t = time.time()
+
+    def _published_clearance(self, obs):
+        """static_reopt's measured clearance of the GB line past `obs`, or None if none is fresh.
+
+        Matched by MAP POSITION: this node carries tracker ids while static_reopt carries the
+        static layer's marker ids, and the two id spaces are unrelated."""
+        feed = getattr(self, "_clr_feed", None)
+        if not feed or (time.time() - getattr(self, "_clr_feed_t", -1e18)) > self.clearance_feed_ttl_s:
+            return None
+        ox, oy = float(getattr(obs, "x_m", float("nan"))), float(getattr(obs, "y_m", float("nan")))
+        if ox != ox or oy != oy:
+            return None
+        best, best_d = None, self.clearance_match_m
+        for (x, y, _r, clr) in feed:
+            dd = float(np.hypot(x - ox, y - oy))
+            if dd <= best_d:
+                best, best_d = float(clr), dd
+        return best
+
     def frenet_pose_cb(self, data: Odometry):
         self.cur_s = data.pose.pose.position.x
         self.cur_d = data.pose.pose.position.y
@@ -1198,6 +1232,21 @@ class StateMachine(Node):
                         else:
                             required_margin = lateral_width_m * np.clip(
                                 gap / free_scaling_reference_distance_m, 0.0, 1.0)
+                        # ONE DEFINITION OF CLEAR. `free_dist` above is a LATERAL distance in this
+                        # node's frenet frame; static_reopt measures the 2-D distance from the line
+                        # it publishes to the obstacle EDGE, and the reactive planner used to
+                        # derive a third. The three agree on a straight and diverge on a curve --
+                        # while being compared against thresholds 2 cm apart, so a curve was enough
+                        # for this node to call BLOCKED a line the planner had already gone idle
+                        # over, which is a TRAILING nothing can leave. On the GB line (the one
+                        # static_reopt owns and measures) its number is the answer; everywhere else
+                        # -- an overtaking spline it never saw -- the local computation stands.
+                        # No fresh measurement means the local computation too: the feed may only
+                        # ever REPLACE a measurement, never remove one.
+                        if is_gb_track_wpnts:
+                            pub_clr = self._published_clearance(obs)
+                            if pub_clr is not None:
+                                free_dist = pub_clr - self.gb_ego_width_m / 2
                         if free_dist < required_margin:
                             is_free = False
                             self.get_logger().info(

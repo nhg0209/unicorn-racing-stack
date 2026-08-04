@@ -44,6 +44,9 @@ import yaml
 SLACK = 0.03  # [m] margin the re-opt clearance must exceed the reactive keep-out by
 # Half the SIM car's width (gym_bridge f1tenth: 0.2032 m wide). The physical thing that has to fit
 # between the published line and the wall.
+# [m] required headroom between the LOWEST clearance the re-opt may settle for (relax_floor, which
+# the coverage ladder lands on exactly) and every consumer threshold that judges that clearance.
+FLOOR_CONSUMER_SLACK_M = 0.05
 MAP_RES_M = 0.05          # [m/px] the shipped maps' occupancy-grid resolution
 WIDTH_CAR_M = 0.30        # [m] car width; half of it is what a wall gate must reserve
 SIM_HALF_WIDTH_M = 0.1016
@@ -510,6 +513,38 @@ def main() -> int:
     else:
         print(f"OK: clear-gate need ({clear_need:.3f}) sits {obs_margin - clear_need:.3f} m below "
               f"the re-opt build and >= half car ({width_car/2:.3f}).")
+
+    # --- THE FLOOR the ladder lands on, against every consumer of that clearance --------------
+    # obs_margin is what the re-opt AIMS for; relax_floor is what it may SETTLE for, and the
+    # coverage ladder lands exactly on that floor by construction -- it walks down in steps until a
+    # rung is accepted, so the accepted clearance IS the rung. Every consumer threshold must
+    # therefore be compared against relax_floor, not obs_margin, and with real room: all three
+    # layers now measure the same quantity (static_reopt's 2-D line-to-edge distance, published on
+    # /static_reopt/clearance), but they still see it through different obstacle estimates, at
+    # different moments, with the box's own radius estimate moving. Two centimetres of headroom is
+    # noise; a consumer that reads a relaxed hump as NOT clear re-avoids a line that already
+    # avoids, and the chain is fail-closed.
+    relax_floor = float(args.get("reopt_relax_floor", obs_margin))
+    sm_p, sm_c = load_sm_params()
+    sm_static_req = (float(sm_c["gb_ego_width_m"]) / 2.0
+                     + float(sm_c["lateral_width_static_gb_m"]))
+    consumers = [("reactive clear-gate entry", clear_need),
+                 ("SM static GB requirement", sm_static_req)]
+    print(f"\nrelaxed-hump floor vs the consumers of THE clearance "
+          f"(/static_reopt/clearance, 2-D line-to-obstacle-edge):")
+    print(f"  reopt_relax_floor = {relax_floor:.3f} m  (the ladder lands ON this, by construction)")
+    for name, thr in consumers:
+        room = relax_floor - thr
+        if room < FLOOR_CONSUMER_SLACK_M - 1e-9:
+            ok = False
+            print(f"FAIL: {name} ({thr:.3f}) leaves only {room:.3f} m under the relaxed floor "
+                  f"({relax_floor:.3f}); {FLOOR_CONSUMER_SLACK_M:.2f} m is required. A hump the "
+                  f"ladder accepted at its floor would read as NOT clear to this consumer, which "
+                  f"re-avoids a line that already avoids -- and the chain is fail-closed. Raise "
+                  f"reopt_relax_floor or lower this threshold.")
+        else:
+            print(f"OK: {name} ({thr:.3f}) sits {room:.3f} m under the relaxed floor "
+                  f"(>= {FLOOR_CONSUMER_SLACK_M:.2f}).")
 
     # --- chain member 3: SM GB free-check vs the clearance the re-opt line is ENFORCED to ---
     sm_path, sm = load_sm_params()

@@ -55,7 +55,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 
 from ament_index_python.packages import get_package_share_directory
-from std_msgs.msg import String, Float32, Bool, Empty
+from std_msgs.msg import String, Float32, Bool, Empty, Float32MultiArray
 from nav_msgs.msg import Odometry
 from visualization_msgs.msg import Marker, MarkerArray
 from f110_msgs.msg import WpntArray, OTWpntArray
@@ -130,7 +130,10 @@ class StaticReoptNode(Node):
         # relieving the reactive layer of that box, but down to here it still clears it by what the
         # reactive planner would itself have driven -- strictly better than not covering it. Set
         # equal to obs_margin to disable the ladder.
-        self.declare_parameter("relax_floor", 0.30)
+        # See the reopt_relax_floor description in base_system.launch.xml: at least the reactive
+        # keep-out (0.30), AND at least 5 cm above every consumer of the clearance it produces --
+        # the reactive clear-gate entry (0.28) binds. The ladder lands exactly on this floor.
+        self.declare_parameter("relax_floor", 0.33)
         # FINAL wall gate: every published point is checked against the eroded occupancy map before
         # the line is allowed to swap in. The corridor the fit works in is derived from the
         # waypoints' d_left/d_right, which are an estimate; the map is the only wall source that
@@ -440,6 +443,9 @@ class StaticReoptNode(Node):
         # "is that box covered by the global line, and if not why" -- is exactly the question asked
         # after the fact, from a bag or a late subscriber.
         self.pub_coverage = self.create_publisher(MarkerArray, "/static_reopt/coverage", latched)
+        # THE clearance definition, published for everyone who needs one. See _publish_clearance.
+        self.pub_clearance = self.create_publisher(Float32MultiArray, "/static_reopt/clearance",
+                                                   latched)
 
         # Eroded occupancy map for the final wall gate (see _wall_gate_ok).
         self.map_filter = None
@@ -571,6 +577,38 @@ class StaticReoptNode(Node):
             m.text = f"id={c['id']} {c['status']} {c['clearance_m']:+.2f}m"
             arr.markers.append(m)
         self.pub_coverage.publish(arr)
+
+    def _publish_clearance(self) -> None:
+        """/static_reopt/clearance — how far the line the car is ACTUALLY FOLLOWING passes each
+        confirmed obstacle, as [x, y, r, clearance] per obstacle.
+
+        THE definition of "clear", in one place. It used to be three: this node measured the 2-D
+        distance from the line to the obstacle EDGE, while the reactive clear gate and the state
+        machine's static free-check each re-derived a LATERAL distance in their own frenet frame.
+        Those agree on a straight and diverge on a curve -- and they were being compared against
+        thresholds only 2 cm apart, so a curve was enough to make one layer believe the line clears
+        an obstacle while another believed it does not. That disagreement is what a fail-closed
+        chain turns into a permanent TRAILING.
+
+        Keyed by MAP POSITION, not by id: this node's obstacles carry the static layer's marker
+        ids while the reactive planner and the state machine carry tracker ids, and the two id
+        spaces are unrelated. Position is the one handle all three already share.
+
+        Published latched, on every swap and on the republish tick. A consumer that has no fresh
+        entry for an obstacle falls back to its own computation -- the feed may only ever REPLACE a
+        measurement, never remove one.
+        """
+        try:
+            obstacles = list(self._obstacles)
+            msg = Float32MultiArray()
+            if obstacles:
+                _sb, xb, yb = self._bundle_xy(self.active)
+                for o in obstacles:
+                    clr = float(np.min(np.hypot(xb - o.x, yb - o.y))) - float(o.r)
+                    msg.data.extend([float(o.x), float(o.y), float(o.r), clr])
+            self.pub_clearance.publish(msg)
+        except Exception as e:                      # a diagnostic must never break the node
+            self.get_logger().debug(f"[static_reopt] clearance publish failed: {e}")
 
     def _map_free(self, xy) -> Optional[np.ndarray]:
         """Vectorised eroded-map lookup: True where the point is in free space, None with no map.
@@ -999,6 +1037,7 @@ class StaticReoptNode(Node):
         self.get_logger().info(
             f"[static_reopt] obstacle set -> {len(obs)} obstacle(s); will batch re-opt at "
             f"start/finish" + ("; queued line kept (set only shrank)" if shrank else ""))
+        self._publish_clearance()      # a changed set means changed clearances, now not in 1 s
         # RETRO association: an obstacle confirmed only AFTER the car passed it (layer confirm
         # latency, typical for obstacles right past the start line) missed its live apex — the
         # avoidance path that produced it is already empty. Replay the recent-path buffer so the
@@ -1753,6 +1792,7 @@ class StaticReoptNode(Node):
         self.get_logger().info(f"[static_reopt] swapped to {kind} at s={s:.2f} m")
         self._publish_active(bundle)             # publish now, don't wait for the republish tick
         self._publish_coverage(bundle)
+        self._publish_clearance()                # the new line clears the boxes by new amounts
         self.pub_update_map.publish(Bool(data=True))   # /global_waypoints already latched above
 
     def _publish_active(self, active: "_Bundle"):
@@ -1819,6 +1859,7 @@ class StaticReoptNode(Node):
     def republish_cb(self):
         now = self.get_clock().now().nanoseconds * 1e-9
         self._collect_solve()          # install an off-executor solve, if one finished
+        self._publish_clearance()      # keep-alive for the consumers of THE clearance definition
         # STALE-FRENET fallback: no odom -> we never see the s-wrap. Solve once so a headless /
         # bag run still gets the obstacle line. Never fires while the car is actually driving.
         frenet_stale = (self._last_frenet_t is None

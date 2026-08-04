@@ -16,7 +16,7 @@ from rcl_interfaces.msg import (
 
 import numpy as np
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Float32, Bool
+from std_msgs.msg import Float32, Bool, Float32MultiArray
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 from scipy.interpolate import BPoly
@@ -249,6 +249,11 @@ class ObstacleSpliner(Node):
         # re-earn idle at the entry margin every time — that reset is what let a cleared obstacle
         # re-trigger a maneuver once per approach.
         self._clear_latch = {}
+        # THE clearance definition, fed by static_reopt from the line it actually publishes.
+        self._clr_feed = []          # [(x, y, r, clearance)] from /static_reopt/clearance
+        self._clr_feed_t = -1e18     # arrival time; staleness is "how long since I last heard"
+        self.clearance_feed_ttl_s = 3.0
+        self.clearance_match_m = 0.50
 
         # --- path commitment (temporal consistency) ------------------------------------------
         # Once a feasible evasion path is chosen, COMMIT to it: keep republishing that SAME
@@ -324,6 +329,9 @@ class ObstacleSpliner(Node):
         # static obstacle this planner reported infeasible. Absolute name, deliberately NOT
         # remapped per-planner (mirrors /planner/avoidance/static_feasible).
         self.create_subscription(Bool, "/planner/avoidance/relax", self.relax_cb, 10)
+        # See _clears_obstacle for why this node stopped deriving its own notion of "clear".
+        self.create_subscription(Float32MultiArray, "/static_reopt/clearance",
+                                 self.clearance_cb, 1)
 
         self.mrks_pub = self.create_publisher(MarkerArray, "/planner/avoidance/markers", 10)
         self.evasion_pub = self.create_publisher(OTWpntArray, "/planner/avoidance/otwpnts", 10)
@@ -779,12 +787,54 @@ class ObstacleSpliner(Node):
         """Does the FOLLOWED line (d = 0 in this node's frenet frame) pass `o` by `need`?
 
         The keep-out interval around the box, widened by `need` on both sides, simply must not
-        contain d = 0. Shared by the raceline-CLEAR gate (which asks it at the gate's own
-        threshold, to decide whether to plan at all) and the knot loop (which asks it at
-        obs_margin, to decide whether this obstacle needs an apex).
+        contain d = 0. This is a LATERAL distance in this node's own frenet frame, and it is the
+        FALLBACK now rather than the definition -- see _clears_obstacle.
         """
         return ((min(o.d_right, o.d_left) - need) > 0.0
                 or (max(o.d_right, o.d_left) + need) < 0.0)
+
+    def clearance_cb(self, msg: Float32MultiArray):
+        d = list(msg.data)
+        self._clr_feed = [tuple(d[i:i + 4]) for i in range(0, len(d) - 3, 4)]
+        self._clr_feed_t = self.get_clock().now().nanoseconds * 1e-9
+
+    def _published_clearance(self, o):
+        """The measured clearance of the FOLLOWED line past `o`, or None if there is none fresh.
+
+        Matched by MAP POSITION: this node carries tracker ids while static_reopt carries the
+        static layer's marker ids, and the two id spaces are unrelated."""
+        feed = getattr(self, "_clr_feed", None)
+        if not feed:
+            return None
+        if (self.get_clock().now().nanoseconds * 1e-9
+                - getattr(self, "_clr_feed_t", -1e18)) > getattr(self, "clearance_feed_ttl_s", 3.0):
+            return None
+        ox, oy = float(getattr(o, "x_m", float("nan"))), float(getattr(o, "y_m", float("nan")))
+        if ox != ox or oy != oy:
+            return None
+        best, best_d = None, getattr(self, "clearance_match_m", 0.50)
+        for (x, y, _r, clr) in feed:
+            dd = float(np.hypot(x - ox, y - oy))
+            if dd <= best_d:
+                best, best_d = float(clr), dd
+        return best
+
+    def _clears_obstacle(self, o, need: float) -> bool:
+        """Does the FOLLOWED line pass `o` by `need`? ONE definition, with a fail-closed fallback.
+
+        The definition is static_reopt's: the 2-D distance from the published line to the obstacle
+        EDGE. This node used to derive its own LATERAL distance in its own frenet frame, the state
+        machine derived a third in ITS frame, and all three were compared against thresholds only
+        2 cm apart -- so a curve was enough for one layer to believe the line clears a box while
+        another believed it does not, and in a fail-closed chain that becomes a permanent TRAILING.
+
+        With no fresh measurement it falls back to the lateral test, which is what it has always
+        done: the feed may only ever REPLACE a measurement, never remove one.
+        """
+        clr = self._published_clearance(o)
+        if clr is None:
+            return self._line_clears_obstacle(o, need)
+        return clr >= need
 
     def _bulge_away_from(self, da: float, o) -> float:
         """Signed apex_bulge that pushes the peak FURTHER FROM THE OBSTACLE.
@@ -889,7 +939,7 @@ class ObstacleSpliner(Node):
             oid = int(o.id)
             latched = (now_s - self._clear_latch.get(oid, -1e18)) < self.clear_latch_ttl_s
             need = base if (latched and not cancelling) else base + self.clear_hyst_m
-            if self._line_clears_obstacle(o, need):
+            if self._clears_obstacle(o, need):
                 self._clear_latch[oid] = now_s
             else:
                 self._clear_latch.pop(oid, None)
@@ -1082,7 +1132,7 @@ class ObstacleSpliner(Node):
             # Deliberately tested at obs_margin, NOT at the clear gate's own (smaller) threshold:
             # obs_ok enforces obs_margin on every obstacle whether or not it got a knot, so this is
             # exactly the condition under which skipping the knot cannot make obs_ok reject.
-            if self._line_clears_obstacle(o, obs_margin):
+            if self._clears_obstacle(o, obs_margin):
                 n_already_clear += 1
                 continue
             s_c = float(np.clip((o.s_center - self.cur_s) % self.gb_max_s, 0.3, lookahead))
