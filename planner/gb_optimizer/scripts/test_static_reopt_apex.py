@@ -91,6 +91,8 @@ def make_node():
     n.apex_span_margin_m = 0.5
     n.apex_undershoot_m = 0.12
     n.relax_floor = 0.30            # the bottom rung of the core's coverage ladder
+    n._swap_block = {}
+    n._swap_lap_t = 0.0
     n.apex_abeam_gap_m = 0.5
     n._apex_change_major = False
     n.active = straight_bundle()      # real node always has one (clean bundle at startup)
@@ -575,6 +577,41 @@ def test_swap_held_while_trailing_a_close_obstacle():
     n._commit_pending(10.0)
     assert n._pending is None, "a stale state must not block the swap forever"
     print("PASS the swap is held while TRAILING a close obstacle")
+
+
+def test_swap_gate_tally_names_the_gate_that_held_the_swap():
+    # The commit path is a chain of fail-closed gates and from outside they are indistinguishable:
+    # the line simply never swaps. The tally turns that into one readable line per lap.
+    n = make_node()
+    n._clock.t = 100.0
+    bundle = straight_bundle()
+    n._pending, n._pending_dev = bundle, np.zeros(400)
+    n._pending_since = 99.0
+    n._last_vs = 5.0
+    n._publish_active = lambda b: None
+    n._publish_coverage = lambda b: None
+    n.pub_update_map = types.SimpleNamespace(publish=lambda m: None)
+
+    n._reactive_active = True                       # the reactive layer is mid-maneuver
+    for _ in range(3):
+        n._commit_pending(10.0)
+    assert n._swap_block.get("reactive_not_idle") == 3, n._swap_block
+
+    n._reactive_active, n._reactive_idle_t = False, 0.0
+    n._pending_dev = np.full(400, 0.5)              # ...and now the lines disagree ahead
+    n._commit_pending(10.0)
+    assert n._swap_block.get("lines_disagree_in_horizon") == 1, n._swap_block
+
+    msgs = []
+    n.get_logger = lambda: types.SimpleNamespace(
+        info=lambda m, **k: msgs.append(m), warn=lambda *a, **k: None,
+        warning=lambda *a, **k: None, error=lambda *a, **k: None, debug=lambda *a, **k: None)
+    n._report_swap_blocks()
+    assert msgs and "reactive_not_idle x3" in msgs[-1] and "lines_disagree_in_horizon x1" in msgs[-1], \
+        msgs
+    assert "a line is still queued" in msgs[-1]
+    assert n._swap_block == {}, "the tally resets each lap"
+    print("PASS the swap-gate tally names the gate that held the swap")
 
 
 def test_solves_are_debounced():
@@ -1139,6 +1176,7 @@ if __name__ == "__main__":
     test_clearance_drift_retriggers_once()
     test_minor_apex_refinement_keeps_the_pending()
     test_swap_held_while_trailing_a_close_obstacle()
+    test_swap_gate_tally_names_the_gate_that_held_the_swap()
     test_solves_are_debounced()
     test_shrinking_set_keeps_the_queued_line()
     test_cluster_curvature_budget_is_local()

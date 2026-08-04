@@ -295,6 +295,11 @@ class StaticReoptNode(Node):
         self.apex_abeam_gap_m = float(self.get_parameter("apex_abeam_gap_m").value)
         self._apex_change_major = False
         self._apex_dirty_pending = False   # an apex changed; arm the rebuild at idle
+        # WHICH GATE held the swap this lap. The commit path is a chain of fail-closed gates, and
+        # from outside they are indistinguishable: the line simply never swaps. One counted line per
+        # lap turns "why is it still on the clean line?" from a bisect into a read.
+        self._swap_block = {}
+        self._swap_lap_t = 0.0
         # Obstacle keys whose clearance drift has already re-armed the solve against the CURRENTLY
         # active line. Without this latch the trigger re-fires every frame until the new line is
         # committed — and _mark_dirty discards the pending, so the very swap that would restore
@@ -1502,6 +1507,29 @@ class StaticReoptNode(Node):
             return None
         return gap if gap < self.swap_min_obs_gap_m else None
 
+    def _note_swap_block(self, reason: str):
+        """Count one cycle in which this gate held the swap (see _swap_block)."""
+        self._swap_block[reason] = self._swap_block.get(reason, 0) + 1
+
+    def _report_swap_blocks(self, lap_hint: str = ""):
+        """One line per lap naming the gate that held the swap, then reset.
+
+        Printed even when nothing blocked, because "the swap was never attempted" and "the swap was
+        blocked 800 times by the reactive layer" are different problems with the same symptom."""
+        blocks = self._swap_block
+        self._swap_block = {}
+        if self._pending is None and not blocks:
+            return
+        if not blocks:
+            self.get_logger().info(
+                f"[static_reopt] swap gates{lap_hint}: nothing blocked a queued line this lap")
+            return
+        top = sorted(blocks.items(), key=lambda kv: -kv[1])
+        self.get_logger().info(
+            f"[static_reopt] swap gates{lap_hint}: held by "
+            + ", ".join(f"{k} x{v}" for k, v in top)
+            + (f" (a line is still queued)" if self._pending is not None else ""))
+
     def _commit_pending(self, s: float, force: bool = False):
         """Swap once BOTH hold: the reactive layer is idle (no obstacle in its horizon, so changing
         the global line cannot pull the rug from under an avoidance in progress), and the lines
@@ -1531,6 +1559,7 @@ class StaticReoptNode(Node):
             # the pending hump at low speed; the normal gates can then never pass. Commit anyway.
             blocked = self._swap_blocked_by_state(car_x, car_y, s, now)
             if blocked is not None:
+                self._note_swap_block("trailing_near_obstacle")
                 # Ahead of the deadlock breaker on purpose: "stuck, slow, waiting" IS what trailing
                 # a close obstacle looks like, so letting the breaker through here would leave the
                 # gate doing nothing in the one case it exists for. It cannot deadlock: the car
@@ -1563,11 +1592,16 @@ class StaticReoptNode(Node):
                     f"— committing mid-hump to un-stick (car {dev_car:.2f} m off the new line)")
             else:
                 if self._reactive_active or (now - self._reactive_idle_t) < self.swap_idle_s:
+                    self._note_swap_block("reactive_not_idle")
                     return
                 horizon = max(self.swap_horizon_min_m, self.swap_horizon_time_s * abs(self._last_vs))
                 La = float(sa[-1]) if len(sa) and sa[-1] > 0 else self._track_len
                 ahead = ((sa - sa[j0]) % La) <= horizon
-                if not ahead.any() or float(np.max(self._pending_dev[ahead])) > 0.05:
+                if not ahead.any():
+                    self._note_swap_block("no_horizon")
+                    return
+                if float(np.max(self._pending_dev[ahead])) > 0.05:
+                    self._note_swap_block("lines_disagree_in_horizon")
                     return
         bundle = self._pending
         self._pending = None
@@ -1614,11 +1648,14 @@ class StaticReoptNode(Node):
         # full lap of travel on top makes the trigger independent of WHERE the car started (the
         # map's s=0 is not the start of the exploration lap) and immune to a parked car's s
         # flickering across the seam (its odometer never advances).
+        # ...and the lap boundary is where the swap-gate tally is reported (see _report_swap_blocks)
         crossed_sf = (self._last_s is not None
                       and s < self._last_s - 1.0
                       and self._last_s > 0.85 * L
                       and self._s_progressed > 0.9 * L)
         self._last_s = s
+        if crossed_sf:
+            self._report_swap_blocks()
         # SOLVE as soon as the set is dirty AND at least one apex has been captured — no need to
         # wait for the lap boundary, the solve is the cheap part and the swap is gated separately.
         # The lap crossing stays as a retry tick for the case where no apex existed yet.
