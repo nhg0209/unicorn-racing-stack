@@ -698,6 +698,71 @@ def _excursions(alpha, tol=0.02):
     return int(np.count_nonzero(off[1:] & ~off[:-1])) + int(off[0])
 
 
+def test_wrap_normals_is_a_correct_lateral_basis():
+    # The lateral basis is the coordinate the offset is laid in AND the coordinate every downstream
+    # check measures in, so an error in it is indistinguishable from an error in the offset. Three
+    # properties, on a closed line WITH the duplicated closing point every raceline ships with.
+    n = 240
+    R = 4.0
+    th = np.arange(n) * (2.0 * np.pi / n)
+    circle = R * np.column_stack([np.cos(th), np.sin(th)])
+    closed = np.vstack([circle, circle[:1]])              # duplicated closing point
+    nv = core._wrap_normals(closed)
+    assert nv.shape == (n + 1, 2), nv.shape
+    assert np.allclose(nv[-1], nv[0]), "the duplicated point must carry station 0's normal"
+    assert np.allclose(np.hypot(nv[:, 0], nv[:, 1]), 1.0), "normals must be unit"
+
+    # (1) PERPENDICULAR, and symmetrically so: a correct normal bisects the turn, so its angle to
+    # the chord ahead and to the chord behind are equal and opposite. This is what the shipped
+    # basis got wrong -- on ifac it is up to 33 deg asymmetric, i.e. simply pointing the wrong way.
+    u = closed[:-1]
+    fwd = np.roll(u, -1, axis=0) - u
+    bwd = u - np.roll(u, 1, axis=0)
+    fwd /= np.hypot(fwd[:, 0], fwd[:, 1])[:, None]
+    bwd /= np.hypot(bwd[:, 0], bwd[:, 1])[:, None]
+    asym = np.abs(np.einsum("ij,ij->i", nv[:n], fwd) + np.einsum("ij,ij->i", nv[:n], bwd))
+    assert asym.max() < 1e-9, f"the normal must bisect the turn, asymmetry {asym.max():.2e}"
+
+    # (2) it ROTATES at the rate the line's own curvature demands, at EVERY station including the
+    # seam. On a circle of radius R that is exactly el/R per segment.
+    a2, b2 = nv[:n], np.roll(nv[:n], -1, axis=0)
+    rot = np.arctan2(a2[:, 0] * b2[:, 1] - a2[:, 1] * b2[:, 0], np.einsum("ij,ij->i", a2, b2))
+    el = np.hypot(*(np.roll(u, -1, axis=0) - u).T)
+    assert np.abs(np.abs(rot) - el / R).max() < 1e-6, "rotation must equal kappa * el everywhere"
+
+    # (3) SIDE CONVENTION unchanged: it agrees with centerline_frame's +right normal everywhere.
+    rl = np.column_stack([closed[:, 0], closed[:, 1], np.ones(n + 1), np.ones(n + 1)])
+    _, nv_cf, _ = core.centerline_frame(rl)
+    nv_cf[-1] = nv_cf[0]
+    assert np.all(np.einsum("ij,ij->i", nv, nv_cf) > 0), "the side convention must not flip"
+    print("PASS _wrap_normals bisects the turn, tracks kappa*el, and keeps the +right convention")
+
+
+def test_wrap_normals_has_no_seam_artifact():
+    # The failure the offset actually saw: the shipped basis arrives at s = 0 having rotated by the
+    # wrong amount, so a smooth offset profile gets a one-station lateral step -- a kink in the
+    # published line where d(s) is perfectly C2.
+    n = 240
+    R = 4.0
+    th = np.arange(n) * (2.0 * np.pi / n)
+    circle = R * np.column_stack([np.cos(th), np.sin(th)])
+    closed = np.vstack([circle, circle[:1]])
+    alpha = np.full(n + 1, 0.5)                          # a CONSTANT offset: a concentric circle
+    stitch = closed + alpha[:, None] * core._wrap_normals(closed)
+    k = np.abs(core._menger_kappa(stitch[:-1]))
+    assert (k.max() - k.min()) < 1e-6, \
+        f"a constant offset must give a constant curvature, spread {k.max() - k.min():.2e}"
+    # ...and the shipped basis does NOT: the seam station stands out, which is the kink.
+    rl = np.column_stack([closed[:, 0], closed[:, 1], np.ones(n + 1), np.ones(n + 1)])
+    _, nv_cf, _ = core.centerline_frame(rl)
+    nv_cf[-1] = nv_cf[0]
+    k_cf = np.abs(core._menger_kappa((closed + alpha[:, None] * nv_cf)[:-1]))
+    assert (k_cf.max() - k_cf.min()) > 10.0 * (k.max() - k.min()) + 1e-6, \
+        "the harness must reproduce the artifact this basis was introduced to remove"
+    print(f"PASS a constant offset is a constant curvature: spread {k.max() - k.min():.2e} "
+          f"(shipped basis: {k_cf.max() - k_cf.min():.2e})")
+
+
 def _hold_case(gap_m, kappa=0.0, hold_gap=8.0, hold_kappa=0.3, n_st=900, half=1.2, pinch=None):
     """One same-side pair `gap_m` apart on a synthetic straight; returns the offset profile.
 
@@ -1039,6 +1104,8 @@ if __name__ == "__main__":
     test_cluster_curvature_budget_is_local()
     test_coverage_outranks_lap_time_in_the_reach_search()
     test_weave_failure_drops_only_the_implicated_humps()
+    test_wrap_normals_is_a_correct_lateral_basis()
+    test_wrap_normals_has_no_seam_artifact()
     test_hold_bridge_holds_a_same_side_pair_on_a_straight()
     test_hold_bridge_gates()
     test_common_side_prepass_unifies_an_accidental_slalom()

@@ -576,6 +576,46 @@ def _fit_hump_to_corridor(u_stn: np.ndarray, u_c: float, d: float, r0: float, tr
     return (lo_a if abs(lo_a) >= 0.03 else 0.0), reach_floor
 
 
+def _wrap_normals(xy: np.ndarray) -> np.ndarray:
+    """Unit normal per station of a CLOSED line, in the same +right convention as
+    `centerline_frame`, from a wrap-around central-difference tangent on the UNIQUE points.
+
+    This is the lateral BASIS the offset is laid on and every downstream check is measured in, so
+    an error in it is indistinguishable from an error in the offset -- and it was the larger of the
+    two. `centerline_frame` derives the normal from tph's numerically differentiated heading over
+    the array AS GIVEN, which for a raceline means two things:
+
+      * THE SEAM. The closed raceline ships with a DUPLICATED closing point (xy[-1] == xy[0]), so
+        the last segment has length 0 and the heading there is 0/0. The existing nvec[-1] = nvec[0]
+        patch repairs that one vector but not its neighbours, and the basis arrives at s = 0 having
+        rotated by the wrong amount: measured against the rotation the line's own curvature
+        demands (kappa_clean * el), the seam segment is off by 23 mrad on ifac and 44 mrad on f.
+        Laid under a ~0.5 m offset that is a ~2 cm lateral step at one station -- a visible kink in
+        the published line, and a |dkappa| of 0.44 where the offset profile itself is perfectly C2.
+      * CORNERS. The same comparison shows up to 64 mrad of station-to-station error on ifac,
+        which under half a metre of offset is the ripple seen along the humps.
+
+    Dropping the duplicate and taking the tangent from p[i+1] - p[i-1] removes both: the residual
+    falls to 9.6 mrad max / 0.5 mrad at the seam on ifac, and 1.3 / 0.6 on f.
+
+    `centerline_frame` itself is left alone -- it has other consumers (modulate_widths) whose
+    geometry is not this raceline.
+    """
+    p = np.asarray(xy, float)[:, :2]
+    n = len(p)
+    dup = bool(n > 1 and np.allclose(p[-1], p[0]))
+    u = p[:-1] if dup else p
+    t = np.roll(u, -1, axis=0) - np.roll(u, 1, axis=0)     # wrap-around central difference
+    nrm = np.hypot(t[:, 0], t[:, 1])
+    nrm[nrm < 1e-12] = 1e-12
+    t = t / nrm[:, None]
+    # +right convention, matching calc_normal_vectors(psi) as used by centerline_frame: verified
+    # against it on both shipped maps (dot > 0 at every station of ifac and f).
+    nv = np.column_stack([t[:, 1], -t[:, 0]])
+    # the duplicated closing point is the SAME physical point as station 0 -- give it that normal
+    return np.vstack([nv, nv[:1]]) if dup else nv
+
+
 def centerline_frame(reftrack: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute per-point heading psi (north-up), unit normal (toward +w_tr_right) and
     unit tangent for a closed reference line.
@@ -2043,13 +2083,14 @@ def _reopt_local_window_impl(
     clean_dl = np.asarray(clean_dl, float)
     clean_vx_arr = np.asarray(clean_vx, float) if clean_vx is not None else None
 
-    # dense raceline normal (toward +right); lays the offset on the clean line + reconstructs bounds.
+    # Dense raceline normal (toward +right). This ONE array is the lateral basis for everything
+    # that follows -- the apex projection, the clearance scan, the offset itself, the curvature
+    # verdicts and the reconstructed bounds -- so it is computed once, here, and passed down; a
+    # second basis anywhere would put the offset and its verification in different coordinates.
+    # See _wrap_normals for why it is not centerline_frame's.
+    nvec_rl = _wrap_normals(clean_xy)
+    # the clean reftrack, returned as `reftrack_mod` for the dict shape (no width modulation here)
     rl_ref = np.column_stack([clean_xy[:, 0], clean_xy[:, 1], clean_dr, clean_dl])
-    _, nvec_rl, _ = centerline_frame(rl_ref)
-    # The closed raceline has a DUPLICATED closing point (xy[-1]==xy[0], el=0); centerline_frame's
-    # normal there is a 0/0 garbage vector. It is the SAME physical point as idx 0, so copy it.
-    if N > 1 and np.allclose(clean_xy[-1], clean_xy[0]):
-        nvec_rl[-1] = nvec_rl[0]
 
     # arc length of the closed clean loop
     seg = np.roll(clean_xy, -1, axis=0) - clean_xy

@@ -103,9 +103,9 @@ def solve(m, apex, cfg_dir, wall_margin, fit_tol, obstacle=None):
 def sweep(m, cfg_dir, wall_margin, fit_tol, step):
     """Walk an obstacle around the lap; return per-solve rows measured on the published geometry."""
     n = len(m["xy"])
-    rl = np.column_stack([m["xy"][:, 0], m["xy"][:, 1], m["dr"], m["dl"]])
-    _, nvec, _ = core.centerline_frame(rl)
-    nvec[-1] = nvec[0]
+    # the SAME lateral basis the core lays the offset on -- a synthetic apex placed with a
+    # different normal is read back a couple of centimetres off in a corner (see _wrap_normals)
+    nvec = core._wrap_normals(m["xy"])
     hi = np.maximum(core._cyclic_smooth(m["dr"] - 0.15 - wall_margin, 7), 0.0)
     lo = np.minimum(core._cyclic_smooth(-(m["dl"] - 0.15 - wall_margin), 7), 0.0)
     rows, dropped = [], []
@@ -213,9 +213,7 @@ def _off_line_arc(traj, clean_xy, dev_tol=0.02):
 def multi_case(m, cfg_dir, wall_margin, fit_tol, anchor, n_obs, gap_m):
     """Place n_obs boxes gap_m apart from `anchor`, solve, and return the gate metrics."""
     xy = m["xy"]
-    rl = np.column_stack([xy[:, 0], xy[:, 1], m["dr"], m["dl"]])
-    _, nvec, _ = core.centerline_frame(rl)
-    nvec[-1] = nvec[0]
+    nvec = core._wrap_normals(xy)      # the basis the core lays the offset on
     hi = np.maximum(core._cyclic_smooth(m["dr"] - 0.15 - wall_margin, 7), 0.0)
     lo = np.minimum(core._cyclic_smooth(-(m["dl"] - 0.15 - wall_margin), 7), 0.0)
     seg = np.roll(xy, -1, axis=0) - xy
@@ -291,9 +289,7 @@ def check_hold(maps, cfg_dir, wall_margin, fit_tol) -> bool:
         return ok
     xy = m["xy"]
     lap0 = clean_metrics(m)[0]
-    rl = np.column_stack([xy[:, 0], xy[:, 1], m["dr"], m["dl"]])
-    _, nvec, _ = core.centerline_frame(rl)
-    nvec[-1] = nvec[0]
+    nvec = core._wrap_normals(xy)      # the basis the core lays the offset on
     hi = np.maximum(core._cyclic_smooth(m["dr"] - 0.15 - wall_margin, 7), 0.0)
     lo = np.minimum(core._cyclic_smooth(-(m["dl"] - 0.15 - wall_margin), 7), 0.0)
     seg = np.roll(xy, -1, axis=0) - xy
@@ -354,9 +350,7 @@ def check_seam(maps, cfg_dir, wall_margin, fit_tol) -> bool:
         s_loop = np.concatenate([[0.0], np.cumsum(el)[:-1]])
         track_len = float(np.sum(el))
         i = int(np.argmin(np.abs(s_loop - (track_len - SEAM_BACK_M))))
-        rl = np.column_stack([m["xy"][:, 0], m["xy"][:, 1], m["dr"], m["dl"]])
-        _, nvec, _ = core.centerline_frame(rl)
-        nvec[-1] = nvec[0]
+        nvec = core._wrap_normals(m["xy"])     # the basis the core lays the offset on
         hi = np.maximum(core._cyclic_smooth(m["dr"] - 0.15 - wall_margin, 7), 0.0)
         lo = np.minimum(core._cyclic_smooth(-(m["dl"] - 0.15 - wall_margin), 7), 0.0)
         side = 1.0 if hi[i] >= -lo[i] else -1.0
