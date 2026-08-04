@@ -90,6 +90,7 @@ def make_node():
     n.obs_change_tol = 0.05
     n.apex_span_margin_m = 0.5
     n.apex_undershoot_m = 0.12
+    n.relax_floor = 0.30            # the bottom rung of the core's coverage ladder
     n.apex_abeam_gap_m = 0.5
     n._apex_change_major = False
     n.active = straight_bundle()      # real node always has one (clean bundle at startup)
@@ -114,10 +115,17 @@ def drive(n, points):
     n.otwpnts_cb(idle_msg())
 
 
+def squeeze_msg(points):
+    """A path the planner could only solve at reduced margins (ot_line = 'squeeze')."""
+    m = path_msg(points)
+    m.ot_line = "squeeze"
+    return m
+
+
 def path_msg(points):
     """OTWpntArray stand-in: list of (x, y, d)."""
     wps = [types.SimpleNamespace(x_m=x, y_m=y, d_m=d) for x, y, d in points]
-    return types.SimpleNamespace(wpnts=wps)
+    return types.SimpleNamespace(wpnts=wps, ot_line="")
 
 
 HUMP = [(x * 0.5, 0.4 * np.exp(-((x * 0.5 - 5.0) ** 2)), 0.4 * np.exp(-((x * 0.5 - 5.0) ** 2)))
@@ -254,6 +262,37 @@ def test_apex_is_anchored_abeam_not_where_the_path_was_widest():
     ax, ay, _amp = n._apex_by_obs[("id", 7)]
     assert abs(ax - o.x) < 1e-6, f"apex x must be the obstacle's station, got {ax:.3f}"
     print(f"PASS the apex is stored abeam the obstacle (x={ax:.2f}, obstacle x={o.x:.2f})")
+
+
+def test_squeeze_apex_is_accepted_at_the_relax_floor():
+    # The planner reaches for a squeeze precisely when it has NO candidate at its design margins,
+    # so a squeeze apex is short of the geometric need BY CONSTRUCTION: on the shipped numbers
+    # |d| = 0.45 against a need of 0.60, a 0.15 m shortfall against an undershoot bound of 0.12.
+    # Judging it by the design bar rejected it, and about a fifth of squeezed obstacles never got a
+    # global hump -- in the one place a global hump would relieve the reactive layer the most.
+    n = make_node()
+    n._obstacles = [core.Obstacle(5.0, 0.0, 0.15)]         # need = 0 + (0.15 + 0.45) = 0.60
+    n._obs_ids = [7]
+    sq = [(x * 0.5, 0.45 * np.exp(-((x * 0.5 - 5.0) ** 2)),
+           0.45 * np.exp(-((x * 0.5 - 5.0) ** 2))) for x in range(20)]
+    n.otwpnts_cb(path_msg(sq))                              # ...as a NORMAL path: still a tail
+    assert ("id", 7) not in n._apex_by_obs, "the design bar must still reject a plain short path"
+    n.otwpnts_cb(squeeze_msg(sq))                           # ...tagged squeeze: usable evidence
+    assert ("id", 7) in n._apex_by_obs, "a squeeze apex clearing the relax floor must be accepted"
+    assert abs(n._apex_by_obs[("id", 7)][2] - 0.45) < 0.02
+    # the floor is the one the CORE will lay a hump at: r + relax_floor = 0.15 + 0.30 = 0.45
+    n._apex_by_obs.clear()
+    thin = [(x, y * 0.8, d * 0.8) for x, y, d in sq]        # 0.36: under the reactive keep-out
+    n.otwpnts_cb(squeeze_msg(thin))
+    assert ("id", 7) not in n._apex_by_obs, \
+        "below the floor the core would lay at, a squeeze apex is not usable evidence either"
+    # ...and the OVERSHOOT clamp still applies to a squeeze path
+    n._apex_by_obs.clear()
+    n._clean_dr = np.full(400, 1.3); n._clean_dl = np.full(400, 1.3)   # room for the overshoot
+    wide = [(x, y * 2.0, d * 2.0) for x, y, d in sq]        # 0.90, well past the need
+    n.otwpnts_cb(squeeze_msg(wide))
+    assert abs(n._apex_by_obs[("id", 7)][2] - 0.60) < 0.02, "a squeeze apex is still clamped"
+    print("PASS a squeeze apex is accepted at the floor the core will lay at")
 
 
 def test_apex_undershoot_rejected():
@@ -1083,6 +1122,7 @@ if __name__ == "__main__":
     test_apex_span_requirement()
     test_apex_is_anchored_abeam_not_where_the_path_was_widest()
     test_apex_undershoot_rejected()
+    test_squeeze_apex_is_accepted_at_the_relax_floor()
     test_apex_frozen_while_the_active_line_covers_it()
     test_implausible_apex_rejected()
     test_overshoot_apex_clamped()

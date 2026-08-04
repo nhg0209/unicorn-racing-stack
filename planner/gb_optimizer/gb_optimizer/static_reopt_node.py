@@ -1038,6 +1038,9 @@ class StaticReoptNode(Node):
         one with the largest |d| seen over the lap (the widest clearance the reactive layer
         committed to). The map-frame (x,y) is stored so the core re-projects it convention-free."""
         wps = msg.wpnts
+        # A SQUEEZE path passed the box at reduced margins (the planner had no candidate at its
+        # design ones). Judging its apex by the design requirement rejects it -- see _apex_candidate.
+        squeeze = str(getattr(msg, "ot_line", "")) == "squeeze"
         # Track whether the reactive layer is currently commanding an avoidance. An empty path, or
         # one that never leaves the raceline, means idle.
         now = self.get_clock().now().nanoseconds * 1e-9
@@ -1070,12 +1073,12 @@ class StaticReoptNode(Node):
         wd = np.fromiter((w.d_m for w in wps), float, len(wps))
         if active:
             # keep recent avoidance paths for RETRO association (obstacle confirmed after the pass)
-            self._path_buffer.append((now, wx, wy, wd))
+            self._path_buffer.append((now, wx, wy, wd, squeeze))
             while self._path_buffer and (now - self._path_buffer[0][0]) > self.apex_buffer_sec:
                 self._path_buffer.popleft()
         if not self._obstacles:
             return
-        if self._record_apexes(wx, wy, wd):
+        if self._record_apexes(wx, wy, wd, squeeze=squeeze):
             self._apex_dirty_pending = True
 
     def _adopt_orphan_apexes(self):
@@ -1126,7 +1129,7 @@ class StaticReoptNode(Node):
         carry outlier d values; recording one poisons the hump the re-opt lays."""
         d, i, _ = self._clean_offset(x, y)
         return -(self._clean_dr[i] - 0.12) <= d <= (self._clean_dl[i] - 0.12)
-    def _apex_candidate(self, wx, wy, wd, owner, idx, o):
+    def _apex_candidate(self, wx, wy, wd, owner, idx, o, squeeze=False):
         """The apex ONE reactive path offers for ONE obstacle, or None.
 
         Every rejection here exists because a bad record is unrecoverable: the apex sets where the
@@ -1187,8 +1190,24 @@ class StaticReoptNode(Node):
         # `need` is what the obstacle REQUIRES: its own offset + radius + keep-out + bulge + slack.
         side = 1.0 if d_rec >= d_obs else -1.0
         need = d_obs + side * (float(o.r) + 0.45)
+        # A SQUEEZE path is held to a different bar, because it answered a different question. The
+        # planner reached for it precisely when it had NO candidate at the design margins, so its
+        # apex is short of `need` by construction -- on the shipped numbers |d| = 0.45 against a
+        # need of 0.60, a 0.15 m shortfall against an undershoot bound of 0.12, so it was rejected
+        # and about a fifth of squeezed obstacles never got a global hump at all. That is backwards:
+        # the squeeze is the evidence that this box CAN be passed, in the one place where a global
+        # hump would relieve the reactive layer the most.
+        #
+        # The honest bar is the floor the core is willing to lay a hump at -- relax_floor, the
+        # reactive keep-out, the bottom rung of the coverage ladder. An apex that proves a pass at
+        # that clearance is usable; below it the core could not use the apex anyway. The OVERSHOOT
+        # clamp is unchanged: a squeeze apex is still clamped to `need`, never beyond it.
+        floor_lo = float(o.r) + self.relax_floor
         if (d_rec - need) * side > 0.0:                    # wider than required -> clamp onto it
             d_rec = need
+        elif squeeze:
+            if abs(d_rec - d_obs) < floor_lo - 1e-9:
+                return None                                 # not even the reactive keep-out
         elif (need - d_rec) * side > self.apex_undershoot_m:
             return None                                     # narrower than required -> a tail
         # --- ANCHOR AT THE OBSTACLE -------------------------------------------------------
@@ -1239,7 +1258,7 @@ class StaticReoptNode(Node):
             return False
         return now >= floor - 1e-9
 
-    def _record_apexes(self, wx, wy, wd) -> bool:
+    def _record_apexes(self, wx, wy, wd, squeeze=False) -> bool:
         """Associate one reactive path with the confirmed obstacles and update the apex records.
         Returns True when any apex was newly recorded or MOVED by more than 5 cm in amplitude
         (or 10 cm in position) — a rebuild-worthy change. Also sets `_apex_change_major`, which
@@ -1264,7 +1283,7 @@ class StaticReoptNode(Node):
         for idx, (o, key) in enumerate(zip(self._obstacles, keys)):
             if self._apex_frozen(key, o):
                 continue
-            cand = self._apex_candidate(wx, wy, wd, owner, idx, o)
+            cand = self._apex_candidate(wx, wy, wd, owner, idx, o, squeeze=squeeze)
             if cand is None:
                 continue
             changed = self._commit_apex(key, o, cand) or changed
@@ -1285,12 +1304,12 @@ class StaticReoptNode(Node):
         ox = np.fromiter((o.x for o in self._obstacles), float, len(self._obstacles))
         oy = np.fromiter((o.y for o in self._obstacles), float, len(self._obstacles))
         best = {}
-        for (_t, wx, wy, wd) in paths:
+        for _t, wx, wy, wd, sq in paths:
             owner = np.argmin(np.hypot(wx[:, None] - ox[None, :], wy[:, None] - oy[None, :]), axis=1)
             for idx, (o, key) in enumerate(zip(self._obstacles, keys)):
                 if self._apex_frozen(key, o):
                     continue
-                cand = self._apex_candidate(wx, wy, wd, owner, idx, o)
+                cand = self._apex_candidate(wx, wy, wd, owner, idx, o, squeeze=sq)
                 if cand is None:
                     continue
                 err = abs(cand[2] - abs(cand[3]))
