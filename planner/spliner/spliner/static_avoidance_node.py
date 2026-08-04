@@ -1667,8 +1667,19 @@ class ObstacleSpliner(Node):
         wpnts.header.frame_id = "map"
         # The squeeze marking must survive commitment: it is republished for the whole maneuver,
         # and the SM's speed cap keys off it. Dropping it on reuse would cap only the first cycle.
+        # It also OUTRANKS the commit-slice tag below: a squeeze path that is now being republished
+        # as a slice is still a squeeze path, and losing the tag would silently lift the speed cap
+        # for the rest of the maneuver.
         if c.get('squeeze'):
             wpnts.ot_line = "squeeze"
+        elif sel.start:
+            # REPUBLISHED SLICE, not a fresh plan: everything before the car has been cut off, so
+            # this path starts AT the car and its widest point is whatever is left of the maneuver
+            # -- usually the exit ramp. Consumers that read a published path as evidence of what
+            # the planner decided (the re-opt's apex recorder above all) need to be able to tell
+            # the difference; without it the exit ramps were recorded as apexes and walked the
+            # hump station up to a metre downstream of the box.
+            wpnts.ot_line = "commit_slice"
         xy = c['xy'][sel]
         s_mod = c['s_mod'][sel]
         d = c['d'][sel]

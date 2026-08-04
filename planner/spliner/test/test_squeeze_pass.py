@@ -125,9 +125,16 @@ def test_commit_records_the_margin_and_the_marking():
         now=lambda: types.SimpleNamespace(to_msg=lambda: stamp))
     msg = n._commit_to_msg(n._committed, slice(0, 4))
     assert msg.ot_line == "squeeze", "the SM speed cap keys off this on every cycle of the maneuver"
+    # ...even when what is left to republish is a SLICE (the tag outranks the slice marking, or
+    # the speed cap would silently lift halfway through the maneuver)
+    assert n._commit_to_msg(n._committed, slice(2, 4)).ot_line == "squeeze"
     # a normal commit must NOT be marked
     n._store_commit(obs, arr, arr, np.zeros((4, 2)), arr, arr, arr, obs_margin=0.30, squeeze=False)
     assert n._commit_to_msg(n._committed, slice(0, 4)).ot_line == ""
+    # ...but a republished SLICE says so: it starts AT the car, so its widest point is whatever is
+    # left of the maneuver -- usually the exit ramp. The re-opt's apex recorder reads published
+    # paths as evidence of what the planner decided, and recorded those ramps as apexes.
+    assert n._commit_to_msg(n._committed, slice(1, 4)).ot_line == "commit_slice"
     print("PASS the solved margin and the squeeze marking are committed with the path")
 
 
