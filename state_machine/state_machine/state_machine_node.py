@@ -1870,6 +1870,36 @@ class StateMachine(Node):
         nearest = int(cand[int(np.argmin(d2))])
         return max(0, nearest - int(back_pts))
 
+    def _splice_index(self, last_s: float, tag: str) -> int:
+        """Index of the first GLOBAL waypoint past `last_s`, found by SEARCH not by division.
+
+        `int(s / wpnt_dist)` assumes the global array is uniformly spaced from s = 0 and that the
+        `s` in hand belongs to it. Neither survives a static_reopt swap: the obstacle-aware line
+        has a different arc length (a 0.5 m hump adds about a metre), so a cached path's last s --
+        stamped on the PREVIOUS line -- names a station up to half a metre away on the new one, and
+        the padding that follows is spliced 4-5 waypoints off. searchsorted asks the array where
+        that s actually falls.
+        """
+        arr = self.cur_gb_wpnts.array
+        try:
+            return int(np.searchsorted(arr[:, 2], float(last_s), side="right"))
+        except Exception:
+            return int(float(last_s) / self.wpnt_dist) + 1
+
+    def _warn_splice_step(self, tail, head, tag: str) -> None:
+        """A splice is a JOIN: if the two ends are further apart than one waypoint spacing, the
+        local path has a step in it, and a step is what the controller feels."""
+        try:
+            step = float(np.hypot(head.x_m - tail.x_m, head.y_m - tail.y_m))
+        except Exception:
+            return
+        if step > 1.5 * self.wpnt_dist:
+            self.get_logger().warn(
+                f"[{self.name}] {tag}: the padded join steps {step:.3f} m "
+                f"(> 1.5 x wpnt_dist = {1.5 * self.wpnt_dist:.3f}); the local path has a "
+                f"discontinuity at the hand-over to the global line",
+                throttle_duration_sec=2.0)
+
     def get_splini_wpts(self) -> WpntArray:
         if self.static_overtaking_mode:
             wpnts = self.cur_static_avoidance_wpnts
@@ -1880,11 +1910,13 @@ class StateMachine(Node):
         avoidance_wpnts = wpnts.list[min_idx:min_idx + self.n_loc_wpnts]
 
         if len(avoidance_wpnts) < self.n_loc_wpnts:
-            glb_start_idx = int(wpnts.list[-1].s_m / self.wpnt_dist) + 1
+            glb_start_idx = self._splice_index(wpnts.list[-1].s_m, "avoidance")
             extra_wpnts = [
                 self.cur_gb_wpnts.list[(glb_start_idx + i) % len(self.cur_gb_wpnts.list)]
                 for i in range(self.n_loc_wpnts - len(avoidance_wpnts))
             ]
+            if avoidance_wpnts and extra_wpnts:
+                self._warn_splice_step(avoidance_wpnts[-1], extra_wpnts[0], "avoidance")
             avoidance_wpnts.extend(extra_wpnts)
         return avoidance_wpnts
 
@@ -1894,11 +1926,15 @@ class StateMachine(Node):
             min_idx = np.argmin(diff)
             wpnts = self.cur_recovery_wpnts.list[min_idx:min_idx + self.n_loc_wpnts]
             if len(wpnts) < self.n_loc_wpnts:
-                glb_start_idx = int(self.cur_recovery_wpnts.list[-1].s_m / self.wpnt_dist)
+                # NB the missing +1: this one restarted the padding ON the last point it already
+                # had, so the joined path carried a duplicated waypoint.
+                glb_start_idx = self._splice_index(self.cur_recovery_wpnts.list[-1].s_m, "recovery")
                 extra_wpnts = [
                     self.cur_gb_wpnts.list[(glb_start_idx + i) % len(self.cur_gb_wpnts.list)]
                     for i in range(self.n_loc_wpnts - len(wpnts))
                 ]
+                if wpnts and extra_wpnts:
+                    self._warn_splice_step(wpnts[-1], extra_wpnts[0], "recovery")
                 wpnts.extend(extra_wpnts)
             return wpnts
 
@@ -1908,11 +1944,13 @@ class StateMachine(Node):
             min_idx = np.argmin(diff)
             start_wpnts = self.cur_start_wpnts.list[min_idx:min_idx + self.n_loc_wpnts]
             if len(start_wpnts) < self.n_loc_wpnts:
-                glb_start_idx = int(self.cur_start_wpnts.list[-1].s_m / self.wpnt_dist) + 1
+                glb_start_idx = self._splice_index(self.cur_start_wpnts.list[-1].s_m, "start")
                 extra_wpnts = [
                     self.cur_gb_wpnts.list[(glb_start_idx + i) % len(self.cur_gb_wpnts.list)]
                     for i in range(self.n_loc_wpnts - len(start_wpnts))
                 ]
+                if start_wpnts and extra_wpnts:
+                    self._warn_splice_step(start_wpnts[-1], extra_wpnts[0], "start")
                 start_wpnts.extend(extra_wpnts)
             return start_wpnts
         else:
