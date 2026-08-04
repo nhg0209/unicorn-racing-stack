@@ -252,6 +252,75 @@ def multi_case(m, cfg_dir, wall_margin, fit_tol, anchor, n_obs, gap_m):
     }
 
 
+# SEAM case. Everything in this pipeline is indexed from s = 0, and a hump centred 0.6 m before
+# the seam has most of its body on the OTHER side of that index. The stationwise sweep above steps
+# past the seam by construction (step 11 -> the last visited waypoint is up to a metre short of it)
+# and the multi-obstacle anchors are all mid-lap, so the wrap was never actually exercised: it was
+# the near-start obstacle that produced the "confirmed but 0 recorded apexes" loop on the car.
+SEAM_BACK_M = 0.6                  # [m] how far BEFORE s = 0 the obstacle sits
+
+
+def check_seam(maps, cfg_dir, wall_margin, fit_tol) -> bool:
+    ok = True
+    print(f"\n--- seam gate: obstacle {SEAM_BACK_M:.2f} m BEFORE s = 0 (the hump must wrap) ---")
+    print("  map   | laid | min clear | wraps | max|kappa| vs bar")
+    for name, m in maps.items():
+        seg = np.roll(m["xy"], -1, axis=0) - m["xy"]
+        el = np.hypot(seg[:, 0], seg[:, 1])
+        s_loop = np.concatenate([[0.0], np.cumsum(el)[:-1]])
+        track_len = float(np.sum(el))
+        i = int(np.argmin(np.abs(s_loop - (track_len - SEAM_BACK_M))))
+        rl = np.column_stack([m["xy"][:, 0], m["xy"][:, 1], m["dr"], m["dl"]])
+        _, nvec, _ = core.centerline_frame(rl)
+        nvec[-1] = nvec[0]
+        hi = np.maximum(core._cyclic_smooth(m["dr"] - 0.15 - wall_margin, 7), 0.0)
+        lo = np.minimum(core._cyclic_smooth(-(m["dl"] - 0.15 - wall_margin), 7), 0.0)
+        side = 1.0 if hi[i] >= -lo[i] else -1.0
+        apex = tuple(m["xy"][i] + side * APEX_OFFSET_M * nvec[i])
+        obstacle = (float(m["xy"][i][0]), float(m["xy"][i][1]), OBS_RADIUS_M)
+        try:
+            res = solve(m, apex, cfg_dir, wall_margin, fit_tol, obstacle)
+        except Exception as exc:
+            ok = False
+            print(f"  {name:5s} | EXCEPTION {type(exc).__name__}: {exc}")
+            continue
+        if res["n_windows"] == 0:
+            why = res["apex_dropped"][0].get("reason", "?") if res["apex_dropped"] else "no-apex"
+            print(f"  {name:5s} |    0 |         — |     — | dropped ({why})")
+            ok = False
+            print(f"    FAIL: the seam obstacle must be laid like any other. A hump the fit cannot "
+                  f"place here leaves the near-start obstacle reactive-only every lap.")
+            continue
+        laid = res["apex_laid"][0]
+        clear = float(laid.get("clear", float("nan")))
+        alpha = np.asarray(res["alpha"], float)
+        # The hump WRAPS: it must be off the raceline on both sides of index 0, or the profile was
+        # silently truncated at the seam and the obstacle is only half covered.
+        n_a = len(alpha)
+        w = max(3, int(0.5 * max(laid["r_in"], laid["r_out"]) / max(track_len / n_a, 1e-6)))
+        before = float(np.max(np.abs(alpha[-w:])))
+        after = float(np.max(np.abs(alpha[:w])))
+        wraps = before > 0.05 and after > 0.05
+        traj = res["main"][0]
+        kg = np.abs(core._menger_kappa(traj[:, 1:3]))
+        bar = max(float(res.get("curvlim", 0.0)), clean_metrics(m)[1])
+        print(f"  {name:5s} | {res['n_windows']:4d} | {clear:9.3f} | {str(wraps):5s} | "
+              f"{kg.max():6.2f} vs {bar:.2f}")
+        if clear == clear and clear < OBS_MARGIN_M - 1e-6:
+            ok = False
+            print(f"    FAIL: the seam hump clears the box by {clear:+.3f} m, under obs_margin "
+                  f"{OBS_MARGIN_M:.2f}.")
+        if not wraps:
+            ok = False
+            print(f"    FAIL: the offset is {before:.3f} m before the seam and {after:.3f} m after "
+                  f"it — the hump was truncated at s = 0 instead of wrapping around it.")
+        if kg.max() > bar + 1e-3:
+            ok = False
+            print(f"    FAIL: max|kappa| {kg.max():.2f} exceeds the bar {bar:.2f} at the seam — the "
+                  f"wrap is being closed with a kink.")
+    return ok
+
+
 def check_multi(maps, cfg_dir, wall_margin, fit_tol, per_apex_s, enforce_laptime=True) -> bool:
     ok = True
     print(f"\n--- multi-obstacle gate (clip / peaks / clearance / lap loss / locality) ---")
@@ -408,6 +477,8 @@ def main() -> int:
     if args.check:
         if not check_multi(loaded, cfg_dir, args.wall_margin[0], args.fit_tol[0],
                            args.lap_loss_per_apex, enforce_laptime=args.enforce_laptime):
+            ok = False
+        if not check_seam(loaded, cfg_dir, args.wall_margin[0], args.fit_tol[0]):
             ok = False
         if not args.enforce_laptime:
             print("\n  NOTE: the lap-loss budget above is REPORTED, not enforced (--enforce-laptime\n"
