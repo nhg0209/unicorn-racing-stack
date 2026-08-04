@@ -768,6 +768,9 @@ class StaticReoptNode(Node):
                 # the car drove reactively is the single most surprising thing this line can do.
                 smsg = (f"; SIDE FLIPPED to d={a['d_used']:+.3f} (apex proposed {a['want']:+.3f})"
                         if a.get("flipped") else "")
+                if a.get("side_unified"):
+                    smsg += ("; SIDE UNIFIED with its neighbours (this obstacle's own reactive "
+                             "apex proposed the other side)")
                 line = (f"[static_reopt] apex @({a['xy'][0]:.2f},{a['xy'][1]:.2f}) "
                         f"laid d={a['laid']:+.3f} (want {a['want']:+.3f}) "
                         f"reach {a['r_in']:.2f}/{a['r_out']:.2f} m of {r_req:.2f} requested "

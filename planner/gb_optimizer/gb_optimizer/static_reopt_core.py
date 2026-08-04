@@ -266,6 +266,108 @@ def _kappa_local_max(kap: np.ndarray, s_loop: np.ndarray, s_a: float, s_b: float
     return float(np.max(kap[mask])) if mask.any() else 0.0
 
 
+def _unify_cluster_sides(knots, track_len, s_loop, hi_inc, lo_inc, kap_geo,
+                         hold_max_gap_m, hold_kappa_max, fit_tol):
+    """Give the obstacles of one close group a COMMON side where the corridor allows it.
+
+    Each knot's side comes from its own recorded reactive apex, which is evidence that a side is
+    drivable and nothing more -- it was chosen one obstacle at a time, by a planner that was
+    looking at one obstacle at a time. Two boxes 5 m apart can therefore end up with opposite
+    sides for no better reason than which way the car happened to be displaced when it met each
+    of them, and the global line then has to cross between them: a slalom the geometry never
+    required, and the shape most likely to be dropped outright by the opposite-side cluster test.
+
+    So before anything is fitted, ask whether ONE side clears the whole group. If it does, the
+    minority apexes are mirrored onto it (the same 2*d_obs - d mirror the coverage ladder uses as
+    its second aim, which means a mistake here is still recoverable: the ladder's fallback IS the
+    original side). If neither side works, nothing changes and the slalom stands -- it was real.
+
+    Gated exactly like the hold bridge, and by the same parameters: close together
+    (hold_max_gap_m) and on a straight (hold_kappa_max, Menger). In a corner the sides are the
+    line, not an accident. Returns (knots, {k_i that were flipped}).
+    """
+    if hold_max_gap_m <= 0.0 or len(knots) < 2 or hi_inc is None or lo_inc is None:
+        return knots, set()
+    ks = sorted(knots, key=lambda k: k[0])
+    hi = np.asarray(hi_inc, float)
+    lo = np.asarray(lo_inc, float)
+    s_arr = np.asarray(s_loop, float)
+
+    def _span_mask(s_c, r):
+        ds = np.abs(((s_arr - float(s_c) + track_len / 2.0) % track_len) - track_len / 2.0)
+        return ds <= float(r)
+
+    def _room(d_t, s_c, r):
+        """Slack the corridor leaves for a peak of `d_t` over this hump's whole span [m], or None
+        when it does not fit. Conservative on purpose: the peak is tested against the TIGHTEST
+        station of the span even though the quintic only reaches it at the centre. Declining to
+        unify leaves the sides exactly as the reactive layer proved them, so the cautious answer
+        is the safe one."""
+        m = _span_mask(s_c, r)
+        if not m.any():
+            return None
+        slack = (float(np.min(hi[m])) - d_t) if d_t > 0 else (d_t - float(np.max(lo[m])))
+        return slack if slack >= -fit_tol else None
+
+    # groups of knots whose consecutive gaps are all inside the hold window
+    groups, cur = [], [0]
+    for i in range(1, len(ks)):
+        if (ks[i][0] - ks[i - 1][0]) % track_len <= hold_max_gap_m:
+            cur.append(i)
+        else:
+            groups.append(cur)
+            cur = [i]
+    groups.append(cur)
+
+    flipped = set()
+    for g in groups:
+        if len(g) < 2:
+            continue
+        members = [ks[i] for i in g]
+        if any(m[8] is None for m in members):
+            continue                                  # no box geometry -> no mirror to compute
+        sides = {1 if m[1] >= 0 else -1 for m in members}
+        if len(sides) < 2:
+            continue                                  # already one side: nothing to unify
+        if kap_geo is not None:
+            ds = (s_arr - members[0][0]) % track_len
+            span = ds <= ((members[-1][0] - members[0][0]) % track_len)
+            if span.any() and float(np.max(np.abs(np.asarray(kap_geo, float)[span]))) >= hold_kappa_max:
+                continue                              # a corner: the sides ARE the line
+        best = None
+        for sigma in (1, -1):
+            targets, n_flip, worst = [], 0, float("inf")
+            for m in members:
+                d_t = float(m[1])
+                if (1 if d_t >= 0 else -1) != sigma:
+                    d_t = 2.0 * float(m[8]) - d_t     # mirror about the box centre
+                    n_flip += 1
+                    if (1 if d_t >= 0 else -1) != sigma or abs(d_t) < 0.03:
+                        targets = None                # the mirror does not land on this side
+                        break
+                room = _room(d_t, m[0], max(m[2], m[3]))
+                if room is None:
+                    targets = None
+                    break
+                worst = min(worst, room)
+                targets.append(d_t)
+            if targets is None or n_flip == 0:
+                continue
+            cand = (n_flip, -worst, sigma, targets)
+            if best is None or cand[:2] < best[:2]:
+                best = cand
+        if best is None:
+            continue
+        _nf, _w, _sigma, targets = best
+        for i, d_t in zip(g, targets):
+            k = list(ks[i])
+            if abs(k[1] - d_t) > 1e-9:
+                flipped.update(ki for _ob, ki in k[6])
+            k[1] = d_t
+            ks[i] = tuple(k)
+    return ks, flipped
+
+
 def _cluster_knots(knots, track_len, merge_gap, curvlim, clean_kappa, s_loop, dropped_out):
     """Resolve CLUSTERS before any hump is fitted: merge what belongs together, drop what cannot
     physically be woven.
@@ -995,6 +1097,18 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
     if not knots:
         return d_global, 0, 0.0, [], []
 
+    # --- COMMON-SIDE pre-pass: one side for a close group, where the corridor allows -----------
+    # Runs BEFORE the cluster stage on purpose: a group unified onto one side is a same-side
+    # cluster, which _cluster_knots merges into a single hump instead of dropping as an
+    # unweavable opposite-side pair, and which the hold bridge can then carry as one excursion.
+    try:
+        kap_geo_pre = _menger_kappa(clean_xy)
+    except Exception:
+        kap_geo_pre = None
+    knots, unified_ki = _unify_cluster_sides(
+        knots, track_len, s_loop, hi_inc, lo_inc, kap_geo_pre,
+        hold_max_gap_m, hold_kappa_max, fit_tol)
+
     # --- CLUSTER pre-pass: merge what belongs together, drop what cannot be woven -------------
     knots = _cluster_knots(knots, track_len, apex_merge_gap_m, curvlim,
                            clean_kappa, s_loop, dropped_out=cluster_dropped)
@@ -1308,6 +1422,8 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                          "floor": float(floor_used),   # the clearance this hump was ACCEPTED at
                          "flipped": bool(d_used is not d and abs(d_used - d) > 1e-9),
                          "d_used": float(d_used),      # the aim that was accepted (mirrored or not)
+                         # side taken from the GROUP rather than from this obstacle's own apex
+                         "side_unified": bool(_ki_m in unified_ki),
                          "r_in": float(r_in), "r_out": float(r_out), "r_req": float(r_req),
                          "kappa_peak": 0.0,        # filled from the laid profile below
                          "clear": float("nan"),    # ditto — measured on the WOVEN profile

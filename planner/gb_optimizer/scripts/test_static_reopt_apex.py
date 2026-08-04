@@ -791,6 +791,73 @@ def test_hold_bridge_gates():
     print("PASS the hold bridge is gated on gap, straightness and corridor room")
 
 
+def _mixed_case(gap_m, hold_gap=8.0, half=1.2, pinch=None, pinch_neg=None, n_st=900, merge=0.0):
+    """Two boxes `gap_m` apart, both ON the raceline, with OPPOSITE-side recorded apexes.
+
+    `pinch` / `pinch_neg` = (x_lo, x_hi, limit) bring the + / - wall in over a band, so a test can
+    say which sides are actually available where."""
+    xy = np.column_stack([np.arange(n_st) * 0.1, np.zeros(n_st)])
+    s_l = np.arange(n_st) * 0.1
+    nv = np.column_stack([np.zeros(n_st), -np.ones(n_st)])
+    hi, lo = np.full(n_st, half), np.full(n_st, -half)
+    if pinch is not None:
+        x_lo, x_hi, lim = pinch
+        hi[(s_l >= x_lo) & (s_l <= x_hi)] = lim
+    if pinch_neg is not None:
+        x_lo, x_hi, lim = pinch_neg
+        lo[(s_l >= x_lo) & (s_l <= x_hi)] = -lim
+    x0 = 30.0
+    apex = [(x0, -0.55), (x0 + gap_m, +0.55)]                     # OPPOSITE sides
+    obs = [(x0, 0.0, 0.15), (x0 + gap_m, 0.0, 0.15)]
+    d, nn, _e, drp, lay = core.build_offset_profile(
+        xy, s_l, float(n_st * 0.1), nv, apex, None, 0.0, 2.0, 2.0, hi_inc=hi, lo_inc=lo,
+        obstacles=obs, obs_margin=0.35, relax_floor=0.30, curvlim=1.5, clean_kappa=None,
+        apex_merge_gap_m=merge, hold_bridge=hold_gap > 0.0, hold_max_gap_m=hold_gap,
+        hold_kappa_max=0.3)
+    return d, nn, lay, drp
+
+
+def test_common_side_prepass_unifies_an_accidental_slalom():
+    # Each side comes from that obstacle's own reactive apex -- evidence that a side is drivable,
+    # chosen one obstacle at a time by a planner looking at one obstacle at a time. Two boxes ON
+    # the raceline 6 m apart can therefore end up with opposite sides for no reason but which way
+    # the car happened to be displaced, and the global line then crosses between them.
+    d_off, nn_off, lay_off, _drp = _mixed_case(6.0, hold_gap=0.0)
+    assert nn_off == 2 and _excursions(d_off) == 2, "without the pre-pass this is a slalom"
+    assert lay_off[0]["laid"] * lay_off[1]["laid"] < 0, "…on opposite sides"
+    d_on, nn_on, lay_on, _drp = _mixed_case(6.0)
+    assert nn_on == 2, "unifying must not cost a hump"
+    assert lay_on[0]["laid"] * lay_on[1]["laid"] > 0, "both humps must end up on ONE side"
+    assert _excursions(d_on) == 1, "…and the line then leaves the raceline once"
+    assert sum(bool(a.get("side_unified")) for a in lay_on) == 1, \
+        "exactly the minority apex is flipped, and it is reported as such"
+    # every laid hump still clears its own box by the floor -- the mirror is measured from the box
+    assert all(a["clear"] >= 0.35 - 1e-6 for a in lay_on), [a["clear"] for a in lay_on]
+    print(f"PASS an accidental slalom is unified onto one side "
+          f"({[round(a['laid'], 2) for a in lay_off]} -> {[round(a['laid'], 2) for a in lay_on]})")
+
+
+def test_common_side_prepass_follows_the_corridor_and_the_gates():
+    # It picks the side that FITS, not the majority: pinching the wall beside the first box on the
+    # + side moves the whole group to the - side instead.
+    _d, nn, lay, _drp = _mixed_case(6.0, pinch=(29.0, 31.0, 0.30))
+    assert nn == 2 and all(a["laid"] < 0 for a in lay), \
+        f"a pinched + side must send the group to the - side, got {[a['laid'] for a in lay]}"
+    # TOO FAR APART: outside the hold window the two obstacles are not a group at all.
+    d_far, _nn, lay_far, _drp = _mixed_case(6.0, hold_gap=4.0)
+    assert lay_far[0]["laid"] * lay_far[1]["laid"] < 0, "a pair wider than the window is left alone"
+    assert _excursions(d_far) == 2
+    # NEITHER SIDE FITS: a GENUINE slalom -- each box's own recorded side is the only one it has,
+    # and they are opposite. Blocking the - wall beside box 1 and the + wall beside box 2 leaves no
+    # common side, and the crossing between them is real geometry, not an accident.
+    _d, nn_b, lay_b, _drp = _mixed_case(6.0, pinch=(34.0, 38.0, 0.30),
+                                        pinch_neg=(28.0, 32.0, 0.30))
+    assert nn_b == 2 and all(not a.get("side_unified") for a in lay_b), \
+        "with no feasible common side the recorded sides must stand"
+    assert lay_b[0]["laid"] * lay_b[1]["laid"] < 0, "…and the real slalom is still laid as one"
+    print("PASS the common-side pre-pass follows the corridor and its gates")
+
+
 def test_line_clearance_veto():
     # A line that does not clear an obstacle it CLAIMS to have reshaped must not be published;
     # one that misses an obstacle no hump was laid for is fine (reactive layer's job). Which
@@ -974,5 +1041,7 @@ if __name__ == "__main__":
     test_weave_failure_drops_only_the_implicated_humps()
     test_hold_bridge_holds_a_same_side_pair_on_a_straight()
     test_hold_bridge_gates()
+    test_common_side_prepass_unifies_an_accidental_slalom()
+    test_common_side_prepass_follows_the_corridor_and_the_gates()
     test_line_clearance_veto()
     print("ALL PASS")
