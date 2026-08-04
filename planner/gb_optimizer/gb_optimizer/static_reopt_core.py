@@ -153,6 +153,34 @@ _HUMP_SPAN_TOTAL_FRAC = 0.40
 # exists — while still preferring the least-overshooting when the track leaves no choice, rather
 # than failing outright.
 _SPAN_OVER_PENALTY_S_PER_M = 1.0
+# Lap-time penalty [s] charged per obstacle a candidate leaves WITHOUT a hump. The reach search
+# ranked candidates on estimated lap time alone, and a candidate that simply fails to lay a hump is
+# always faster than one that lays it: on the real run a reach of 1.0 m fitted one of three humps
+# and scored 11.95 s, the 2.0 m candidate covered all three and scored 13.30 s -- so the search
+# picked the line that left two obstacles to the reactive layer, every lap, and reported "laid 1".
+# Coverage is not a tiebreak against lap time, it is the reason the re-optimization exists, so the
+# charge is steep enough (10 s against a ~0.4 s spread between reaches, 1 s/m of span overshoot) to
+# be lexicographic in practice: any candidate covering more obstacles beats any covering fewer.
+# Below that it still ranks on lap time, and when NO candidate covers everything the least-dropping
+# one wins rather than the search failing.
+#
+# Only genuine coverage losses count. An apex the raceline already clears never enters `dropped`
+# (it needs no hump), and a same-side cluster MERGE keeps its members on the surviving knot; what
+# is counted is the corridor/curvature/weave failures and the impossible-gap cluster drop, i.e.
+# exactly the obstacles this line hands back to the reactive planner.
+_DROP_PENALTY_S = 10.0
+
+
+def _rank_cost(est_s: float, span_over_m: float, n_dropped: int) -> float:
+    """Ranking cost for one candidate offset profile [s]. NOT a lap time.
+
+    Lexicographic in practice, by weight rather than by branch, so that a candidate which is worse
+    on coverage can still be selected when nothing better exists:
+        coverage (10 s/obstacle)  >  span overshoot (1 s/m)  >  estimated lap time (~0.4 s spread).
+    """
+    return (float(est_s)
+            + _SPAN_OVER_PENALTY_S_PER_M * max(0.0, float(span_over_m))
+            + _DROP_PENALTY_S * int(n_dropped))
 
 
 def _reach_floor(track_len: float) -> float:
@@ -1855,9 +1883,13 @@ def _reopt_local_window_impl(
         # still selects the least-overshooting rather than failing.
         span = sum(a["r_in"] + a["r_out"] for a in lay)
         over = max(0.0, span - _span_budget(track_len, len(lay)))
-        return dg, nn, est + _SPAN_OVER_PENALTY_S_PER_M * over, ek, drp, lay
+        # COVERAGE first (see _DROP_PENALTY_S): the returned figure is the RANKING cost, not a lap
+        # time. Charged here rather than in the stage-1 loop so the ramp-stretching stages 2 and 3,
+        # which compare against best_est under a small tolerance, cannot buy a smoother merge by
+        # dropping a hump either.
+        return dg, nn, _rank_cost(est, over, len(drp)), ek, drp, lay
 
-    # STAGE 1 — symmetric reach, minimise lap time.
+    # STAGE 1 — symmetric reach, minimise the ranking cost (coverage, then span, then lap time).
     d_global, n_solved, best_est, best_ek, best_r = None, 0, float("inf"), 0.0, cand_r[0]
     apex_dropped: List[dict] = []
     apex_laid: List[dict] = []

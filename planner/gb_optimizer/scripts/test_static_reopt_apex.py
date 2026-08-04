@@ -483,6 +483,25 @@ def test_minor_apex_refinement_keeps_the_pending():
     print("PASS a minor apex refinement keeps the pending bundle, a major one drops it")
 
 
+def test_coverage_outranks_lap_time_in_the_reach_search():
+    # The reach search ranked candidates on estimated lap time alone, and NOT laying a hump is
+    # always faster than laying it. The real run: reach 1.0 m fitted one of three humps and scored
+    # 11.95 s, reach 2.0 m covered all three at 13.30 s -- so it shipped the line that left two
+    # obstacles to the reactive layer, every lap.
+    covers_all = core._rank_cost(13.30, 0.0, 0)
+    drops_two = core._rank_cost(11.95, 0.0, 2)
+    assert covers_all < drops_two, \
+        f"a 1.35 s faster line that drops two obstacles must lose: {drops_two:.2f} vs {covers_all:.2f}"
+    # one dropped obstacle is not outweighed by any plausible lap-time spread between reaches
+    assert core._rank_cost(13.30, 0.0, 0) < core._rank_cost(11.95, 0.0, 1)
+    # ...but at EQUAL coverage lap time still decides, and the span budget still outranks it
+    assert core._rank_cost(11.95, 0.0, 1) < core._rank_cost(13.30, 0.0, 1)
+    assert core._rank_cost(11.95, 3.0, 0) > core._rank_cost(13.30, 0.0, 0)
+    # and when nothing covers everything, the least-dropping candidate still wins (no failure)
+    assert core._rank_cost(20.0, 0.0, 1) < core._rank_cost(11.95, 0.0, 2)
+    print("PASS coverage outranks lap time in the reach search")
+
+
 def test_weave_failure_drops_only_the_implicated_humps():
     # A weave violation is an INTERACTION between overlapping humps. Discarding the whole profile
     # made an interaction at one end of the lap cost every other obstacle its coverage -- and the
@@ -669,6 +688,7 @@ if __name__ == "__main__":
     test_raceline_already_clear_lays_nothing()
     test_clearance_drift_retriggers_once()
     test_minor_apex_refinement_keeps_the_pending()
+    test_coverage_outranks_lap_time_in_the_reach_search()
     test_weave_failure_drops_only_the_implicated_humps()
     test_line_clearance_veto()
     print("ALL PASS")
