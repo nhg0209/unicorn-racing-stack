@@ -192,6 +192,10 @@ class ObstacleSpliner(Node):
         self.ramp_len = 4.5          # [m] gentle entry-ramp length (raceline -> apex)
         self.hold_after = 0.5        # [m] (unused in apex-loaded profile; kept for param compatibility)
         self.return_len = 4.5        # [m] gentle exit-ramp length (apex -> raceline)
+        # Floor for the ADAPTIVE shortening of the two above (see _fit_ramp). A ramp is shortened
+        # only where the corridor will not accept the offset over its full length; below this the
+        # curvature cost (A/L^2) stops being worth the feasibility it buys.
+        self.ramp_len_min_m = 2.5    # [m]
         self.apex_bulge = 0.10       # [m] extra offset at the box CENTRE (apex) beyond the clearance
                                      # value: higher = car swings WIDER around the obstacle. 0 = flat hold.
         self.max_weave = 3           # max obstacles woven into one path (slalom); 1 = single-apex only
@@ -298,7 +302,8 @@ class ObstacleSpliner(Node):
             'safety_margin', 'static_near_zero_mps', 'static_promote_sec',
             'static_demote_mps', 'static_demote_sec',
             'wall_margin', 'shift_min', 'shift_buffer', 'ramp_len', 'hold_after',
-            'return_len', 'apex_bulge', 'max_weave', 'width_car', 'tail_m', 'w_d', 'w_k', 'w_c', 'w_obs', 'obs_sigma',
+            'return_len', 'ramp_len_min_m',
+            'apex_bulge', 'max_weave', 'width_car', 'tail_m', 'w_d', 'w_k', 'w_c', 'w_obs', 'obs_sigma',
             'use_grid_check', 'trust_grid_bounds', 'grid_scan_max', 'grid_scan_step', 'bounds_warn_m',
             'clear_gate_enable', 'clear_hyst_m', 'clear_max_cur_d', 'clear_margin_m', 'reframe_warn_m',
             'clear_latch_ttl_s', 'squeeze_enable', 'squeeze_steps', 'squeeze_safety_floor_m',
@@ -391,6 +396,8 @@ class ObstacleSpliner(Node):
         self.declare_parameter('ramp_len', 4.5, dbl(0.5, 15.0, "ramp length onto the offset [m]"))
         self.declare_parameter('hold_after', 0.5, dbl(0.0, 5.0, "hold the offset past the obstacle far-edge [m]"))
         self.declare_parameter('return_len', 4.5, dbl(0.5, 10.0, "ramp length back to the raceline [m]"))
+        self.declare_parameter('ramp_len_min_m', 2.5,
+                               dbl(0.5, 10.0, "floor for the adaptive ramp shortening [m]"))
         self.declare_parameter('apex_bulge', 0.10, dbl(0.0, 1.0, "extra apex offset beyond clearance: higher=wider avoidance [m]"))
         self.declare_parameter('max_weave', 3, intd(1, 5, "max obstacles woven into one path (slalom); 1=single-apex"))
         self.declare_parameter('width_car', 0.30, dbl(0.1, 1.0, "car width [m]"))
@@ -484,6 +491,8 @@ class ObstacleSpliner(Node):
                 self.hold_after = float(p.value)
             elif n == 'return_len':
                 self.return_len = float(p.value)
+            elif n == 'ramp_len_min_m':
+                self.ramp_len_min_m = float(p.value)
             elif n == 'apex_bulge':
                 self.apex_bulge = float(p.value)
             elif n == 'max_weave':
@@ -1223,14 +1232,98 @@ class ObstacleSpliner(Node):
 
         knot_cor = [(d_lo, d_hi)] + [_corridor_at(kc, ks) for (ks, _ko, kc) in knots[1:]]
 
-        m_span = (s_local > s_entry0) & (s_local <= s_exit_end)
-        span_ok = s_exit_end > s_entry0 + 1e-3
-        dp0 = cur_dp if s_entry0 == 0.0 else 0.0              # match car heading only if the ramp starts at the car
+        # --- ADAPTIVE RAMP LENGTH ------------------------------------------------------------
+        # The corridor was tested at the obstacle's own station and nowhere else, while the path
+        # carries offset over ramp_len + return_len = 9 m of track. Where that 9 m runs through a
+        # pinch the ramp is already off the raceline when it gets there, and every candidate dies
+        # -- measured on ifac as the single largest feasibility term: 57 of 123 stations at 4.5 m
+        # against 83 at 2.5 m.
+        #
+        # Shortening the ramps globally is the wrong trade: a quintic's peak curvature goes as
+        # A/L^2, so 4.5 -> 2.5 m more than triples it, and these lengths were RAISED to carry speed
+        # (the straight-line cap falls from 5.0 to 3.75 m/s at 3.75 m). So the length is chosen per
+        # candidate instead: keep 4.5 m wherever the corridor accepts the offset over the whole
+        # ramp, and shorten only where it does not -- a shorter ramp decays faster, so it asks the
+        # pinch for less. Floored at ramp_len_min_m; below that the curvature cost stops being
+        # worth the feasibility.
+        #
+        # Scanned ONCE per cycle at 0.5 m (about 20 grid-corridor calls, ~1.4 ms), not per
+        # candidate. The grid is built from the FULL ramp length, so a shortened ramp is a subset
+        # of it and no candidate needs its own grid.
+        _RAMP_LADDER = (1.0, 0.85, 0.7, 0.6, 0.5)
+        scan_lo_s = knots[0][0] - self.ramp_len
+        scan_hi_s = knots[-1][0] + self.return_len
+        scan_s = np.arange(scan_lo_s, scan_hi_s + 1e-9, 0.5)
+        scan_lo = scan_hi = None
+        if self.trust_grid_bounds:
+            # only as wide as the path can go: the sampled offsets plus the bulge and a cell
+            scan_d_max = float(np.max(np.abs(d_ends))) + self.apex_bulge + 0.10
+            scan_lo, scan_hi = self._grid_corridor_batch(
+                scan_s, d_max=max(scan_d_max, 0.5), d_step=max(self.grid_scan_step, 0.10))
+        if scan_lo is None:
+            scan_lo = np.empty(len(scan_s)); scan_hi = np.empty(len(scan_s))
+            scan_lo[:] = np.nan; scan_hi[:] = np.nan
+        miss = ~np.isfinite(scan_lo)             # unmeasurable -> the waypoint corridor
+        if miss.any():
+            jj = ((scan_s[miss] % self.gb_max_s) / wpnt_dist).astype(int) % self.gb_max_idx
+            scan_lo[miss] = np.array([-(gb_wpnts[j].d_right - sample_margin) for j in jj])
+            scan_hi[miss] = np.array([gb_wpnts[j].d_left - sample_margin for j in jj])
+
+        def _ramp_limits(s_c, full_len, entry):
+            """For each candidate ramp length, the widest offset that ramp can carry through the
+            corridor: (R, amp_max_positive, amp_min_negative) per rung, longest first.
+
+            Precomputed because only the AMPLITUDE differs between candidates -- the ramp shape and
+            the corridor under it do not -- so the per-candidate choice becomes a lookup instead of
+            a scan, and the whole feature costs one batched corridor read per cycle."""
+            out = []
+            for frac in _RAMP_LADDER:
+                R = max(full_len * frac, self.ramp_len_min_m)
+                ds = (s_c - scan_s) if entry else (scan_s - s_c)
+                m = (ds >= 0.0) & (ds <= R)
+                if not m.any():
+                    out.append((R, np.inf, -np.inf))
+                    continue
+                t = np.clip(1.0 - ds[m] / max(R, 1e-6), 0.0, 1.0)
+                shape = t * t * t * (10.0 + t * (-15.0 + 6.0 * t))          # 0 at the ramp end, 1 at the apex
+                sig = shape > 1e-3
+                if not sig.any():
+                    out.append((R, np.inf, -np.inf))
+                    continue
+                hi_m, lo_m, sh = scan_hi[m][sig], scan_lo[m][sig], shape[sig]
+                out.append((R, float(np.min(hi_m / sh)), float(np.max(lo_m / sh))))
+                if R <= self.ramp_len_min_m + 1e-9:
+                    break
+            return out
+
+        ramp_lim_in = _ramp_limits(knots[0][0], self.ramp_len, entry=True)
+        ramp_lim_out = _ramp_limits(knots[-1][0], self.return_len, entry=False)
+
+        def _fit_ramp(amp, limits, full_len):
+            """Longest ramp whose offset profile fits the corridor along its WHOLE length."""
+            if abs(amp) < 1e-6 or full_len <= self.ramp_len_min_m:
+                return full_len
+            for R, amp_hi, amp_lo in limits:
+                if amp_lo - 1e-9 <= amp <= amp_hi + 1e-9:
+                    return R
+            return limits[-1][0] if limits else full_len
+
+        dp0_full = cur_dp
         d_cands = np.zeros((N, n))
+        cand_entry_i = np.zeros(N, dtype=int)                 # per-candidate prefix boundary
         for k, d_end in enumerate(d_ends):
             d_apex = [float(d_end)]
             for i in range(1, len(knots)):
                 d_apex.append(_pass_offset(knot_cor[i], knots[i][1], d_apex[-1]))
+            # this candidate's own ramps, from the offsets IT carries (see _fit_ramp)
+            r_in = _fit_ramp(d_apex[0], ramp_lim_in, self.ramp_len)
+            r_out = _fit_ramp(d_apex[-1], ramp_lim_out, self.return_len)
+            s_entry0 = max(0.0, knots[0][0] - r_in)
+            s_exit_end = knots[-1][0] + r_out
+            m_span = (s_local > s_entry0) & (s_local <= s_exit_end)
+            span_ok = s_exit_end > s_entry0 + 1e-3
+            dp0 = dp0_full if s_entry0 == 0.0 else 0.0   # match the car heading only at the car
+            cand_entry_i[k] = int(np.clip(np.searchsorted(s_local, s_entry0), 0, max(n - 3, 0)))
             # PRE-RAMP, i.e. everything before the hump's entry. This used to hold the car's CURRENT
             # lateral offset flat all the way to s_entry0 -- with a 15 m lookahead and a 4.5 m entry
             # ramp that is up to 10.5 m of published path carrying the instantaneous tracking error
@@ -1337,14 +1430,13 @@ class ObstacleSpliner(Node):
         # So the geometry checks start where the planner's own geometry starts. The prefix is not
         # ignored -- a violation there is REPORTED, because it means the car is being tracked into
         # a wall and that is worth knowing; it is just not a reason to discard the escape route.
-        i_entry = int(np.searchsorted(s_local, s_entry0)) if span_ok else 0
-        i_entry = int(np.clip(i_entry, 0, max(n - 3, 0)))
-        if i_entry > 0 and self.use_grid_check:
-            pre_xy = xy_all[0][:i_entry]
+        i_entry_min = int(cand_entry_i.min()) if N else 0
+        if i_entry_min > 0 and self.use_grid_check:
+            pre_xy = xy_all[0][:i_entry_min]
             if self._path_off_track(pre_xy) or self._path_body_unsafe(pre_xy):
                 self.get_logger().warn(
                     f"[{self.name}] the path PREFIX (the car at d={self.cur_d:+.2f} decaying to "
-                    f"the raceline over {min(self.preramp_len_m, s_entry0):.1f} m) leaves the "
+                    f"the raceline over {self.preramp_len_m:.1f} m) leaves the "
                     f"drivable area. Not a candidate rejection -- every candidate shares it and "
                     f"none can change it -- but the car is being tracked close to a wall.",
                     throttle_duration_sec=2.0)
@@ -1363,7 +1455,7 @@ class ObstacleSpliner(Node):
                 n_obs += 1
                 continue
             xy = xy_all[k]
-            xy_own = xy[i_entry:]                 # the part of the path this candidate decides
+            xy_own = xy[cand_entry_i[k]:]         # the part of the path this candidate decides
             if self.use_grid_check and self._path_off_track(xy_own):
                 n_grid += 1
                 continue
@@ -1488,7 +1580,8 @@ class ObstacleSpliner(Node):
 
         if self.commit_enable:
             self._store_commit(obs_ahead, s_mod, d_sel, xy, v_arr, psi_pub, kappa_,
-                               obs_margin=obs_margin, squeeze=squeeze, s_entry0=s_entry0)
+                               obs_margin=obs_margin, squeeze=squeeze,
+                               s_entry0=float(s_local[cand_entry_i[best_k]]))
         self._publish_feasible(True)
         return wpnts, self._candidate_markers(xy_all, status, best_k)
 
@@ -1898,6 +1991,56 @@ class ObstacleSpliner(Node):
         if d_hi < d_lo:                        # narrower than 2*wall_margin -> collapse to its middle
             d_lo = d_hi = 0.5 * (float(d_scan[lo_i]) + float(d_scan[hi_i]))
         return d_lo, d_hi
+
+    def _grid_corridor_batch(self, s_query: np.ndarray, d_max: float = None, d_step: float = None):
+        """_grid_corridor for MANY stations at once: (lo[n], hi[n]), NaN where unmeasurable.
+
+        One converter call and one image lookup for the whole set. The per-station version costs
+        ~0.07 ms each, which is affordable twice a cycle and not affordable twenty times -- and the
+        adaptive ramp scan needs it over the ramp's whole length.
+
+        `d_max`/`d_step` narrow the lateral sweep. The ramp scan only has to resolve offsets the
+        path can actually reach, and sweeping the full +-grid_scan_max at 5 cm for that is most of
+        the cost of the feature. A run that reaches the edge of a narrowed sweep is reported as
+        ending there, which UNDERSTATES the corridor -- the conservative direction for a scan whose
+        only output is "shorten this ramp".
+        """
+        n_s = len(s_query)
+        if self.gb_max_s is None or getattr(self, "converter", None) is None or n_s == 0:
+            return None, None
+        d_lim = float(self.grid_scan_max if d_max is None else d_max)
+        d_res = float(self.grid_scan_step if d_step is None else d_step)
+        d_scan = np.arange(-d_lim, d_lim + 1e-9, d_res)
+        n_d = len(d_scan)
+        ss = np.repeat(np.asarray(s_query, float) % self.gb_max_s, n_d)
+        dd = np.tile(d_scan, n_s)
+        resp = self.converter.get_cartesian(ss, dd)
+        xy = (resp.T if resp.ndim == 2 else resp).reshape(-1, 2)
+        free = self._free_mask(xy)
+        if free is None:
+            return None, None
+        free = free.reshape(n_s, n_d)
+        i0 = int(np.argmin(np.abs(d_scan)))
+        lo = np.full(n_s, np.nan)
+        hi = np.full(n_s, np.nan)
+        for r in range(n_s):
+            fr = free[r]
+            if not fr.any():
+                continue
+            j0 = i0
+            if not fr[j0]:                       # raceline blocked here -> nearest free sample
+                cand = np.flatnonzero(fr)
+                j0 = int(cand[np.argmin(np.abs(d_scan[cand]))])
+            a_i = b_i = j0
+            while a_i > 0 and fr[a_i - 1]:
+                a_i -= 1
+            while b_i < n_d - 1 and fr[b_i + 1]:
+                b_i += 1
+            l, h = float(d_scan[a_i]) + self.wall_margin, float(d_scan[b_i]) - self.wall_margin
+            if h < l:
+                l = h = 0.5 * (float(d_scan[a_i]) + float(d_scan[b_i]))
+            lo[r], hi[r] = l, h
+        return lo, hi
 
     def _grid_is_authority(self) -> bool:
         """True when the occupancy grid both replaces the waypoint corridor AND is checked per path

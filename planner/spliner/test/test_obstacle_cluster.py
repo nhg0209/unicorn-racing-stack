@@ -86,6 +86,7 @@ def planner(obstacles, cur_d=0.0, cur_s=0.0):
     n.n_d_samples, n.sample_gaps = 10, True
     n.max_weave = 3
     n.ramp_len, n.return_len, n.tail_m = 4.5, 4.5, 0.0
+    n.ramp_len_min_m = 2.5       # adaptive-ramp floor; == ramp_len would disable the shortening
     n.apex_bulge, n.preramp_len_m = 0.10, 3.0
     n.kappa_add_max, n.kappa_abs_max = 5.0, 5.5
     n.a_lat_max, n.a_long_max, n.a_long_accel = 6.0, 4.0, 3.0

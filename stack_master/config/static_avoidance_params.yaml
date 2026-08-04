@@ -99,6 +99,14 @@ static_avoidance_planner:
     ramp_len: 4.5           # [m]  gentle entry-ramp length (raceline -> apex)
     hold_after: 0.5         # [m]  (unused in apex-loaded profile; kept for param compatibility)
     return_len: 4.5         # [m]  gentle exit-ramp length (apex -> raceline)
+    # Floor for the ADAPTIVE shortening of the two above. The corridor used to be tested at the
+    # obstacle's own station and nowhere else, while the path carries offset over ramp_len +
+    # return_len = 9 m of track; where that 9 m runs through a pinch, every candidate died. The
+    # ramps are now scanned over their whole length and shortened ONLY where the corridor will not
+    # accept the offset -- a shorter ramp decays faster, so it asks the pinch for less. Wherever
+    # there is room the full 4.5 m is kept, because a quintic's peak curvature goes as A/L^2 and
+    # these lengths were raised to carry speed. Below this floor that trade stops paying.
+    ramp_len_min_m: 2.5     # [m]
     apex_bulge: 0.10        # [m] extra offset at the box CENTRE beyond the clearance value: the path peaks
                             #      here (widest, furthest from the obstacle). higher = swing WIDER around the
                             #      obstacle; 0 = flat hold. Limited by corridor (bulge past the wall -> reject).
