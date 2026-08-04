@@ -15,13 +15,15 @@ HARD GUARANTEE — it must NEVER stop publishing a valid raceline:
 So even a track-blocking obstacle degrades to "publish the previous good line" (the reactive
 planner then handles what the global line cannot) — it never emits nothing or a broken line.
 
-THREADING — the solve is SYNCHRONOUS on the single-threaded rclpy executor, inside frenet_cb.
-This header used to claim a background thread and a lock, and neither has ever existed (see the
-state block in __init__): the `local_window` solve is ~10 ms with BLAS pinned to one thread, which
-is why running it inline is acceptable, and the absence of concurrency is precisely why no lock is
-needed. The claim mattered because it read as a latency guarantee the code does not provide — a
-slow solve DOES block the executor, and the legacy `reopt_method: "global"` path (minutes per
-solve) must therefore never be used online.
+THREADING — the solve runs on a ONE-WORKER ThreadPoolExecutor and its result is collected in
+republish_cb. It used to be synchronous inside frenet_cb, on the claim that the solve is ~10 ms;
+measured, it is 200-850 ms (ifac 1/2/3 obstacles: 211/464/630 ms, map f: 389/731/844), so a
+40 Hz callback was stalling for the better part of a second and BLOCKING THE VERY GATES THE SWAP
+WAITS ON -- ego-s freshness and reactive idleness are both judged from callbacks that could not
+run. No lock is needed: the solve is a pure function of a snapshot (clean line, reftrack, apex
+pairs, obstacles), and every mutation of node state stays on the executor thread. The legacy
+`reopt_method: "global"` path (minutes per solve) must still never be used online -- off the
+executor it no longer freezes the node, but a line that arrives minutes late is not a plan.
 
 Obstacle input (phase 1, before the perception static-layer exists): a MarkerArray on
 `/static_reopt/obstacles`; each marker -> Obstacle(x, y, r=max(scale.x,scale.y)/2 or the
@@ -35,6 +37,7 @@ continuity; a timeout forces the swap if no frenet odom is seen (bench testing).
 import copy
 import os
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 # Pin BLAS/OpenMP to ONE thread BEFORE numpy loads. OpenBLAS otherwise spawns a large pool
 # that, on the tiny windowed-QP matrices, pegs every core for ~1s per solve and starves the
@@ -404,6 +407,12 @@ class StaticReoptNode(Node):
         self._sm_state = ""
         self._sm_state_t = -1e9
         self._solve_backoff_until = 0.0
+        # ONE worker: the solves are serial by nature (each supersedes the last) and a second
+        # thread would only contend for the BLAS core the core pins itself to.
+        self._solve_pool = ThreadPoolExecutor(max_workers=1,
+                                              thread_name_prefix="static_reopt_solve")
+        self._solve_future = None
+        self._solve_ctx = None
         self._last_solve_t = -1e9               # solve debounce, see solve_min_interval_s
 
         # --- pub/sub ----------------------------------------------------------------------
@@ -700,9 +709,16 @@ class StaticReoptNode(Node):
             self.get_logger().debug(f"[static_reopt] clearance check failed: {e}")
             return True
 
-    def _build_obstacle_bundle(self, obstacles: List[core.Obstacle]) -> _Bundle:
+    def _build_obstacle_bundle(self, obstacles: List[core.Obstacle], pairs=None) -> _Bundle:
         """Run the width-modulated re-optimization and assemble a full bundle. May raise;
-        the caller runs this inside a try/except so a failure never reaches the timer."""
+        the caller runs this inside a try/except so a failure never reaches the timer.
+
+        RUNS ON A WORKER THREAD (see _rebuild_and_swap). Everything it reads must therefore be
+        either immutable after startup -- the clean line, the reftrack, the tuning -- or passed in
+        as a snapshot. `pairs` is the one mutable input: the apex records are rewritten by
+        otwpnts_cb at 20 Hz, so they are resolved on the caller's thread and handed over."""
+        if pairs is None:
+            pairs = self._apex_pairs(obstacles)
         if self.reopt_method == "local_window":
             # Reshape the recorded reactive apexes into the global line (keep apex, gentle ramps).
             # The apex's OWN obstacle goes with it: obs_margin is a hard acceptance floor in the
@@ -710,7 +726,6 @@ class StaticReoptNode(Node):
             # reactive layer rather than laid short (which used to pass the amplitude-ratio test
             # at 0.90 x apex = ~0.345 m of edge clearance, under the 0.35 m everything downstream
             # assumes the line is built to).
-            pairs = self._apex_pairs(obstacles)
             apexes = [xy for xy, _o in pairs]
             apex_obs = [(float(o.x), float(o.y), float(o.r)) for _xy, o in pairs]
             res = core.reoptimize_local_window(
@@ -1384,22 +1399,58 @@ class StaticReoptNode(Node):
                 throttle_duration_sec=5.0)
             self._obstacles_dirty = True         # re-arm; do NOT burn the flag
             return
+        if self._solve_future is not None and not self._solve_future.done():
+            return                               # one solve at a time; the trigger stays armed
         self._obstacles_dirty = False
         now = self.get_clock().now().nanoseconds * 1e-9
         self._last_solve_t = now                 # debounce clock: stamped for EVERY solve attempt,
-        try:                                     # including the fallback paths that skip the gate
-            if obstacles:
-                with open(os.devnull, "w") as devnull, redirect_stdout(devnull):
-                    bundle = self._build_obstacle_bundle(obstacles)
-            else:
-                bundle = self.clean_bundle
-        except Exception as e:  # noqa: BLE001 — must never propagate to the executor
+                                                 # including the fallback paths that skip the gate
+        # An EMPTY set needs no solve at all -- the clean bundle is precomputed -- so it takes the
+        # result path immediately and never waits on a worker.
+        if not obstacles:
+            self._finish_rebuild(self.clean_bundle, [], reason, now)
+            return
+        # OFF THE EXECUTOR. The solve is 200-850 ms of pure function over a snapshot; running it
+        # inline stalled the 40 Hz frenet_cb for that long, and the swap gates it feeds -- ego-s
+        # freshness, reactive idleness -- are judged from callbacks that then could not run, so the
+        # solve was blocking the very conditions it was waiting for. The apex pairs are resolved
+        # HERE, on this thread, because otwpnts_cb rewrites them at 20 Hz.
+        pairs = self._apex_pairs(obstacles)
+
+        def _work():
+            with open(os.devnull, "w") as devnull, redirect_stdout(devnull):
+                return self._build_obstacle_bundle(obstacles, pairs=pairs)
+
+        self._solve_future = self._solve_pool.submit(_work)
+        self._solve_ctx = (obstacles, reason, now)
+        self.get_logger().info(
+            f"[static_reopt] solving ({reason}) for {len(obstacles)} obstacle(s) off the "
+            f"executor; the result is collected on the republish tick",
+            throttle_duration_sec=2.0)
+
+    def _collect_solve(self):
+        """Take a finished off-executor solve and run the install path on the executor thread."""
+        fut = self._solve_future
+        if fut is None or not fut.done():
+            return
+        self._solve_future = None
+        obstacles, reason, now = self._solve_ctx
+        self._solve_ctx = None
+        try:
+            bundle = fut.result()
+        except Exception as e:  # noqa: BLE001 — must never propagate to the timer
             self.get_logger().warn(
                 f"[static_reopt] batch re-opt FAILED ({type(e).__name__}: {str(e)[:80]}); "
                 f"keeping the current line — will retry (reactive planner handles the gap)")
             self._obstacles_dirty = True         # re-arm; a transient failure must not eat the trigger
-            self._solve_backoff_until = now + self.solve_retry_backoff_s
+            self._solve_backoff_until = (self.get_clock().now().nanoseconds * 1e-9
+                                         + self.solve_retry_backoff_s)
             return
+        self._finish_rebuild(bundle, obstacles, reason, now)
+
+    def _finish_rebuild(self, bundle, obstacles, reason: str, now: float):
+        """Everything after the solve: the acceptance gates and the queueing of the swap. Runs on
+        the executor thread in both paths, so node state is still touched from one thread only."""
         if bundle is self.active:
             return
         # Same guard, now on the BUILT result: every apex was corridor-rejected (all-or-nothing
@@ -1679,6 +1730,7 @@ class StaticReoptNode(Node):
 
     def republish_cb(self):
         now = self.get_clock().now().nanoseconds * 1e-9
+        self._collect_solve()          # install an off-executor solve, if one finished
         # STALE-FRENET fallback: no odom -> we never see the s-wrap. Solve once so a headless /
         # bag run still gets the obstacle line. Never fires while the car is actually driving.
         frenet_stale = (self._last_frenet_t is None
@@ -1687,8 +1739,12 @@ class StaticReoptNode(Node):
         # frenet_cb owns the trigger — this path would otherwise swap at an arbitrary s.
         if self._obstacles_dirty and frenet_stale and (now - self._dirty_since) > self.swap_timeout_s:
             self._rebuild_and_swap("frenet stale fallback")
-            if self._pending is not None:        # no odometry -> no station/horizon gate available
-                self._commit_pending(self._last_s if self._last_s is not None else 0.0, force=True)
+        # ...and force it in on a LATER tick, because the solve is no longer synchronous: with no
+        # odometry there is no station or horizon gate to satisfy, so whenever a line is queued and
+        # frenet is stale it should simply go in. Checked outside the trigger above, since by the
+        # time the result exists the dirty flag has been consumed.
+        if frenet_stale and self._pending is not None:
+            self._commit_pending(self._last_s if self._last_s is not None else 0.0, force=True)
 
         active = self.active
         # publish ONLY when the line changed, or as a slow keep-alive (>= 5 s). No churn.
@@ -1714,6 +1770,12 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        # stop the solve worker before tearing the node down, or a solve in flight outlives the
+        # node it would write into
+        try:
+            node._solve_pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

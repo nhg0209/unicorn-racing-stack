@@ -14,6 +14,8 @@ Run:  python3 planner/gb_optimizer/scripts/test_static_reopt_apex.py
 (needs the workspace sourced OR PYTHONPATH pointing at src gb_optimizer + f110 deps)
 """
 import sys
+import threading
+import time
 import types
 import numpy as np
 from pathlib import Path
@@ -577,6 +579,60 @@ def test_swap_held_while_trailing_a_close_obstacle():
     n._commit_pending(10.0)
     assert n._pending is None, "a stale state must not block the swap forever"
     print("PASS the swap is held while TRAILING a close obstacle")
+
+
+def test_solve_runs_off_the_executor_and_is_collected_later():
+    # The solve is 200-850 ms of pure function. Run inline on the 40 Hz frenet callback it stalled
+    # the node for that long -- and the swap gates it feeds (ego-s freshness, reactive idleness)
+    # are judged from callbacks that then could not run, so the solve blocked the very conditions
+    # it was waiting for.
+    from concurrent.futures import ThreadPoolExecutor
+    n = make_node()
+    n._solve_pool = ThreadPoolExecutor(max_workers=1)
+    n._solve_future = None
+    n._solve_ctx = None
+    n.reopt_method = "local_window"
+    n._obstacles = [core.Obstacle(5.0, -0.2, 0.15)]
+    n._obs_ids = [7]
+    n._apex_by_obs = {("id", 7): (5.0, 0.4, 0.4)}
+    built = []
+    gate = threading.Event()
+
+    def slow_build(obstacles, pairs=None):
+        gate.wait(5.0)                                # stands in for the 200-850 ms solve
+        built.append((list(obstacles), pairs))
+        return straight_bundle()
+    n._build_obstacle_bundle = slow_build
+    installed = []
+    n._finish_rebuild = lambda b, o, r, t: installed.append((b, r))
+
+    t0 = time.perf_counter()
+    n._rebuild_and_swap("apex captured")
+    submit_ms = (time.perf_counter() - t0) * 1e3
+    assert submit_ms < 50.0, f"the trigger must return at once, took {submit_ms:.1f} ms"
+    assert not installed, "nothing may be installed before the solve finishes"
+    n._collect_solve()
+    assert not installed, "a solve still running must not be collected"
+    # a second trigger while one is in flight must not queue a second solve
+    n._obstacles_dirty = True
+    n._rebuild_and_swap("apex captured")
+    gate.set()
+    n._solve_future.result(timeout=5.0)
+    assert len(built) == 1, f"one solve at a time, ran {len(built)}"
+    n._collect_solve()
+    assert len(installed) == 1 and installed[0][1] == "apex captured", installed
+    assert n._solve_future is None
+    # the apex pairs are resolved on the CALLER's thread -- otwpnts_cb rewrites them at 20 Hz
+    assert built[0][1] is not None, "pairs must be snapshotted before the hand-off"
+    # an EMPTY set needs no solve at all: the clean bundle is precomputed
+    installed.clear()
+    n._obstacles, n._obs_ids, n._apex_by_obs = [], [], {}
+    n._obstacles_dirty = True
+    n._rebuild_and_swap("obstacles cleared")
+    assert len(installed) == 1 and installed[0][0] is n.clean_bundle, \
+        "the clean revert must not wait on a worker"
+    n._solve_pool.shutdown(wait=True)
+    print("PASS the solve runs off the executor and is collected on the republish tick")
 
 
 def test_swap_gate_tally_names_the_gate_that_held_the_swap():
@@ -1176,6 +1232,7 @@ if __name__ == "__main__":
     test_clearance_drift_retriggers_once()
     test_minor_apex_refinement_keeps_the_pending()
     test_swap_held_while_trailing_a_close_obstacle()
+    test_solve_runs_off_the_executor_and_is_collected_later()
     test_swap_gate_tally_names_the_gate_that_held_the_swap()
     test_solves_are_debounced()
     test_shrinking_set_keeps_the_queued_line()
