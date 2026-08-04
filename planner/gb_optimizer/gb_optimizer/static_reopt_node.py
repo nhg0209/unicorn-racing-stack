@@ -262,7 +262,20 @@ class StaticReoptNode(Node):
         # (pending) line over. Below it the queued line and the rebuilt one differ by centimetres,
         # and the queued one is allowed to commit first — see _mark_dirty.
         self.declare_parameter("apex_major_change_m", 0.10)
+        # [m] how far past the obstacle's abeam station a reactive path must extend on BOTH sides
+        # before its apex is believed. Rejects the exit ramp of an already-passed committed slice.
+        self.declare_parameter("apex_span_margin_m", 0.5)
+        # [m] max |d| the recorded apex may fall SHORT of what the obstacle geometrically requires.
+        # Symmetric with the long-standing overshoot clamp; without it a decaying tail reads as a
+        # legitimately tighter apex.
+        self.declare_parameter("apex_undershoot_m", 0.12)
+        # [m] max along-track distance from the obstacle to the recorded point. 1.0 admitted the
+        # polluted records (0.4-1.0 m) as readily as the healthy ones (all <= 0.1 m).
+        self.declare_parameter("apex_abeam_gap_m", 0.5)
         self.apex_major_change_m = float(self.get_parameter("apex_major_change_m").value)
+        self.apex_span_margin_m = float(self.get_parameter("apex_span_margin_m").value)
+        self.apex_undershoot_m = float(self.get_parameter("apex_undershoot_m").value)
+        self.apex_abeam_gap_m = float(self.get_parameter("apex_abeam_gap_m").value)
         self._apex_change_major = False
         # Obstacle keys whose clearance drift has already re-armed the solve against the CURRENTLY
         # active line. Without this latch the trigger re-fires every frame until the new line is
@@ -811,9 +824,7 @@ class StaticReoptNode(Node):
         # avoidance path that produced it is already empty. Replay the recent-path buffer so the
         # just-driven maneuver still contributes its apex, and the solve can run THIS lap.
         if obs and self._path_buffer:
-            replayed = False
-            for _t, wx, wy, wd in self._path_buffer:
-                replayed = self._record_apexes(wx, wy, wd) or replayed
+            replayed = self._record_apexes_best_of(list(self._path_buffer))
             if replayed:
                 self.get_logger().info(
                     f"[static_reopt] retro-associated apex(es) from {len(self._path_buffer)} "
@@ -1002,6 +1013,98 @@ class StaticReoptNode(Node):
         carry outlier d values; recording one poisons the hump the re-opt lays."""
         d, i, _ = self._clean_offset(x, y)
         return -(self._clean_dr[i] - 0.12) <= d <= (self._clean_dl[i] - 0.12)
+    def _apex_candidate(self, wx, wy, wd, owner, idx, o):
+        """The apex ONE reactive path offers for ONE obstacle, or None.
+
+        Every rejection here exists because a bad record is unrecoverable: the apex sets where the
+        hump is centred, and a hump centred in the wrong place misses its box by a few centimetres
+        with no downstream check able to put it back. Forensics on the failing run: records drifted
+        up to 1.0 m DOWNSTREAM of the obstacle, and the resulting humps were 3-12 cm short.
+
+        The predicates, in the order they fire:
+
+          SPAN. The path must extend past the obstacle's abeam station in BOTH directions. The
+          committed-path reuse in the reactive planner republishes the slice still AHEAD of the
+          car, so once the car is beside a box the republished slice is that box's exit RAMP --
+          a decaying tail whose widest point sits downstream of the obstacle. Under newest-wins
+          those tails overwrote good records every cycle. A path that genuinely passed the box
+          starts before it and ends after it.
+
+          UNDERSHOOT. The overshoot clamp below has always bounded how much WIDER than necessary a
+          record may be. Nothing bounded how much narrower, so a decaying tail that survived the
+          other gates was recorded as a legitimately tighter apex. Symmetric bound.
+
+          ABEAM. The recorded point must sit beside the obstacle along the track: 0.5 m, down from
+          1.0. Measured on the run, healthy records were all within 0.1 m and the polluted ones sat
+          at 0.4-1.0 m, so the old gate admitted exactly the bad half.
+        """
+        mine = np.where(owner == idx)[0]
+        if mine.size == 0:
+            return None
+        dist = np.hypot(wx[mine] - o.x, wy[mine] - o.y)
+        j = int(mine[int(np.argmax(np.abs(wd[mine])))])
+        if float(dist.min()) > self._apex_assoc_tol or abs(wd[j]) < self._apex_min_d:
+            return None
+        if float(np.hypot(wx[j] - o.x, wy[j] - o.y)) > self._apex_assoc_tol:
+            return None
+        d_rec, i_rec, _left = self._clean_offset(float(wx[j]), float(wy[j]))
+        d_obs, i_obs, left_obs = self._clean_offset(float(o.x), float(o.y))
+        n_cl = len(self._clean_xy)
+        st_m = self._track_len / max(n_cl - 1, 1)          # metres per station
+        # --- SPAN -------------------------------------------------------------------------
+        _d0, i_first, _l0 = self._clean_offset(float(wx[0]), float(wy[0]))
+        _d1, i_last, _l1 = self._clean_offset(float(wx[-1]), float(wy[-1]))
+        margin = max(1, int(self.apex_span_margin_m / max(st_m, 1e-6)))
+        fwd_len = (i_last - i_first) % n_cl
+        fwd_obs = (i_obs - i_first) % n_cl
+        if not (margin <= fwd_obs <= fwd_len - margin):
+            return None
+        # --- ABEAM ------------------------------------------------------------------------
+        gap_st = abs(i_rec - i_obs)
+        gap_st = min(gap_st, n_cl - gap_st) * st_m
+        if gap_st > self.apex_abeam_gap_m:
+            return None
+        if not self._apex_plausible(float(wx[j]), float(wy[j])):
+            self.get_logger().warning(
+                f"[static_reopt] REJECTED implausible apex xy=({wx[j]:.2f},{wy[j]:.2f}) "
+                f"d={wd[j]:+.2f}m for obstacle @({o.x:.2f},{o.y:.2f}) — outside the track "
+                f"corridor (displaced-frame outlier)", throttle_duration_sec=2.0)
+            return None
+        # --- OVERSHOOT clamp / UNDERSHOOT reject ------------------------------------------
+        # `need` is what the obstacle REQUIRES: its own offset + radius + keep-out + bulge + slack.
+        side = 1.0 if d_rec >= d_obs else -1.0
+        need = d_obs + side * (float(o.r) + 0.45)
+        if (d_rec - need) * side > 0.0:                    # wider than required -> clamp onto it
+            d_rec = need
+        elif (need - d_rec) * side > self.apex_undershoot_m:
+            return None                                     # narrower than required -> a tail
+        # --- ANCHOR AT THE OBSTACLE -------------------------------------------------------
+        # Store the point beside the OBSTACLE, not the point the path happened to be widest at.
+        # d_rec survives as amplitude/side evidence; i_rec does not, because it is the thing that
+        # drifts. This is what makes a stale record cost nothing: it can only be wrong about how
+        # far out to go, never about where.
+        ax_x = float(self._clean_xy[i_obs][0] + d_rec * left_obs[0])
+        ax_y = float(self._clean_xy[i_obs][1] + d_rec * left_obs[1])
+        return ax_x, ax_y, abs(float(d_rec)), float(need)
+
+    def _commit_apex(self, key, o, cand) -> bool:
+        """Store one accepted apex. Returns True when it is a rebuild-worthy change."""
+        ax_x, ax_y, amp, _need = cand
+        prev = self._apex_by_obs.get(key)
+        self._apex_by_obs[key] = (ax_x, ax_y, amp)
+        if prev is None:
+            self._apex_change_major = True                 # a hump that did not exist before
+            self.get_logger().info(
+                f"[static_reopt] recorded reactive apex for obstacle @({o.x:.2f},{o.y:.2f}) "
+                f"-> apex xy=({ax_x:.2f},{ax_y:.2f}) |d|={amp:.2f}m (anchored abeam)")
+            return True
+        d_amp = abs(amp - prev[2])
+        d_pos = float(np.hypot(prev[0] - ax_x, prev[1] - ax_y))
+        if d_amp > 0.05 or d_pos > 0.10:
+            if d_amp >= self.apex_major_change_m or d_pos >= self.apex_major_change_m:
+                self._apex_change_major = True
+            return True
+        return False
 
     def _record_apexes(self, wx, wy, wd) -> bool:
         """Associate one reactive path with the confirmed obstacles and update the apex records.
@@ -1010,77 +1113,55 @@ class StaticReoptNode(Node):
         separates "a new obstacle to lay a hump for" from "the same hump, a few centimetres
         different": only the former is worth discarding a pending bundle over (see _mark_dirty).
 
-        The record is NEWEST-WINS, not keep-the-max: the historical max RATCHETED — one outlier
-        path from a displaced frame (stuck/flap phases) permanently inflated the hump (measured:
-        apex growing 0.61 -> 0.96 -> 1.41 m on a 1.39 m-wide track; the breaker then committed a
-        line the car could never reach). The newest qualifying path self-corrects outliers, and
-        _apex_plausible rejects candidates outside the physical corridor outright.
+        NEWEST-WINS among paths that pass _apex_candidate: the historical max RATCHETED (one
+        outlier permanently inflated the hump), and the acceptance predicates are what keep
+        "newest" from meaning "whatever the exit ramp said last".
 
         OWNERSHIP first: give every spline point to its NEAREST obstacle, then let each obstacle
         pick its apex only from the points it owns — a second obstacle sitting inside the FIRST
         one's avoidance hump must not record that hump as its own apex."""
         self._apex_change_major = False
         keys = self._keys_for(self._obstacles, self._obs_ids)
+        if not self._obstacles:
+            return False
         ox = np.fromiter((o.x for o in self._obstacles), float, len(self._obstacles))
         oy = np.fromiter((o.y for o in self._obstacles), float, len(self._obstacles))
         owner = np.argmin(np.hypot(wx[:, None] - ox[None, :], wy[:, None] - oy[None, :]), axis=1)
         changed = False
         for idx, (o, key) in enumerate(zip(self._obstacles, keys)):
-            mine = np.where(owner == idx)[0]
-            if mine.size == 0:
+            cand = self._apex_candidate(wx, wy, wd, owner, idx, o)
+            if cand is None:
                 continue
-            dist = np.hypot(wx[mine] - o.x, wy[mine] - o.y)
-            # apex = the largest deviation among MY points, and it must be beside me
-            j = int(mine[int(np.argmax(np.abs(wd[mine])))])
-            if float(dist.min()) > self._apex_assoc_tol or abs(wd[j]) < self._apex_min_d:
-                continue
-            if float(np.hypot(wx[j] - o.x, wy[j] - o.y)) > self._apex_assoc_tol:
-                continue
-            # ABEAM guard: the apex must sit BESIDE its obstacle ALONG the track. Ramp points of
-            # a NEIGHBOURING avoidance (or the decaying return right after passing this obstacle)
-            # sweep within association range when obstacles sit a few metres apart — under
-            # newest-wins they OVERWROTE a good record with the ramp's small d, and the first
-            # obstacle's hump then vanished from the next rebuild ("the line forgot obstacle 1").
-            d_rec, i_rec, left = self._clean_offset(float(wx[j]), float(wy[j]))
-            d_obs, i_obs, _ = self._clean_offset(float(o.x), float(o.y))
-            n_cl = len(self._clean_xy)
-            gap_st = abs(i_rec - i_obs)
-            gap_st = min(gap_st, n_cl - gap_st) * (self._track_len / max(n_cl - 1, 1))
-            if gap_st > 1.0:
-                continue
-            if not self._apex_plausible(float(wx[j]), float(wy[j])):
-                self.get_logger().warning(
-                    f"[static_reopt] REJECTED implausible apex xy=({wx[j]:.2f},{wy[j]:.2f}) "
-                    f"d={wd[j]:+.2f}m for obstacle @({o.x:.2f},{o.y:.2f}) — outside the track "
-                    f"corridor (displaced-frame outlier)", throttle_duration_sec=2.0)
-                continue
-            # OVERSHOOT clamp: while the car rides the hump with steering slip, the replanned
-            # path is anchored at the DISPLACED car, so its widest point can exceed what the
-            # avoidance needs (measured: apex creeping 0.6 -> 0.85+ while "steering clipped").
-            # The record must hold what the obstacle REQUIRES: obstacle offset + radius +
-            # keep-out(0.31) + bulge(0.10) + slack — clamp anything wider back onto that.
-            ax_x, ax_y = float(wx[j]), float(wy[j])
-            side = 1.0 if d_rec >= d_obs else -1.0
-            need = d_obs + side * (float(o.r) + 0.45)
-            if (d_rec - need) * side > 0.0:
-                ax_x = float(self._clean_xy[i_rec][0] + need * left[0])
-                ax_y = float(self._clean_xy[i_rec][1] + need * left[1])
-                d_rec = need
-            prev = self._apex_by_obs.get(key)
-            self._apex_by_obs[key] = (ax_x, ax_y, abs(float(d_rec)))
-            if prev is None:
-                changed = True
-                self._apex_change_major = True          # a hump that did not exist before
-                self.get_logger().info(
-                    f"[static_reopt] recorded reactive apex for obstacle @({o.x:.2f},{o.y:.2f}) "
-                    f"-> apex xy=({ax_x:.2f},{ax_y:.2f}) d={d_rec:+.2f}m")
-            else:
-                d_amp = abs(abs(float(d_rec)) - prev[2])
-                d_pos = float(np.hypot(prev[0] - ax_x, prev[1] - ax_y))
-                if d_amp > 0.05 or d_pos > 0.10:
-                    changed = True
-                    if d_amp >= self.apex_major_change_m or d_pos >= self.apex_major_change_m:
-                        self._apex_change_major = True
+            changed = self._commit_apex(key, o, cand) or changed
+        return changed
+
+    def _record_apexes_best_of(self, paths) -> bool:
+        """Retro association over the buffered paths: take the BEST candidate per obstacle, not
+        the last one.
+
+        Replaying the buffer newest-last meant the most recent path won even when an earlier one
+        had passed the obstacle properly and the latest was its decaying tail. With the acceptance
+        predicates in place the tails are rejected outright, but among survivors "newest" is still
+        arbitrary -- so pick the one whose amplitude is closest to what the obstacle geometrically
+        requires."""
+        keys = self._keys_for(self._obstacles, self._obs_ids)
+        if not self._obstacles:
+            return False
+        ox = np.fromiter((o.x for o in self._obstacles), float, len(self._obstacles))
+        oy = np.fromiter((o.y for o in self._obstacles), float, len(self._obstacles))
+        best = {}
+        for (_t, wx, wy, wd) in paths:
+            owner = np.argmin(np.hypot(wx[:, None] - ox[None, :], wy[:, None] - oy[None, :]), axis=1)
+            for idx, (o, key) in enumerate(zip(self._obstacles, keys)):
+                cand = self._apex_candidate(wx, wy, wd, owner, idx, o)
+                if cand is None:
+                    continue
+                err = abs(cand[2] - abs(cand[3]))
+                if key not in best or err < best[key][0]:
+                    best[key] = (err, o, cand)
+        changed = False
+        for key, (_err, o, cand) in best.items():
+            changed = self._commit_apex(key, o, cand) or changed
         return changed
 
     def _apex_pairs(self, obstacles: List[core.Obstacle]) -> List[tuple]:

@@ -73,6 +73,9 @@ def make_node():
     n.clearance_dirty_m = 0.30
     n._clearance_dirty_keys = set()
     n.apex_major_change_m = 0.10
+    n.apex_span_margin_m = 0.5
+    n.apex_undershoot_m = 0.12
+    n.apex_abeam_gap_m = 0.5
     n._apex_change_major = False
     n.active = straight_bundle()      # real node always has one (clean bundle at startup)
     n.pub_coverage = types.SimpleNamespace(publish=lambda m: None)
@@ -148,19 +151,78 @@ def test_retro_association():
     print("PASS retro association from the path buffer")
 
 
-def test_newest_wins_shrink():
+def test_newest_wins_shrink_within_the_undershoot_bound():
     # keep-the-max RATCHETED (one outlier path permanently inflated the hump to 1.4 m on a
-    # 1.39 m track); the record must follow the NEWEST qualifying path, shrink included.
+    # 1.39 m track), so the record follows the NEWEST qualifying path, shrink included -- but
+    # "qualifying" now bounds the shrink too. The obstacle here needs |d| = 0.40; a path offering
+    # 0.32 is a real, slightly tighter avoidance, while one offering 0.20 is a decaying tail and
+    # recording it would centre the next hump on a clearance the obstacle does not have.
     n = make_node()
     n._obstacles = [core.Obstacle(5.0, -0.2, 0.15)]
     n._obs_ids = [7]
-    n.otwpnts_cb(path_msg(HUMP))                     # apex 0.40
+    n.otwpnts_cb(path_msg(HUMP))                                   # apex 0.40 == the geometric need
     n._obstacles_dirty = False
-    smaller = [(x, y * 0.5, d * 0.5) for x, y, d in HUMP]   # apex 0.20
+    smaller = [(x, y * 0.8, d * 0.8) for x, y, d in HUMP]   # apex 0.32: 8 cm under, inside 0.12
     n.otwpnts_cb(path_msg(smaller))
-    assert abs(n._apex_by_obs[("id", 7)][2] - 0.20) < 0.03, "newest path must replace the max"
+    assert abs(n._apex_by_obs[("id", 7)][2] - 0.32) < 0.03, "a real shrink must still be adopted"
     assert n._obstacles_dirty, ">5cm shrink is a rebuild-worthy change"
-    print("PASS newest path wins (ratchet removed)")
+    tail = [(x, y * 0.5, d * 0.5) for x, y, d in HUMP]      # apex 0.20: 20 cm under -> a tail
+    n.otwpnts_cb(path_msg(tail))
+    assert abs(n._apex_by_obs[("id", 7)][2] - 0.32) < 0.03, \
+        "a record that undershoots the geometric need must be rejected, not adopted"
+    print("PASS newest path wins, but only within the undershoot bound")
+
+
+def test_apex_span_requirement():
+    # The reactive planner republishes the slice still AHEAD of the car, so once the car is beside
+    # a box the republished path is that box's EXIT RAMP -- widest point downstream of the box.
+    # Under newest-wins those tails walked the record up to 1.0 m downstream and the hump built on
+    # it missed by 3-12 cm. A path that genuinely passed the box starts before it and ends after it.
+    n = make_node()
+    n._obstacles = [core.Obstacle(5.0, -0.2, 0.15)]
+    n._obs_ids = [7]
+    n.otwpnts_cb(path_msg(HUMP))                       # spans x = 0 .. 9.5, obstacle at 5.0
+    assert ("id", 7) in n._apex_by_obs, "a path that spans the obstacle must be accepted"
+    n._apex_by_obs.clear()
+    # the same geometry, sliced to start AT the obstacle: an exit ramp, nothing before the box
+    tail = [(x, y, d) for x, y, d in HUMP if x >= 5.0]
+    n.otwpnts_cb(path_msg(tail))
+    assert ("id", 7) not in n._apex_by_obs, "an exit ramp must not set the record"
+    # ...and sliced to END at the obstacle: an entry ramp, nothing after it
+    n._apex_by_obs.clear()
+    head = [(x, y, d) for x, y, d in HUMP if x <= 5.0]
+    n.otwpnts_cb(path_msg(head))
+    assert ("id", 7) not in n._apex_by_obs, "an entry ramp must not set the record either"
+    print("PASS an apex is only believed from a path that spans the obstacle")
+
+
+def test_apex_is_anchored_abeam_not_where_the_path_was_widest():
+    # The record's STATION is what centres the hump. It is now taken from the obstacle, so a path
+    # whose widest point drifted downstream can be wrong about the amplitude but never about where.
+    n = make_node()
+    o = core.Obstacle(5.0, -0.2, 0.15)
+    n._obstacles = [o]
+    n._obs_ids = [7]
+    # a hump whose peak sits 0.30 m past the obstacle (inside the 0.5 m abeam gate)
+    skew = [(x * 0.1, 0.4 * np.exp(-((x * 0.1 - 5.30) ** 2)),
+             0.4 * np.exp(-((x * 0.1 - 5.30) ** 2))) for x in range(110)]
+    n.otwpnts_cb(path_msg(skew))
+    ax, ay, _amp = n._apex_by_obs[("id", 7)]
+    assert abs(ax - o.x) < 1e-6, f"apex x must be the obstacle's station, got {ax:.3f}"
+    print(f"PASS the apex is stored abeam the obstacle (x={ax:.2f}, obstacle x={o.x:.2f})")
+
+
+def test_apex_undershoot_rejected():
+    # Symmetric with the long-standing overshoot clamp. The obstacle needs |d| = 0.40.
+    n = make_node()
+    n._obstacles = [core.Obstacle(5.0, -0.2, 0.15)]
+    n._obs_ids = [7]
+    n.otwpnts_cb(path_msg([(x, y * 0.72, d * 0.72) for x, y, d in HUMP]))   # 0.29: 11 cm under
+    assert ("id", 7) in n._apex_by_obs, "a slightly tighter avoidance is still an avoidance"
+    n._apex_by_obs.clear()
+    n.otwpnts_cb(path_msg([(x, y * 0.4, d * 0.4) for x, y, d in HUMP]))     # 0.16: 24 cm under
+    assert ("id", 7) not in n._apex_by_obs, "a decaying tail must not become the record"
+    print("PASS an apex that undershoots the geometric need is rejected")
 
 
 def test_implausible_apex_rejected():
@@ -345,7 +407,7 @@ def test_minor_apex_refinement_keeps_the_pending():
     n = make_node()
     n._obstacles = [core.Obstacle(5.0, -0.2, 0.15)]
     n._obs_ids = [7]
-    n.otwpnts_cb(path_msg(HUMP))                       # first apex -> major, no pending yet
+    n.otwpnts_cb(path_msg(HUMP))                                     # first apex -> major, no pending yet
     assert n._apex_change_major is True
 
     sentinel = object()
@@ -360,9 +422,13 @@ def test_minor_apex_refinement_keeps_the_pending():
 
     n._pending, n._pending_dev = sentinel, np.zeros(3)
     n._obstacles_dirty = False
-    shrunk = [(x, y * 0.5, d * 0.5) for x, y, d in HUMP]       # 0.40 -> 0.20: 20 cm, major
-    n.otwpnts_cb(path_msg(shrunk))
-    assert n._obstacles_dirty and n._apex_change_major, "20 cm must read as a major change"
+    # a NEW apex -- the realistic major trigger, a newly confirmed obstacle -- must drop it. (A
+    # large SHRINK cannot be used here any more: the undershoot predicate rejects a record that
+    # falls more than apex_undershoot_m below what the obstacle geometrically requires.)
+    n._apex_by_obs.clear()
+    n._obstacles_dirty = False
+    n.otwpnts_cb(path_msg(HUMP))
+    assert n._obstacles_dirty and n._apex_change_major, "a new apex must read as a major change"
     assert n._pending is None, "a major apex change must discard the queued line"
     print("PASS a minor apex refinement keeps the pending bundle, a major one drops it")
 
@@ -533,7 +599,10 @@ if __name__ == "__main__":
     test_new_apex_sets_dirty()
     test_small_growth_no_retrigger()
     test_retro_association()
-    test_newest_wins_shrink()
+    test_newest_wins_shrink_within_the_undershoot_bound()
+    test_apex_span_requirement()
+    test_apex_is_anchored_abeam_not_where_the_path_was_widest()
+    test_apex_undershoot_rejected()
     test_implausible_apex_rejected()
     test_overshoot_apex_clamped()
     test_neighbor_ramp_does_not_overwrite()
