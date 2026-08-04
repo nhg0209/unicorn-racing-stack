@@ -1390,7 +1390,8 @@ class ObstacleSpliner(Node):
             # vs curvature, with the geometry so you can see if it's genuinely impassable or a knob.
             self.get_logger().warn(
                 f"[{self.name}] NO feasible candidate ({N} sampled) -> TRAILING | "
-                f"reject bounds={n_bounds} obs_box={n_obs} grid={n_grid} curv={n_curv} | "
+                f"reject bounds={n_bounds} obs_box={n_obs} grid={n_grid} body={n_body} "
+                f"curv={n_curv} | "
                 f"g_near={g_near:.2f} obs_half_s={obs_half_s:.2f} n_box={len(knots)} apex_bulge={self.apex_bulge:.2f} | "
                 f"sample d_range=[{d_lo:.2f},{d_hi:.2f}] ({cor_src}) corridor@obs "
                 f"wpnt L={gb_wpnts[obs_j].d_left:.2f}/R={gb_wpnts[obs_j].d_right:.2f} | "
