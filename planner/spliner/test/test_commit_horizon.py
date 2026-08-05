@@ -150,7 +150,7 @@ def knot_ids(p):
     return set() if c is None else {oid for (oid, _s, _d) in c['obs']}
 
 
-def test_a_box_that_enters_the_lookahead_releases_the_commit():
+def test_a_box_that_comes_into_reach_releases_the_commit():
     # A box from BEYOND the gather horizon -- the one case the gather cannot cover, because there
     # is nothing to gather yet. Box 2 sits 12 m behind box 1, outside the 19.5 m gather horizon
     # when the plan around box 1 is frozen, and comes into the lookahead while that plan is still
@@ -175,7 +175,7 @@ def test_a_box_that_enters_the_lookahead_releases_the_commit():
             if fired is None and any("came into the" in m and "never" in m for m in p.log.msgs):
                 fired = cur_s
         if drop:
-            assert fired is not None, "box 2 entered the lookahead and the commit was not released"
+            assert fired is not None, "box 2 came into reach and the commit was not released"
             gap = S2 - fired
             assert gap > 10.0, f"box 2 was only reacted to at {gap:.2f} m"
             assert planned is not None and planned <= fired + 1e-9, \
@@ -183,7 +183,7 @@ def test_a_box_that_enters_the_lookahead_releases_the_commit():
             assert first_false is None, (
                 f"feasible=False at s={first_false:.2f} (box 2 {S2 - first_false:.2f} m ahead): "
                 f"the release is supposed to make the re-plan happen BEFORE anything is violated")
-            print(f"PASS a box entering the lookahead releases the commit and is planned around "
+            print(f"PASS a box coming into reach releases the commit and is planned around "
                   f"in the same cycle ({gap:.2f} m ahead, no feasible=False at all)")
         else:
             assert fired is None, "the harness must reproduce the failure: no release without it"
@@ -251,6 +251,33 @@ def test_a_box_past_the_lookahead_takes_only_a_LEFTOVER_weave_slot():
     print("PASS a box past the lookahead takes a weave slot only when one is left over")
 
 
+def test_a_box_is_planned_around_as_soon_as_it_is_reachable():
+    # The release and the gather now use the SAME horizon, so "a box the plan never knew about"
+    # and "a box the next plan would shape around" are the same set. The moment box 2 is inside
+    # the gather horizon AND the planner is publishing, it must be in the plan -- not one lookahead
+    # later, when the frozen path finally expires.
+    for spacing in (1.5, 2.5, 3.5, 5.0, 7.0, 9.0):
+        p = Planner([box(20.0, -0.35, 1), box(20.0 + spacing, -0.35, 2)])
+        s2 = 20.0 + spacing
+        gather = (max(p.n.lookahead_min, p.n.lookahead_k * p.n.cur_vs) + p.n.obs_gather_extra_m)
+        active = got = None
+        for k in range(0, 200):
+            cur_s = 2.0 + 0.1 * k
+            w = p.step(cur_s)
+            if active is None and w.wpnts and (s2 - cur_s) <= gather:
+                active = cur_s
+            if got is None and 2 in p.committed_ids():
+                got = cur_s
+            if got is not None:
+                break
+        assert active is not None and got is not None, f"spacing {spacing}: box 2 never planned for"
+        assert got - active <= 1.0, (
+            f"spacing {spacing}: box 2 was inside the gather horizon and the planner was active "
+            f"for {got - active:.2f} m before it was planned around")
+    print("PASS a reachable box is planned around in the first cycle it is reachable "
+          "(spacings 1.5-9.0 m, 0.00 m of travel)")
+
+
 def test_no_infeasible_cycle_while_the_second_box_is_still_ahead():
     # The symptom, end to end: feasible must not flip to False while there is still room to plan.
     for spacing in (1.5, 2.5, 3.5, 5.0, 7.0, 9.0):
@@ -269,9 +296,10 @@ def test_no_infeasible_cycle_while_the_second_box_is_still_ahead():
 
 
 if __name__ == "__main__":
-    test_a_box_that_enters_the_lookahead_releases_the_commit()
+    test_a_box_that_comes_into_reach_releases_the_commit()
     test_the_release_does_not_fire_on_the_boxes_it_was_planned_around()
     test_the_gather_horizon_reaches_as_far_as_the_path()
     test_a_box_past_the_lookahead_takes_only_a_LEFTOVER_weave_slot()
+    test_a_box_is_planned_around_as_soon_as_it_is_reachable()
     test_no_infeasible_cycle_while_the_second_box_is_still_ahead()
     print("ALL PASS")

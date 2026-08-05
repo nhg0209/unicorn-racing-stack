@@ -1129,6 +1129,10 @@ class ObstacleSpliner(Node):
         cur_vs = self.cur_vs if self.cur_vs is not None else 0.0
         lookahead = max(self.lookahead_min, self.lookahead_k * cur_vs)
         lookahead = min(lookahead, self.gb_max_s / 2.0)
+        # How far obstacles are COLLECTED: as far as the path reaches (see the gather below). The
+        # commit release uses the same horizon, so "a box the plan never knew about" and "a box
+        # the next plan would shape around" are the same set.
+        gather = lookahead + max(0.0, self.obs_gather_extra_m)
 
         # --- committed-path reuse: follow the SAME world-fixed evasion path we already chose ---
         # (see the commit_* notes in __init__). Re-solving from the instantaneous pose every cycle
@@ -1141,7 +1145,7 @@ class ObstacleSpliner(Node):
         # decided by the call that is now retrying (and which left _committed None to get here).
         if self.commit_enable and self._committed is not None and not retry:
             reuse = self._reuse_committed(gb_wpnts, wpnt_dist, obs_margin_d, half_car,
-                                          obs_margin_s, lookahead)
+                                          obs_margin_s, gather)
             if reuse is not None:
                 return reuse
 
@@ -1155,7 +1159,6 @@ class ObstacleSpliner(Node):
         # obstacle, so the box-1-only path failed its own re-check on the next cycle, published
         # feasible=False, was re-planned identically, and flapped at 20 Hz. Measured with two
         # boxes 5 m apart: feasible alternated True/False every cycle from 16.9 m out.
-        gather = lookahead + max(0.0, self.obs_gather_extra_m)
         cands_obs = self._gather_obstacles_ahead(self.obstacles, gather)
         now = self.get_clock().now()
         if cands_obs:
@@ -1950,7 +1953,7 @@ class ObstacleSpliner(Node):
         }
 
     def _reuse_committed(self, gb_wpnts, wpnt_dist, obs_margin, half_car, obs_margin_s=None,
-                         lookahead: float = 0.0):
+                         gather: float = 0.0):
         """Try to republish the committed path (the slice still ahead of the car). Returns
         (OTWpntArray, MarkerArray) on reuse, or None -- after dropping the commit -- when a fresh
         plan is needed. Publishes the feasibility verdict itself in every path it returns from."""
@@ -2032,7 +2035,7 @@ class ObstacleSpliner(Node):
                 self._committed = None                        # box moved enough -> re-plan the apex
                 return None
 
-        # --- a box the commit was never planned around has come into the lookahead ---
+        # --- a box the commit was never planned around has come into the gather horizon ---
         # The commit is a statement about the obstacles that were known when it was frozen, and
         # "a new box appeared" was not among its release conditions. The one that eventually fires
         # is the safety re-check below -- but that one publishes feasible=False, which is the state
@@ -2044,14 +2047,14 @@ class ObstacleSpliner(Node):
         # re-plan and gives the new box an apex at the range where an apex is still worth having.
         if self.commit_drop_on_new_obstacle:
             planned = {oid for (oid, _s, _d) in c['obs']}
-            fresh = [o for _g, o in self._gather_obstacles_ahead(self.obstacles, lookahead)
+            fresh = [o for _g, o in self._gather_obstacles_ahead(self.obstacles, gather)
                      if int(o.id) not in planned]
             if fresh:
                 self.get_logger().info(
                     f"[static_avoidance] commit released: "
                     + ", ".join(f"box {int(o.id)} (s={o.s_center:.1f} d={o.d_center:+.2f})"
                                 for o in fresh)
-                    + f" came into the {lookahead:.1f} m lookahead and this path was never "
+                    + f" came into the {gather:.1f} m gather horizon and this path was never "
                       f"planned around it -- re-planning so it gets an apex",
                     throttle_duration_sec=1.0)
                 self._committed = None
