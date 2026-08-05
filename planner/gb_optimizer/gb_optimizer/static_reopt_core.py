@@ -2546,6 +2546,7 @@ def _reopt_local_window_impl(
     bound_r = clean_xy + np.asarray(clean_dr, float)[:, None] * nvec_rl
     bound_l = clean_xy - np.asarray(clean_dl, float)[:, None] * nvec_rl
 
+    kappa_published_ok, kappa_published_max, kappa_published_allow = True, 0.0, float(curvlim)
     # UNIFORM-spacing resample: the offset compresses the point spacing on inner curves, and a
     # downstream spline through unevenly spaced waypoints can wiggle. Only when an arc was laid
     # (n_solved) — a clean line is already uniform. Shape is preserved; the COUNT is pinned to the
@@ -2589,6 +2590,27 @@ def _reopt_local_window_impl(
         # restoration above leaves at the edges of each arc) — see
         # _cap_speed_to_published_curvature. It stays the FINAL pass for exactly that reason.
         _cap_speed_to_published_curvature(traj, ggv, axm)
+        # CURVLIM ON THE PUBLISHED GEOMETRY. Both upstream curvature gates (_kappa_peak against
+        # _kappa_allow, and _weave_violations) run on the ANALYTIC offset profile, before the
+        # uniform resample. Nothing re-checked the points that actually go on the wire, and the
+        # resample moves them: measured on ifac with three boxes, the published max|kappa| came
+        # out at 1.60-1.71 against a curvlim of 1.50, and three boxes is the IFAC format.
+        # _cap_speed_to_published_curvature does not cover this -- it keeps the SPEED inside the
+        # friction budget, while curvlim is a STEERING limit, so a line the car cannot turn is
+        # simply driven slowly into the apex and understeers out of it.
+        # Corner-fair, like every other curvature judgment in this file: the clean raceline itself
+        # sits at curvlim through its own apexes, so the bound at each published point is
+        # max(curvlim, the clean line's own curvature there) -- the maneuver may not ADD steering
+        # beyond the limit, and is never blamed for the corner it is driving through.
+        k_pub = np.abs(_menger_kappa(traj[:, 1:3]))
+        k_cln = np.abs(_menger_kappa(clean_xy))
+        _, j_near = _on_clean_mask(traj, clean_xy, dev_tol=np.inf)
+        k_allow = np.maximum(float(curvlim), k_cln[j_near])
+        over = k_pub - k_allow
+        i_worst = int(np.argmax(over))
+        kappa_published_ok = bool(over[i_worst] <= 0.0)
+        kappa_published_max = float(k_pub[i_worst])
+        kappa_published_allow = float(k_allow[i_worst])
         # ax likewise has to describe the PUBLISHED vx over the PUBLISHED spacing. It was computed
         # on the pre-resample grid and then linearly interpolated, leaving it inconsistent by up to
         # 0.85 m/s^2 (the clean line's own residual is 0.001) — a wrong feed-forward for any
@@ -2601,6 +2623,11 @@ def _reopt_local_window_impl(
         est = float(np.sum(_el[:-1] / np.maximum(traj[:-1, 5], 1e-3)))   # est on the FINAL profile
 
     return {"reftrack_mod": rl_mod, "report": report,
+            # PUBLISHED-geometry curvature verdict (see the gate above). False = the line steers
+            # harder than the car can; the caller refuses it down the clearance_ok path.
+            "kappa_published_ok": kappa_published_ok,
+            "kappa_published_max": kappa_published_max,
+            "kappa_published_allow": kappa_published_allow,
             "main": (traj, bound_r, bound_l, est), "d_right": d_right, "d_left": d_left,
             "n_windows": n_solved, "n_failed": n_failed, "apex_dropped": apex_dropped,
             "apex_laid": apex_laid, "curvlim": float(curvlim),

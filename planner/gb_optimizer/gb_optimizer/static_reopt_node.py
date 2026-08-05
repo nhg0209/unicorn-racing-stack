@@ -1088,6 +1088,21 @@ class StaticReoptNode(Node):
                                                       floors=floors_by_id)
             # ...and the wall, which no upstream check consults directly. Same refusal path.
             clearance_ok = self._wall_gate_ok(traj) and clearance_ok
+            # ...and curvlim on the geometry that actually goes on the wire. Both upstream
+            # curvature gates run on the analytic offset profile, before the uniform resample; the
+            # resample moves the points, and nothing re-checked them. A line that steers harder
+            # than the car can is not fixed by slowing down -- _cap_speed_to_published_curvature
+            # keeps the SPEED inside the friction budget, but curvlim is a STEERING limit, so the
+            # car simply understeers out of the apex. Same refusal path as the other two.
+            if not res.get("kappa_published_ok", True):
+                self.get_logger().warning(
+                    f"[static_reopt] REFUSED: published max|kappa| "
+                    f"{res.get('kappa_published_max', float('nan')):.3f} exceeds what the car can "
+                    f"steer there ({res.get('kappa_published_allow', float('nan')):.3f} = "
+                    f"max(curvlim, the clean line's own curvature)). The upstream curvature gates "
+                    f"run on the pre-resample analytic profile; this one reads the points that "
+                    f"would be published")
+                clearance_ok = False
             # Baseline for the drift trigger: what THIS line clears each box by, at the positions
             # it was built from. Travels with the bundle so the comparison is always against the
             # line that is actually active (a pending bundle may never commit).

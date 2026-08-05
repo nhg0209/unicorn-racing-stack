@@ -649,6 +649,38 @@ class _RingMap:
         self.eroded_image = np.where(free, 255, 0).astype(np.uint8)
 
 
+def test_the_published_geometry_is_checked_against_curvlim():
+    # Both upstream curvature gates (_kappa_peak vs _kappa_allow, and _weave_violations) run on
+    # the ANALYTIC offset profile, before the uniform resample. The resample moves the points and
+    # nothing re-checked them: measured on ifac with three boxes -- the IFAC format -- the
+    # published max|kappa| came out at 1.60-1.71 against a curvlim of 1.50.
+    # The verdict is corner-fair: the clean raceline sits AT curvlim through its own apexes, so
+    # the bound is max(curvlim, the clean line's own curvature at that point).
+    N = 400
+    line = np.column_stack([np.arange(N) * 0.1, np.zeros(N)])
+    dr = np.full(N, 1.2)
+    dl = np.full(N, 1.2)
+    ref = np.column_stack([line[:, 0], line[:, 1], dr, dl])
+    cfg = str(Path(__file__).resolve().parents[3] / "stack_master/config/SIM")
+    res = core.reoptimize_local_window(
+        line, dr, dl, ref, [(20.0, 0.45)], cfg,
+        params=core.ModulationParams(obs_margin=0.35), w_veh=0.30, clean_vx=np.full(N, 5.0),
+        wall_margin=0.05, reach_time=0.0, reach_min=1.0, reach_max=6.0,
+        clean_kappa=np.zeros(N), fit_tol=core._FIT_TOL_DEFAULT,
+        apex_obstacles=[(20.0, 0.0, 0.15)])
+    assert res["apex_laid"], "the fixture must lay a hump"
+    traj = res["main"][0]
+    k = float(np.max(np.abs(core._menger_kappa(traj[:, 1:3]))))
+    assert abs(res["kappa_published_max"] - k) < 1e-9, \
+        f"the verdict must be measured on the PUBLISHED points: {res['kappa_published_max']} vs {k}"
+    assert res["kappa_published_ok"] is (k <= res["kappa_published_allow"]), "verdict must match"
+    assert res["kappa_published_ok"], f"a straight-line hump must be steerable: {k:.3f}"
+    # ...and the allowance is the corner-fair one, not a bare curvlim
+    assert res["kappa_published_allow"] >= res["curvlim"] - 1e-9
+    print(f"PASS the published geometry is checked against curvlim "
+          f"(max|kappa| {k:.3f} <= {res['kappa_published_allow']:.3f})")
+
+
 def test_the_grid_corridor_is_measured_where_the_offset_is_laid():
     # The corridor the re-opt fits its humps into came from the waypoints' d_left/d_right, which
     # are optimistic by 5-44 mm exactly where a corner hump's exit ramp runs -- and the final wall
@@ -1663,6 +1695,7 @@ if __name__ == "__main__":
     test_the_drift_check_reads_the_LIVE_obstacle_position()
     test_minor_apex_refinement_keeps_the_pending()
     test_swap_held_while_trailing_a_close_obstacle()
+    test_the_published_geometry_is_checked_against_curvlim()
     test_the_grid_corridor_is_measured_where_the_offset_is_laid()
     test_the_grid_corridor_can_only_tighten_the_fit()
     test_every_obstacle_gets_a_knot_even_with_no_reactive_apex()
