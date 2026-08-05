@@ -204,6 +204,11 @@ class ObstacleSD:
     # window where the position std is still tiny; a static box shows only jitter/T.
     rate = None
     static_speed_max = None   # [m/s] above this an obstacle may NOT vote static
+    # [m] net displacement a track may show over its window and still vote static, regardless of
+    # how short the window is. Covers the centroid shift of a stationary box whose visible face
+    # changes on approach (observed <= 0.10 m); an opponent at 2 m/s covers 0.30 m in the same
+    # 0.15 s window and is still vetoed.
+    static_net_floor = 0.12
     demote_speed = None       # [m/s] above this (sustained) a confirmed static demotes
 
     def __init__(self, id, s_meas, d_meas, lap, size, isVisible, t_meas=None):
@@ -300,7 +305,15 @@ class ObstacleSD:
             normalize_s(self.measurments_s[-1] - self.measurments_s[0], track_length),
             self.measurments_d[-1] - self.measurments_d[0],
         )
+        self._last_win = (net, win_t)
         return net / win_t
+
+    def window_net(self, track_length):
+        """(net displacement [m], window time [s]) of the current window, or (None, None)."""
+        v = self.window_speed(track_length)
+        if v is None:
+            return None, None
+        return getattr(self, "_last_win", (None, None))
 
     def isStatic(self, track_length):
         # --- get a representative data set for the obstacle ---
@@ -336,8 +349,22 @@ class ObstacleSD:
             # while its window std is still small (young window / slow opponent). A track
             # riding within the suppression radius of an initialized dynamic track (spare
             # detection cluster of that car) may not vote static either.
-            speed_ok = (win_v is None or ObstacleSD.static_speed_max is None
-                        or win_v < ObstacleSD.static_speed_max) and not self.near_dynamic
+            # NET DISPLACEMENT WITH A FLOOR, not speed alone. On a young window (min_nb_meas /
+            # rate ~ 0.15 s) the speed is net/0.15, so a box whose CENTROID shifts by 0.06 m --
+            # which a 0.3-0.6 m box does routinely on approach, as the visible face changes --
+            # reads 0.4 m/s and is vetoed from voting static. Every recreated track therefore
+            # spent its first frames classified dynamic, the static planner dropped it
+            # (static_promote_sec), feasible went False and the SM fell out of the overtake.
+            # A fixed floor separates the two: a genuinely moving opponent at 2 m/s covers
+            # 0.30 m in that window, far past the floor, so the veto that keeps a static ghost
+            # off a moving car is untouched.
+            net_d, win_t = self.window_net(track_length)
+            if net_d is None or ObstacleSD.static_speed_max is None:
+                speed_ok = not self.near_dynamic
+            else:
+                moved = max(ObstacleSD.static_speed_max * win_t,
+                            ObstacleSD.static_net_floor)
+                speed_ok = (net_d < moved) and not self.near_dynamic
             # --- create a voting system so that the outliers don't affect much the result ---
             if (std_s < ObstacleSD.min_std and std_d < ObstacleSD.min_std) and speed_ok:
                 self.static_count = self.static_count + 1
@@ -435,6 +462,7 @@ class StaticDynamic(Node):
         self.max_std = self._get_param("max_std")
         self.min_std = self._get_param("min_std")
         self.min_nb_meas = self._get_param("min_nb_meas")
+        self.static_net_floor_m = self._get_param("static_net_floor_m", 0.12)
         self.noMemoryMode = self._get_param("noMemoryMode")
         self.debug_mode = self._get_param("debug_mode")
         self.publish_static = self._get_param("publish_static")
@@ -475,6 +503,7 @@ class StaticDynamic(Node):
         ObstacleSD.demote_min_count = max(1, int(self.demote_time_s * self.rate))
         ObstacleSD.rate = self.rate
         ObstacleSD.static_speed_max = self.static_speed_max_mps
+        ObstacleSD.static_net_floor = float(self.static_net_floor_m)
         ObstacleSD.demote_speed = self.demote_speed_mps
         self.vs_reset = self.vs_reset
 
@@ -522,6 +551,7 @@ class StaticDynamic(Node):
         self.ratio_to_glob_path = self._get_param("ratio_to_glob_path")
         self.ttl_static = self._get_param("ttl_static")
         self.min_nb_meas = self._get_param("min_nb_meas")
+        self.static_net_floor_m = self._get_param("static_net_floor_m", 0.12)
         self.dist_deletion = self._get_param("dist_deletion")
         self.dist_infront = self._get_param("dist_infront")
         self.min_std = self._get_param("min_std")
@@ -550,6 +580,7 @@ class StaticDynamic(Node):
         ObstacleSD.demote_min_count = max(1, int(self.demote_time_s * self.rate))
         ObstacleSD.rate = self.rate
         ObstacleSD.static_speed_max = self.static_speed_max_mps
+        ObstacleSD.static_net_floor = float(self.static_net_floor_m)
         ObstacleSD.demote_speed = self.demote_speed_mps
 
         obstacle_params = [ObstacleSD.ttl, ObstacleSD.min_nb_meas, ObstacleSD.min_std, ObstacleSD.max_std]
@@ -927,7 +958,13 @@ class StaticDynamic(Node):
                             tracked_obstacle.staticFlag = True
                             tracked_obstacle.static_count = 0
                             tracked_obstacle.total_count = 0
-                            tracked_obstacle.nb_meas = 0
+                            # NOT 0. nb_meas = 0 put the track back below min_nb_meas, so (i) its
+                            # staticFlag went None again and it vanished from /tracking/obstacles
+                            # for another window, and (ii) update_mean's nb_meas == 0 branch
+                            # snapped the running mean onto the newest measurement, inflating the
+                            # std on the next frames and inviting a flip straight back to dynamic.
+                            # The track has a full window of history; keep it.
+                            tracked_obstacle.nb_meas = ObstacleSD.min_nb_meas + 1
                         else:
                             tracked_obstacle.dynamic_state.update(tracked_obstacle)
                             # tracked_obstacle.dynamic_state.id = tracked_obstacle.id

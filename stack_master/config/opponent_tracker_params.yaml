@@ -68,6 +68,14 @@ tracking:
     # static_speed_max_mps; above demote_speed_mps the static vote hard-resets / a confirmed
     # static demotes (sustained for demote_time_s).
     static_speed_max_mps: 0.4
+    # [m] net displacement a track may show over its measurement window and still vote static,
+    # whatever the window's DURATION. The veto above is a speed, and on a young window
+    # (min_nb_meas / rate ~ 0.15 s) speed is net/0.15 -- so a stationary box whose centroid shifts
+    # 0.06 m as its visible face changes on approach reads 0.4 m/s and is vetoed. Every recreated
+    # track then spent its first frames classified dynamic, the static planner dropped it, and the
+    # state machine fell out of the overtake into TRAILING. An opponent at 2 m/s covers 0.30 m in
+    # the same window, so the veto that keeps a static ghost off a moving car is unaffected.
+    static_net_floor_m: 0.12
     demote_speed_mps: 0.6
     # a track whose measurement lies within this radius of an initialized DYNAMIC track is a
     # spare detection cluster of that car (the box detector splits the opponent into 2 clusters
