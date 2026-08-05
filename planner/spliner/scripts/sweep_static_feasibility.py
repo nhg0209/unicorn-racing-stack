@@ -206,6 +206,13 @@ def main():
 
     H = Harness(a.map)
     fails = []
+    # check_track_bounds.py --all exits 1 today: map f ships with d_left/d_right SWAPPED on 402
+    # stations against 0 correct, in all four of its waypoint sets. The corridor, the sampled
+    # terminal offsets and the obstacle keep-out sides in this sweep all come from those bounds,
+    # so a run on that map describes a mirrored track rather than this code. ifac is clean.
+    if a.map in ("f",):
+        print(f"  !! WARNING: map {a.map} ships with d_left/d_right SWAPPED "
+              f"(check_track_bounds.py --all). These numbers are not evidence about the planner.")
 
     # --- feasibility + superset ------------------------------------------------------------
     cells = {}

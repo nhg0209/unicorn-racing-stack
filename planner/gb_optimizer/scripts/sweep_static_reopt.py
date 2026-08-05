@@ -682,6 +682,23 @@ def check_multi(maps, cfg_dir, wall_margin, fit_tol, per_apex_s, enforce_laptime
     return ok
 
 
+SWAPPED_BOUNDS_MAPS = {"f"}   # see stack_master/scripts/check_track_bounds.py --all
+
+
+def _warn_if_bounds_swapped(name):
+    """Say so, loudly, when a map's own d_left/d_right are the wrong way round.
+
+    check_track_bounds.py --all exits 1 today because map f ships SWAPPED on 402 stations against
+    0 correct, in all four of its waypoint sets. Every corridor in this sweep is derived from
+    those bounds, so a run on that map measures a mirrored track: it is not evidence about the
+    code under test. ifac and map_test are clean.
+    """
+    if name in SWAPPED_BOUNDS_MAPS:
+        print(f"  !! WARNING: map {name} ships with d_left/d_right SWAPPED "
+              f"(check_track_bounds.py --all: 402 stations vs 0). Every corridor below is derived "
+              f"from those bounds, so these numbers describe a mirrored track, not this code.")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--maps", nargs="+", default=["ifac", "f"])
@@ -714,6 +731,7 @@ def main() -> int:
         lap0, kappa0, ay0 = clean_metrics(m)
         print(f"\n##### map {name}: clean lap {lap0:.3f} s | clean geometric |kappa|max {kappa0:.2f} "
               f"| clean implied ay max {ay0:.2f} | ggv ay_max {ay_max:.2f}")
+        _warn_if_bounds_swapped(name)
         print("  wall_m fit_tol | laid drop | curvlim | kappa_true: med   p90   MAX | over | ay MAX "
               "| lap loss: med     p90     MAX | reach med")
         for wm in args.wall_margin:
