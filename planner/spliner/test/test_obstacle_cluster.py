@@ -82,6 +82,7 @@ def planner(obstacles, cur_d=0.0, cur_s=0.0):
     n.gb_max_s, n.gb_max_idx = TRACK_LEN, int(TRACK_LEN / WPNT_DIST)
     n.obstacles = obstacles
     n.width_car, n.safety_margin, n.wall_margin = 0.30, 0.15, 0.10
+    n.safety_margin_d = n.safety_margin   # LATERAL half of the keep-out
     n.lookahead_min, n.lookahead_k = 15.0, 1.5
     n.n_d_samples, n.sample_gaps = 10, True
     n.max_weave = 3

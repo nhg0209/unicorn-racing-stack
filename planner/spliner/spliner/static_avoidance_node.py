@@ -147,6 +147,12 @@ class ObstacleSpliner(Node):
         self.a_long_accel = 3.0      # [m/s^2] longitudinal ACCEL for the forward pass (gentle exit ramp-up;
                                      # lower = more gradual "fast-out" acceleration off the apex)
         self.safety_margin = 0.16    # [m] extra clearance around the obstacle box (beyond half car).
+        # LATERAL half of the keep-out. Split from safety_margin so the two axes obs_margin
+        # conflates can move independently: the longitudinal one is bounded by half the car's
+        # LENGTH (0.29 m) and the lateral one by the SM's accept lines, the clear gate and the
+        # tracker's position error. Equal to safety_margin here, which makes the split a pure
+        # refactor -- every published path is bit-identical to before it.
+        self.safety_margin_d = 0.16
         self.static_near_zero_mps = 0.15  # speed band for the near-stationary fallback
         self.static_promote_sec = 0.5     # how long it must hold before the fallback is believed
         self.static_demote_mps = 0.35     # clearly-moving band that ends the belief
@@ -308,7 +314,7 @@ class ObstacleSpliner(Node):
             'kernel_size', 'body_kernel_size',
             'lookahead_min', 'lookahead_k', 'n_d_samples', 'sample_gaps', 'kappa_max',
             'kappa_add_max', 'kappa_abs_max', 'a_lat_max', 'a_long_max', 'a_long_accel',
-            'safety_margin', 'static_near_zero_mps', 'static_promote_sec',
+            'safety_margin', 'safety_margin_d', 'static_near_zero_mps', 'static_promote_sec',
             'static_demote_mps', 'static_demote_sec',
             'wall_margin', 'knot_merge_s_m', 'shift_min', 'shift_buffer', 'ramp_len', 'hold_after',
             'return_len', 'ramp_len_min_m',
@@ -381,6 +387,7 @@ class ObstacleSpliner(Node):
         self.declare_parameter('a_long_max', 4.0, dbl(0.5, 20.0, "longitudinal decel for backward speed pass [m/s^2]"))
         self.declare_parameter('a_long_accel', 3.0, dbl(0.5, 20.0, "longitudinal accel for forward pass (gentle exit) [m/s^2]"))
         self.declare_parameter('safety_margin', 0.16, dbl(0.0, 1.0, "clearance around obstacle box [m]"))
+        self.declare_parameter('safety_margin_d', 0.16, dbl(0.0, 1.0, "LATERAL clearance around the obstacle box [m]"))
         self.declare_parameter('static_near_zero_mps', 0.15,
                                dbl(0.0, 1.0, "speed band for the near-stationary fallback [m/s]"))
         self.declare_parameter('static_promote_sec', 0.5,
@@ -493,6 +500,8 @@ class ObstacleSpliner(Node):
                 self.a_long_accel = float(p.value)
             elif n == 'safety_margin':
                 self.safety_margin = float(p.value)
+            elif n == 'safety_margin_d':
+                self.safety_margin_d = float(p.value)
             elif n == 'wall_margin':
                 self.wall_margin = float(p.value)
             elif n == 'knot_merge_s_m':
@@ -732,7 +741,8 @@ class ObstacleSpliner(Node):
     def _relax_active(self) -> bool:
         return (self.get_clock().now().nanoseconds * 1e-9) < self._relax_until
 
-    def _gate_samples(self, obs_ahead, anchor, corridor, obs_margin: float) -> List[float]:
+    def _gate_samples(self, obs_ahead, anchor, corridor, obs_margin_d: float,
+                      obs_margin_s: float = None) -> List[float]:
         """Terminal offsets aimed at the lanes left free by ALL boxes overlapping `anchor` in s.
 
         The gap sampling above measures its two free intervals against the anchor box alone. With a
@@ -748,19 +758,20 @@ class ObstacleSpliner(Node):
         try:
             d_lo, d_hi = corridor
             L = self.gb_max_s
-            a_lo = (anchor.s_start - obs_margin - self.cur_s) % L
-            a_hi = (anchor.s_end + obs_margin - self.cur_s) % L
+            m_s = obs_margin_d if obs_margin_s is None else obs_margin_s
+            a_lo = (anchor.s_start - m_s - self.cur_s) % L
+            a_hi = (anchor.s_end + m_s - self.cur_s) % L
             free = [(d_lo, d_hi)]
             n_over = 0
             for o in obs_ahead:
-                o_lo = (o.s_start - obs_margin - self.cur_s) % L
-                o_hi = (o.s_end + obs_margin - self.cur_s) % L
+                o_lo = (o.s_start - m_s - self.cur_s) % L
+                o_hi = (o.s_end + m_s - self.cur_s) % L
                 if o is not anchor and (o_lo > a_hi or o_hi < a_lo):
                     continue                            # disjoint in s -> its keep-out is elsewhere
                 if o is not anchor:
                     n_over += 1                         # budget counts the EXTRA boxes only...
-                cut_lo = min(o.d_right, o.d_left) - obs_margin
-                cut_hi = max(o.d_right, o.d_left) + obs_margin
+                cut_lo = min(o.d_right, o.d_left) - obs_margin_d
+                cut_hi = max(o.d_right, o.d_left) + obs_margin_d
                 nxt = []
                 for lo, hi in free:
                     if cut_hi <= lo or cut_lo >= hi:    # cut misses this interval
@@ -1015,6 +1026,10 @@ class ObstacleSpliner(Node):
         """Plan one static-avoidance path. `squeeze` marks a reduced-margin RETRY (see
         _squeeze_schedule); such a call returns None instead of an empty result so the caller can
         try the next step, and never publishes the feasibility verdict itself."""
+        # The squeeze lowers `safety_margin`; both axes give up the SAME amount, so a squeeze after
+        # the split behaves exactly as it did before it.
+        safety_margin_d = self.safety_margin_d - (self.safety_margin - (
+            self.safety_margin if safety_margin is None else safety_margin))
         safety_margin = self.safety_margin if safety_margin is None else safety_margin
         wall_margin = self.wall_margin if wall_margin is None else wall_margin
         wpnts = OTWpntArray()
@@ -1038,7 +1053,17 @@ class ObstacleSpliner(Node):
 
         wpnt_dist = gb_wpnts[1].s_m - gb_wpnts[0].s_m
         half_car = self.width_car / 2.0
-        obs_margin = half_car + safety_margin           # keep-out half-width around obstacle boxes
+        # TWO AXES, NOT ONE. obs_margin was used for two different jobs: the LATERAL keep-out
+        # (how far the line must pass the box) and the LONGITUDINAL one (how far the box's
+        # s-interval is inflated before the lateral test is applied at all). They are bounded by
+        # different things -- the lateral one by the SM's accept lines, the clear gate and the
+        # tracker's position error; the longitudinal one by HALF THE CAR'S LENGTH, because a car
+        # whose nose is level with the box edge is still half a length from having passed it. Tying
+        # them together meant lowering the lateral margin silently spent the longitudinal one, and
+        # that is what put the nose into the box.
+        obs_margin_s = half_car + safety_margin         # box s-interval inflation
+        obs_margin_d = half_car + safety_margin_d       # lateral keep-out half-width
+        obs_margin = obs_margin_d                       # legacy name, LATERAL, for the log lines
         sample_margin = half_car + wall_margin          # how close to the wall a candidate may reach
 
         # --- speed-proportional lookahead (capped at half the lap) ---
@@ -1056,7 +1081,8 @@ class ObstacleSpliner(Node):
         # A squeeze RETRY skips this: whether to reuse or re-plan was already decided by the
         # full-margin call that is now retrying (and which left _committed None to get here).
         if self.commit_enable and self._committed is not None and not squeeze:
-            reuse = self._reuse_committed(gb_wpnts, wpnt_dist, obs_margin, half_car)
+            reuse = self._reuse_committed(gb_wpnts, wpnt_dist, obs_margin_d, half_car,
+                                          obs_margin_s)
             if reuse is not None:
                 return reuse
 
@@ -1140,7 +1166,7 @@ class ObstacleSpliner(Node):
             # Deliberately tested at obs_margin, NOT at the clear gate's own (smaller) threshold:
             # obs_ok enforces obs_margin on every obstacle whether or not it got a knot, so this is
             # exactly the condition under which skipping the knot cannot make obs_ok reject.
-            if self._clears_obstacle(o, obs_margin):
+            if self._clears_obstacle(o, obs_margin_d):
                 n_already_clear += 1
                 continue
             # A box the car is already BESIDE gets no knot. Its s_center is a fraction of a metre
@@ -1255,8 +1281,8 @@ class ObstacleSpliner(Node):
         else:
             d_lo, d_hi = d_lo_wp, d_hi_wp
         cor_src = "grid" if grid_cor is not None else "wpnt"
-        obox_lo = min(nearest.d_right, nearest.d_left) - obs_margin   # car-centre keep-out, right edge
-        obox_hi = max(nearest.d_right, nearest.d_left) + obs_margin   # car-centre keep-out, left edge
+        obox_lo = min(nearest.d_right, nearest.d_left) - obs_margin_d  # car-centre keep-out, right
+        obox_hi = max(nearest.d_right, nearest.d_left) + obs_margin_d  # car-centre keep-out, left
         n_left = n_right = 0
         if d_hi <= d_lo:
             d_ends = np.array([0.0])
@@ -1277,7 +1303,8 @@ class ObstacleSpliner(Node):
             # by luck. That is the clustered-obstacle all-rejected case: the gate exists, nothing
             # aimed at it. Subtract the overlapping keep-outs from both gaps and aim at what
             # survives explicitly.
-            d_list += self._gate_samples(obs_ahead, nearest, (d_lo, d_hi), obs_margin)
+            d_list += self._gate_samples(obs_ahead, nearest, (d_lo, d_hi),
+                                         obs_margin_d, obs_margin_s)
             d_ends = np.unique(np.round(np.asarray(d_list, dtype=float), 4))
             d_ends[int(np.argmin(np.abs(d_ends)))] = 0.0       # snap nearest sample onto the raceline
         else:
@@ -1291,8 +1318,8 @@ class ObstacleSpliner(Node):
         # centre -> a single clean hump per obstacle (raceline -> apex -> raceline), no flat shoulders.
         def _pass_offset(cor, o, prev_d):
             c_lo, c_hi = cor                                  # corridor at this obstacle (car centre)
-            obox_lo = min(o.d_right, o.d_left) - obs_margin   # car-centre keep-out, right edge
-            obox_hi = max(o.d_right, o.d_left) + obs_margin   # car-centre keep-out, left edge
+            obox_lo = min(o.d_right, o.d_left) - obs_margin_d   # car-centre keep-out, right edge
+            obox_hi = max(o.d_right, o.d_left) + obs_margin_d   # car-centre keep-out, left edge
             opts = []
             if obox_hi <= c_hi + 1e-6:                        # room to pass on the LEFT of the obstacle
                 opts.append(obox_hi)
@@ -1501,10 +1528,10 @@ class ObstacleSpliner(Node):
             gc = (o.s_center - self.cur_s) % self.gb_max_s
             if gc > self.gb_max_s / 2.0:
                 gc -= self.gb_max_s                     # signed: negative = behind the car
-            g0 = gc - o_span / 2.0 - obs_margin
-            g1 = gc + o_span / 2.0 + obs_margin
-            d_box_lo = min(o.d_right, o.d_left) - obs_margin
-            d_box_hi = max(o.d_right, o.d_left) + obs_margin
+            g0 = gc - o_span / 2.0 - obs_margin_s
+            g1 = gc + o_span / 2.0 + obs_margin_s
+            d_box_lo = min(o.d_right, o.d_left) - obs_margin_d
+            d_box_hi = max(o.d_right, o.d_left) + obs_margin_d
             s_in = (gap_wp >= g0) & (gap_wp <= g1)
             d_in = (d_cands >= d_box_lo) & (d_cands <= d_box_hi)
             obs_ok &= ~(d_in & s_in[None, :]).any(axis=1)
@@ -1622,7 +1649,8 @@ class ObstacleSpliner(Node):
                 f"sample d_range=[{d_lo:.2f},{d_hi:.2f}] ({cor_src}) corridor@obs "
                 f"wpnt L={gb_wpnts[obs_j].d_left:.2f}/R={gb_wpnts[obs_j].d_right:.2f} | "
                 f"obs d=[{min(nearest.d_right, nearest.d_left):.2f},{max(nearest.d_right, nearest.d_left):.2f}] "
-                f"obs_margin={obs_margin:.2f} sample_margin={sample_margin:.2f}",
+                f"obs_margin d={obs_margin_d:.2f} s={obs_margin_s:.2f} "
+                f"sample_margin={sample_margin:.2f}",
                 throttle_duration_sec=0.5)
             self._committed = None
             self._publish_feasible(False)
@@ -1676,7 +1704,7 @@ class ObstacleSpliner(Node):
 
         if self.commit_enable:
             self._store_commit(obs_ahead, s_mod, d_sel, xy, v_arr, psi_pub, kappa_,
-                               obs_margin=obs_margin, squeeze=squeeze,
+                               obs_margin=obs_margin_d, obs_margin_s=obs_margin_s, squeeze=squeeze,
                                s_entry0=float(s_local[cand_entry_i[best_k]]))
         self._publish_feasible(True)
         return wpnts, self._candidate_markers(xy_all, status, best_k)
@@ -1741,7 +1769,7 @@ class ObstacleSpliner(Node):
         return bool((o.is_static or self._near_zero_static(o)) and o.is_visible)
 
     def _store_commit(self, obs_ahead, s_mod, d_sel, xy, v_arr, psi_pub, kappa_,
-                      obs_margin=None, squeeze=False, s_entry0=0.0):
+                      obs_margin=None, obs_margin_s=None, squeeze=False, s_entry0=0.0):
         """Snapshot the freshly chosen path (+ the obstacles it was planned around) so later
         cycles republish it verbatim instead of re-solving from the moving car.
 
@@ -1752,7 +1780,8 @@ class ObstacleSpliner(Node):
         ask the question the path was built to answer.
         """
         self._committed = {
-            'obs_margin': obs_margin,
+            'obs_margin': obs_margin,          # LATERAL keep-out this path was solved at
+            'obs_margin_s': obs_margin_s,      # ...and the box s-inflation it was solved at
             'squeeze': bool(squeeze),
             # path-local arc length at which this path's OWN geometry starts (see the prefix note
             # in do_spline). The re-check has to skip the same prefix the candidate check did, or
@@ -1767,7 +1796,7 @@ class ObstacleSpliner(Node):
             'kappa': np.asarray(kappa_, dtype=float).copy(),
         }
 
-    def _reuse_committed(self, gb_wpnts, wpnt_dist, obs_margin, half_car):
+    def _reuse_committed(self, gb_wpnts, wpnt_dist, obs_margin, half_car, obs_margin_s=None):
         """Try to republish the committed path (the slice still ahead of the car). Returns
         (OTWpntArray, MarkerArray) on reuse, or None -- after dropping the commit -- when a fresh
         plan is needed. Publishes the feasibility verdict itself in every path it returns from."""
@@ -1776,6 +1805,9 @@ class ObstacleSpliner(Node):
         # Re-check at the margin this path was SOLVED at, not the current design value -- see
         # _store_commit. A squeeze path judged by the full margin fails on its first reuse.
         obs_margin = c.get('obs_margin') or obs_margin
+        # ...and the s-axis margin it was solved at, for the same reason
+        obs_margin_s = c.get('obs_margin_s') or (obs_margin_s if obs_margin_s is not None
+                                                 else obs_margin)
 
         # --- forward slice via path-local arc length (robust to the s=0 seam) ---
         # s_local is the committed path's own 0..span arc length -- its points are forward-ordered
@@ -1849,7 +1881,8 @@ class ObstacleSpliner(Node):
         # --- safety: the committed slice must still clear EVERY live box + stay in the corridor ---
         # This is the sole interlock the SM has during static sustain, so it is re-derived here
         # against live obstacles every cycle: geometry frozen, verdict live.
-        if not self._commit_slice_clear(c, sel, gb_wpnts, wpnt_dist, obs_margin, half_car):
+        if not self._commit_slice_clear(c, sel, gb_wpnts, wpnt_dist, obs_margin, half_car,
+                                        obs_margin_s):
             self.get_logger().warn(
                 f"[static_avoidance] commit released: the frozen slice no longer clears the live "
                 f"obstacles/corridor at the margin it was solved with ({obs_margin:.2f} m) — "
@@ -1921,7 +1954,8 @@ class ObstacleSpliner(Node):
             self.get_logger().warn(f"[{self.name}] commit re-anchor failed: {e}")
             return False
 
-    def _commit_slice_clear(self, c, sel, gb_wpnts, wpnt_dist, obs_margin, half_car) -> bool:
+    def _commit_slice_clear(self, c, sel, gb_wpnts, wpnt_dist, obs_margin, half_car,
+                            obs_margin_s=None) -> bool:
         """True if the committed forward slice stays inside the track corridor AND clears every
         live (static / near-stationary, visible) obstacle's inflated box. Same box idiom as the
         obs_ok check in do_spline, evaluated on the frozen path against the CURRENT obstacles."""
@@ -1963,8 +1997,9 @@ class ObstacleSpliner(Node):
             gc = (o.s_center - self.cur_s) % L
             if gc > L / 2.0:
                 gc -= L
-            g0 = gc - o_span / 2.0 - obs_margin
-            g1 = gc + o_span / 2.0 + obs_margin
+            m_s = obs_margin if obs_margin_s is None else obs_margin_s
+            g0 = gc - o_span / 2.0 - m_s
+            g1 = gc + o_span / 2.0 + m_s
             d_lo = min(o.d_right, o.d_left) - obs_margin
             d_hi = max(o.d_right, o.d_left) + obs_margin
             s_in = (gap_wp >= g0) & (gap_wp <= g1)

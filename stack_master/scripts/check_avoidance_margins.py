@@ -39,6 +39,7 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import math
 import yaml
 
 SLACK = 0.03  # [m] margin the re-opt clearance must exceed the reactive keep-out by
@@ -47,6 +48,12 @@ SLACK = 0.03  # [m] margin the re-opt clearance must exceed the reactive keep-ou
 # [m] required headroom between the LOWEST clearance the re-opt may settle for (relax_floor, which
 # the coverage ladder lands on exactly) and every consumer threshold that judges that clearance.
 FLOOR_CONSUMER_SLACK_M = 0.05
+# [m] headroom the LONGITUDINAL keep-out must keep over half the car's length. Not a comfort
+# figure -- exactly zero is a measured failure: safety_margin 0.14 put keepout_s on 0.290 against a
+# 0.290 half-length and the car began grazing boxes with its nose and tail, while the shipped 0.150
+# (0.010 of headroom) does not. The evidence is one data point either side of the boundary, which
+# is why this is the shipped value and not a rounder one.
+LONGITUDINAL_HEADROOM_M = 0.01
 MAP_RES_M = 0.05          # [m/px] the shipped maps' occupancy-grid resolution
 WIDTH_CAR_M = 0.30        # [m] car width; half of it is what a wall gate must reserve
 SIM_HALF_WIDTH_M = 0.1016
@@ -425,7 +432,15 @@ def main() -> int:
     safety_margin = float(cfg["safety_margin"])
     apex_bulge = float(cfg.get("apex_bulge", 0.0))
     reactive_wall = float(cfg.get("wall_margin", 0.0))
-    keepout = width_car / 2.0 + safety_margin
+    # TWO AXES. The planner's obs_margin was one number doing two jobs, and the two are bounded by
+    # different things -- so a rule written against "the keep-out" silently constrained whichever
+    # axis it did not mean. keepout_s inflates the box's s-interval and must cover half the CAR'S
+    # LENGTH; keepout_d is the lateral pass distance and is bounded by the SM's accept lines, the
+    # clear gate and the tracker's own position error.
+    safety_margin_d = float(cfg.get("safety_margin_d", safety_margin))
+    keepout_s = width_car / 2.0 + safety_margin
+    keepout_d = width_car / 2.0 + safety_margin_d
+    keepout = keepout_d                    # legacy name: the LATERAL one
 
     obs_margin = float(args["reopt_obs_margin"])
     reopt_wall = float(args.get("reopt_wall_margin", 0.0))
@@ -433,7 +448,10 @@ def main() -> int:
     reopt_safety_width = float(args.get("reopt_safety_width", 0.0))
 
     print(f"reactive ({yaml_path.name}):")
-    print(f"  width_car/2 + safety_margin = {width_car/2:.3f} + {safety_margin:.3f} = {keepout:.3f} m (keep-out)")
+    print(f"  keep-out LONGITUDINAL width_car/2 + safety_margin   = {width_car/2:.3f} + "
+          f"{safety_margin:.3f} = {keepout_s:.3f} m  (inflates the box's s-interval)")
+    print(f"  keep-out LATERAL      width_car/2 + safety_margin_d = {width_car/2:.3f} + "
+          f"{safety_margin_d:.3f} = {keepout_d:.3f} m  (how far the line passes the box)")
     print(f"  apex_bulge = {apex_bulge:.3f} m, wall_margin = {reactive_wall:.3f} m")
     print(f"re-opt ({launch_path.name} defaults; node defaults apply only if launched without these args):")
     print(f"  reopt_obs_margin = {obs_margin:.3f} m, reopt_wall_margin = {reopt_wall:.3f} m")
@@ -634,6 +652,64 @@ def main() -> int:
         print(f"OK: the lateral keep-out ({keepout:.3f}) covers the SM's static GB requirement "
               f"({sm_static_need:.3f}).")
 
+    # --- (a3) the LATERAL keep-out vs the reactive clear gate's ENTRY threshold -------------
+    # The gate decides whether the FOLLOWED line already avoids everything. Below its entry
+    # threshold the planner is still planning, so a keep-out under it means the planner is asked to
+    # re-clear a box at less than the clearance that would have made it stop asking.
+    entry_need = width_car / 2.0 + float(cfg.get("clear_margin_m", 0.0)) + float(
+        cfg.get("clear_hyst_m", 0.0))
+    print(f"  LATERAL keep-out {keepout_d:.3f} m vs the clear-gate entry "
+          f"width_car/2 + clear_margin_m + clear_hyst_m = {entry_need:.3f} m")
+    if keepout_d < entry_need - 1e-9:
+        ok = False
+        print(f"FAIL: the lateral keep-out ({keepout_d:.3f}) is under the clear-gate entry "
+              f"({entry_need:.3f}). The planner would build to less clearance than the gate needs "
+              f"to stop it planning. Raise safety_margin_d or lower clear_margin_m.")
+    else:
+        print(f"OK: the lateral keep-out ({keepout_d:.3f}) covers the clear-gate entry "
+              f"({entry_need:.3f}).")
+
+    # ...and the physical budget under it. TRACKING_BUDGET_M is the controller's; the obstacle
+    # estimate's share is derived from the tracker's own acceptance band: a track votes static only
+    # while its position std stays under min_std, so 2 sigma of that is the position error the
+    # layer can hand this planner without ever noticing.
+    trk = STACK_MASTER / "config" / "opponent_tracker_params.yaml"
+    try:
+        tcfg = yaml.safe_load(trk.read_text())
+        def _find(o, k):
+            if isinstance(o, dict):
+                if k in o:
+                    return o[k]
+                for v in o.values():
+                    r = _find(v, k)
+                    if r is not None:
+                        return r
+            return None
+        min_std = float(_find(tcfg, "min_std") or 0.0)
+    except Exception:
+        min_std = 0.0
+    min_nb = float(_find(tcfg, "min_nb_meas") or 1.0) if min_std else 1.0
+    # 2 sigma of the MEAN over the acceptance window: a track votes static only while its per-axis
+    # position std stays under min_std, and the reported centre is the mean of min_nb_meas samples,
+    # so this is the position error the layer can hand the planner without the tracker ever
+    # objecting. The CONTROLLER's own error is not added here -- it is spent against the WALL, and
+    # is checked against the wall reserve above; a box is not a wall and the car may lean toward
+    # the line's own side of it.
+    est_budget = 2.0 * min_std / math.sqrt(max(min_nb, 1.0)) if min_std else 0.0
+    phys = width_car / 2.0 + est_budget
+    print(f"  physical budget = width_car/2 + tracker 2-sigma = {width_car/2:.3f} + "
+          f"{est_budget:.3f} = {phys:.3f} m  (min_std {min_std:.3f} over min_nb_meas "
+          f"{min_nb:.0f}, {trk.name})")
+    if keepout_d < phys - 1e-9:
+        ok = False
+        print(f"FAIL: the lateral keep-out ({keepout_d:.3f}) is under the physical budget "
+              f"({phys:.3f}): half the car plus the position error the tracker accepts without "
+              f"comment. Below this the swept body can reach the box while every check reads "
+              f"clear. Raise safety_margin_d.")
+    else:
+        print(f"OK: the lateral keep-out ({keepout_d:.3f}) covers the physical budget "
+              f"({phys:.3f}), by {keepout_d - phys:.3f} m.")
+
     # --- (b) obs_margin is also an S-WINDOW, so it must cover half the car's LENGTH ---------
     # The keep-out is inflated by obs_margin in s as well as in d (obs_ok widens the box's
     # s-interval by it). A car whose nose is level with the box edge is still one half-length from
@@ -642,15 +718,19 @@ def main() -> int:
     # lateral room -- a constraint that lived only in a comment until now.
     dyn_cfg = STACK_MASTER / "config" / "SIM" / "dynamics.yaml"
     veh_len = float(yaml.safe_load(dyn_cfg.read_text()).get("length", 0.0))
-    print(f"  obs_margin as an s-window = width_car/2 + safety_margin = {keepout:.3f} m vs "
-          f"half the car's length = {veh_len/2:.3f} m ({dyn_cfg.name})")
-    if veh_len > 0.0 and keepout < veh_len / 2.0 - 1e-9:
+    print(f"  LONGITUDINAL keep-out {keepout_s:.3f} m vs half the car's length "
+          f"{veh_len/2:.3f} + {LONGITUDINAL_HEADROOM_M:.3f} headroom = "
+          f"{veh_len/2 + LONGITUDINAL_HEADROOM_M:.3f} m ({dyn_cfg.name})")
+    if veh_len > 0.0 and keepout_s < veh_len / 2.0 + LONGITUDINAL_HEADROOM_M - 1e-9:
         ok = False
-        print(f"FAIL: the keep-out ({keepout:.3f}) is under half the car's length "
-              f"({veh_len/2:.3f}). obs_margin inflates the box's S-interval too, so a path can "
-              f"clip the box lengthwise while reading clear across. Raise safety_margin.")
+        print(f"FAIL: the longitudinal keep-out ({keepout_s:.3f}) is under half the car's length "
+              f"plus {LONGITUDINAL_HEADROOM_M:.3f} m of headroom "
+              f"({veh_len/2:.3f}). obs_ok inflates the box's S-interval by it, so a path can clip "
+              f"the box lengthwise while reading clear across. Raise safety_margin -- NOT "
+              f"safety_margin_d, which is the lateral one.")
     else:
-        print(f"OK: the keep-out ({keepout:.3f}) covers half the car's length ({veh_len/2:.3f}).")
+        print(f"OK: the longitudinal keep-out ({keepout_s:.3f}) covers half the car's length "
+              f"({veh_len/2:.3f}), by {keepout_s - veh_len/2:.3f} m.")
 
     if not check_static_chain_ordering(sm_path, sm, cfg, yaml_path, args, launch_path):
         ok = False

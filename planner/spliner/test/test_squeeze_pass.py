@@ -54,6 +54,7 @@ def node(cur_vs=0.0, safety=0.15, wall=0.10, enable=True, steps=2,
     n._committed = None
     n.cur_vs = cur_vs
     n.safety_margin = safety
+    n.safety_margin_d = n.safety_margin   # LATERAL half of the keep-out
     n.wall_margin = wall
     n.squeeze_enable = enable
     n.squeeze_steps = steps

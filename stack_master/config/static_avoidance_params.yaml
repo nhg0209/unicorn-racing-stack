@@ -53,6 +53,16 @@ static_avoidance_planner:
                             #      it to recover a tight section is the squeeze pass's job, not a
                             #      standing setting -- and see the wall_margin note below for why the
                             #      corridor margins are not the binding constraint anyway.
+    # LATERAL half of the keep-out, split from safety_margin above so the two axes obs_margin
+    # conflates can be tuned independently. safety_margin now bounds only the LONGITUDINAL one --
+    # obs_ok inflates the box's s-interval by it, and that has to cover half the CAR'S LENGTH
+    # (0.29 m), since a car whose nose is level with the box edge is still half a length from
+    # having passed it. This one bounds the lateral keep-out, whose floor comes from somewhere
+    # else entirely: the SM's accept lines, the reactive clear-gate entry (0.28), and the
+    # tracker's own position error.
+    # Equal to safety_margin here on purpose -- the split shipped as a pure refactor, verified
+    # bit-identical over 1656 planning cases. Move it, not safety_margin, to narrow the avoidance.
+    safety_margin_d: 0.15
     wall_margin: 0.1        # [m]  how close to the wall a candidate may reach (corridor room).
                             #   NOT a feasibility knob either, despite what the safety_margin note above
                             #   implies about tight sections: measured over the same grid, feasible
