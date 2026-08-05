@@ -71,7 +71,7 @@ def make_node():
     n.swap_deadlock_s = 5.0
     n.swap_deadlock_max_vs = 2.0
     n.swap_deadlock_max_dev = 0.6
-    n.clean_bundle = object()
+    n.clean_bundle = straight_bundle()   # a real bundle: _line_dev/_bundle_xy read its wpnts
     n._notify_scaler_ticks = 0
     n.notify_ticks = 0
     n.obs_margin = 0.35
@@ -96,6 +96,9 @@ def make_node():
     n.side_hint_margin_m = 0.15
     n.obs_forget_s = 1.5
     n.swap_min_gain_m = 0.05
+    n._solve_epoch = 0
+    n._solve_future = None
+    n._solve_ctx = None
     n._last_seen = {}
     n.map_filter = None             # no map in the harness -> _grid_room falls back
     n._swap_block = {}
@@ -648,6 +651,103 @@ def test_knot_side_comes_from_the_map_not_the_waypoint_bounds():
     (kx, ky), _po, from_apex = n._apex_pairs([o])[0]
     assert from_apex is True and ky < 0, "a symmetric corridor must defer to the recorded apex"
     print("PASS the knot side is measured in the map, with the apex as the tie-break")
+
+
+def test_a_stale_solve_cannot_undo_a_clean_swap():
+    # THE terminal state. Three boxes are removed, the layer drops them, the set empties and the
+    # line correctly swaps to CLEAN -- and then a solve submitted 0.95 s earlier, while the boxes
+    # were still confirmed, lands and puts the obstacle-aware line back. With the set now empty and
+    # unchanging there is nothing left to arm the trigger, so that line is permanent: the observed
+    # run drove its last 37 s on it and pressing clear again did nothing.
+    from concurrent.futures import ThreadPoolExecutor
+    n = make_node()
+    n._solve_pool = ThreadPoolExecutor(max_workers=1)
+    n.reopt_method = "local_window"
+    n._obstacles = [core.Obstacle(5.0, -0.2, 0.15)]
+    n._obs_ids = [7]
+    n._apex_by_obs = {("id", 7): (5.0, 0.4, 0.4)}
+    n.active = straight_bundle()
+    n._publish_active = lambda b: None
+    n._publish_coverage = lambda b: None
+    n._publish_clearance = lambda: None
+    n.pub_update_map = types.SimpleNamespace(publish=lambda m: None)
+    gate = threading.Event()
+    obstacle_line = straight_bundle()
+    obstacle_line.n_apex, obstacle_line.clearance_ok, obstacle_line.coverage = 1, True, []
+
+    def slow_build(obstacles, pairs=None):
+        gate.wait(5.0)
+        return obstacle_line
+    n._build_obstacle_bundle = slow_build
+
+    n._obstacles_dirty = True
+    n._rebuild_and_swap("apex captured")            # submitted WITH the obstacle
+    assert n._solve_future is not None
+
+    # the boxes are removed: the set empties and the clean line goes in
+    n._obstacles, n._obs_ids = [], []
+    n._mark_dirty()
+    n._obstacles_dirty = True
+    n._rebuild_and_swap("obstacles cleared")
+    assert n.active is n.clean_bundle or n._pending is n.clean_bundle, \
+        "the empty set must produce the clean line"
+    n.active = n.clean_bundle
+    n._pending = None
+
+    # ...and NOW the old solve finishes and is collected
+    gate.set()
+    for _ in range(50):
+        n._collect_solve()
+        if n._solve_future is None:
+            break
+        time.sleep(0.01)
+    assert n.active is n.clean_bundle, "a stale solve must not undo the clean swap"
+    assert n._pending is not obstacle_line, "…nor be queued for one"
+    n._solve_pool.shutdown(wait=True)
+    print("PASS a stale solve cannot undo a clean swap")
+
+
+def test_an_empty_set_can_only_install_the_clean_line():
+    # The backstop, independent of the epoch check: every gate below reasons about obstacles, so an
+    # obstacle-aware bundle arriving with an empty set passes them all by default.
+    n = make_node()
+    n.active = straight_bundle()
+    n._obstacles, n._obs_ids = [], []
+    n._publish_active = lambda b: None
+    n._publish_coverage = lambda b: None
+    n._publish_clearance = lambda: None
+    n.pub_update_map = types.SimpleNamespace(publish=lambda m: None)
+    rogue = straight_bundle()
+    rogue.n_apex, rogue.clearance_ok, rogue.coverage = 1, True, []
+    n._finish_rebuild(rogue, [], "stale", 100.0)
+    assert n._pending is None and n.active is not rogue, \
+        "an obstacle-aware line must not be installable with no obstacles"
+    print("PASS an empty obstacle set can only install the clean line")
+
+
+def test_a_finished_solve_is_collected_before_the_next_is_submitted():
+    # A FINISHED but uncollected result was overwritten by the next submit and silently lost -- and
+    # its trigger had already been burned, so the work vanished with nothing re-arming.
+    from concurrent.futures import ThreadPoolExecutor
+    n = make_node()
+    n._solve_pool = ThreadPoolExecutor(max_workers=1)
+    n.reopt_method = "local_window"
+    n._obstacles = [core.Obstacle(5.0, -0.2, 0.15)]
+    n._obs_ids = [7]
+    n._apex_by_obs = {("id", 7): (5.0, 0.4, 0.4)}
+    built = []
+    n._build_obstacle_bundle = lambda obstacles, pairs=None: built.append(1) or straight_bundle()
+    collected = []
+    n._finish_rebuild = lambda b, o, r, t: collected.append(r)
+
+    n._obstacles_dirty = True
+    n._rebuild_and_swap("first")
+    n._solve_future.result(timeout=5.0)              # finished, NOT collected
+    n._obstacles_dirty = True
+    n._rebuild_and_swap("second")
+    assert "first" in collected, f"the finished result must be collected, got {collected}"
+    n._solve_pool.shutdown(wait=True)
+    print("PASS a finished solve is collected before the next is submitted")
 
 
 def test_solve_runs_off_the_executor_and_is_collected_later():
@@ -1402,6 +1502,9 @@ if __name__ == "__main__":
     test_swap_held_while_trailing_a_close_obstacle()
     test_every_obstacle_gets_a_knot_even_with_no_reactive_apex()
     test_knot_side_comes_from_the_map_not_the_waypoint_bounds()
+    test_a_stale_solve_cannot_undo_a_clean_swap()
+    test_an_empty_set_can_only_install_the_clean_line()
+    test_a_finished_solve_is_collected_before_the_next_is_submitted()
     test_solve_runs_off_the_executor_and_is_collected_later()
     test_swap_gate_tally_names_the_gate_that_held_the_swap()
     test_solves_are_debounced()

@@ -436,6 +436,15 @@ class StaticReoptNode(Node):
                                               thread_name_prefix="static_reopt_solve")
         self._solve_future = None
         self._solve_ctx = None
+        # EPOCH of the confirmed obstacle set. Bumped by every change of what is being solved FOR
+        # (see _mark_dirty / clear_cb / the empty-set path). A solve carries the epoch it was
+        # submitted under, and a result whose epoch no longer matches is thrown away instead of
+        # installed -- otherwise a 0.95 s solve submitted while three boxes were still confirmed
+        # lands AFTER the set has emptied and the line has correctly swapped to CLEAN, and puts the
+        # obstacle-aware line back. With the set now empty and unchanging there is nothing left to
+        # re-arm the trigger, so that stale line is terminal: the observed run drove its last 37 s
+        # on it and pressing clear again did nothing.
+        self._solve_epoch = 0
         self._last_solve_t = -1e9               # solve debounce, see solve_min_interval_s
 
         # --- pub/sub ----------------------------------------------------------------------
@@ -1108,6 +1117,7 @@ class StaticReoptNode(Node):
             self._obstacles = []
             self._obs_ids = []
             self._mark_dirty()
+        self._solve_epoch += 1                   # discard anything in flight for the old set
         self.get_logger().info("[static_reopt] obstacle set + apex records CLEARED by external request")
 
     def _mark_dirty(self, keep_pending: bool = False):
@@ -1128,6 +1138,7 @@ class StaticReoptNode(Node):
         """
         self._obstacles_dirty = True
         self._dirty_since = self.get_clock().now().nanoseconds * 1e-9
+        self._solve_epoch += 1                   # anything in flight was solved for the old set
         if not keep_pending:
             self._pending = None
             self._pending_dev = None
@@ -1599,17 +1610,29 @@ class StaticReoptNode(Node):
         # building a bit-for-bit CLEAN line and burning the dirty flag on it -- that outcome is now
         # only reachable when the CORRIDOR rejects every hump, which the n_apex == 0 guard in
         # _finish_rebuild catches with the honest reason attached.
-        if self._solve_future is not None and not self._solve_future.done():
-            return                               # one solve at a time; the trigger stays armed
-        self._obstacles_dirty = False
         now = self.get_clock().now().nanoseconds * 1e-9
-        self._last_solve_t = now                 # debounce clock: stamped for EVERY solve attempt,
-                                                 # including the fallback paths that skip the gate
-        # An EMPTY set needs no solve at all -- the clean bundle is precomputed -- so it takes the
-        # result path immediately and never waits on a worker.
+        # AN EMPTY SET IS ANSWERED IMMEDIATELY, AHEAD OF EVERYTHING. The clean bundle is
+        # precomputed, so this needs no worker -- and it must not be made to wait behind an
+        # in-flight solve, because that solve was computed FOR OBSTACLES and cannot describe an
+        # empty set. Reverting to the clean line is also the safe direction, so it is the one
+        # thing that should never be queued behind anything.
         if not obstacles:
+            self._obstacles_dirty = False
+            self._last_solve_t = now
+            self._invalidate_solve("the obstacle set emptied")
             self._finish_rebuild(self.clean_bundle, [], reason, now)
             return
+        if self._solve_future is not None:
+            # NOT just "still running". A FINISHED but uncollected result was being overwritten by
+            # the next submit and silently lost -- the trigger had already been burned for it, so
+            # its work was thrown away and nothing re-armed. Collect it first; if it is still
+            # running, leave the trigger armed and come back.
+            if not self._solve_future.done():
+                return
+            self._collect_solve()
+        self._obstacles_dirty = False
+        self._last_solve_t = now                 # debounce clock: stamped for EVERY solve attempt,
+                                                 # including the fallback paths that skip the gate
         # OFF THE EXECUTOR. The solve is 200-850 ms of pure function over a snapshot; running it
         # inline stalled the 40 Hz frenet_cb for that long, and the swap gates it feeds -- ego-s
         # freshness, reactive idleness -- are judged from callbacks that then could not run, so the
@@ -1622,11 +1645,21 @@ class StaticReoptNode(Node):
                 return self._build_obstacle_bundle(obstacles, pairs=pairs)
 
         self._solve_future = self._solve_pool.submit(_work)
-        self._solve_ctx = (obstacles, reason, now)
+        self._solve_ctx = (obstacles, reason, now, self._solve_epoch)
         self.get_logger().info(
             f"[static_reopt] solving ({reason}) for {len(obstacles)} obstacle(s) off the "
             f"executor; the result is collected on the republish tick",
             throttle_duration_sec=2.0)
+
+    def _invalidate_solve(self, why: str) -> None:
+        """Drop an in-flight or uncollected solve whose premise no longer holds."""
+        if self._solve_future is None:
+            return
+        self._solve_future.cancel()
+        self._solve_future = None
+        self._solve_ctx = None
+        self.get_logger().info(
+            f"[static_reopt] discarding the in-flight solve: {why}", throttle_duration_sec=2.0)
 
     def _collect_solve(self):
         """Take a finished off-executor solve and run the install path on the executor thread."""
@@ -1634,8 +1667,18 @@ class StaticReoptNode(Node):
         if fut is None or not fut.done():
             return
         self._solve_future = None
-        obstacles, reason, now = self._solve_ctx
+        obstacles, reason, now, epoch = self._solve_ctx
         self._solve_ctx = None
+        if epoch != self._solve_epoch:
+            # The set changed while this was solving. Installing it would describe a world that no
+            # longer exists -- and if the set has since EMPTIED, would undo a correct clean swap
+            # with nothing left to re-arm the trigger. Re-arm and let the next solve answer the
+            # question that is actually being asked.
+            self.get_logger().info(
+                f"[static_reopt] discarding a stale solve ({reason}, epoch {epoch} != "
+                f"{self._solve_epoch}); the obstacle set changed while it ran")
+            self._obstacles_dirty = True
+            return
         try:
             bundle = fut.result()
         except Exception as e:  # noqa: BLE001 — must never propagate to the timer
@@ -1651,6 +1694,17 @@ class StaticReoptNode(Node):
     def _finish_rebuild(self, bundle, obstacles, reason: str, now: float):
         """Everything after the solve: the acceptance gates and the queueing of the swap. Runs on
         the executor thread in both paths, so node state is still touched from one thread only."""
+        # INVARIANT: with no confirmed obstacles, the only line that may be installed is the clean
+        # one. Everything below reasons about obstacles -- the coverage comparison returns None
+        # when the active line has none, and the no-change check is guarded on self._obstacles --
+        # so an obstacle-aware bundle arriving here after the set emptied passes every gate by
+        # default. This is the backstop for that, independent of the epoch check upstream.
+        if not self._obstacles and bundle is not self.clean_bundle:
+            self.get_logger().warn(
+                f"[static_reopt] refusing an obstacle-aware line ({reason}) with an EMPTY "
+                f"obstacle set — the clean line is the only correct answer here",
+                throttle_duration_sec=5.0)
+            return
         if bundle is self.active:
             return
         # Same guard, now on the BUILT result: every apex was corridor-rejected (all-or-nothing
