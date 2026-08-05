@@ -416,9 +416,15 @@ class StaticReoptNode(Node):
         # state. Hold the commit while the state machine reports TRAILING and the nearest obstacle
         # ahead is inside swap_min_obs_gap_m -- the pending is not discarded, only held.
         self.declare_parameter("swap_block_trailing", True)
+        # [m] a rebuild whose geometry differs from the active line by less than this, and which
+        # covers no more, is not queued at all -- see _finish_rebuild. Same scale as the horizon
+        # agreement tolerance the commit gate already uses, because it is the same question: below
+        # it the two lines are the same line as far as the controller is concerned.
+        self.declare_parameter("swap_min_gain_m", 0.05)
         self.declare_parameter("swap_min_obs_gap_m", 3.0)
         self.declare_parameter("swap_state_stale_s", 1.0)
         self.swap_block_trailing = bool(self.get_parameter("swap_block_trailing").value)
+        self.swap_min_gain_m = float(self.get_parameter("swap_min_gain_m").value)
         self.swap_min_obs_gap_m = float(self.get_parameter("swap_min_obs_gap_m").value)
         self.swap_state_stale_s = float(self.get_parameter("swap_state_stale_s").value)
         self._sm_state = ""
@@ -1680,8 +1686,38 @@ class StaticReoptNode(Node):
                 f"[static_reopt] rebuild REFUSED: it would reduce coverage — {regress}. Keeping "
                 f"the active line; see /static_reopt/coverage", throttle_duration_sec=5.0)
             return
+        # A SWAP WITH NOTHING IN IT. Of 16 swaps in one run, 6 moved the line by at most 0.054 m
+        # anywhere -- rebuilds triggered by re-measurement noise, producing a line the car cannot
+        # tell from the one it is on. Each still costs a /global_waypoints publish and a
+        # FrenetConverter rebuild in the controller, the state machine and the planner.
+        #
+        # Skipped only when BOTH hold: the geometry is within swap_min_gain_m everywhere, AND the
+        # ACTIVE line still clears every current obstacle by the floor its own humps were accepted
+        # at. The first alone is not enough -- a line identical to a stale one is still stale --
+        # and the second is what makes coverage-equality an argument rather than an assumption:
+        # with max deviation < eps the two lines' clearances differ by at most eps, and no new hump
+        # of amplitude >= the floor can exist inside it.
+        dev = self._line_dev(bundle, self.active)
+        if self._obstacles and float(np.max(dev)) < self.swap_min_gain_m:
+            floors = getattr(self.active, "floor_by_key", {}) or {}
+            keys = self._keys_for(self._obstacles, self._obs_ids)
+            _sa, xa, ya = self._bundle_xy(self.active)
+            gaps = [float(np.min(np.hypot(xa - o.x, ya - o.y))) - float(o.r)
+                    for o in self._obstacles]
+            still_ok = all(g >= floors.get(k, self.relax_floor) - self.fit_tol - 1e-6
+                           for g, k in zip(gaps, keys))
+            if still_ok:
+                self.get_logger().info(
+                    f"[static_reopt] rebuild ({reason}) differs from the active line by at most "
+                    f"{float(np.max(dev)) * 1e3:.0f} mm and the active line still clears every "
+                    f"obstacle -- not queueing a swap for it",
+                    throttle_duration_sec=5.0)
+                # deliberately NOT refreshing active.clearance_by_key here: _clearance_drifted
+                # fires once per active line off that baseline, and rewriting it with today's
+                # numbers would disarm the drift trigger for these obstacles for good.
+                return
         self._pending = bundle
-        self._pending_dev = self._line_dev(bundle, self.active)
+        self._pending_dev = dev
         self._pending_since = now
         kind = "CLEAN" if (bundle is self.clean_bundle or n_ap == 0) else f"OBSTACLE-AWARE ({n_ap} apex)"
         self.get_logger().info(

@@ -95,6 +95,7 @@ def make_node():
     n.relax_floor = 0.30            # the bottom rung of the core's coverage ladder
     n.side_hint_margin_m = 0.15
     n.obs_forget_s = 1.5
+    n.swap_min_gain_m = 0.05
     n._last_seen = {}
     n.map_filter = None             # no map in the harness -> _grid_room falls back
     n._swap_block = {}
@@ -773,6 +774,44 @@ def test_solves_are_debounced():
     print("PASS solves are debounced to one per solve_min_interval_s")
 
 
+def test_a_rebuild_that_changes_nothing_is_not_queued():
+    # 6 of 16 swaps in one run moved the line by at most 0.054 m -- rebuilds triggered by
+    # re-measurement noise, producing a line the car cannot tell from the one it is on, each still
+    # costing a /global_waypoints publish and a FrenetConverter rebuild in three consumers.
+    n = make_node()
+    n._obstacles = [core.Obstacle(5.0, 0.60, 0.15)]     # the straight active line clears it by 0.45
+    n._obs_ids = [7]
+    n.active = straight_bundle()
+    n.active.floor_by_key = {("id", 7): 0.35}
+    n.active.coverage = []
+    n._publish_active = lambda b: None
+    n._publish_coverage = lambda b: None
+    n._publish_clearance = lambda: None
+    n.pub_update_map = types.SimpleNamespace(publish=lambda m: None)
+
+    same = straight_bundle()                            # identical geometry
+    same.n_apex, same.clearance_ok, same.coverage = 1, True, []
+    n._finish_rebuild(same, n._obstacles, "apex captured", 100.0)
+    assert n._pending is None, "a rebuild identical to the active line must not be queued"
+
+    # ...but one that MOVES the line is queued as before
+    moved = straight_bundle()
+    for w in moved.glb_wpnts.wpnts:
+        w.y_m += 0.40
+    moved.n_apex, moved.clearance_ok, moved.coverage = 1, True, []
+    n._finish_rebuild(moved, n._obstacles, "apex captured", 100.0)
+    assert n._pending is moved, "a materially different line must still be queued"
+
+    # ...and so is an identical one when the ACTIVE line no longer clears the obstacle
+    n._pending = None
+    n.active.floor_by_key = {("id", 7): 0.90}           # a promise the active line does not keep
+    same2 = straight_bundle()
+    same2.n_apex, same2.clearance_ok, same2.coverage = 1, True, []
+    n._finish_rebuild(same2, n._obstacles, "apex captured", 100.0)
+    assert n._pending is same2, "coverage loss must override the no-change skip"
+    print("PASS a rebuild with no material change and no coverage loss is not queued")
+
+
 def test_a_brief_tracker_dropout_does_not_shrink_the_set():
     # The tracker deletes and recreates its tracks around every lap, and a recreated track is
     # published by nobody for a few frames. Taken at face value that shrinks the confirmed set,
@@ -1366,6 +1405,7 @@ if __name__ == "__main__":
     test_solve_runs_off_the_executor_and_is_collected_later()
     test_swap_gate_tally_names_the_gate_that_held_the_swap()
     test_solves_are_debounced()
+    test_a_rebuild_that_changes_nothing_is_not_queued()
     test_a_brief_tracker_dropout_does_not_shrink_the_set()
     test_marker_id_zero_does_not_flip_the_key_scheme()
     test_obstacle_set_change_is_compared_by_id_not_by_order()
