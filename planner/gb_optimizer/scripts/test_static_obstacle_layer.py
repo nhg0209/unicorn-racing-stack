@@ -248,6 +248,37 @@ def test_publish_position_follows_a_real_move_at_once():
     print(f"PASS a real move is republished immediately (now at {got[0]})")
 
 
+def test_raw_detection_suppresses_the_streak_but_a_removed_box_still_unlatches():
+    # A freshly (re-)created track has staticFlag = None for its first frames, so the tracker does
+    # not put it on /tracking/obstacles at all -- and the clear streak, reading only that topic,
+    # counted "there but unclassified" as "gone". The raw detections separate the two.
+    node = make_node()
+    confirm_obstacle(node, x=3.0, y=0.0, s=10.0)
+    node.frenet_cb(odom(7.0))                        # gap 3.0, inside the window
+    node.raw_obstacles_cb(arr(det(3.02, 0.01, 10.0)))   # detected, not yet classified
+    for _ in range(4 * node.unlatch_clear_msgs):
+        node.obstacles_cb(arr())                     # nothing on the CLASSIFIED topic
+    assert node._tracks[0].confirmed, "a detected-but-unclassified box must not be demoted"
+    assert node._tracks[0].clear_streak == 0, "and must not accumulate a streak"
+
+    # ...and a box that has physically been taken away appears on NEITHER topic, so the fast
+    # unlatch still does its job -- that is the whole purpose and it is untouched.
+    node.raw_obstacles_cb(arr())
+    for _ in range(node.unlatch_clear_msgs):
+        node.obstacles_cb(arr())
+    assert not node._tracks[0].confirmed, "a genuinely removed box must still unlatch"
+
+    # a raw detection somewhere else entirely must not shield it either
+    node2 = make_node()
+    confirm_obstacle(node2, x=3.0, y=0.0, s=10.0)
+    node2.frenet_cb(odom(7.0))
+    node2.raw_obstacles_cb(arr(det(30.0, 30.0, 25.0)))
+    for _ in range(node2.unlatch_clear_msgs):
+        node2.obstacles_cb(arr())
+    assert not node2._tracks[0].confirmed, "a detection elsewhere must not suppress the streak"
+    print("PASS a raw detection suppresses the streak; a removed box still unlatches")
+
+
 def test_window_exit_resets():
     node = make_node()
     t = confirm_obstacle(node, s=10.0)
@@ -358,7 +389,8 @@ def test_track_s_reanchors_on_a_line_swap():
 def main():
     rclpy.init()
     try:
-        for fn in (test_publish_position_holds_still_under_estimate_noise,
+        for fn in (test_raw_detection_suppresses_the_streak_but_a_removed_box_still_unlatches,
+                   test_publish_position_holds_still_under_estimate_noise,
                    test_publish_position_follows_a_real_move_at_once,
                    test_confirm_and_unlatch, test_unlatch_demotes_and_keeps_the_identity,
                    test_demoted_track_decays_at_the_lap_boundary,

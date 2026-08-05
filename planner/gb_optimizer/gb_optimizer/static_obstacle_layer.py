@@ -133,6 +133,7 @@ class StaticObstacleLayer(Node):
 
         self._ego_d: Optional[float] = None
         self._ego_vs: Optional[float] = None
+        self._raw_xy = []                     # /tracking/raw_obstacles, STREAK SUPPRESSION ONLY
         self._line_xy = None                  # geometry the tracks' `s` values are expressed in
         self._glb_change_t = 0.0              # wall time of the last /global_waypoints swap
         self._tracks: List[_Track] = []
@@ -145,6 +146,9 @@ class StaticObstacleLayer(Node):
 
         self.pub = self.create_publisher(MarkerArray, "/static_reopt/obstacles", 10)
         self.create_subscription(ObstacleArray, "/tracking/obstacles", self.obstacles_cb, 10)
+        # STREAK SUPPRESSION ONLY -- see raw_obstacles_cb. Never confirmation, never the EMA.
+        self.create_subscription(ObstacleArray, "/tracking/raw_obstacles",
+                                 self.raw_obstacles_cb, 10)
         self.create_subscription(Odometry, "/car_state/odom_frenet", self.frenet_cb, 10)
         self.create_subscription(WpntArray, "/global_waypoints", self.glb_cb, 10)
         # Pit/bench reset: `ros2 topic pub --once /static_reopt/clear_obstacles std_msgs/msg/Empty`
@@ -351,6 +355,19 @@ class StaticObstacleLayer(Node):
             if any(g < gap for g in dyn_gaps):
                 survivors.append(t)           # opponent between ego and the spot: suspend, don't count
                 continue
+            # THERE IS A DETECTION, IT IS JUST NOT CLASSIFIED YET. A freshly (re-)created track has
+            # staticFlag = None for its first few frames, so the tracker does not put it on
+            # /tracking/obstacles at all -- and this streak, which reads only that topic, cannot
+            # tell "the box is gone" from "the box is there and the classifier has not voted".
+            # Counting the second as evidence of removal is what demoted parked boxes on approach.
+            # The raw detections answer exactly that question and nothing else: they are used HERE
+            # and nowhere near confirmation or the EMA.
+            #
+            # The purpose of the fast unlatch is untouched. A box that has physically been taken
+            # away produces no detection on EITHER topic, so its streak advances as before.
+            if self._raw_near(t):
+                survivors.append(t)
+                continue
             t.clear_streak += 1
             if t.clear_streak >= self._clear_msgs_needed():
                 # DEMOTE, do not delete. The streak is ~0.5 s of clear views: strong enough to stop
@@ -373,6 +390,26 @@ class StaticObstacleLayer(Node):
                 t.clear_streak = 0
             survivors.append(t)
         self._tracks = survivors
+
+    def raw_obstacles_cb(self, msg: ObstacleArray):
+        """/tracking/raw_obstacles -- STREAK SUPPRESSION ONLY (see _update_unlatch_streaks).
+
+        Never feeds confirmation, the EMA, `s`, or the published set: a raw detection has not been
+        classified static, and treating one as an obstacle would put the opponent on the global
+        line. It answers one question -- "is something being detected at this spot right now?"
+        """
+        self._raw_xy = [(float(o.x_m), float(o.y_m), float(getattr(o, "size", 0.0)) / 2.0)
+                        for o in msg.obstacles
+                        if not getattr(o, "is_actually_a_gap", False)]
+
+    def _raw_near(self, t: _Track) -> bool:
+        """Is a raw detection inside this track's own match gate?"""
+        if not self._raw_xy:
+            return False
+        for (x, y, r) in self._raw_xy:
+            if math.hypot(t.x - x, t.y - y) < self.match_radius + 0.5 * (t.r + r):
+                return True
+        return False
 
     def clear_cb(self, _msg: Empty):
         n = len(self._tracks)
