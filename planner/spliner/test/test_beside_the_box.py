@@ -86,6 +86,12 @@ def planner(obstacles, cur_s, cur_d=0.0):
     n.knot_merge_s_m = 0.4
     n.ramp_len, n.return_len, n.tail_m = 4.5, 4.5, 0.0
     n.ramp_len_min_m = 2.5
+    # the ramp ladder, as shipped (see test_ramp_search.py): a retry that only runs
+    # when every candidate at the adaptive geometry was already rejected
+    n.ramp_search_enable = True
+    n.ramp_search_entry_m = [3.15, 2.5, 2.0, 1.5, 1.0]
+    n.ramp_search_exit_m = [4.5, 2.5, 1.5]
+    n.ramp_search_max_ms = 1000.0
     n.apex_bulge, n.preramp_len_m = 0.05, 3.0
     n.kappa_add_max, n.kappa_abs_max = 5.0, 5.5
     n.a_lat_max, n.a_long_max, n.a_long_accel = 6.0, 4.0, 3.0

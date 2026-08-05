@@ -206,6 +206,16 @@ class ObstacleSpliner(Node):
         # only where the corridor will not accept the offset over its full length; below this the
         # curvature cost (A/L^2) stops being worth the feasibility it buys.
         self.ramp_len_min_m = 2.5    # [m]
+        # RAMP LADDER (see the retry at `if best is None`). The adaptive shortening above only
+        # fires where the corridor scan refuses the offset; in a narrow corner the ramp is refused
+        # by geometry the scan cannot see (the obstacle keep-out, the body floor, curvature), and
+        # the only thing that ever produced a path was the gap itself falling under the ramp
+        # length -- i.e. the car arriving on top of the box. So the ramp PAIR is retried as a
+        # search dimension, longest first, when every candidate at today's geometry was rejected.
+        self.ramp_search_enable = True
+        self.ramp_search_entry_m = [3.15, 2.5, 2.0, 1.5, 1.0]   # [m] deliberately below ramp_len_min_m
+        self.ramp_search_exit_m = [4.5, 2.5, 1.5]               # [m] full first: shorten the entry alone
+        self.ramp_search_max_ms = 8.0                           # [ms] budget for the whole ladder
         self.apex_bulge = 0.05       # [m] extra offset at the box CENTRE (apex) beyond the clearance
                                      # value: higher = car swings WIDER around the obstacle. 0 = flat hold.
         self.max_weave = 3           # max obstacles woven into one path (slalom); 1 = single-apex only
@@ -318,6 +328,7 @@ class ObstacleSpliner(Node):
             'static_demote_mps', 'static_demote_sec',
             'wall_margin', 'knot_merge_s_m', 'shift_min', 'shift_buffer', 'ramp_len', 'hold_after',
             'return_len', 'ramp_len_min_m',
+            'ramp_search_enable', 'ramp_search_entry_m', 'ramp_search_exit_m', 'ramp_search_max_ms',
             'apex_bulge', 'max_weave', 'width_car', 'tail_m', 'w_d', 'w_k', 'w_c', 'w_obs', 'obs_sigma',
             'use_grid_check', 'trust_grid_bounds', 'grid_scan_max', 'grid_scan_step', 'bounds_warn_m',
             'clear_gate_enable', 'clear_hyst_m', 'clear_max_cur_d', 'clear_margin_m', 'reframe_warn_m',
@@ -419,6 +430,17 @@ class ObstacleSpliner(Node):
         self.declare_parameter('return_len', 4.5, dbl(0.5, 10.0, "ramp length back to the raceline [m]"))
         self.declare_parameter('ramp_len_min_m', 2.5,
                                dbl(0.5, 10.0, "floor for the adaptive ramp shortening [m]"))
+        self.declare_parameter('ramp_search_enable', True,
+                               ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
+                                                   description="Retry a rejected plan with shorter ramp pairs before the squeeze pass"))
+        self.declare_parameter('ramp_search_entry_m', [3.15, 2.5, 2.0, 1.5, 1.0],
+                               ParameterDescriptor(type=ParameterType.PARAMETER_DOUBLE_ARRAY,
+                                                   description="entry-ramp lengths tried on retry, longest first [m]"))
+        self.declare_parameter('ramp_search_exit_m', [4.5, 2.5, 1.5],
+                               ParameterDescriptor(type=ParameterType.PARAMETER_DOUBLE_ARRAY,
+                                                   description="exit-ramp lengths tried on retry, longest first [m]"))
+        self.declare_parameter('ramp_search_max_ms', 8.0,
+                               dbl(0.0, 100.0, "time budget for the whole ramp ladder; over it, fall through to the squeeze [ms]"))
         self.declare_parameter('apex_bulge', 0.05, dbl(0.0, 1.0, "extra apex offset beyond clearance: higher=wider avoidance [m]"))
         self.declare_parameter('max_weave', 3, intd(1, 5, "max obstacles woven into one path (slalom); 1=single-apex"))
         self.declare_parameter('width_car', 0.30, dbl(0.1, 1.0, "car width [m]"))
@@ -518,6 +540,14 @@ class ObstacleSpliner(Node):
                 self.return_len = float(p.value)
             elif n == 'ramp_len_min_m':
                 self.ramp_len_min_m = float(p.value)
+            elif n == 'ramp_search_enable':
+                self.ramp_search_enable = bool(p.value)
+            elif n == 'ramp_search_entry_m':
+                self.ramp_search_entry_m = [float(v) for v in p.value]
+            elif n == 'ramp_search_exit_m':
+                self.ramp_search_exit_m = [float(v) for v in p.value]
+            elif n == 'ramp_search_max_ms':
+                self.ramp_search_max_ms = float(p.value)
             elif n == 'apex_bulge':
                 self.apex_bulge = float(p.value)
             elif n == 'max_weave':
@@ -1022,16 +1052,22 @@ class ObstacleSpliner(Node):
         return cands
 
     def do_spline(self, gb_wpnts, safety_margin: float = None, wall_margin: float = None,
-                  squeeze: bool = False) -> Tuple[OTWpntArray, MarkerArray]:
+                  squeeze: bool = False,
+                  ramp_retry: Tuple[float, float] = None) -> Tuple[OTWpntArray, MarkerArray]:
         """Plan one static-avoidance path. `squeeze` marks a reduced-margin RETRY (see
         _squeeze_schedule); such a call returns None instead of an empty result so the caller can
-        try the next step, and never publishes the feasibility verdict itself."""
+        try the next step, and never publishes the feasibility verdict itself.
+
+        `ramp_retry` is the same kind of retry one dimension over: (entry, exit) ramp lengths that
+        OVERRIDE the adaptive fit, at the FULL margins. Both retries return None instead of an
+        empty result, and neither publishes a verdict -- only the top-level call does."""
         # The squeeze lowers `safety_margin`; both axes give up the SAME amount, so a squeeze after
         # the split behaves exactly as it did before it.
         safety_margin_d = self.safety_margin_d - (self.safety_margin - (
             self.safety_margin if safety_margin is None else safety_margin))
         safety_margin = self.safety_margin if safety_margin is None else safety_margin
         wall_margin = self.wall_margin if wall_margin is None else wall_margin
+        retry = squeeze or ramp_retry is not None      # a nested attempt: report nothing, return None
         wpnts = OTWpntArray()
         wpnts.header.stamp = self.get_clock().now().to_msg()
         wpnts.header.frame_id = "map"
@@ -1049,7 +1085,7 @@ class ObstacleSpliner(Node):
             return wpnts, m
 
         if self.cur_s is None or self.gb_max_s is None or self.cur_d is None:
-            return None if squeeze else _empty()
+            return None if retry else _empty()
 
         wpnt_dist = gb_wpnts[1].s_m - gb_wpnts[0].s_m
         half_car = self.width_car / 2.0
@@ -1078,9 +1114,9 @@ class ObstacleSpliner(Node):
         # against the live obstacles and publishes feasible=False the instant the slice stops
         # clearing them. Runs BEFORE the obstacle gather so the committed exit ramp is still
         # followed once the box has dropped out of "ahead".
-        # A squeeze RETRY skips this: whether to reuse or re-plan was already decided by the
-        # full-margin call that is now retrying (and which left _committed None to get here).
-        if self.commit_enable and self._committed is not None and not squeeze:
+        # A RETRY (squeeze or ramp ladder) skips this: whether to reuse or re-plan was already
+        # decided by the call that is now retrying (and which left _committed None to get here).
+        if self.commit_enable and self._committed is not None and not retry:
             reuse = self._reuse_committed(gb_wpnts, wpnt_dist, obs_margin_d, half_car,
                                           obs_margin_s)
             if reuse is not None:
@@ -1096,7 +1132,7 @@ class ObstacleSpliner(Node):
                 (now - self._mem_cands_time).nanoseconds * 1e-9 < self.obs_memory_sec:
             cands_obs = self._gather_obstacles_ahead(self._mem_cands_obs, lookahead)
         obs_ahead = [o for _, o in cands_obs]
-        if squeeze and not obs_ahead:
+        if retry and not obs_ahead:
             return None
         if not obs_ahead:
             # nothing to avoid -> no avoidance path (state machine stays on the raceline).
@@ -1122,9 +1158,9 @@ class ObstacleSpliner(Node):
         # already cleared. Nothing was being protected either: the committed-path branch above has
         # already returned by the time control gets here, so there is no maneuver in flight, and
         # the predicate itself certifies the followed line clears every box ahead.
-        # Skipped on a squeeze RETRY: the full-margin call already ran the gate this cycle and did
-        # not idle; re-running it would only re-latch on the same obstacles.
-        if self.clear_gate_enable and not squeeze:
+        # Skipped on a RETRY (squeeze or ramp ladder): the call that is retrying already ran the
+        # gate this cycle and did not idle; re-running it would only re-latch on the same obstacles.
+        if self.clear_gate_enable and not retry:
             # The trigger threshold is NOT obs_margin. obs_margin (half_car + safety_margin = 0.30)
             # is what a NEW path is designed to, and reusing it here asks "is the current line
             # planned to my full design clearance?" instead of "does the car fit past this box?".
@@ -1215,7 +1251,7 @@ class ObstacleSpliner(Node):
                 f"followed line (>= {obs_margin:.2f} m) -> no avoidance needed",
                 throttle_duration_sec=2.0)
             self._committed = None
-            return None if squeeze else _empty()
+            return None if retry else _empty()
         # Anchor the gap sampling on the first box we are actually shaping around, not on the
         # nearest one in the list -- that one may have been skipped as already cleared.
         nearest = knots[0][1]
@@ -1427,10 +1463,19 @@ class ObstacleSpliner(Node):
         ramp_lim_in = _ramp_limits(knots[0][0], self.ramp_len, entry=True)
         ramp_lim_out = _ramp_limits(knots[-1][0], self.return_len, entry=False)
 
-        def _fit_ramp(amp, limits, full_len):
-            """Longest ramp whose offset profile fits the corridor along its WHOLE length."""
+        ramp_in_fixed, ramp_out_fixed = ramp_retry if ramp_retry else (None, None)
+
+        def _fit_ramp(amp, limits, full_len, fixed=None):
+            """Longest ramp whose offset profile fits the corridor along its WHOLE length.
+
+            `fixed` is the ladder's override (see the retry at `if best is None`): an explicit
+            length, taken as given. It bypasses the corridor fit AND ramp_len_min_m, because the
+            ladder exists precisely for the corners where the scan's answer is not the binding
+            one -- what judges the result is the full feasibility filter, on the path itself."""
             if abs(amp) < 1e-6 or full_len <= self.ramp_len_min_m:
                 return full_len
+            if fixed is not None:
+                return float(min(fixed, full_len))
             for R, amp_hi, amp_lo in limits:
                 if amp_lo - 1e-9 <= amp <= amp_hi + 1e-9:
                     return R
@@ -1444,8 +1489,8 @@ class ObstacleSpliner(Node):
             for i in range(1, len(knots)):
                 d_apex.append(_pass_offset(knot_cor[i], knots[i][1], d_apex[-1]))
             # this candidate's own ramps, from the offsets IT carries (see _fit_ramp)
-            r_in = _fit_ramp(d_apex[0], ramp_lim_in, self.ramp_len)
-            r_out = _fit_ramp(d_apex[-1], ramp_lim_out, self.return_len)
+            r_in = _fit_ramp(d_apex[0], ramp_lim_in, self.ramp_len, ramp_in_fixed)
+            r_out = _fit_ramp(d_apex[-1], ramp_lim_out, self.return_len, ramp_out_fixed)
             s_entry0 = max(0.0, knots[0][0] - r_in)
             s_exit_end = knots[-1][0] + r_out
             m_span = (s_local > s_entry0) & (s_local <= s_exit_end)
@@ -1624,8 +1669,58 @@ class ObstacleSpliner(Node):
                 best_J, best_k, best = J, k, (xy, psi_, kappa_)
 
         if best is None:
-            if squeeze:
-                return None                     # caller tries the next margin step, then gives up
+            if retry:
+                return None                     # caller tries the next rung / margin step
+            # RAMP LADDER, BEFORE the squeeze. Every candidate was rejected with the ramps the
+            # adaptive fit chose -- but that fit only shortens a ramp where the CORRIDOR SCAN
+            # refuses the offset, and in a narrow corner the ramp is refused by things the scan
+            # does not look at: the obstacle keep-out, the body floor, curvature. The 4.5 m entry
+            # ramp is then laid straight across the pinch and nothing shortens it, so the only way
+            # a path ever appeared was the gap itself falling below the ramp length -- the car
+            # arriving on top of the box. Measured on ifac: over the 33 stations with |kappa| >
+            # 0.8, the first distance at which a plan existed averaged 10.70 m, and at some of them
+            # (241-244) it was one or two metres.
+            #
+            # Order matters twice over:
+            #   LONGEST FIRST, first success adopted. A shorter ramp is more curved (peak goes as
+            #   A/L^2) and therefore slower, so the ladder must not be allowed to pick a shorter
+            #   rung because its raw cost happened to come out lower.
+            #   BEFORE THE SQUEEZE, at the full margins, across every rung. Shortening a ramp pays
+            #   in curvature; squeezing pays in clearance. Nesting the squeeze inside each rung
+            #   inverts that and buys with the margin first (measured: squeeze publications 36 ->
+            #   69).
+            # The exit ramp is searched too, not just the entry: on the stations whose bottleneck
+            # is the return (206/207/209) an entry-only ladder regresses, and the two-dimensional
+            # one recovers all three at LOWER peak curvature.
+            #
+            # Rung 0 is today's adaptive geometry, which the pass above already tried, so the
+            # ladder is a strict superset and cannot regress.
+            if self.ramp_search_enable and (self.ramp_search_entry_m or self.ramp_search_exit_m):
+                t_ladder = time.perf_counter()
+                out_of_time = False
+                for r_in_try in (self.ramp_search_entry_m or [self.ramp_len]):
+                    if out_of_time:
+                        break
+                    for r_out_try in (self.ramp_search_exit_m or [self.return_len]):
+                        if (time.perf_counter() - t_ladder) * 1e3 > self.ramp_search_max_ms:
+                            self.get_logger().warn(
+                                f"[{self.name}] ramp ladder out of time after "
+                                f"{self.ramp_search_max_ms:.1f} ms at rung "
+                                f"({r_in_try:.2f}, {r_out_try:.2f}) -> squeeze",
+                                throttle_duration_sec=2.0)
+                            out_of_time = True
+                            break
+                        res = self.do_spline(gb_wpnts, safety_margin=safety_margin,
+                                             wall_margin=wall_margin,
+                                             ramp_retry=(float(r_in_try), float(r_out_try)))
+                        if res is not None and len(res[0].wpnts) > 0:
+                            self.get_logger().info(
+                                f"[{self.name}] ramp ladder: no candidate at the adaptive ramp "
+                                f"geometry; passing with entry={r_in_try:.2f} m exit="
+                                f"{r_out_try:.2f} m at the FULL margins "
+                                f"(safety={safety_margin:.2f}/wall={wall_margin:.2f})",
+                                throttle_duration_sec=1.0)
+                            return res
             # SQUEEZE PASS. Every candidate was rejected at the FULL design margins, which is not
             # the same as "impassable". On ifac the track narrows below 1.20 m, and a box in the
             # middle of that needs width_car/2 + safety_margin = 0.30 m of clearance per side plus

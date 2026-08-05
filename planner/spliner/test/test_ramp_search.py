@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Why the avoidance starts far too late in a narrow corner.
+"""The two halves of "the avoidance starts far too late in a narrow corner".
 
-The adaptive ramp scan read the corridor at the WRONG STATION. scan_s is path-local -- distance
+1. The adaptive ramp scan read the corridor at the WRONG STATION. scan_s is path-local -- distance
    from the car -- and _grid_corridor_batch treats its argument as an absolute station. Same bug
    6b8112e fixed for knot_cor, left behind in the ramp scan. The sampled points slid along the
    track as the car approached, so the ramp was shortened, or not, by a corridor belonging
    somewhere else entirely.
+
+2. The 4.5 m entry ramp is laid across the pinch in a narrow corner, and every candidate dies on
+   it. Nothing shortens the ramp except the corridor scan agreeing to, so the path only appears
+   once the gap itself has fallen below the ramp length -- i.e. with the car right on top of the
+   box. The ramp pair is now a SEARCH DIMENSION, retried longest-first when every candidate at
+   today's geometry was rejected.
 
 Run (after sourcing the workspace):
   ~/miniforge3/envs/unicorn/bin/python3 planner/spliner/test/test_ramp_search.py
@@ -51,6 +57,34 @@ class _Converter:
         return 0.0
 
 
+class _PinchGrid:
+    """Eroded-map stand-in: free within +-w_pinch of the raceline over [lo, hi), +-w_open elsewhere.
+
+    A short pinch a fixed distance BEFORE the box is the geometry the ladder exists for. The
+    offset a ramp carries at a fixed station falls with the ramp length, so shortening the ramp is
+    what gets the path through -- and below ramp_len_min_m the adaptive fit cannot go.
+    """
+
+    def __init__(self, lo, hi, w_pinch, w_open, resolution=0.05):
+        self.resolution = resolution
+        self.origin = (-1.0, -3.0)
+        h = int(6.0 / resolution)
+        w = int((TRACK_LEN + 2.0) / resolution)
+        y = (np.arange(h) + 0.5) * resolution + self.origin[1]
+        x = (np.arange(w) + 0.5) * resolution + self.origin[0]
+        pinch = (x >= lo) & (x < hi)
+        free = np.where(pinch[None, :], np.abs(y)[:, None] <= w_pinch,
+                        np.abs(y)[:, None] <= w_open)
+        self.eroded_image = np.where(free, 255, 0).astype(np.uint8)
+
+    def is_point_inside(self, x, y):
+        px = int((x - self.origin[0]) / self.resolution)
+        py = int((y - self.origin[1]) / self.resolution)
+        if px < 0 or py < 0 or px >= self.eroded_image.shape[1] or py >= self.eroded_image.shape[0]:
+            return False
+        return self.eroded_image[py, px] == 255
+
+
 class _BandGrid:
     """Eroded-map stand-in: free within +-w_a of the raceline before `split`, +-w_b after it.
 
@@ -68,6 +102,14 @@ class _BandGrid:
         a = (np.abs(y)[:, None] <= w_a) & (x[None, :] < split)
         b = (np.abs(y)[:, None] <= w_b) & (x[None, :] >= split)
         self.eroded_image = np.where(a | b, 255, 0).astype(np.uint8)
+
+    def is_point_inside(self, x, y):
+        """Verbatim GridFilter.is_point_inside -- _path_off_track calls it per point."""
+        px = int((x - self.origin[0]) / self.resolution)
+        py = int((y - self.origin[1]) / self.resolution)
+        if px < 0 or py < 0 or px >= self.eroded_image.shape[1] or py >= self.eroded_image.shape[0]:
+            return False
+        return self.eroded_image[py, px] == 255
 
 
 def gb_wpnts():
@@ -175,6 +217,50 @@ def test_the_ramp_scan_reads_the_real_stations():
           f"at the path-local station)")
 
 
+def test_the_ladder_finds_a_path_the_full_ramp_cannot_fit():
+    # A box in the MIDDLE of the track (pass offset 0.45 m either way) with a 0.4 m pinch one
+    # metre before it. The offset a ramp is carrying at a fixed station falls with the ramp
+    # length, so the pinch is passable -- but only by a ramp shorter than ramp_len_min_m, which is
+    # the floor the adaptive fit cannot go below. It returns 2.5 m, the path puts 0.31 m of offset
+    # into a 0.20 m gap, and every candidate is rejected.
+    def run(enable):
+        n = planner([box(33.0, 0.0, oid=1)], cur_s=25.0)
+        n.trust_grid_bounds, n.use_grid_check = True, True
+        n.ramp_search_enable = enable
+        n.map_filter = n.body_filter = _PinchGrid(lo=31.6, hi=32.0, w_pinch=0.20, w_open=1.20)
+        n.body_kernel_size = 7
+        w, _m = n.do_spline(gb_wpnts())
+        return w
+
+    assert not run(False).wpnts, (
+        "the harness must reproduce the failure: at today's ramp geometry, floored at "
+        "ramp_len_min_m, every candidate is rejected here")
+    w = run(True)
+    assert w.wpnts, "the ladder must find the shorter ramp that fits the pinch"
+    start = hump_start(w, 25.0)
+    assert 8.0 - start < 2.5, "the rung that passed must be one the adaptive fit could not reach"
+    print(f"PASS the ladder plans where the full ramp cannot (entry ramp {8.0 - start:.2f} m, "
+          f"below the {2.5:.1f} m adaptive floor; no path at all without it)")
+
+
+def test_the_ladder_is_a_last_resort_and_never_shortens_a_ramp_that_fits():
+    # rung 0 is today's geometry: whatever the main pass accepts must come out unchanged, or the
+    # ladder is buying feasibility with curvature it did not have to spend.
+    def run(enable):
+        n = planner([box(33.0, -0.35, oid=1)], cur_s=25.0)
+        n.ramp_search_enable = enable
+        w, _m = n.do_spline(gb_wpnts())
+        return w
+
+    a, b = run(False), run(True)
+    assert a.wpnts and b.wpnts
+    assert [round(x.d_m, 9) for x in a.wpnts] == [round(x.d_m, 9) for x in b.wpnts], \
+        "an open corridor must plan identically with and without the ladder"
+    print("PASS where the full ramp already fits, the ladder changes nothing")
+
+
 if __name__ == "__main__":
     test_the_ramp_scan_reads_the_real_stations()
+    test_the_ladder_finds_a_path_the_full_ramp_cannot_fit()
+    test_the_ladder_is_a_last_resort_and_never_shortens_a_ramp_that_fits()
     print("ALL PASS")

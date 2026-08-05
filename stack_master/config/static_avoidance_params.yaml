@@ -139,6 +139,41 @@ static_avoidance_planner:
     # there is room the full 4.5 m is kept, because a quintic's peak curvature goes as A/L^2 and
     # these lengths were raised to carry speed. Below this floor that trade stops paying.
     ramp_len_min_m: 2.5     # [m]
+    # RAMP LADDER. The adaptive shortening above only fires where the CORRIDOR SCAN refuses the
+    # offset. In a narrow corner the ramp is refused by things the scan does not look at -- the
+    # obstacle keep-out, the body floor, curvature -- so the 4.5 m entry ramp is laid straight
+    # across the pinch and nothing shortens it. The only way a path appeared was the gap itself
+    # falling below the ramp length, i.e. the car arriving on top of the box: measured on ifac,
+    # over the 33 stations with |kappa| > 0.8, the first distance at which a plan existed averaged
+    # 11.1 m and at some of them was one or two metres.
+    #
+    # So the ramp PAIR is retried when every candidate at the adaptive geometry was rejected:
+    # longest first, entry outer / exit inner, first success adopted. Longest-first is not a
+    # preference but a requirement -- peak curvature goes as amplitude/length^2 and the speed the
+    # maneuver can be driven at as sqrt(a_lat/kappa), so picking a shorter rung on cost would buy
+    # feasibility with speed that was available. The entry list deliberately goes BELOW
+    # ramp_len_min_m; that floor governs the automatic shortening, and this is the deliberate
+    # last resort. The exit list starts at the full 4.5 m so that shortening the entry alone is
+    # tried first, and it is searched at all because the stations whose bottleneck is the RETURN
+    # regress without it.
+    #
+    # Runs at the FULL margins, ahead of the squeeze pass, and the squeeze is not nested inside a
+    # rung: a shorter ramp pays in curvature, a squeeze pays in clearance, and that is the order
+    # the two should be spent in.
+    ramp_search_enable: true
+    ramp_search_entry_m: [3.15, 2.5, 2.0, 1.5, 1.0]   # [m]
+    ramp_search_exit_m: [4.5, 2.5, 1.5]               # [m]
+    # [ms] budget for the whole ladder, checked before each rung; over it, fall through to the
+    # squeeze. MEASURE THIS ONE BEFORE TRUSTING IT: one rung is a full re-plan, ~5 ms on a
+    # development machine and slower on the car, so 8 ms buys one or two rungs of the fifteen.
+    # Offline on ifac (123 stations x {12,8,4,2} m x {0, 0.3} m of tracking error, 984 cells),
+    # feasible cells against the budget:
+    #     ladder off 611 | 8 ms 671 | 20 ms 727 | 40 ms 759 | unlimited 762
+    # i.e. 8 ms captures 40% of what the ladder can do and 40 ms captures 98%. The loop runs at
+    # 20 Hz (50 ms), and the ladder only runs in a cycle that was going to publish nothing at all,
+    # so there is room -- raise this if the corners still plan late on the car. It is
+    # live-reconfigurable; no rebuild needed to try.
+    ramp_search_max_ms: 8.0
     # [m] extra offset at the box CENTRE beyond the clearance value: the path peaks here (widest,
     # furthest from the obstacle). Limited by the corridor (a bulge past the wall is clipped to it).
     #
