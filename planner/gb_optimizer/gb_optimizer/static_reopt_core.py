@@ -153,6 +153,9 @@ _HUMP_SPAN_TOTAL_FRAC = 0.40
 # exists — while still preferring the least-overshooting when the track leaves no choice, rather
 # than failing outright.
 _SPAN_OVER_PENALTY_S_PER_M = 1.0
+# Ramp-stretch multipliers, finest first. 1.5 was the smallest step and it overshoots the corridor
+# on a reach already near its cap, so the stage found nothing between "as fitted" and "rejected".
+_STRETCH_SCALES = (1.15, 1.35, 1.5, 2.0, 3.0)
 # Lap-time penalty [s] charged per obstacle a candidate leaves WITHOUT a hump. The reach search
 # ranked candidates on estimated lap time alone, and a candidate that simply fails to lay a hump is
 # always faster than one that lays it: on the real run a reach of 1.0 m fitted one of three humps
@@ -1049,7 +1052,9 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                          apex_merge_gap_m: float = 0.0,
                          hold_bridge: bool = False,
                          hold_max_gap_m: float = 0.0,
-                         hold_kappa_max: float = 0.0
+                         hold_kappa_max: float = 0.0,
+                         merge_span_extra_m: float = 1.5,
+                         merge_easement_kappa_max: float = 0.60
                          ) -> Tuple[np.ndarray, int, float, list, list]:
     """Lateral offset d(s) on the CLOSED clean loop that PRESERVES each recorded reactive apex
     but re-grows long, gentle entry/exit ramps — the "keep the apex, press the secondary apexes"
@@ -1465,18 +1470,48 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
             # not bound it (stretching the entry costs <30 ms, so it always "wins"), and on ifac an
             # 18 m entry + 6 m exit put 65% of the 35 m lap off the racing line and pushed the hump
             # across s=0. Budget the whole hump to a fraction of the lap.
-            span_cap = max(2.0 * r_f, _HUMP_SPAN_FRAC * track_len)
+            # A MERGE EASEMENT ALLOWANCE, on top of the locality cap. span_cap and the reach cap
+            # are otherwise the same number (_HUMP_SPAN_FRAC * track_len), so once the search picks
+            # a reach at the cap -- which it does, a wider hump being smoother -- `span_cap -
+            # r_fixed` leaves nothing and every stretch bisects straight back. The easement is a
+            # MERGE property, not a locality one: it lengthens the join without moving the apex or
+            # the clearance. It is added HERE and never to _span_budget, which is what bounds how
+            # much of the lap the line spends off the raceline.
+            span_cap = max(2.0 * r_f, _HUMP_SPAN_FRAC * track_len) + merge_span_extra_m
 
-            def _stretch(scale, r_fixed, stretch_entry):
-                """Longest feasible stretched ramp <= scale*r_f within the span budget."""
+            def _corner_ok(r_new, r_old, stretch_entry):
+                """Is the arc this stretch NEWLY covers straight enough to ease into?
+
+                A longer ramp is gentler only where the clean line is straight; run into a corner
+                it rides the raceline's own curvature and the join gets WORSE while looking longer.
+                Only the new arc is judged -- the old one was already accepted."""
+                if merge_easement_kappa_max <= 0.0 or kap_geo is None:
+                    return True
+                if stretch_entry:
+                    mm = (u_all >= u - r_new) & (u_all <= u - r_old)
+                else:
+                    mm = (u_all >= u + r_old) & (u_all <= u + r_new)
+                if not mm.any():
+                    return True
+                return bool(float(np.max(np.abs(np.asarray(kap_geo, float)[mm])))
+                            <= merge_easement_kappa_max)
+
+            def _stretch(scale, r_budget, stretch_entry):
+                """Longest feasible stretched ramp <= scale*r_f within the span and corner caps.
+
+                `r_budget` is the OTHER ramp's length for the span arithmetic. The exit used to be
+                budgeted against the already-stretched entry, so a long entry starved the exit of
+                the very allowance the merge wanted; both are budgeted against r_f now."""
                 if scale <= 1.0:
                     return r_f
                 r_best = r_f
-                r_try = min(r_f * scale, max(r_f, span_cap - r_fixed))
+                r_try = min(r_f * scale, max(r_f, span_cap - r_budget))
                 for _ in range(12):
-                    ri, ro = (r_try, r_fixed) if stretch_entry else (r_fixed, r_try)
+                    ri, ro = (r_try, r_budget) if stretch_entry else (r_budget, r_try)
                     v = _hump_values(u_all, u, d_f, ri, ro)
-                    if v is not None and np.all(v <= hi_a + fit_tol) and np.all(v >= lo_a - fit_tol):
+                    if (v is not None and np.all(v <= hi_a + fit_tol)
+                            and np.all(v >= lo_a - fit_tol)
+                            and _corner_ok(r_try, r_f, stretch_entry)):
                         r_best = r_try
                         break
                     r_try = 0.5 * (r_try + r_f)
@@ -1485,7 +1520,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                 return r_best
 
             r_in = _stretch(entry_scale, r_f, stretch_entry=True)
-            r_out = _stretch(exit_scale, r_in, stretch_entry=False)
+            r_out = _stretch(exit_scale, r_f, stretch_entry=False)
             fitted.append((u, d_f, r_in, r_out, r_f))    # r_f = pre-stretch reach (budget recovery)
             # one record per MEMBER: a merged hump covers every obstacle it absorbed, and the
             # coverage report attributes each of them separately.
@@ -2094,6 +2129,8 @@ def _reopt_local_window_impl(
     apex_merge_gap_m: float = 0.0,
     hold_max_gap_m: float = 8.0,
     hold_kappa_max: float = 0.3,
+    merge_span_extra_m: float = 1.5,
+    merge_easement_kappa_max: float = 0.60,
 ) -> dict:
     """Fast ONLINE obstacle-aware raceline: reshape the REACTIVE avoidance spline into a global
     line. Each `apex` (map-frame (x,y) captured from the reactive spliner on the exploration lap)
@@ -2212,7 +2249,9 @@ def _reopt_local_window_impl(
             obstacles=apex_obstacles, obs_margin=params.obs_margin,
             relax_floor=relax_floor, apex_merge_gap_m=apex_merge_gap_m,
             hold_bridge=hold, hold_max_gap_m=hold_max_gap_m,
-            hold_kappa_max=hold_kappa_max)
+            hold_kappa_max=hold_kappa_max,
+            merge_span_extra_m=merge_span_extra_m,
+            merge_easement_kappa_max=merge_easement_kappa_max)
         if nn == 0:
             return dg, 0, float("inf"), ek, drp, lay
         est = _offset_lap_time(dg, clean_xy, nvec_rl, el_cl,
@@ -2270,13 +2309,13 @@ def _reopt_local_window_impl(
         if n_s:
             tol = 0.03                                    # [s] lap-time budget for a softer turn-in
             best_e = 1.0
-            for e_scale in (1.5, 2.0, 3.0):
+            for e_scale in _STRETCH_SCALES:
                 d_try, n_try, est_try, ek_try, drp_try, lay_try = _try(best_r, e_scale, hold=hold)
                 if n_try and est_try <= best_est + tol and ek_try < best_ek:
                     d_g, n_s, best_ek, best_e, cost_fin = d_try, n_try, ek_try, e_scale, est_try
                     drp_b, lay_b = drp_try, lay_try
             tol_exit = 0.05                               # [s] merge smoothness is worth a bit more
-            for x_scale in (1.5, 2.0, 3.0):
+            for x_scale in _STRETCH_SCALES:
                 d_try, n_try, est_try, ek_try, drp_try, lay_try = _try(best_r, best_e, x_scale,
                                                                        hold=hold)
                 if n_try and est_try <= best_est + tol_exit and ek_try < best_ek:
