@@ -94,6 +94,8 @@ def make_node():
     n.apex_undershoot_m = 0.12
     n.relax_floor = 0.30            # the bottom rung of the core's coverage ladder
     n.side_hint_margin_m = 0.15
+    n.obs_forget_s = 1.5
+    n._last_seen = {}
     n.map_filter = None             # no map in the harness -> _grid_room falls back
     n._swap_block = {}
     n._swap_lap_t = 0.0
@@ -771,6 +773,67 @@ def test_solves_are_debounced():
     print("PASS solves are debounced to one per solve_min_interval_s")
 
 
+def test_a_brief_tracker_dropout_does_not_shrink_the_set():
+    # The tracker deletes and recreates its tracks around every lap, and a recreated track is
+    # published by nobody for a few frames. Taken at face value that shrinks the confirmed set,
+    # re-solves, swaps, and does it again in reverse a fraction of a second later.
+    from visualization_msgs.msg import Marker, MarkerArray
+
+    def markers(*specs):
+        msg = MarkerArray()
+        for mid, x, y in specs:
+            m = Marker(); m.action = Marker.ADD; m.id = mid
+            m.pose.position.x, m.pose.position.y = float(x), float(y)
+            m.scale.x = m.scale.y = 0.3
+            msg.markers.append(m)
+        return msg
+
+    n = make_node()
+    n.default_obs_radius, n.apex_miss_frames = 0.15, 20
+    n._clock.t = 100.0
+    n.obstacles_cb(markers((7, 5.0, -0.2), (8, 12.0, 0.2)))
+    assert len(n._obstacles) == 2
+    n._obstacles_dirty = False
+    n._clock.t = 100.2                                  # 0.2 s later, id 8 is missing
+    n.obstacles_cb(markers((7, 5.0, -0.2)))
+    assert len(n._obstacles) == 2, "a 0.2 s dropout must not shrink the set"
+    assert not n._obstacles_dirty, "…and must not arm a re-solve"
+    # ...but a box gone for longer than obs_forget_s really is gone
+    n._clock.t = 102.0
+    n.obstacles_cb(markers((7, 5.0, -0.2)))
+    assert len(n._obstacles) == 1, "past obs_forget_s the set must shrink"
+    print("PASS a brief tracker dropout does not shrink the confirmed set")
+
+
+def test_marker_id_zero_does_not_flip_the_key_scheme():
+    # marker_id 0 is a perfectly good id -- the layer hands it out first. `any(i != 0)` meant the
+    # key scheme flipped to position quantization the moment the only confirmed obstacle left was
+    # the one holding id 0, and every lookup keyed on ("id", 0) missed at once: floor_by_key,
+    # clearance_by_key, _apex_by_obs, and with them the apex freeze.
+    n = make_node()
+    o = core.Obstacle(5.0, -0.2, 0.15)
+    assert n._keys_for([o], [0]) == [("id", 0)], n._keys_for([o], [0])
+    assert n._keys_for([o, core.Obstacle(9.0, 0.1, 0.15)], [0, 1]) == [("id", 0), ("id", 1)]
+    # duplicated ids are a real ambiguity and still fall back to position
+    dup = n._keys_for([o, core.Obstacle(9.0, 0.1, 0.15)], [3, 3])
+    assert all(k[0] == "q" for k in dup), dup
+    print("PASS marker_id 0 keeps the id key scheme")
+
+
+def test_obstacle_set_change_is_compared_by_id_not_by_order():
+    # The old zip() paired the n-th new obstacle with the n-th old one, so a MarkerArray that
+    # merely arrived in a different order read as every obstacle having jumped.
+    n = make_node()
+    a = core.Obstacle(5.0, -0.2, 0.15)
+    b = core.Obstacle(12.0, 0.2, 0.15)
+    n._obstacles, n._obs_ids = [a, b], [7, 8]
+    assert n._obstacles_changed([b, a], [8, 7]) is False, "reordering is not a change"
+    assert n._obstacles_changed([a, b], [7, 8]) is False
+    moved = core.Obstacle(12.4, 0.2, 0.15)
+    assert n._obstacles_changed([moved, a], [8, 7]) is True, "a real move still reads as one"
+    print("PASS the obstacle set is compared by id, not by list order")
+
+
 def test_shrinking_set_keeps_the_queued_line():
     # An unlatch flap (item: the layer demotes a track for ~0.5 s) used to throw the queued bundle
     # away, and the commit gates -- hardest to satisfy exactly where the obstacles are -- had to be
@@ -1303,6 +1366,9 @@ if __name__ == "__main__":
     test_solve_runs_off_the_executor_and_is_collected_later()
     test_swap_gate_tally_names_the_gate_that_held_the_swap()
     test_solves_are_debounced()
+    test_a_brief_tracker_dropout_does_not_shrink_the_set()
+    test_marker_id_zero_does_not_flip_the_key_scheme()
+    test_obstacle_set_change_is_compared_by_id_not_by_order()
     test_shrinking_set_keeps_the_queued_line()
     test_cluster_curvature_budget_is_local()
     test_coverage_outranks_lap_time_in_the_reach_search()

@@ -152,6 +152,12 @@ class StaticReoptNode(Node):
         # before it overrules the side a recorded reactive apex proved. Within this band the apex
         # wins: it knows something a corridor width does not, namely that the car actually got
         # through there. 0 makes the map always decide.
+        # [s] how long a confirmed obstacle is carried after it stops being reported. The tracker
+        # recreates its tracks around every lap and a recreated track is published by nobody for a
+        # few frames; without this, that gap reads as a removal and costs a re-solve and a swap
+        # each way. Actual removal is still handled -- by the layer's unlatch and lap accounting,
+        # which have evidence this node does not.
+        self.declare_parameter("obs_forget_s", 1.5)
         self.declare_parameter("side_hint_margin_m", 0.15)
         self.declare_parameter("apex_merge_gap_m", 2.0)
         # HOLD BRIDGE. Two boxes on the SAME side, close together on a STRAIGHT, do not need the
@@ -221,6 +227,7 @@ class StaticReoptNode(Node):
         self.obs_margin = float(self.get_parameter("obs_margin").value)
         self.relax_floor = float(self.get_parameter("relax_floor").value)
         self.wall_gate_kernel = int(self.get_parameter("wall_gate_kernel").value)
+        self.obs_forget_s = float(self.get_parameter("obs_forget_s").value)
         self.side_hint_margin_m = float(self.get_parameter("side_hint_margin_m").value)
         self.apex_merge_gap_m = float(self.get_parameter("apex_merge_gap_m").value)
         self.hold_max_gap_m = float(self.get_parameter("hold_max_gap_m").value)
@@ -306,6 +313,7 @@ class StaticReoptNode(Node):
         self.apex_undershoot_m = float(self.get_parameter("apex_undershoot_m").value)
         self.apex_abeam_gap_m = float(self.get_parameter("apex_abeam_gap_m").value)
         self._apex_change_major = False
+        self._last_seen = {}               # marker id -> (wall time, Obstacle); see obs_forget_s
         self._apex_dirty_pending = False   # an apex changed; arm the rebuild at idle
         # WHICH GATE held the swap this lap. The commit path is a chain of fail-closed gates, and
         # from outside they are indistinguishable: the line simply never swaps. One counted line per
@@ -1018,6 +1026,27 @@ class StaticReoptNode(Node):
             obs.append(core.Obstacle(m.pose.position.x, m.pose.position.y, r))
             ids.append(int(getattr(m, "id", 0)))
 
+        # A BRIEF DISAPPEARANCE IS NOT A REMOVAL. The tracker deletes and recreates tracks around
+        # every lap (ids 22 -> 36 -> 43 -> 54 for three physical boxes), and each recreation costs
+        # a few frames during which the box is classified by nobody and published by nobody. Taking
+        # that at face value shrinks the set, re-solves, swaps, and then does it all again in
+        # reverse a fraction of a second later. An obstacle seen within obs_forget_s is carried.
+        # Position and radius come from the LAST sighting -- this only keeps it in the set.
+        now_t = self.get_clock().now().nanoseconds * 1e-9
+        for o, i in zip(obs, ids):
+            self._last_seen[i] = (now_t, o)
+        for i in list(self._last_seen):
+            t_seen, o = self._last_seen[i]
+            if (now_t - t_seen) > self.obs_forget_s:
+                del self._last_seen[i]
+            elif i not in ids:
+                obs.append(o)
+                ids.append(i)
+                self.get_logger().info(
+                    f"[static_reopt] obstacle id={i} @({o.x:.2f},{o.y:.2f}) not reported this "
+                    f"frame; carried for up to {self.obs_forget_s:.1f} s rather than treated as "
+                    f"removed", throttle_duration_sec=2.0)
+
         # Age out apex records on EVERY frame (not only on a "changed" frame): a track that is
         # missing for a single frame must not lose its apex, but one gone for good must.
         live = set(self._keys_for(obs, ids))
@@ -1030,7 +1059,7 @@ class StaticReoptNode(Node):
                     del self._apex_by_obs[k]
                     self._apex_miss.pop(k, None)
 
-        if not self._clearance_drifted(obs, ids) and not self._obstacles_changed(obs):
+        if not self._clearance_drifted(obs, ids) and not self._obstacles_changed(obs, ids):
             self._obs_ids = ids           # ids can be re-issued without the position changing
             self._adopt_orphan_apexes()   # re-issued ids must not orphan the apex records
             return
@@ -1153,10 +1182,28 @@ class StaticReoptNode(Node):
                 return True
         return False
 
-    def _obstacles_changed(self, new: List[core.Obstacle]) -> bool:
+    def _obstacles_changed(self, new: List[core.Obstacle], new_ids=None) -> bool:
+        """Has the confirmed set materially changed?
+
+        Compared BY ID, not by position in the list. The old zip() paired the n-th new obstacle
+        with the n-th old one, so a MarkerArray that merely arrived in a different order read as
+        every obstacle having jumped -- a full set change, a re-solve and a swap, for nothing.
+        """
+        old_ids = list(self._obs_ids or [])
+        new_ids = list(new_ids if new_ids is not None else [])
+        tol = self.obs_change_tol
+        if len(old_ids) == len(self._obstacles) and len(new_ids) == len(new):
+            old_by = {i: o for i, o in zip(old_ids, self._obstacles)}
+            if len(old_by) == len(self._obstacles):          # ids unambiguous on the old side
+                if set(new_ids) != set(old_by):
+                    return True
+                for i, o in zip(new_ids, new):
+                    b = old_by[i]
+                    if (abs(o.x - b.x) > tol or abs(o.y - b.y) > tol or abs(o.r - b.r) > tol):
+                        return True
+                return False
         if len(new) != len(self._obstacles):
             return True
-        tol = self.obs_change_tol
         for a, b in zip(new, self._obstacles):
             if abs(a.x - b.x) > tol or abs(a.y - b.y) > tol or abs(a.r - b.r) > tol:
                 return True
@@ -1175,7 +1222,12 @@ class StaticReoptNode(Node):
         marker_id once per track and keeps it across EMA position updates) so an apex survives the
         obstacle drifting; falls back to position quantization only if the ids are absent or
         ambiguous (all zero / duplicated), which would otherwise alias two obstacles onto one key."""
-        if ids and len(ids) == len(obs) and any(i != 0 for i in ids) and len(set(ids)) == len(ids):
+        # NOT `any(i != 0)`. marker_id 0 is a perfectly good id -- the layer hands it out first --
+        # so that clause meant the key scheme FLIPPED to position quantization the moment the only
+        # confirmed obstacle left was the one holding id 0. Every lookup keyed on ("id", 0) then
+        # missed at once: floor_by_key, clearance_by_key, _apex_by_obs, and with them the apex
+        # freeze. Duplicated ids are still a real ambiguity and still fall back.
+        if ids and len(ids) == len(obs) and len(set(ids)) == len(ids):
             return [("id", i) for i in ids]
         return [self._quant_key(o) for o in obs]
 
