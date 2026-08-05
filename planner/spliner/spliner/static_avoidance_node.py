@@ -543,6 +543,14 @@ class ObstacleSpliner(Node):
                 self.safety_margin = float(p.value)
             elif n == 'safety_margin_d':
                 self.safety_margin_d = float(p.value)
+            elif n == 'static_near_zero_mps':
+                self.static_near_zero_mps = float(p.value)
+            elif n == 'static_promote_sec':
+                self.static_promote_sec = float(p.value)
+            elif n == 'static_demote_mps':
+                self.static_demote_mps = float(p.value)
+            elif n == 'static_demote_sec':
+                self.static_demote_sec = float(p.value)
             elif n == 'wall_margin':
                 self.wall_margin = float(p.value)
             elif n == 'knot_merge_s_m':
