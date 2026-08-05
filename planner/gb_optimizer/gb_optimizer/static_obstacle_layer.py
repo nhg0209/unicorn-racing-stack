@@ -49,6 +49,10 @@ class _Track:
     miss_laps: int = 0
     marker_id: int = 0
     clear_streak: int = 0    # consecutive tracking msgs with a clear in-window view and no sighting
+    # PUBLISHED position, held still until the estimate moves materially (see publish_deadband_m).
+    # None until the track is first published.
+    pub_x: float = None
+    pub_y: float = None
 
 
 class StaticObstacleLayer(Node):
@@ -97,6 +101,15 @@ class StaticObstacleLayer(Node):
         # was unlatched DURING its own avoidance, then re-confirmed 0.2 s later (set flap 1->0->1).
         self.declare_parameter("unlatch_max_ego_d", 0.20)    # [m] suspend streak when |ego d| exceeds
         self.declare_parameter("unlatch_swap_suspend_s", 1.0)  # [s] suspend the streak after a line swap
+        # [m] how far the internal estimate must move before the PUBLISHED position follows it.
+        # The estimate never settles: the same physical box wanders 0.04-0.06 m lap to lap (median
+        # error against ground truth 0.09 m), because each approach sees a different face of it.
+        # Every one of those wanders is an obstacle-set change downstream -- 12 of 25 set changes
+        # in one run were nothing but this -- and each costs a re-solve, a swap, and a
+        # FrenetConverter rebuild in three consumers. Sized just over the largest wander observed
+        # (0.126 m); a box that has actually been moved (0.53 m in the same log) crosses it at once,
+        # so nothing is slowed down. The estimate itself is untouched -- this is a publish gate.
+        self.declare_parameter("publish_deadband_m", 0.12)
 
         self.static_vel_thresh = float(self.get_parameter("static_vel_thresh").value)
         self.require_is_static = bool(self.get_parameter("require_is_static").value)
@@ -116,6 +129,7 @@ class StaticObstacleLayer(Node):
         self.unlatch_clear_msgs_min = int(self.get_parameter("unlatch_clear_msgs_min").value)
         self.unlatch_max_ego_d = float(self.get_parameter("unlatch_max_ego_d").value)
         self.unlatch_swap_suspend_s = float(self.get_parameter("unlatch_swap_suspend_s").value)
+        self.publish_deadband_m = float(self.get_parameter("publish_deadband_m").value)
 
         self._ego_d: Optional[float] = None
         self._ego_vs: Optional[float] = None
@@ -407,8 +421,18 @@ class StaticObstacleLayer(Node):
             m.id = t.marker_id
             m.type = Marker.CYLINDER
             m.action = Marker.ADD
-            m.pose.position.x = t.x
-            m.pose.position.y = t.y
+            # the HELD position, not the live estimate (see publish_deadband_m)
+            if t.pub_x is None or t.pub_y is None:
+                t.pub_x, t.pub_y = t.x, t.y
+            elif math.hypot(t.x - t.pub_x, t.y - t.pub_y) > self.publish_deadband_m:
+                self.get_logger().info(
+                    f"[static_obs_layer] obstacle @({t.pub_x:.2f},{t.pub_y:.2f}) moved "
+                    f"{math.hypot(t.x - t.pub_x, t.y - t.pub_y):.2f} m "
+                    f"(> {self.publish_deadband_m:.2f}) -> republishing at "
+                    f"({t.x:.2f},{t.y:.2f})")
+                t.pub_x, t.pub_y = t.x, t.y
+            m.pose.position.x = t.pub_x
+            m.pose.position.y = t.pub_y
             m.pose.orientation.w = 1.0
             m.scale.x = 2.0 * t.r
             m.scale.y = 2.0 * t.r

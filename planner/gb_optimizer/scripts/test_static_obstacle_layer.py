@@ -5,7 +5,9 @@ No ROS graph needed beyond rclpy init (no spin, no sim):
     source install/setup.bash && python3 planner/gb_optimizer/scripts/test_static_obstacle_layer.py
 """
 import sys
+import types
 
+import numpy as np
 import rclpy
 from f110_msgs.msg import Obstacle, ObstacleArray
 from nav_msgs.msg import Odometry
@@ -206,6 +208,46 @@ def test_a_track_behind_the_car_never_accumulates_a_clear_streak():
     print("PASS a track behind the car accumulates no clear streak")
 
 
+def published_xy(node):
+    """The positions the layer actually PUBLISHES (skipping the DELETEALL marker)."""
+    pub = []
+    node.pub = types.SimpleNamespace(publish=lambda arr: pub.append(arr))
+    node.publish_cb()
+    return [(round(m.pose.position.x, 3), round(m.pose.position.y, 3))
+            for m in pub[-1].markers if m.action == 0]
+
+
+def test_publish_position_holds_still_under_estimate_noise():
+    # The estimate never settles -- the same physical box wanders 0.04-0.06 m lap to lap because
+    # each approach sees a different face of it. Every wander was an obstacle-set change
+    # downstream: 12 of 25 set changes in one run were nothing else, and each cost a re-solve, a
+    # swap and a FrenetConverter rebuild in three consumers.
+    node = make_node()
+    t = confirm_obstacle(node, x=3.0, y=0.0, s=10.0)
+    assert published_xy(node) == [(3.0, 0.0)], published_xy(node)
+    for dx, dy in ((0.05, 0.02), (-0.04, 0.03), (0.06, -0.05), (0.03, 0.06)):
+        for _ in range(6):                      # let the EMA settle on the wandered position
+            node.obstacles_cb(arr(det(3.0 + dx, 0.0 + dy, 10.0)))
+        assert published_xy(node) == [(3.0, 0.0)], \
+            f"a {np.hypot(dx, dy):.3f} m wander must not move the published position"
+    assert np.hypot(t.x - 3.0, t.y - 0.0) > 0.0, "…while the internal estimate did follow it"
+    print(f"PASS the published position holds still through wanders up to "
+          f"{max(np.hypot(*d) for d in ((0.05,0.02),(0.04,0.03),(0.06,0.05),(0.03,0.06))):.3f} m")
+
+
+def test_publish_position_follows_a_real_move_at_once():
+    # A box that has actually been moved crosses the dead band immediately -- reactivity is kept.
+    node = make_node()
+    confirm_obstacle(node, x=3.0, y=0.0, s=10.0)
+    published_xy(node)
+    for _ in range(8):
+        node.obstacles_cb(arr(det(3.51, -0.16, 10.0)))   # the 0.53 m move seen in the log
+    got = published_xy(node)
+    assert got and np.hypot(got[0][0] - 3.0, got[0][1] - 0.0) > 0.3, \
+        f"a real move must be republished at once, got {got}"
+    print(f"PASS a real move is republished immediately (now at {got[0]})")
+
+
 def test_window_exit_resets():
     node = make_node()
     t = confirm_obstacle(node, s=10.0)
@@ -316,7 +358,9 @@ def test_track_s_reanchors_on_a_line_swap():
 def main():
     rclpy.init()
     try:
-        for fn in (test_confirm_and_unlatch, test_unlatch_demotes_and_keeps_the_identity,
+        for fn in (test_publish_position_holds_still_under_estimate_noise,
+                   test_publish_position_follows_a_real_move_at_once,
+                   test_confirm_and_unlatch, test_unlatch_demotes_and_keeps_the_identity,
                    test_demoted_track_decays_at_the_lap_boundary,
                    test_line_swap_suspends_the_streak, test_ego_offline_suspends_streak,
                    test_sighting_resets_streak, test_memory_detection_does_not_reset,
