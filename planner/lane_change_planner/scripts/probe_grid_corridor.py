@@ -5,6 +5,12 @@ waypoint bounds were rejecting on the f map?
 Runs the REAL _grid_corridor / _lane_bounds / _choose_lane against the REAL f map: its
 global_waypoints.json AND its f.png occupancy grid, with a GridFilter stand-in that
 reproduces GridFilter's own pixel convention and erosion exactly.
+
+A DIAGNOSTIC, not a test: it prints a comparison table and asserts nothing. It lived in test/
+under a test_ name, where pytest collected it and ran the whole body -- map loads, erosion and a
+few hundred _choose_lane solves -- as a side effect of collection, with no verdict at the end.
+
+  ~/miniforge3/envs/unicorn/bin/python3 planner/lane_change_planner/scripts/probe_grid_corridor.py
 """
 import json
 import types
