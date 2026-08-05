@@ -19,6 +19,24 @@ from gb_optimizer.static_obstacle_layer import StaticObstacleLayer
 TRACK_LEN = 40.0
 
 
+# The tests construct a REAL StaticObstacleLayer, so rclpy must be initialised. main() does that
+# for a standalone run; under pytest there is no main(), and every test failed with
+# NotInitializedException -- i.e. the whole file counted as "collected" while gating nothing.
+try:
+    import pytest
+
+    @pytest.fixture(scope="module", autouse=True)
+    def _rclpy_context():
+        if not rclpy.ok():
+            rclpy.init()
+            yield
+            rclpy.shutdown()
+        else:
+            yield
+except ImportError:                                   # standalone run without pytest installed
+    pass
+
+
 def make_node():
     node = StaticObstacleLayer()
     wp = WpntArray()
