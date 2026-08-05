@@ -2166,6 +2166,8 @@ def _reopt_local_window_impl(
     hold_kappa_max: float = 0.3,
     merge_span_extra_m: float = 1.5,
     merge_easement_kappa_max: float = 0.60,
+    corridor_hi: Optional[np.ndarray] = None,
+    corridor_lo: Optional[np.ndarray] = None,
 ) -> dict:
     """Fast ONLINE obstacle-aware raceline: reshape the REACTIVE avoidance spline into a global
     line. Each `apex` (map-frame (x,y) captured from the reactive spliner on the exploration lap)
@@ -2234,6 +2236,22 @@ def _reopt_local_window_impl(
     # tolerance the fit is already permitted to spend.
     hi_raw = clean_dr - 0.5 * w_veh - wall_margin
     lo_raw = -(clean_dl - 0.5 * w_veh - wall_margin)
+    # ...and INTERSECTED with the corridor measured in the eroded occupancy map, where the caller
+    # can supply one (car-centre limits, NaN at a station it could not measure). The waypoint
+    # bounds are optimistic exactly where it matters: measured on ifac, at the stations a corner
+    # hump's EXIT ramp runs through, the laid offset exceeded the map's own car-centre limit by
+    # 5-44 mm. The bundle then died at the final wall gate -- 14 of 15 live re-opt refusals, all
+    # the same violation -- and because that gate judges the whole bundle, the humps of every
+    # OTHER obstacle went with it.
+    # An intersection can only TIGHTEN: a line that changes because of this is a line that would
+    # have been refused. NaN stations keep the waypoint bound, so a missing or unmeasurable map
+    # costs nothing and never fails closed.
+    if corridor_hi is not None:
+        ch = np.asarray(corridor_hi, float)
+        hi_raw = np.minimum(hi_raw, np.where(np.isfinite(ch), ch, np.inf))
+    if corridor_lo is not None:
+        cl = np.asarray(corridor_lo, float)
+        lo_raw = np.maximum(lo_raw, np.where(np.isfinite(cl), cl, -np.inf))
     hi_off = np.minimum(_cyclic_smooth(hi_raw, win=7), hi_raw + fit_tol)
     lo_off = np.maximum(_cyclic_smooth(lo_raw, win=7), lo_raw - fit_tol)
     lo_inc = np.minimum(lo_off, 0.0)

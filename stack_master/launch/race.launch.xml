@@ -54,6 +54,7 @@
   <arg name="reopt_hold_max_gap" default="8.0" description="[m] widest gap between two SAME-SIDE obstacles the re-optimized line may HOLD its offset across instead of returning to the raceline between them. Returning costs two merge inflections and a speed dip, and buys a stretch of racing line the car leaves again immediately; beyond this gap the stretch is long enough to be worth taking. The held shape is offered to the reach search as an extra CANDIDATE -- the ordinary lap-time ranking still picks the winner. 0 disables it."/>
   <arg name="reopt_hold_kappa_max" default="0.3" description="[1/m] the hold above is only offered where the RACELINE is straight: max |kappa_clean| over the bridged span. In a corner the line between two boxes is the apex, and holding an offset across it gives that away."/>
   <arg name="reopt_fit_tol" default="0.005" description="[m] corridor-fit tolerance of the re-optimizer. The corridor is a smoothed estimate rippling ~2 mm between stations while the amplitude cap parks the hump peak exactly on it, so a zero tolerance rejects every wide reach over a sub-mm violation. Spent out of reopt_wall_margin."/>
+  <arg name="reopt_grid_corridor" default="true" description="Intersect the re-optimizer's corridor with the one MEASURED in the eroded occupancy map (min(waypoint, grid)). The waypoint bounds are optimistic by 5-44 mm where a corner hump's exit ramp runs, and the final wall gate was rejecting whole bundles over it (14 of 15 live refusals). An intersection can only tighten, and a station the map cannot answer for keeps its waypoint bound. false reproduces the old corridor."/>
   <!-- Detection front-end used effectively: sim has no Livox, so force the 2D 'scan' path there;
        the real car honours detection_source. -->
   <let name="det_src" value="scan" if="$(var sim)"/>
@@ -96,6 +97,7 @@
     <arg name="reopt_hold_max_gap" value="$(var reopt_hold_max_gap)"/>
     <arg name="reopt_hold_kappa_max" value="$(var reopt_hold_kappa_max)"/>
     <arg name="reopt_fit_tol" value="$(var reopt_fit_tol)"/>
+    <arg name="reopt_grid_corridor" value="$(var reopt_grid_corridor)"/>
     <arg name="use_hokuyo" value="$(var use_hokuyo)"/>
     <arg name="use_livox"  value="$(var use_livox)"/>
   </include>

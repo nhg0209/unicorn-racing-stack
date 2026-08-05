@@ -607,6 +607,108 @@ class _FakeMap:
         self.eroded_image[(y < wall_lo) | (y > wall_hi), :] = 0
 
 
+class _RingMap:
+    """Eroded-map stand-in: free in an ANNULUS around a circle of radius R.
+
+    A closed loop, because _wrap_normals is a wrap-around difference -- an open line has a seam
+    where the basis flips. Asymmetric on purpose (more room outside than in) so the two sides of
+    the measured corridor are distinguishable.
+    """
+
+    def __init__(self, R=8.0, inward=0.60, outward=0.90, resolution=0.05):
+        self.resolution = resolution
+        self.origin = (-(R + 4.0), -(R + 4.0))
+        n = int(2 * (R + 4.0) / resolution)
+        ax = (np.arange(n) + 0.5) * resolution + self.origin[0]
+        ay = (np.arange(n) + 0.5) * resolution + self.origin[1]
+        r = np.hypot(ax[None, :], ay[:, None])
+        free = (r >= R - inward) & (r <= R + outward)
+        self.eroded_image = np.where(free, 255, 0).astype(np.uint8)
+
+
+def test_the_grid_corridor_is_measured_where_the_offset_is_laid():
+    # The corridor the re-opt fits its humps into came from the waypoints' d_left/d_right, which
+    # are optimistic by 5-44 mm exactly where a corner hump's exit ramp runs -- and the final wall
+    # gate, which judges the WHOLE bundle, was rejecting every other obstacle's hump along with it.
+    # Measuring it in the eroded map instead is what makes the fit see the real wall.
+    R, IN, OUT = 8.0, 0.60, 0.90
+    n = make_node()
+    th = np.arange(0.0, 2 * np.pi, 0.1 / R)
+    n._clean_xy = np.column_stack([R * np.cos(th), R * np.sin(th)])
+    n.wall_margin = 0.05
+    n.wall_gate_kernel = 7
+    n.map_filter = _RingMap(R=R, inward=IN, outward=OUT)
+    n._grid_corr_cache = None
+    lo, hi = n._grid_corridor_lap()
+    # +d is the direction _wrap_normals points -- the same basis the offset is laid on, and the
+    # same sign convention as the waypoint bound (hi from d_right)
+    radial = n._clean_xy / np.linalg.norm(n._clean_xy, axis=1)[:, None]
+    outward_is_plus = float(np.mean(np.sum(core._wrap_normals(n._clean_xy) * radial, axis=1))) > 0
+    plus, minus = ((OUT, -IN) if outward_is_plus else (IN, -OUT))
+    # the erosion already reserves half a car, so only wall_margin comes off the measured extent
+    assert abs(np.nanmedian(hi) - (plus - 0.05)) < 0.06, np.nanmedian(hi)
+    assert abs(np.nanmedian(lo) - (minus + 0.05)) < 0.06, np.nanmedian(lo)
+    assert np.isfinite(hi).all(), "a free band must be measurable at every station"
+    # cached against the image itself: a second call must not re-measure
+    img = n.map_filter.eroded_image
+    assert n._grid_corr_cache[0] is img
+    n.map_filter.eroded_image = None
+    assert n._grid_corridor_lap() is None, "no map -> None, and the caller keeps the waypoint bounds"
+    print(f"PASS the grid corridor is measured on the laid basis "
+          f"(annulus [{minus:+.2f}, {plus:+.2f}] in +d -> "
+          f"[{np.nanmedian(lo):+.2f}, {np.nanmedian(hi):+.2f}])")
+
+
+def test_the_grid_corridor_can_only_tighten_the_fit():
+    # Variant C, min(waypoint, grid): a line that CHANGES because of this is a line that would
+    # have been refused by the wall gate. So a corridor wider than the waypoint bound must change
+    # nothing at all, an unmeasurable station must keep its waypoint bound -- and where the map IS
+    # tighter, the fit must obey it.
+    #
+    # The tightening is applied over the EXIT RAMP, not at the apex, because that is the measured
+    # failure: the apex clears the box by design, and it was the ramp running out of a corner that
+    # sat 5-44 mm outside the map's own limit and took the whole bundle down with it.
+    N = 400
+    line = np.column_stack([np.arange(N) * 0.1, np.zeros(N)])
+    dr = np.full(N, 1.2)
+    dl = np.full(N, 1.2)
+    ref = np.column_stack([line[:, 0], line[:, 1], dr, dl])
+    kappa = np.zeros(N)
+    vx = np.full(N, 5.0)
+    apex = [(20.0, 0.45)]
+    obs = [(20.0, 0.0, 0.15)]
+    cfg = str(Path(__file__).resolve().parents[3] / "stack_master/config/SIM")
+
+    def solve(hi=None, lo=None):
+        return core.reoptimize_local_window(
+            line, dr, dl, ref, apex, cfg,
+            params=core.ModulationParams(obs_margin=0.35), w_veh=0.30, clean_vx=vx,
+            wall_margin=0.05, reach_time=0.0, reach_min=1.0, reach_max=6.0, clean_kappa=kappa,
+            fit_tol=core._FIT_TOL_DEFAULT, apex_obstacles=obs, corridor_hi=hi, corridor_lo=lo)
+
+    a0 = np.asarray(solve()["alpha"], float)
+    assert np.allclose(a0, np.asarray(solve(hi=np.full(N, 5.0), lo=np.full(N, -5.0))["alpha"], float)), \
+        "a corridor wider than the waypoint bound must change nothing"
+    assert np.allclose(a0, np.asarray(solve(hi=np.full(N, np.nan),
+                                            lo=np.full(N, np.nan))["alpha"], float)), \
+        "an unmeasurable station must keep its waypoint bound"
+
+    ramp = slice(225, 245)                        # 2.5-4.5 m past the apex, inside the exit ramp
+    assert np.max(np.abs(a0[ramp])) > 0.12, "the baseline must actually use the stations under test"
+    lo = np.full(N, -5.0)
+    hi = np.full(N, 5.0)
+    lo[ramp] = -0.10
+    hi[ramp] = 0.10
+    a1 = np.asarray(solve(hi=hi, lo=lo)["alpha"], float)
+    tol = core._FIT_TOL_DEFAULT
+    assert np.max(np.abs(a1[ramp])) <= 0.10 + tol + 1e-9, \
+        f"the laid line broke the corridor it was given: {np.max(np.abs(a1[ramp])):.4f} > 0.10"
+    assert np.max(np.abs(a1)) > 0.4, "the apex itself must survive -- only the ramp was tightened"
+    print(f"PASS the grid corridor binds where it is tighter and nowhere else "
+          f"(exit ramp {np.max(np.abs(a0[ramp])):.3f} -> {np.max(np.abs(a1[ramp])):.3f} m, "
+          f"apex {np.max(np.abs(a1)):.2f} m kept)")
+
+
 def test_every_obstacle_gets_a_knot_even_with_no_reactive_apex():
     # A hump's amplitude and station were already derived from the obstacle; its EXISTENCE was not.
     # It needed a recorded reactive apex, so an obstacle the reactive layer never once avoided
@@ -1537,6 +1639,8 @@ if __name__ == "__main__":
     test_clearance_drift_retriggers_once()
     test_minor_apex_refinement_keeps_the_pending()
     test_swap_held_while_trailing_a_close_obstacle()
+    test_the_grid_corridor_is_measured_where_the_offset_is_laid()
+    test_the_grid_corridor_can_only_tighten_the_fit()
     test_every_obstacle_gets_a_knot_even_with_no_reactive_apex()
     test_knot_side_comes_from_the_map_not_the_waypoint_bounds()
     test_a_stale_solve_cannot_undo_a_clean_swap()

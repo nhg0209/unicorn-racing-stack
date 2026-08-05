@@ -36,6 +36,7 @@ continuity; a timeout forces the swap if no frenet odom is seen (bench testing).
 
 import copy
 import os
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -219,6 +220,11 @@ class StaticReoptNode(Node):
         # laid curvature from 1.98 to 1.46 (curvlim 1.5) and +1.62 s of lap time back to +0.05 s.
         # Raise only if the walls are being shaved; it is spent out of wall_margin.
         self.declare_parameter("fit_tol", 0.005)
+        # Intersect the corridor the re-opt fits its humps into with the one MEASURED in the eroded
+        # occupancy map (see _grid_corridor_lap). Off reproduces the waypoint-only corridor, which
+        # is optimistic by 5-44 mm exactly where a corner hump's exit ramp runs -- and that is what
+        # the final wall gate was rejecting whole bundles over.
+        self.declare_parameter("reopt_grid_corridor", True)
 
         self.map_name = self.get_parameter("map").value
         self.racecar_version = self.get_parameter("racecar_version").value
@@ -248,6 +254,8 @@ class StaticReoptNode(Node):
         self.qp_veh_width = float(self.get_parameter("qp_veh_width").value)
         self.wall_margin = float(self.get_parameter("wall_margin").value)
         self.fit_tol = float(self.get_parameter("fit_tol").value)
+        self.reopt_grid_corridor = bool(self.get_parameter("reopt_grid_corridor").value)
+        self._grid_corr_cache = None            # (eroded_image, (lo, hi)) -- computed once per map
 
         self.input_path = os.path.join(
             get_package_share_directory("stack_master"), "config", self.racecar_version)
@@ -659,6 +667,69 @@ class StaticReoptNode(Node):
         free[inside] = img[py[inside], px[inside]] == 255
         return free
 
+    def _grid_corridor_lap(self):
+        """Car-centre lateral limits (lo[N], hi[N]) at EVERY station of the clean line, measured in
+        the eroded occupancy map. NaN where the map cannot answer. None when no map has arrived.
+
+        The waypoint bounds d_left/d_right are what the re-opt fits its humps into, and they are
+        optimistic where it matters: measured on ifac, at the stations a corner hump's EXIT ramp
+        runs through, the laid offset sat 5-44 mm outside the map's own car-centre limit. The
+        bundle then died at the final wall gate -- which judges the WHOLE bundle, so one corner
+        took every other obstacle's hump with it (14 of 15 live refusals, all this violation).
+
+        Measuring it here instead of clipping afterwards is what makes the fit see the real wall:
+        the amplitude cap, the reach search and the corridor-fit tolerance all read these bounds.
+        Same convention as the rest of the file: the erosion (wall_gate_kernel = 7 cells = 0.15 m)
+        already reserves half a car, so what is measured IS a car-centre limit and only
+        wall_margin comes off on top -- the same total reserve as the waypoint side's
+        0.5*w_veh + wall_margin.
+
+        Computed ONCE per map (~5 ms for 368 stations x 121 samples in one vectorised lookup) and
+        cached against the eroded image itself, so a solve pays nothing.
+        """
+        f = self.map_filter
+        img = getattr(f, "eroded_image", None) if f is not None else None
+        if img is None:
+            return None
+        if self._grid_corr_cache is not None and self._grid_corr_cache[0] is img:
+            return self._grid_corr_cache[1]
+        t0 = time.perf_counter()
+        nvec = core._wrap_normals(self._clean_xy)      # the basis the offset is laid on
+        reach, step = 3.0, 0.05
+        d_scan = np.arange(-reach, reach + 1e-9, step)
+        i0 = int(np.argmin(np.abs(d_scan)))
+        pts = self._clean_xy[:, None, :] + d_scan[None, :, None] * nvec[:, None, :]
+        free = self._map_free(pts.reshape(-1, 2))
+        if free is None:
+            return None
+        free = free.reshape(len(self._clean_xy), len(d_scan))
+        n = len(self._clean_xy)
+        hi = np.full(n, np.nan)
+        lo = np.full(n, np.nan)
+        # Only the CONTIGUOUS free run containing the raceline counts: free space belonging to
+        # another part of the track further out must not widen the corridor.
+        blocked_hi = ~free[:, i0:]
+        blocked_lo = ~free[:, :i0 + 1][:, ::-1]
+        any_hi, any_lo = blocked_hi.any(axis=1), blocked_lo.any(axis=1)
+        k_hi = np.where(any_hi, np.argmax(blocked_hi, axis=1), blocked_hi.shape[1])
+        k_lo = np.where(any_lo, np.argmax(blocked_lo, axis=1), blocked_lo.shape[1])
+        ok = free[:, i0]                               # the raceline itself must read free
+        hi[ok] = (k_hi[ok] - 1) * step - self.wall_margin
+        lo[ok] = -((k_lo[ok] - 1) * step - self.wall_margin)
+        # A station whose free run is narrower than 2*wall_margin has no room for the reserve;
+        # collapse it to the middle rather than invert it.
+        bad = ok & (hi < lo)
+        mid = 0.5 * (hi + lo)
+        hi[bad] = mid[bad]
+        lo[bad] = mid[bad]
+        n_meas = int(np.count_nonzero(np.isfinite(hi)))
+        self.get_logger().info(
+            f"[static_reopt] grid corridor measured at {n_meas}/{n} stations in "
+            f"{(time.perf_counter() - t0) * 1e3:.1f} ms (kernel {self.wall_gate_kernel}, "
+            f"wall_margin {self.wall_margin:.2f}); the rest keep the waypoint bounds")
+        self._grid_corr_cache = (img, (lo, hi))
+        return lo, hi
+
     def _grid_room(self, i: int, left: np.ndarray, d_obs: float, r: float):
         """Free room beside the obstacle on each side, measured in the ERODED MAP: (left, right).
 
@@ -849,6 +920,8 @@ class StaticReoptNode(Node):
             # assumes the line is built to).
             apexes = [xy for xy, _o, _src in pairs]
             apex_obs = [(float(o.x), float(o.y), float(o.r)) for _xy, o, _src in pairs]
+            corr = self._grid_corridor_lap() if self.reopt_grid_corridor else None
+            corr_lo, corr_hi = corr if corr is not None else (None, None)
             res = core.reoptimize_local_window(
                 self._clean_xy, self._clean_dr, self._clean_dl, self.reftrack,
                 apexes, self.input_path,
@@ -858,7 +931,8 @@ class StaticReoptNode(Node):
                 clean_kappa=self._clean_kappa, fit_tol=self.fit_tol,
                 apex_obstacles=apex_obs, relax_floor=self.relax_floor,
                 apex_merge_gap_m=self.apex_merge_gap_m,
-                hold_max_gap_m=self.hold_max_gap_m, hold_kappa_max=self.hold_kappa_max)
+                hold_max_gap_m=self.hold_max_gap_m, hold_kappa_max=self.hold_kappa_max,
+                corridor_lo=corr_lo, corridor_hi=corr_hi)
         else:
             # Legacy whole-track mincurv_iqp (offline-grade; minutes/solve).
             res = core.reoptimize_with_obstacles(

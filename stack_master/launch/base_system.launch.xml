@@ -39,6 +39,7 @@
   <arg name="reopt_hold_max_gap" default="8.0" description="[m] widest gap between two SAME-SIDE obstacles the re-optimized line may HOLD its offset across instead of returning to the raceline between them. Returning costs two merge inflections and a speed dip, and buys a stretch of racing line the car leaves again immediately; beyond this gap the stretch is long enough to be worth taking. The held shape is offered to the reach search as an extra CANDIDATE -- the ordinary lap-time ranking still picks the winner. 0 disables it."/>
   <arg name="reopt_hold_kappa_max" default="0.3" description="[1/m] the hold above is only offered where the RACELINE is straight: max |kappa_clean| over the bridged span. In a corner the line between two boxes is the apex, and holding an offset across it gives that away."/>
   <arg name="reopt_fit_tol" default="0.005" description="[m] corridor-fit tolerance of the re-optimizer. The corridor is a smoothed estimate rippling ~2 mm between stations while the amplitude cap parks the hump peak exactly on it, so a zero tolerance rejects every wide reach over a sub-mm violation and collapses the hump (ifac: reach 5.00 -> 1.24 m, +1.62 s/lap, curvlim exceeded). Spent out of reopt_wall_margin."/>
+  <arg name="reopt_grid_corridor" default="true" description="Intersect the re-optimizer's corridor with the one MEASURED in the eroded occupancy map (min(waypoint, grid)). The waypoint bounds are optimistic by 5-44 mm where a corner hump's exit ramp runs, and the final wall gate was rejecting whole bundles over it (14 of 15 live refusals). An intersection can only tighten, and a station the map cannot answer for keeps its waypoint bound. false reproduces the old corridor."/>
 
   <!-- sim -> SIM config folder, real hardware -> CAR config folder -->
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/SIM" if="$(var sim)"/>
@@ -129,6 +130,7 @@
       <param name="hold_max_gap_m" value="$(var reopt_hold_max_gap)"/>
       <param name="hold_kappa_max" value="$(var reopt_hold_kappa_max)"/>
       <param name="fit_tol" value="$(var reopt_fit_tol)"/>
+      <param name="reopt_grid_corridor" value="$(var reopt_grid_corridor)"/>
     </node>
     <node pkg="gb_optimizer" exec="static_obstacle_layer" name="static_obstacle_layer" output="screen"/>
   </group>
