@@ -150,6 +150,63 @@ def knot_ids(p):
     return set() if c is None else {oid for (oid, _s, _d) in c['obs']}
 
 
+def test_a_box_that_enters_the_lookahead_releases_the_commit():
+    # A box from BEYOND the gather horizon -- the one case the gather cannot cover, because there
+    # is nothing to gather yet. Box 2 sits 12 m behind box 1, outside the 19.5 m gather horizon
+    # when the plan around box 1 is frozen, and comes into the lookahead while that plan is still
+    # being republished. The commit must be released by THIS condition rather than by the safety
+    # re-check, which fires later, once the frozen geometry is already violated, and publishes
+    # feasible=False -- the state machine's cue to abandon the overtake.
+    S2 = 32.0
+    for drop in (True, False):
+        p = Planner([box(20.0, -0.35, 1), box(S2, -0.35, 2)], commit_drop_on_new_obstacle=drop)
+        p.step(8.0)
+        assert p.committed_ids() == {1}, p.committed_ids()
+        fired = first_false = planned = None
+        for k in range(1, 100):                      # 0.1 m steps, past box 2 entering
+            p.log.msgs.clear()
+            p.feasible.clear()
+            cur_s = 8.0 + 0.1 * k
+            p.step(cur_s)
+            if first_false is None and False in p.feasible:
+                first_false = cur_s
+            if planned is None and 2 in p.committed_ids():
+                planned = cur_s
+            if fired is None and any("came into the" in m and "never" in m for m in p.log.msgs):
+                fired = cur_s
+        if drop:
+            assert fired is not None, "box 2 entered the lookahead and the commit was not released"
+            gap = S2 - fired
+            assert gap > 10.0, f"box 2 was only reacted to at {gap:.2f} m"
+            assert planned is not None and planned <= fired + 1e-9, \
+                "the release must be followed by a plan that includes box 2, in the same cycle"
+            assert first_false is None, (
+                f"feasible=False at s={first_false:.2f} (box 2 {S2 - first_false:.2f} m ahead): "
+                f"the release is supposed to make the re-plan happen BEFORE anything is violated")
+            print(f"PASS a box entering the lookahead releases the commit and is planned around "
+                  f"in the same cycle ({gap:.2f} m ahead, no feasible=False at all)")
+        else:
+            assert fired is None, "the harness must reproduce the failure: no release without it"
+            assert planned is None, (
+                "...and without it box 2 gets no apex at all while the frozen plan is being "
+                "republished -- it waits for the commit to expire, or for the safety re-check to "
+                "fail, whichever comes first")
+
+
+def test_the_release_does_not_fire_on_the_boxes_it_was_planned_around():
+    # The commit exists to stop the planner re-solving from a moving car every cycle. A release
+    # that fired on the boxes it was planned around would be a re-plan every cycle.
+    p = Planner([box(20.0, -0.35, 1), box(25.0, -0.35, 2)])
+    p.step(8.0)
+    assert {1, 2} <= p.committed_ids(), p.committed_ids()
+    n_before = len(p.log.msgs)
+    for k in range(1, 40):
+        p.step(8.0 + 0.1 * k)
+    released = [m for m in p.log.msgs[n_before:] if "came into the" in m]
+    assert not released, f"the commit was released without a new box: {released[:2]}"
+    print("PASS the release does not fire on the obstacles the commit was planned around")
+
+
 def test_the_gather_horizon_reaches_as_far_as_the_path():
     # obs_ok used to be filtered by the LOOKAHEAD while the path itself runs return_len + tail_m
     # past the last knot, so a candidate could be certified while its own exit ramp went through a
@@ -212,6 +269,8 @@ def test_no_infeasible_cycle_while_the_second_box_is_still_ahead():
 
 
 if __name__ == "__main__":
+    test_a_box_that_enters_the_lookahead_releases_the_commit()
+    test_the_release_does_not_fire_on_the_boxes_it_was_planned_around()
     test_the_gather_horizon_reaches_as_far_as_the_path()
     test_a_box_past_the_lookahead_takes_only_a_LEFTOVER_weave_slot()
     test_no_infeasible_cycle_while_the_second_box_is_still_ahead()

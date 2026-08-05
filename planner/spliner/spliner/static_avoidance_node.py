@@ -299,6 +299,10 @@ class ObstacleSpliner(Node):
         # feasibility is RE-DERIVED against live obstacles every cycle here: the geometry is
         # frozen, the safety verdict is not.
         self.commit_enable = True
+        # Release the commit when a QUALIFYING obstacle the commit never planned around comes into
+        # the lookahead. Freezing a path is a statement about the obstacles that were known when it
+        # was frozen, and "a new box appeared" was not among the release conditions.
+        self.commit_drop_on_new_obstacle = True
         # [m] deviation at which the committed path's ENTRY is re-anchored onto the car (it is no
         # longer a drop -- see _reanchor_commit). Must sit ABOVE the controller's steady-state
         # tracking error (~0.5 m, documented in state_machine_params.yaml recovery_exit_d_m), or
@@ -343,6 +347,7 @@ class ObstacleSpliner(Node):
             'clear_latch_ttl_s', 'squeeze_enable', 'squeeze_steps', 'squeeze_safety_floor_m',
             'squeeze_wall_floor_m', 'squeeze_max_speed_mps', 'relax_hold_s',
             'commit_enable', 'commit_dev_max', 'commit_obs_ds', 'commit_obs_dd',
+            'commit_drop_on_new_obstacle',
             'commit_reanchor_len_m', 'commit_reanchor_max_m', 'preramp_len_m',
         ]))
         self.add_on_set_parameters_callback(self.dyn_param_cb)
@@ -487,6 +492,9 @@ class ObstacleSpliner(Node):
         self.declare_parameter('commit_enable', True,
                                ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
                                                    description="Commit to a chosen evasion path and reuse it (temporal consistency) instead of re-solving every cycle"))
+        self.declare_parameter('commit_drop_on_new_obstacle', True,
+                               ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
+                                                   description="Release the committed path when an obstacle it was not planned around enters the lookahead"))
         self.declare_parameter('commit_dev_max', 0.6, dbl(0.05, 2.0, "re-anchor the committed path's entry if the car deviates this far from it [m]"))
         self.declare_parameter('commit_reanchor_len_m', 2.0, dbl(0.5, 10.0, "arc length the entry re-anchor is faded out over [m]"))
         self.declare_parameter('commit_reanchor_max_m', 1.0, dbl(0.1, 3.0, "deviation beyond which a full re-plan is taken instead [m]"))
@@ -617,6 +625,8 @@ class ObstacleSpliner(Node):
                 self.commit_enable = bool(p.value)
                 if not self.commit_enable:
                     self._committed = None
+            elif n == 'commit_drop_on_new_obstacle':
+                self.commit_drop_on_new_obstacle = bool(p.value)
             elif n == 'commit_dev_max':
                 self.commit_dev_max = float(p.value)
             elif n == 'commit_reanchor_len_m':
@@ -1131,7 +1141,7 @@ class ObstacleSpliner(Node):
         # decided by the call that is now retrying (and which left _committed None to get here).
         if self.commit_enable and self._committed is not None and not retry:
             reuse = self._reuse_committed(gb_wpnts, wpnt_dist, obs_margin_d, half_car,
-                                          obs_margin_s)
+                                          obs_margin_s, lookahead)
             if reuse is not None:
                 return reuse
 
@@ -1939,7 +1949,8 @@ class ObstacleSpliner(Node):
             'kappa': np.asarray(kappa_, dtype=float).copy(),
         }
 
-    def _reuse_committed(self, gb_wpnts, wpnt_dist, obs_margin, half_car, obs_margin_s=None):
+    def _reuse_committed(self, gb_wpnts, wpnt_dist, obs_margin, half_car, obs_margin_s=None,
+                         lookahead: float = 0.0):
         """Try to republish the committed path (the slice still ahead of the car). Returns
         (OTWpntArray, MarkerArray) on reuse, or None -- after dropping the commit -- when a fresh
         plan is needed. Publishes the feasibility verdict itself in every path it returns from."""
@@ -2019,6 +2030,31 @@ class ObstacleSpliner(Node):
                     f"re-planning the apex",
                     throttle_duration_sec=1.0)
                 self._committed = None                        # box moved enough -> re-plan the apex
+                return None
+
+        # --- a box the commit was never planned around has come into the lookahead ---
+        # The commit is a statement about the obstacles that were known when it was frozen, and
+        # "a new box appeared" was not among its release conditions. The one that eventually fires
+        # is the safety re-check below -- but that one publishes feasible=False, which is the state
+        # machine's cue to abandon the overtake, and it fires when the frozen geometry is already
+        # violated rather than when there is still room to plan.
+        #
+        # An id NOT in the commit's own list is precisely "never planned around": that list is
+        # every obstacle the plan was built against (see _store_commit). Releasing here costs one
+        # re-plan and gives the new box an apex at the range where an apex is still worth having.
+        if self.commit_drop_on_new_obstacle:
+            planned = {oid for (oid, _s, _d) in c['obs']}
+            fresh = [o for _g, o in self._gather_obstacles_ahead(self.obstacles, lookahead)
+                     if int(o.id) not in planned]
+            if fresh:
+                self.get_logger().info(
+                    f"[static_avoidance] commit released: "
+                    + ", ".join(f"box {int(o.id)} (s={o.s_center:.1f} d={o.d_center:+.2f})"
+                                for o in fresh)
+                    + f" came into the {lookahead:.1f} m lookahead and this path was never "
+                      f"planned around it -- re-planning so it gets an apex",
+                    throttle_duration_sec=1.0)
+                self._committed = None
                 return None
 
         # --- safety: the committed slice must still clear EVERY live box + stay in the corridor ---

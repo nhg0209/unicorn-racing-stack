@@ -331,6 +331,14 @@ static_avoidance_planner:
     # clears a live box, or maneuver done). Safety is NOT frozen: the committed slice is re-checked
     # against live obstacles every cycle and publishes feasible=False the instant it stops clearing.
     commit_enable: true
+    # Release the commit when a QUALIFYING obstacle it was never planned around comes into the
+    # lookahead. A frozen path is a statement about the obstacles that were known when it was
+    # frozen, and "a new box appeared" was not among the release conditions -- the one that
+    # eventually fired was the safety re-check, which fires later (once the frozen geometry is
+    # already violated) and publishes feasible=False, the state machine's cue to abandon the
+    # overtake. Measured with a box arriving from beyond the gather horizon: box 2 was planned
+    # around 15.0 m ahead with this on, and not at all with it off until the commit expired.
+    commit_drop_on_new_obstacle: true
     commit_dev_max: 0.6     # [m] deviation at which the committed path's ENTRY is re-anchored onto
                             #      the car. Was 0.35 -- BELOW the controller's ~0.5 m steady-state
                             #      tracking error -- and it dropped the commit outright, so normal
