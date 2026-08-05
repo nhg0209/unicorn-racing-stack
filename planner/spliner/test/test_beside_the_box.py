@@ -164,6 +164,57 @@ def test_a_box_behind_the_car_does_not_pull_a_knot_forward():
     print("PASS a box just behind the car does not pull a knot to the lookahead edge")
 
 
+class _PhantomGrid:
+    """Eroded-map stand-in that is FREE only in a band, and only over part of the track.
+
+    The point is that the corridor differs by station: reading it at the wrong s gives a different
+    answer, which is exactly the defect under test. Free within +-`w_near` of the raceline for
+    s < `split`, and +-`w_far` beyond it.
+    """
+
+    def __init__(self, split=20.0, w_near=1.2, w_far=0.42, resolution=0.05):
+        self.resolution = resolution
+        self.origin = (-1.0, -3.0)
+        h = int(6.0 / resolution)
+        w = int((TRACK_LEN + 2.0) / resolution)
+        y = (np.arange(h) + 0.5) * resolution + self.origin[1]
+        x = (np.arange(w) + 0.5) * resolution + self.origin[0]
+        near = (np.abs(y)[:, None] <= w_near) & (x[None, :] < split)
+        far = (np.abs(y)[:, None] <= w_far) & (x[None, :] >= split)
+        self.eroded_image = np.where(near | far, 255, 0).astype(np.uint8)
+
+
+def test_the_second_knot_reads_its_own_corridor():
+    # knots[i][0] is the distance from the CAR; _corridor_at handed it to _grid_corridor as an
+    # ABSOLUTE station. So every knot after the first read its corridor at a phantom point
+    # elsewhere on the track -- and the apex bulge was then clipped to that phantom corridor.
+    #
+    # Here the map is wide up to s = 20 and narrow after it. Two boxes sit in the WIDE part, and
+    # the car is close enough that the s-local station of the second knot (~1.6 m) falls in the
+    # wide part too -- so a correct read gives the wide corridor for both. The regression is
+    # visible the other way round: with the car at s = 18.5, the second knot's s-local value is
+    # ~1.6 while its true station is ~20.1, i.e. across the split.
+    n = planner([box(20.1, -0.35, oid=1), box(21.1, -0.35, oid=2)], cur_s=18.5)
+    n.trust_grid_bounds, n.use_grid_check = True, False
+    n.grid_scan_max, n.grid_scan_step = 3.0, 0.05
+    n.map_filter = _PhantomGrid(split=20.0)
+    # the second knot's TRUE station is past the split (narrow); its s-local value is not
+    true_cor = n._grid_corridor(21.1, wall_margin=n.wall_margin)
+    phantom_cor = n._grid_corridor(21.1 - 18.5, wall_margin=n.wall_margin)
+    assert true_cor is not None and phantom_cor is not None
+    assert abs((true_cor[1] - true_cor[0]) - (phantom_cor[1] - phantom_cor[0])) > 0.5, \
+        "the harness must make the two reads genuinely differ"
+    w, _m = n.do_spline(gb_wpnts())
+    assert w.wpnts, "the pair must still be plannable"
+    # the peak must respect the corridor at the SECOND box's own station, not the phantom one
+    peak = max(abs(x.d_m) for x in w.wpnts)
+    assert peak <= max(abs(true_cor[0]), abs(true_cor[1])) + 1e-6, \
+        f"peak |d| {peak:.3f} exceeds the corridor at the knot's real station {true_cor}"
+    print(f"PASS the second knot reads the corridor at its own station "
+          f"(true {true_cor[1]-true_cor[0]:.2f} m wide vs phantom "
+          f"{phantom_cor[1]-phantom_cor[0]:.2f} m)")
+
+
 def test_a_path_exists_on_the_approach():
     # Where the geometry is solvable, a path must come out. Closer than that the car is already
     # inside the box's INFLATED keep-out (obs_margin on top of the box), which no re-plan can
@@ -197,6 +248,7 @@ def test_a_box_already_behind_the_car_keeps_its_keep_out():
 if __name__ == "__main__":
     test_a_blocking_box_keeps_its_knot_while_the_car_is_beside_the_first()
     test_a_box_behind_the_car_does_not_pull_a_knot_forward()
+    test_the_second_knot_reads_its_own_corridor()
     test_a_path_exists_on_the_approach()
     test_a_box_already_behind_the_car_keeps_its_keep_out()
     print("ALL PASS")

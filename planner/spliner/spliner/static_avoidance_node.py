@@ -1312,7 +1312,18 @@ class ObstacleSpliner(Node):
             return (-(gb_wpnts[cor_idx].d_right - sample_margin),
                     gb_wpnts[cor_idx].d_left - sample_margin)
 
-        knot_cor = [(d_lo, d_hi)] + [_corridor_at(kc, ks) for (ks, _ko, kc) in knots[1:]]
+        # The obstacle's ABSOLUTE station, not knots[i][0]. That first element is the distance
+        # from the CAR (s_c = min(gap_c, lookahead)), while _corridor_at hands it to
+        # _grid_corridor as an absolute s (`s_query % gb_max_s`). So every knot after the first had
+        # its corridor read at a phantom point somewhere else on the track, the apex bulge was
+        # clipped to that phantom corridor, and when the clip landed exactly on d_box_hi the
+        # inclusive keep-out test in obs_ok rejected every candidate -- an empty publication beside
+        # the second box. Only under trust_grid_bounds: the waypoint fallback below already used
+        # cor_idx, which is the obstacle's own index.
+        #
+        # knots[i][0] itself stays s-local: it is consumed that way by the ramp fit, the BPoly
+        # breakpoints, the span mask and the merge window.
+        knot_cor = [(d_lo, d_hi)] + [_corridor_at(kc, _ko.s_center) for (_ks, _ko, kc) in knots[1:]]
 
         # --- ADAPTIVE RAMP LENGTH ------------------------------------------------------------
         # The corridor was tested at the obstacle's own station and nowhere else, while the path
