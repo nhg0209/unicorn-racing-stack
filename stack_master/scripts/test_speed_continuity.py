@@ -21,7 +21,9 @@ obstacles at s ~= 36.3 and ~= 3.5):
      lateral error was only 0.018 m -- which is past the controller's AEB_thres (0.5 m), so AEB
      clamped to 2.0 m/s for 0.4 s and then released with a +1.24 m/s step.
 
-Run standalone (no ROS, no build):   python3 stack_master/scripts/test_speed_continuity.py
+Run (needs a sourced workspace -- the window-anchor check loads the real state machine):
+    source /opt/ros/jazzy/setup.bash && source ~/unicorn_ws/install/setup.bash
+    python3 stack_master/scripts/test_speed_continuity.py
 Re-check a new recording:            python3 stack_master/scripts/test_speed_continuity.py --bag <dir>
 
 The --bag mode needs a sourced workspace (it deserializes f110_msgs).
@@ -30,6 +32,7 @@ The --bag mode needs a sourced workspace (it deserializes f110_msgs).
 import argparse
 import os
 import sys
+import types
 
 import numpy as np
 
@@ -73,33 +76,66 @@ def test_slew_limit():
 
 
 def test_trailing_handoff():
-    """3.47 -> 5.13 (the t=21.92 transition) must ramp, and must still get there quickly."""
+    """3.47 -> 5.13 (the t=21.92 transition) must ramp, and must still get there quickly.
+
+    Driven through the REAL Controller._slew_limit_speed, like test_slew_limit above. It used to
+    run its own `h = min(target, h + step)` arithmetic, which is a statement about a formula this
+    file wrote rather than about the code that ships -- it would have passed unchanged if the
+    limiter had been deleted.
+    """
+    C = _load_controller_slew()
+
+    class Stub:
+        loop_rate, max_accel_mps2, max_decel_mps2 = LOOP_RATE, GGV_AX_MAX, GGV_AX_MAX
+        _speed_cmd_prev = None
+        _slew_limit_speed = C._slew_limit_speed
+
     step = GGV_AX_MAX / LOOP_RATE
-    h, target = 3.47, 5.13
-    cmds, prev = [], h
+    s = Stub()
+    prev, target = 3.47, 5.13
+    s._slew_limit_speed(prev)                      # first cycle adopts, i.e. the handoff starts here
+    cmds = []
     for _ in range(200):
-        h = min(target, h + step)
-        cmds.append(h)
-        if h >= target - 1e-3:
+        cmds.append(s._slew_limit_speed(target))
+        if cmds[-1] >= target - 1e-3:
             break
     assert max(np.diff([prev] + cmds)) <= step + 1e-9, "handoff exceeded the accel limit"
+    assert cmds[-1] >= target - 1e-3, "the handoff never reached the commanded speed"
     secs = len(cmds) / LOOP_RATE
     assert secs < 0.5, f"handoff took {secs:.2f} s — too sluggish to pass with"
     print(f"PASS trailing handoff: {prev:.2f} -> {target:.2f} m/s in {len(cmds)} cycles "
-          f"({secs:.2f} s), max step {step:.3f} m/s")
+          f"({secs:.2f} s) through Controller._slew_limit_speed, max step {step:.3f} m/s")
+
+
+def _load_state_machine():
+    """The REAL StateMachine class, without constructing a node (needs a sourced workspace)."""
+    import types
+    p = os.path.join(STACK_MASTER, "..", "state_machine", "state_machine", "state_machine_node.py")
+    mod = types.ModuleType("sm_under_test")
+    mod.__dict__["__file__"] = p
+    with open(p) as f:
+        exec(compile(f.read(), p, "exec"), mod.__dict__)
+    return mod.StateMachine
 
 
 def test_window_anchor():
     """A window index that is 0.55 m ahead (the observed reopt-swap frame mismatch) must snap back,
-    and the +-search_m bound must stop it snapping across the track."""
+    and the +-search_m bound must stop it snapping across the track.
+
+    Driven through the REAL StateMachine.anchor_gb_index. It used to define a local copy of the
+    same arithmetic, so nothing in this repo called the shipped method: it could have been
+    deleted, or its search bound removed, with every test still green.
+    """
     n, ds = 366, 0.1
     arr = np.column_stack([np.arange(n) * ds, np.zeros(n)])   # straight track, x = s
+    SM = _load_state_machine()
 
     def anchor(s_idx, car_x, search_m=3.0):
-        k = max(1, int(search_m / ds))
-        idx = (s_idx + np.arange(-k, k + 1)) % n
-        d = np.hypot(arr[idx, 0] - car_x, arr[idx, 1] - 0.0)
-        return int(idx[int(np.argmin(d))])
+        f = types.SimpleNamespace(
+            current_position=(car_x, 0.0),
+            cur_gb_wpnts=types.SimpleNamespace(is_init=True, array=arr),
+            num_glb_wpnts=n, wpnt_dist=ds)
+        return SM.anchor_gb_index(f, s_idx, search_m)
 
     car_x = 8.64
     bad = int(car_x / ds + 0.5) + 6                # s frame off by 6 stations = 0.6 m
