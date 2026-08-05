@@ -386,9 +386,17 @@ class StaticReoptNode(Node):
         # car within ~apex distance of the new line; anything bigger means the pending geometry
         # is poisoned (observed: a ratcheted 1.41 m hump) and committing it strands the car.
         self.declare_parameter("swap_deadlock_max_dev", 0.6)
+        # [m] how far the car may be from the PENDING line and still have the deadlock breaker
+        # force the swap. Above it the breaker holds instead: a queued line is kept, the current
+        # one keeps being followed, and the swap waits for the car to be near the new geometry.
+        # swap_deadlock_max_dev (0.6) is a different question -- above THAT the pending is judged
+        # poisoned and thrown away. Between the two the line is fine and the moment is not.
+        self.declare_parameter("swap_deadlock_max_dev_commit_m", 0.25)
         self.swap_deadlock_s = float(self.get_parameter("swap_deadlock_s").value)
         self.swap_deadlock_max_vs = float(self.get_parameter("swap_deadlock_max_vs").value)
         self.swap_deadlock_max_dev = float(self.get_parameter("swap_deadlock_max_dev").value)
+        self.swap_deadlock_max_dev_commit_m = float(
+            self.get_parameter("swap_deadlock_max_dev_commit_m").value)
         self._pending_since = 0.0               # wall time the current pending was installed
         # RETRO-APEX buffer: recent reactive paths. A near-start obstacle is often CONFIRMED only
         # after the car already passed it (layer confirm latency) — the avoidance that was just
@@ -1920,6 +1928,28 @@ class StaticReoptNode(Node):
                         f"pending; waiting for a sane apex/rebuild")
                     self._pending = None
                     self._pending_dev = None
+                    return
+                if dev_car > self.swap_deadlock_max_dev_commit_m:
+                    # NOT sane enough to force. The breaker exists to un-stick a car that has been
+                    # waiting behind an obstacle, and its old cap only DISCARDED a pending beyond
+                    # 0.6 m -- so anything under that was committed however far the car was from
+                    # it. Observed: 0.59 m, forced mid-hump after a 5.3 s wait. The reference
+                    # stepped half a metre sideways under a car already in an avoidance, the
+                    # obstacle's d jumped 0.58 m in one cycle as the frame changed, and the two
+                    # replans that followed were at g_near 0.81 and 0.56 m -- inside the 0.9-2.0 m
+                    # a fresh plan needs, so arithmetically unsolvable.
+                    #
+                    # The pending is KEPT, not discarded: it is a good line, just not one to hand
+                    # over from here. The car goes on following the line it is already tracking,
+                    # and the swap lands when the car is near the new line -- which is what the
+                    # normal gates were always waiting for.
+                    self.get_logger().warn(
+                        f"[static_reopt] deadlock breaker HELD: the car is {dev_car:.2f} m from "
+                        f"the pending line (> {self.swap_deadlock_max_dev_commit_m:.2f}); forcing "
+                        f"the swap here would step the reference sideways under a car that is "
+                        f"mid-avoidance. Keeping the queued line and the current one",
+                        throttle_duration_sec=2.0)
+                    self._note_swap_block("deadlock_dev_too_large")
                     return
                 self.get_logger().warn(
                     f"[static_reopt] swap deadlock breaker: pending waited "

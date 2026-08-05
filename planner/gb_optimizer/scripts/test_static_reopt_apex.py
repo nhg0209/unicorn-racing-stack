@@ -71,6 +71,7 @@ def make_node():
     n.swap_deadlock_s = 5.0
     n.swap_deadlock_max_vs = 2.0
     n.swap_deadlock_max_dev = 0.6
+    n.swap_deadlock_max_dev_commit_m = 0.25
     n.clean_bundle = straight_bundle()   # a real bundle: _line_dev/_bundle_xy read its wpnts
     n._notify_scaler_ticks = 0
     n.notify_ticks = 0
@@ -1359,6 +1360,39 @@ def test_line_clearance_veto():
     print("PASS line clearance vetoes only lines that break their own promise")
 
 
+def test_breaker_holds_when_the_car_is_far_from_the_pending_line():
+    # The breaker's only cap DISCARDED a pending beyond 0.6 m, so anything under that was forced
+    # however far the car was from it. Observed: 0.59 m, forced mid-hump after a 5.3 s wait -- the
+    # reference stepped half a metre sideways under a car already in an avoidance, the obstacle's
+    # d jumped 0.58 m in one cycle as the frame changed, and the two replans that followed were at
+    # g_near 0.81 and 0.56 m, inside the 0.9-2.0 m a fresh plan needs.
+    n = make_node()
+    sa = np.arange(0.0, 40.0, 0.1)
+    wp = [types.SimpleNamespace(s_m=s, x_m=s, y_m=0.0) for s in sa]
+    pending = types.SimpleNamespace(glb_wpnts=types.SimpleNamespace(wpnts=wp))
+    n._pending = pending
+    dev = np.zeros_like(sa); dev[(sa > 10.0) & (sa < 18.0)] = 0.59      # the observed deviation
+    n._pending_dev = dev
+    n._pending_since = 0.0
+    n._reactive_active = False
+    n._last_vs = 0.5                                   # slow + long wait = the breaker fires
+    n._clock.t = 10.0
+    n.active = straight_bundle()
+    n._publish_active = lambda b: None
+    n._publish_coverage = lambda b: None
+    n._publish_clearance = lambda: None
+    n.pub_update_map = types.SimpleNamespace(publish=lambda m: None)
+    n._commit_pending(12.0)
+    assert n._pending is pending, "0.59 m from the car must not be forced, and must not be thrown away"
+    assert n.active is not pending
+    assert n._swap_block.get("deadlock_dev_too_large") == 1, n._swap_block
+    # ...and it still un-sticks once the car is near the new line
+    n._pending_dev = np.full_like(sa, 0.10)
+    n._commit_pending(12.0)
+    assert n.active is pending, "within the cap the breaker must still commit"
+    print("PASS the deadlock breaker holds when the car is far from the pending line")
+
+
 def test_breaker_refuses_poisoned_pending():
     n = make_node()
     sa = np.arange(0.0, 40.0, 0.1)
@@ -1435,7 +1469,9 @@ def test_deadlock_breaker():
         wp = [types.SimpleNamespace(s_m=s, x_m=s, y_m=0.0) for s in sa]
         n._pending = types.SimpleNamespace(glb_wpnts=types.SimpleNamespace(wpnts=wp))
         n.active = straight_bundle()
-        dev = np.zeros_like(sa); dev[(sa > 10.0) & (sa < 18.0)] = 0.4   # hump around the car
+        # 0.20 m of hump around the car -- inside swap_deadlock_max_dev_commit_m, so the breaker
+        # may force it. Past that cap it holds instead; that case is its own test below.
+        dev = np.zeros_like(sa); dev[(sa > 10.0) & (sa < 18.0)] = 0.20  # hump around the car
         n._pending_dev = dev
         n._reactive_active = True                 # planner flickering on the obstacle ahead
         n._last_vs = vs
@@ -1493,6 +1529,7 @@ if __name__ == "__main__":
     test_commit_horizon()
     test_commit_horizon_wrap()
     test_deadlock_breaker()
+    test_breaker_holds_when_the_car_is_far_from_the_pending_line()
     test_breaker_refuses_poisoned_pending()
     test_clearance_floor_is_enforced_and_drops_honestly()
     test_amplitude_comes_from_the_obstacle_not_the_apex()
