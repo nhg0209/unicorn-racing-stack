@@ -623,9 +623,14 @@ def check_multi(maps, cfg_dir, wall_margin, fit_tol, per_apex_s, enforce_laptime
         lap0 = clean_metrics(m)[0]
         seg = np.roll(m["xy"], -1, axis=0) - m["xy"]
         track_len = float(np.sum(np.hypot(seg[:, 0], seg[:, 1])))
-        budget = core._HUMP_SPAN_TOTAL_FRAC * track_len
         for anchor in MULTI_ANCHORS:
             r = multi_case(m, cfg_dir, wall_margin, fit_tol, anchor, case["n"], case["gap_m"])
+            # ASK THE CORE. This used to hardcode _HUMP_SPAN_TOTAL_FRAC * track_len, which was the
+            # whole of _span_budget when it was written and is now only its floor -- the budget
+            # scales with how many humps were actually laid. A gate that re-derives a constraint
+            # instead of calling it drifts the moment the constraint changes, and this one would
+            # have failed a line the core deliberately allowed.
+            budget = core._span_budget(track_len, max(1, r["n_laid"]))
             loss = r["lap"] - lap0
             print(f"  {name:5s} {r['n_obs']} {r['gap_m']:5.1f} {anchor:6d} | {r['n_laid']:4d} | "
                   f"{r['clip_bite'] * 1e3:8.3f} mm | {r['peaks']:7d} | "
@@ -663,8 +668,10 @@ def check_multi(maps, cfg_dir, wall_margin, fit_tol, per_apex_s, enforce_laptime
             if r["total_off"] > budget + 1e-6:
                 ok = False
                 print(f"    FAIL: {r['total_off']:.1f} m of the lap is off the racing line, over "
-                      f"the {budget:.1f} m span budget ({core._HUMP_SPAN_TOTAL_FRAC:.0%} of "
-                      f"{track_len:.1f} m).")
+                      f"the {budget:.1f} m span budget for {max(1, r['n_laid'])} hump(s) "
+                      f"(_span_budget: the greater of {core._HUMP_SPAN_TOTAL_FRAC:.0%} of "
+                      f"{track_len:.1f} m and {core._HUMP_EXCURSION_M:.1f} m per hump, capped at "
+                      f"{core._HUMP_SPAN_HARD_FRAC:.0%}).")
             if r["longest_off"] > budget + RETURN_CLEAN_M:
                 ok = False
                 print(f"    FAIL: a single excursion runs {r['longest_off']:.1f} m without "

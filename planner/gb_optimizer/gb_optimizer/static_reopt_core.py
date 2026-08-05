@@ -148,6 +148,13 @@ _HUMP_SPAN_FRAC = 0.28   # 0.20 -> 0.28: room for the entry/exit ramp stretching
 # car. Recovery order is the reverse of the order the span was bought in: the entry/exit stretch
 # (a <=0.08 s smoothness tiebreak) is given back first, then the reach.
 _HUMP_SPAN_TOTAL_FRAC = 0.40
+# [m] arc one hump is ALLOWED to occupy, for the per-obstacle term of _span_budget. Under what a
+# hump at the locality reach cap actually occupies (~8.6 m on ifac), and under half the lap
+# fraction, so small obstacle counts keep the fraction and are unaffected.
+_HUMP_EXCURSION_M = 7.0
+# ...and the absolute ceiling on the total, so a large obstacle count cannot turn the lap into one
+# continuous excursion.
+_HUMP_SPAN_HARD_FRAC = 0.75
 # Lap-time penalty [s per metre] charged to a candidate whose TOTAL span exceeds the budget. Steep
 # against the ~0.4 s spread between candidate reaches, so an in-budget candidate always wins if one
 # exists — while still preferring the least-overshooting when the track leaves no choice, rather
@@ -218,13 +225,36 @@ def _span_budget(track_len: float, n_humps: int) -> float:
     """Total arc length all humps together may occupy [m].
 
     A flat fraction of the lap is the right bound for ONE or TWO obstacles and the wrong one for
-    several: three boxes cannot share 0.40 of a 36 m lap without each being squeezed below the
-    reach its own corridor and curvature checks already accepted, and the search then prefers
-    candidates that cover fewer obstacles. So the budget also scales with how many humps there
-    are -- each needs at least its floor reach on both sides, plus half again for the ramps that
-    make it drivable -- and the larger of the two bounds wins."""
-    return max(_HUMP_SPAN_TOTAL_FRAC * float(track_len),
-               max(0, int(n_humps)) * 2.0 * _reach_floor(track_len) * 1.5)
+    several. On ifac two humps already occupy 14.55 m of the 14.64 m the fraction allows, so a
+    THIRD obstacle -- anywhere on the track, including a straight far from the other two -- put the
+    same candidate reaches 5.6 m over budget, and at 1 s/m of penalty against a 0.9 s spread
+    between candidates the search had no choice but to shrink. And it shrinks with ONE scalar: the
+    reach is shared by every hump in a candidate, so pressure from a third box squeezed the ramps
+    of the first two equally. Curvature goes as A/r^2, so 5.0 -> 2.5 m is four times the ramp
+    curvature on humps whose own corridor and curvature checks had accepted the wide reach.
+    Measured in the field: two obstacles laid at "reach 4.09/6.00 m of 4.00 requested", and 2.5 s
+    later with a third confirmed, all three at "2.50/2.88 m of 2.50" -- same amplitudes, same
+    clearances, nothing dropped, curvature at 41-56% of curvlim.
+
+    So the budget is now PER OBSTACLE, floored by the lap fraction and capped in absolute terms:
+
+        min(_HUMP_SPAN_HARD_FRAC * L, max(_HUMP_SPAN_TOTAL_FRAC * L, n * _HUMP_EXCURSION_M))
+
+    _HUMP_EXCURSION_M is what one hump actually occupies, not what it is allowed to request: a
+    smootherstep of reach r is outside the 2 cm deadband for about 1.68r, so at the locality reach
+    cap (0.5 * _HUMP_SPAN_FRAC * L = 5.12 m on ifac) one hump occupies ~8.6 m. 7.0 is deliberately
+    under that, and deliberately under half the fraction (2 * 7.0 = 14.0 < 0.40 * 36.6 = 14.64), so
+    on ifac n <= 2 is STRUCTURALLY unchanged -- the lap fraction still wins and the budget is
+    bit-identical. The hard cap keeps a large obstacle count from turning the whole lap into one
+    excursion.
+
+    The replaced second term, n * 2 * _reach_floor * 1.5, was dimensionally wrong: _reach_floor is
+    the smallest reach the corridor fit may BISECT DOWN TO before giving up, not an allowance per
+    obstacle, and on ifac it made that term n * 3.0 -- which needs n = 5 before it can even reach
+    the lap fraction it is supposed to relieve."""
+    n = max(0, int(n_humps))
+    return min(_HUMP_SPAN_HARD_FRAC * float(track_len),
+               max(_HUMP_SPAN_TOTAL_FRAC * float(track_len), n * _HUMP_EXCURSION_M))
 # ALL-OR-NOTHING apex fit: a hump the corridor forces below this fraction of the recorded
 # reactive apex does NOT clear the obstacle (the apex |d| is the reactive-PROVEN clearance) —
 # laying the shrunken hump wastes lap time, still triggers the reactive layer every lap
