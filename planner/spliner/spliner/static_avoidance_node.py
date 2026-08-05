@@ -221,6 +221,13 @@ class ObstacleSpliner(Node):
         self.max_weave = 3           # max obstacles woven into one path (slalom); 1 = single-apex only
         self.width_car = 0.30        # [m]
         self.tail_m = 1.0            # [m] short raceline (d=0) tail after the return
+        # [m] how far PAST the lookahead obstacles are still collected. Knots are assigned within
+        # the lookahead, as before -- the max_weave slots belong to the boxes the car is driving
+        # at -- but obs_ok is checked against everything the PATH reaches, and the path runs
+        # return_len + tail_m past its last apex. Without this a candidate could be certified
+        # while its own exit ramp ran through a box, and _commit_slice_clear (which looks at every
+        # live obstacle) then failed the very path the planner had just published.
+        self.obs_gather_extra_m = 4.5   # = return_len + tail_m
         self.w_d = 1.0               # cost: raceline deviation
         self.w_k = 0.1               # cost: curvature (smoothness)
         self.w_c = 5.0               # cost: consistency with previous choice
@@ -329,7 +336,8 @@ class ObstacleSpliner(Node):
             'wall_margin', 'knot_merge_s_m', 'shift_min', 'shift_buffer', 'ramp_len', 'hold_after',
             'return_len', 'ramp_len_min_m',
             'ramp_search_enable', 'ramp_search_entry_m', 'ramp_search_exit_m', 'ramp_search_max_ms',
-            'apex_bulge', 'max_weave', 'width_car', 'tail_m', 'w_d', 'w_k', 'w_c', 'w_obs', 'obs_sigma',
+            'apex_bulge', 'max_weave', 'width_car', 'tail_m', 'obs_gather_extra_m',
+            'w_d', 'w_k', 'w_c', 'w_obs', 'obs_sigma',
             'use_grid_check', 'trust_grid_bounds', 'grid_scan_max', 'grid_scan_step', 'bounds_warn_m',
             'clear_gate_enable', 'clear_hyst_m', 'clear_max_cur_d', 'clear_margin_m', 'reframe_warn_m',
             'clear_latch_ttl_s', 'squeeze_enable', 'squeeze_steps', 'squeeze_safety_floor_m',
@@ -445,6 +453,9 @@ class ObstacleSpliner(Node):
         self.declare_parameter('max_weave', 3, intd(1, 5, "max obstacles woven into one path (slalom); 1=single-apex"))
         self.declare_parameter('width_car', 0.30, dbl(0.1, 1.0, "car width [m]"))
         self.declare_parameter('tail_m', 1.0, dbl(0.0, 20.0, "short raceline tail after the return [m]"))
+        self.declare_parameter('obs_gather_extra_m', 4.5,
+                               dbl(0.0, 20.0, "collect obstacles this far PAST the lookahead for "
+                                              "the keep-out check (= return_len + tail_m) [m]"))
         self.declare_parameter('w_d', 1.0, dbl(0.0, 100.0, "cost weight: raceline deviation"))
         self.declare_parameter('w_k', 0.1, dbl(0.0, 100.0, "cost weight: curvature"))
         self.declare_parameter('w_c', 5.0, dbl(0.0, 100.0, "cost weight: choice consistency"))
@@ -556,6 +567,8 @@ class ObstacleSpliner(Node):
                 self.width_car = float(p.value)
             elif n == 'tail_m':
                 self.tail_m = float(p.value)
+            elif n == 'obs_gather_extra_m':
+                self.obs_gather_extra_m = float(p.value)
             elif n == 'w_d':
                 self.w_d = float(p.value)
             elif n == 'w_k':
@@ -1123,15 +1136,26 @@ class ObstacleSpliner(Node):
                 return reuse
 
         # --- obstacles ahead (with brief-dropout memory) ---
-        cands_obs = self._gather_obstacles_ahead(self.obstacles, lookahead)
+        # TWO SETS, because the path is longer than the lookahead. Knots are assigned within the
+        # lookahead: the max_weave slots belong to the boxes the car is actually driving at. But
+        # the path runs return_len + tail_m PAST its last apex, and obs_ok used to be filtered by
+        # the lookahead as well -- so a candidate could be certified while its own exit ramp went
+        # through a box just outside it. That path is not merely optimistic, it is one the planner
+        # itself rejects: _commit_slice_clear re-checks the frozen slice against EVERY live
+        # obstacle, so the box-1-only path failed its own re-check on the next cycle, published
+        # feasible=False, was re-planned identically, and flapped at 20 Hz. Measured with two
+        # boxes 5 m apart: feasible alternated True/False every cycle from 16.9 m out.
+        gather = lookahead + max(0.0, self.obs_gather_extra_m)
+        cands_obs = self._gather_obstacles_ahead(self.obstacles, gather)
         now = self.get_clock().now()
         if cands_obs:
             self._mem_cands_obs = [o for _, o in cands_obs]
             self._mem_cands_time = now
         elif self._mem_cands_obs and self._mem_cands_time is not None and \
                 (now - self._mem_cands_time).nanoseconds * 1e-9 < self.obs_memory_sec:
-            cands_obs = self._gather_obstacles_ahead(self._mem_cands_obs, lookahead)
-        obs_ahead = [o for _, o in cands_obs]
+            cands_obs = self._gather_obstacles_ahead(self._mem_cands_obs, gather)
+        obs_reach = [o for _, o in cands_obs]                     # everything the path can reach
+        obs_ahead = [o for g, o in cands_obs if g <= lookahead]   # the driving horizon
         if retry and not obs_ahead:
             return None
         if not obs_ahead:
@@ -1193,7 +1217,14 @@ class ObstacleSpliner(Node):
         cur_dp = float(np.tan(np.clip(e_psi, -0.5, 0.5)))
         knots = []          # [(s_centre, obstacle, corridor_idx), ...] strictly increasing in s
         n_already_clear = 0
-        for o in obs_ahead:
+        # Over obs_enforce, not obs_ahead: a box obs_ok enforces but nothing shaped the path around
+        # is a box every candidate is rejected on (the return ramp after the last apex runs
+        # straight through it). Because the list is sorted by gap, the boxes INSIDE the lookahead
+        # are considered first and therefore still have first claim on the max_weave slots -- the
+        # driving horizon keeps its priority without any bookkeeping. A box past the lookahead
+        # takes a slot only when one is left over, and the path span is derived from the last knot,
+        # so it stretches to cover it.
+        for o in obs_reach:
             # An obstacle the FOLLOWED line already passes at the full keep-out needs no apex: the
             # path is welcome to stay where it is beside it. Spending a knot on one costs twice --
             # it consumes a max_weave slot a genuinely blocking box needed, and it bends the line
@@ -1222,7 +1253,7 @@ class ObstacleSpliner(Node):
             gap_c = ((o.s_center - self.cur_s + L / 2.0) % L) - L / 2.0     # SIGNED
             if gap_c <= 0.0:
                 continue                                   # centre level with or behind the car
-            s_c = float(min(gap_c, lookahead))
+            s_c = float(min(gap_c, gather))
             if knots and s_c <= knots[-1][0] + self.knot_merge_s_m:
                 continue                                   # too close in s to the previous apex -> merge
             knots.append((s_c, o, int(o.s_center / wpnt_dist) % self.gb_max_idx))
@@ -1233,10 +1264,20 @@ class ObstacleSpliner(Node):
         # then judged against all of them. The return ramp after the last apex runs straight through
         # whatever was left out, and every candidate is rejected. Name them: this is otherwise
         # indistinguishable from a genuinely impassable section in the all-rejected diagnostic.
-        if len(obs_ahead) > len(knots):
-            missed = [o for o in obs_ahead if all(o is not ko for (_s, ko, _c) in knots)]
+        # ENFORCED = the driving horizon, plus the boxes past it this path actually shaped around.
+        # Extending obs_ok to everything the path reaches is right only for boxes a knot could be
+        # spent on. A box past the lookahead that found no free max_weave slot cannot be shaped
+        # around, and enforcing it anyway rejects every candidate -- measured with three boxes
+        # filling the slots and a fourth at 17 m: no path at all, where today one is published.
+        # Vetoing a plan that is correct for the whole driving horizon, because of a box the
+        # planner is not allowed to weave in yet, trades a real path for nothing.
+        knotted = {id(ko) for (_s, ko, _c) in knots}
+        obs_enforce = obs_ahead + [o for o in obs_reach
+                                   if o not in obs_ahead and id(o) in knotted]
+        if len(obs_enforce) > len(knots) + n_already_clear:
+            missed = [o for o in obs_enforce if all(o is not ko for (_s, ko, _c) in knots)]
             self.get_logger().warn(
-                f"[{self.name}] {len(missed)} of {len(obs_ahead)} obstacle(s) ahead got NO knot "
+                f"[{self.name}] {len(missed)} of {len(obs_enforce)} obstacle(s) ahead got NO knot "
                 f"(max_weave={self.max_weave}): "
                 + "; ".join(f"id={o.id} s={o.s_center:.1f} d={o.d_center:+.2f}" for o in missed)
                 + ". They are still enforced by obs_ok, so the path must clear them without being "
@@ -1575,7 +1616,7 @@ class ObstacleSpliner(Node):
         # the box's s-interval — the old `g1 < g0: continue` skipped the check exactly then,
         # letting candidates cut straight through an obstacle near s=0.
         obs_ok = np.ones(N, dtype=bool)
-        for o in obs_ahead:
+        for o in obs_enforce:
             o_span = (o.s_end - o.s_start) % self.gb_max_s
             gc = (o.s_center - self.cur_s) % self.gb_max_s
             if gc > self.gb_max_s / 2.0:
@@ -1805,7 +1846,7 @@ class ObstacleSpliner(Node):
                                   kappa=kappa_[i], wpnts=wpnts))
 
         if self.commit_enable:
-            self._store_commit(obs_ahead, s_mod, d_sel, xy, v_arr, psi_pub, kappa_,
+            self._store_commit(obs_enforce, s_mod, d_sel, xy, v_arr, psi_pub, kappa_,
                                obs_margin=obs_margin_d, obs_margin_s=obs_margin_s, squeeze=squeeze,
                                s_entry0=float(s_local[cand_entry_i[best_k]]))
         self._publish_feasible(True)

@@ -211,6 +211,22 @@ static_avoidance_planner:
                             #       B's apex was never captured, so the re-opt only ever knew A.
                             #       2 covers the IFAC two-obstacle format; raise to 3 for triples.
     tail_m: 0.0             # [m]  short raceline (d=0) tail after the return (on_spline horizon)
+    # [m] how far PAST the lookahead obstacles are still COLLECTED. The path is longer than the
+    # lookahead -- it runs return_len + tail_m past its last apex -- and obs_ok used to be filtered
+    # by the lookahead, so a candidate could be certified while its own exit ramp went through a
+    # box just outside it. That path is not merely optimistic: _commit_slice_clear re-checks the
+    # frozen slice against EVERY live obstacle, so the box-1-only path failed its own re-check on
+    # the next cycle, published feasible=False, was re-planned identically, and flapped at 20 Hz.
+    # Measured with two boxes and the car swept 6 -> 19 m, cycles with NO path published:
+    #     spacing  1.5 m   2.5 m   3.5 m   5.0 m
+    #     before      3       8      13      20
+    #     after       0       0       0       0
+    # Knots still go to the driving horizon FIRST (the list is sorted by gap, so the boxes inside
+    # the lookahead have first claim on the max_weave slots); a box past it takes a slot only when
+    # one is left over, and is enforced only if it got one -- enforcing a box no knot could be
+    # spent on rejects every candidate, which is a blackout in place of a path that was correct
+    # for the whole driving horizon.
+    obs_gather_extra_m: 4.5   # = return_len + tail_m
 
     # --- feasibility limits ---
     # Curvature is checked CORNER-FAIR: bound the curvature the maneuver ADDS over the raceline
