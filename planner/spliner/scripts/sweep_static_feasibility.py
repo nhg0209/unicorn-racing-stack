@@ -7,10 +7,11 @@ raceline at each station, and asks:
 
   FEASIBILITY  at what fraction of the stations does a path come out, per {forward gap} x
                {lateral tracking error}
-  EARLINESS    at the CORNER stations (|kappa| > 0.8), the greatest distance at which a plan
-               exists. This is the number the driver feels: below it the car is still committed to
-               TRAILING, and a plan that only appears two metres from the box is a plan that
-               arrives after the braking decision.
+  EARLINESS    how many of the CORNER stations (|kappa| > 0.8) can be planned at ANY distance,
+               and how far out. This is what the driver feels: until a plan exists the car is
+               committed to TRAILING, and a plan that only appears two metres from the box arrives
+               after the braking decision. The COUNT is what is gated -- see MIN_CORNERS_PLANNABLE
+               for why the mean distance cannot fail.
   SPEED        the maneuver's curvature-limited speed cap, sqrt(a_lat_max / peak|kappa|). The ramp
                ladder buys feasibility with curvature, so this is the price side of the trade and
                it is gated, not just reported.
@@ -38,7 +39,13 @@ STATION_STRIDE = 3                 # 123 stations on ifac
 GAPS = [12.0, 8.0, 4.0, 2.0]       # forward distance from the car to the box
 FEASIBLE_GATE_GAPS = (12.0, 8.0)   # the two the floor below is asserted at
 MIN_FEASIBLE = 95                  # of the 123, at those gaps, for every tracking error
-MIN_EARLY_M = 13.5                 # mean greatest-plannable distance over the corner stations
+# HOW MANY of the corner stations can be planned at all, NOT the mean distance at which they can.
+# The mean is degenerate as a gate: the harness drives the planner at a fixed 3 m/s, so the
+# lookahead is max(lookahead_min, 1.5*3) = lookahead_min exactly, and a box further away than that
+# is not in the planner's horizon at all. Every station that is plannable is therefore plannable at
+# precisely lookahead_min and the mean over them is exactly that number -- it read 15.00 with 22 of
+# 33 stations plannable and would still read 15.00 with one. The count is the quantity that moves.
+MIN_CORNERS_PLANNABLE = 22         # of the 33 ifac stations with |kappa| > CORNER_KAPPA
 MIN_SPEED_CAP = 2.50               # [m/s] mean over the feasible cells
 A_LAT_MAX = 6.0
 CORNER_KAPPA = 0.8
@@ -247,10 +254,15 @@ def main():
                 break
     got = [v for v in first.values() if v is not None]
     mean_early = float(np.mean(got)) if got else 0.0
+    # the mean over ALL corner stations, unplannable counted as zero: unlike the mean over the
+    # plannable ones it is not pinned to the lookahead, so it is worth printing
+    mean_all = float(np.mean([v if v is not None else 0.0 for v in first.values()]))
     print(f"=== earliness | {len(H.corners)} corner stations (|kappa| > {CORNER_KAPPA}) | "
-          f"{len(got)} ever plannable | mean greatest-plannable distance {mean_early:.2f} m ===")
-    if mean_early < MIN_EARLY_M:
-        fails.append(f"mean first-plannable distance {mean_early:.2f} m < {MIN_EARLY_M}")
+          f"{len(got)} ever plannable (gate {MIN_CORNERS_PLANNABLE}) | greatest-plannable "
+          f"distance {mean_early:.2f} m over those, {mean_all:.2f} m over all ===")
+    if len(got) < MIN_CORNERS_PLANNABLE:
+        fails.append(f"only {len(got)} of {len(H.corners)} corner stations are plannable at any "
+                     f"distance (need {MIN_CORNERS_PLANNABLE})")
 
     if fails:
         print("\nFAILED:")
