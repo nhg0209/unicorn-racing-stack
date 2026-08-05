@@ -601,6 +601,14 @@ class StaticDynamic(Node):
             if os.path.exists(self.save_yaml_path):
                 with open(self.save_yaml_path, "r") as f:
                     data = yaml.safe_load(f) or {}
+            # PER KEY, never a whole-block replacement. The old line assigned a freshly built
+            # dict to data['tracking']['ros__parameters'], which DELETES every key the dict does
+            # not happen to list -- and it did not list static_net_floor_m, livox_max_view_dist,
+            # measure or from_bag. One press of the save button in rqt dropped them from the yaml
+            # and the node fell back to its code defaults on the next run, silently:
+            # static_net_floor_m is the static/dynamic classification floor, so that is a race-day
+            # behaviour change nobody asked for and nothing reports. Same idiom as the state
+            # machine's save_params_to_yaml: update the keys we own, leave the rest alone.
             tracking_params = {
                 'rate_tracking': int(self.rate),
                 'P_vs': float(Opponent_state.P_vs),
@@ -634,7 +642,8 @@ class StaticDynamic(Node):
                 'near_dynamic_suppress_m': float(self.near_dynamic_suppress_m),
                 'save_params': False,
             }
-            data.setdefault('tracking', {})['ros__parameters'] = tracking_params
+            block = data.setdefault('tracking', {}).setdefault('ros__parameters', {})
+            block.update(tracking_params)
             with open(self.save_yaml_path, "w") as f:
                 yaml.dump(data, f, default_flow_style=False, sort_keys=False)
             self.get_logger().info(f"Tracking params saved to: {self.save_yaml_path}")
