@@ -1558,6 +1558,11 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
                 laid.append({"xy": (float(xa), float(ya)), "want": float(d), "laid": float(d_f),
                          "obs_i": _ki_m,
                          "floor": float(floor_used),   # the clearance this hump was ACCEPTED at
+                         # The reach the corridor and the curvature bar would have ALLOWED here,
+                         # independent of the span budget. `r_req` is already the budgeted request,
+                         # so a shrink measured against it reads 100% however hard the budget
+                         # squeezed -- which is exactly how a 5.0 -> 2.5 m collapse went unreported.
+                         "r_allow": float(r_grow_cap),
                          "flipped": bool(d_used is not d and abs(d_used - d) > 1e-9),
                          "d_used": float(d_used),      # the aim that was accepted (mirrored or not)
                          # side taken from the GROUP rather than from this obstacle's own apex
@@ -2351,7 +2356,7 @@ def _reopt_local_window_impl(
                 if n_try and est_try <= best_est + tol_exit and ek_try < best_ek:
                     d_g, n_s, best_ek, cost_fin = d_try, n_try, ek_try, est_try
                     drp_b, lay_b = drp_try, lay_try
-        return d_g, n_s, cost_fin, drp_b, lay_b
+        return d_g, n_s, cost_fin, drp_b, lay_b, best_r
 
     # THE HELD VARIANT IS A PARALLEL CANDIDATE, not a preference: the same estimator that ranks
     # everything else decides, and on the ifac straight it says the held line is ~0.2-0.4 s faster.
@@ -2368,7 +2373,7 @@ def _reopt_local_window_impl(
     runs = [_run_stages(False)]
     if hold_max_gap_m > 0.0 and len(apexes) > 1:
         runs.append(_run_stages(True))
-    d_global, n_solved, _cost, apex_dropped, apex_laid = min(
+    d_global, n_solved, _cost, apex_dropped, apex_laid, chosen_r = min(
         runs, key=lambda t: (t[2] if t[1] else float("inf")))
     if d_global is None:
         d_global, n_solved = np.zeros(N), 0
@@ -2585,7 +2590,13 @@ def _reopt_local_window_impl(
             # pre-resample station, which is the analytic profile whose extremum count says whether
             # the line is a set of clean humps or a comb; and how hard the corridor clip had to
             # bite, which must stay inside fit_tol or the shaping has escaped the fit.
-            "alpha": alpha_full, "clip_bite": clip_bite}
+            "alpha": alpha_full, "clip_bite": clip_bite,
+            # span accounting of the CHOSEN candidate: what it occupies, what it was allowed, and
+            # what the overshoot cost it in the ranking. Nothing in the logs mentioned any of the
+            # three, which is why a budget that had silently halved every ramp was invisible.
+            "span_m": float(_offline_arc(alpha_full, clean_xy, nvec_rl, el_cl)) if n_solved else 0.0,
+            "span_budget_m": float(_span_budget(track_len, max(1, n_solved))),
+            "span_reach_m": float(chosen_r)}
 
 
 # ======================================================================================

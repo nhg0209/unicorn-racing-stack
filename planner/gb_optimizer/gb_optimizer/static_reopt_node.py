@@ -876,8 +876,23 @@ class StaticReoptNode(Node):
             # and exceeds curvlim. Log what was actually laid, and WARN when the reach came back
             # less than half of what was requested or the geometry is near the curvature limit.
             curvlim = float(res.get("curvlim", 0.0))
+            # SPAN ACCOUNTING. Not one line of this node's output mentioned span, budget or
+            # give-back, so a budget that had quietly halved every ramp left no trace at all -- the
+            # per-apex lines below reported "100% of requested" throughout, because the request had
+            # already been cut to fit.
+            span_m = float(res.get("span_m", 0.0))
+            span_b = float(res.get("span_budget_m", 0.0))
+            over = max(0.0, span_m - span_b)
+            self.get_logger().info(
+                f"[static_reopt] span {span_m:.2f} m of budget {span_b:.2f} "
+                + (f"(over {over:.2f} -> penalty {over:.2f} s)" if over > 1e-9 else "(within)")
+                + f"; chose reach {float(res.get('span_reach_m', 0.0)):.2f} m for {n_ap} hump(s)")
             for a in res.get("apex_laid", []):
-                r_req = max(a.get("r_req", 0.0), 1e-6)
+                # Against what the CORRIDOR AND CURVATURE would have allowed, not against r_req --
+                # r_req is the already-budgeted request, so measuring the shrink against it reads
+                # 100% however hard the span budget squeezed. That is precisely how a 5.0 -> 2.5 m
+                # collapse across three humps went unreported for a whole session.
+                r_req = max(a.get("r_allow", a.get("r_req", 0.0)), 1e-6)
                 shrink = min(a["r_in"], a["r_out"]) / r_req
                 kp, kmsg = a.get("kappa_peak", 0.0), ""
                 if curvlim > 0.0:
@@ -904,7 +919,7 @@ class StaticReoptNode(Node):
                              "apex proposed the other side)")
                 line = (f"[static_reopt] apex @({a['xy'][0]:.2f},{a['xy'][1]:.2f}) "
                         f"laid d={a['laid']:+.3f} (want {a['want']:+.3f}) "
-                        f"reach {a['r_in']:.2f}/{a['r_out']:.2f} m of {r_req:.2f} requested "
+                        f"reach {a['r_in']:.2f}/{a['r_out']:.2f} m of {r_req:.2f} allowed "
                         f"({shrink:.0%}); max|kappa| {kp:.2f}{kmsg}{cmsg}{smsg}")
                 if shrink < 0.5 or (curvlim > 0.0 and kp > 0.9 * curvlim):
                     self.get_logger().warning(
