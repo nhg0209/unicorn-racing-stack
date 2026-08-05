@@ -456,16 +456,30 @@ def _cluster_knots(knots, track_len, merge_gap, curvlim, clean_kappa, s_loop, dr
     return out
 
 
-def _fitted_span(fitted, u_all: np.ndarray, el_stn: np.ndarray) -> float:
-    """Arc length the fitted humps actually OCCUPY [m], counting shared arc once.
+def _fitted_span(fitted, u_all: np.ndarray, el_stn: np.ndarray,
+                 clean_xy: np.ndarray, nvec: np.ndarray, tol: float = 0.02) -> float:
+    """Arc length the fitted humps actually OCCUPY [m] -- the arc they are OFF THE LINE for.
 
-    sum(r_in + r_out) charges an overlap twice, and an overlap is exactly what a merge is."""
+    Two wrong answers preceded this one. sum(r_in + r_out) charges an overlap twice, and an
+    overlap is exactly what a merge is. Unioning the NOMINAL [u - r_in, u + r_out] intervals fixes
+    the double charge but still measures the envelope rather than the excursion: a smootherstep is
+    within `tol` of the raceline well before its ramp ends, so the envelope over-reports. Measured
+    on the ifac hold pair, the same profile came out 16.156 m by envelope against 13.950 m of
+    actual excursion, on a budget of 14.640 -- so step 1 handed the ramp stretch back on EVERY
+    candidate to cure an overdraft that did not exist, which is what pinned the reaches at 5.00.
+
+    Measured the way the ranking penalty measures it (_offline_arc on the offset polyline), the two
+    estimators now agree to within 0.04 m instead of contradicting each other by 1.5.
+    """
     if not len(fitted):
         return 0.0
-    covered = np.zeros(len(u_all), dtype=bool)
-    for (u, _d, ri, ro, _rf) in fitted:
-        covered |= (u_all >= u - ri) & (u_all <= u + ro)
-    return float(np.sum(np.asarray(el_stn, float)[covered]))
+    prof = np.zeros(len(u_all), dtype=float)
+    for (u, d, ri, ro, _rf) in fitted:
+        v = _hump_values(u_all, u, d, ri, ro)
+        if v is None:
+            continue
+        prof = np.where(np.abs(v) > np.abs(prof), v, prof)   # overlap: the deeper offset wins
+    return _offline_arc(prof, clean_xy, nvec, el_stn, tol)
 
 
 def _relax_ladder(need: float, floor: float, step: float = _RELAX_STEP) -> List[float]:
@@ -1515,7 +1529,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         span_budget = _span_budget(track_len, len(fitted))
         seg_stn = np.roll(clean_xy, -1, axis=0) - clean_xy
         el_stn = np.hypot(seg_stn[:, 0], seg_stn[:, 1])
-        occupied = _fitted_span(fitted, u_all, el_stn)
+        occupied = _fitted_span(fitted, u_all, el_stn, clean_xy, nvec_rl)
         if occupied > span_budget:
             fitted = [(u, d, min(ri, rf), min(ro, rf), rf) for (u, d, ri, ro, rf) in fitted]
         # r_f has done its job; the weave and the verification below take 4-tuples.
