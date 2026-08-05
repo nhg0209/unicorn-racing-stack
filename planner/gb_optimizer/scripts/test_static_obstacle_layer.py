@@ -184,6 +184,28 @@ def test_occlusion_suspends():
     print("PASS occlusion suspends streak")
 
 
+def test_a_track_behind_the_car_never_accumulates_a_clear_streak():
+    # The fast unlatch judges "I looked where it should be and it was not there", which is only
+    # meaningful on the APPROACH. A track the car has already driven past is not being looked at,
+    # so clear views of its spot mean nothing -- and if they counted, every confirmed obstacle
+    # would be demoted once per lap on the way out, taking the obstacle SET with it and forcing a
+    # /global_waypoints swap each lap.
+    node = make_node()
+    confirm_obstacle(node, s=10.0)
+    for gap in (-0.5, -3.0, -8.0):                 # the box BEHIND the car, by |gap| metres
+        node.frenet_cb(odom((10.0 - gap) % TRACK_LEN))
+        for _ in range(5 * node.unlatch_clear_msgs):
+            node.obstacles_cb(arr())               # no detection at all
+        assert node._tracks[0].confirmed, f"a box {abs(gap):.1f} m BEHIND must not be unlatched"
+        assert node._tracks[0].clear_streak == 0, "and must not even accumulate a streak"
+    # ...and the same track still unlatches normally once it is ahead again, in the window
+    node.frenet_cb(odom(7.0))                      # gap 3.0, inside [1.0, 5.0]
+    for _ in range(node.unlatch_clear_msgs):
+        node.obstacles_cb(arr())
+    assert not node._tracks[0].confirmed, "the approach window must still work"
+    print("PASS a track behind the car accumulates no clear streak")
+
+
 def test_window_exit_resets():
     node = make_node()
     t = confirm_obstacle(node, s=10.0)
@@ -298,7 +320,9 @@ def main():
                    test_demoted_track_decays_at_the_lap_boundary,
                    test_line_swap_suspends_the_streak, test_ego_offline_suspends_streak,
                    test_sighting_resets_streak, test_memory_detection_does_not_reset,
-                   test_occlusion_suspends, test_window_exit_resets, test_lap_guard,
+                   test_occlusion_suspends, test_window_exit_resets,
+                   test_a_track_behind_the_car_never_accumulates_a_clear_streak,
+                   test_lap_guard,
                    test_unlatch_streak_scales_with_speed,
                    test_memory_frame_does_not_confirm_or_feed_a_track,
                    test_track_s_reanchors_on_a_line_swap):
