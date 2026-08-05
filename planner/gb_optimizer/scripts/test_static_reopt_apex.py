@@ -79,6 +79,7 @@ def make_node():
     n.fit_tol = 0.005
     n.clearance_dirty_m = 0.30
     n._clearance_dirty_keys = set()
+    n._live_xy = {}                 # marker id -> the layer's UNHELD estimate (see obstacles_cb)
     n.apex_major_change_m = 0.10
     n.solve_min_interval_s = 1.0
     n.swap_block_trailing = True
@@ -515,6 +516,28 @@ def test_clearance_drift_retriggers_once():
     n2.active.clearance_by_key = {("id", 7): 0.12}     # hump was dropped; line was always short
     assert n2._clearance_drifted([core.Obstacle(5.0, 0.20, 0.15)], [7]) is False
     print("PASS clearance drift re-arms the solve exactly once per active line")
+
+
+def test_the_drift_check_reads_the_LIVE_obstacle_position():
+    # THE reason the documented safety net could never fire. static_obstacle_layer HOLDS the pose
+    # it publishes inside publish_deadband_m (0.12) to stop estimate noise re-arming a rebuild --
+    # and this check was measuring the drift with that same held number, so the cause of a drift
+    # and the measurement of it were one stale value. Arithmetic: the enforced floor is 0.35 and
+    # the dead-band 0.12, so real clearance can be 0.23 m against the state machine's 0.25 m
+    # static-GB requirement -- the line reads BLOCKED, the car trails, and nothing re-solves
+    # because "the obstacle did not move". The layer now carries the live estimate in points[0].
+    n = make_node()
+    n.active = straight_bundle()                       # line along y=0
+    n.active.clearance_by_key = {("id", 7): 0.40}
+    n._mark_dirty = lambda: setattr(n, "_obstacles_dirty", True)
+    held = core.Obstacle(5.0, 0.55, 0.15)              # what the layer PUBLISHES: 0.40 m clear
+    assert n._clearance_drifted([held], [7]) is False
+    # the same marker, whose live estimate has drifted 0.15 m in -- inside the dead-band, so the
+    # published pose does not move at all
+    n._live_xy = {7: (5.0, 0.40)}                      # 0.25 m clear: under the 0.30 threshold
+    assert n._clearance_drifted([held], [7]) is True, (
+        "a drift the publish dead-band is hiding must still re-arm the solve")
+    print("PASS the drift check reads the live estimate, not the position the dead-band froze")
 
 
 def test_minor_apex_refinement_keeps_the_pending():
@@ -1637,6 +1660,7 @@ if __name__ == "__main__":
     test_amplitude_comes_from_the_obstacle_not_the_apex()
     test_raceline_already_clear_lays_nothing()
     test_clearance_drift_retriggers_once()
+    test_the_drift_check_reads_the_LIVE_obstacle_position()
     test_minor_apex_refinement_keeps_the_pending()
     test_swap_held_while_trailing_a_close_obstacle()
     test_the_grid_corridor_is_measured_where_the_offset_is_laid()

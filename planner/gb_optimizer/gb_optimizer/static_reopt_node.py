@@ -256,6 +256,7 @@ class StaticReoptNode(Node):
         self.fit_tol = float(self.get_parameter("fit_tol").value)
         self.reopt_grid_corridor = bool(self.get_parameter("reopt_grid_corridor").value)
         self._grid_corr_cache = None            # (eroded_image, (lo, hi)) -- computed once per map
+        self._live_xy = {}                      # marker id -> the layer's UNHELD (x, y) estimate
 
         self.input_path = os.path.join(
             get_package_share_directory("stack_master"), "config", self.racecar_version)
@@ -1122,6 +1123,13 @@ class StaticReoptNode(Node):
                 r = self.default_obs_radius
             obs.append(core.Obstacle(m.pose.position.x, m.pose.position.y, r))
             ids.append(int(getattr(m, "id", 0)))
+            # The layer HOLDS the published pose inside a dead-band and carries the live estimate
+            # in points[0]. The set-change logic keeps reading the held pose -- that hold is what
+            # stops estimate noise re-arming a rebuild every frame -- but the drift check must not:
+            # measuring a drift with the same frozen coordinate that caused it can never fire.
+            pts = getattr(m, "points", None)
+            if pts:
+                self._live_xy[int(getattr(m, "id", 0))] = (float(pts[0].x), float(pts[0].y))
 
         # A BRIEF DISAPPEARANCE IS NOT A REMOVAL. The tracker deletes and recreates tracks around
         # every lap (ids 22 -> 36 -> 43 -> 54 for three physical boxes), and each recreation costs
@@ -1252,17 +1260,22 @@ class StaticReoptNode(Node):
             return False
         thr = self.clearance_dirty_m
         drifted = False
-        for o, key in zip(obs, self._keys_for(obs, ids)):
+        for o, i, key in zip(obs, ids, self._keys_for(obs, ids)):
             was = base.get(key)
             if was is None or was < thr or key in self._clearance_dirty_keys:
                 continue                        # never cleared by this line, or already reported
-            now = float(np.min(np.hypot(xa - o.x, ya - o.y))) - float(o.r)
+            # the LIVE estimate, not the held one the layer publishes as the pose. The hold is a
+            # dead-band on the SET (it stops estimate noise re-arming a rebuild), and reading it
+            # here made the cause and the measurement of a drift the same stale number -- the
+            # check documented as the safety net for sub-tolerance drift could not fire at all.
+            ox, oy = self._live_xy.get(i, (o.x, o.y))
+            now = float(np.min(np.hypot(xa - ox, ya - oy))) - float(o.r)
             if now >= thr:
                 continue
             self._clearance_dirty_keys.add(key)
             drifted = True
             self.get_logger().warning(
-                f"[static_reopt] obstacle @({o.x:.2f},{o.y:.2f}) drifted into the active line: "
+                f"[static_reopt] obstacle @({ox:.2f},{oy:.2f}) drifted into the active line: "
                 f"clearance {was:+.2f} -> {now:+.2f} m, under {thr:.2f} — re-optimizing before "
                 f"the state machine reads the line as blocked")
         return drifted

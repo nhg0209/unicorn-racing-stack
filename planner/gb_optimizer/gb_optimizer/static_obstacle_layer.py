@@ -30,6 +30,7 @@ from typing import Dict, List, Optional
 import rclpy
 from rclpy.node import Node
 
+from geometry_msgs.msg import Point
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Empty
 from visualization_msgs.msg import Marker, MarkerArray
@@ -110,6 +111,16 @@ class StaticObstacleLayer(Node):
         # (0.126 m); a box that has actually been moved (0.53 m in the same log) crosses it at once,
         # so nothing is slowed down. The estimate itself is untouched -- this is a publish gate.
         self.declare_parameter("publish_deadband_m", 0.12)
+        # Sightings a track must have before its published position is FROZEN. The dead-band
+        # suppresses set-change noise, but it was seeded the first time a confirmed track was
+        # published -- at confirm_hits sightings, i.e. the moment the EMA has seen the LEAST. With
+        # a = 0.3 the residual after k updates is 0.7^k: 17% of the initial error is still there at
+        # 5 hits and 0.5% at 15. Everything the estimate learned after the seed was then discarded
+        # for good, as long as it stayed inside the 0.12 m band -- so the re-opt could be fitting
+        # its humps to a position 0.12 m stale, and floor 0.35 - 0.12 = 0.23 m of real clearance is
+        # under the state machine's 0.25 m static-GB requirement: the line reads BLOCKED and the
+        # car trails a box the line actually clears.
+        self.declare_parameter("publish_seed_hits", 15)
 
         self.static_vel_thresh = float(self.get_parameter("static_vel_thresh").value)
         self.require_is_static = bool(self.get_parameter("require_is_static").value)
@@ -130,6 +141,7 @@ class StaticObstacleLayer(Node):
         self.unlatch_max_ego_d = float(self.get_parameter("unlatch_max_ego_d").value)
         self.unlatch_swap_suspend_s = float(self.get_parameter("unlatch_swap_suspend_s").value)
         self.publish_deadband_m = float(self.get_parameter("publish_deadband_m").value)
+        self.publish_seed_hits = int(self.get_parameter("publish_seed_hits").value)
 
         self._ego_d: Optional[float] = None
         self._ego_vs: Optional[float] = None
@@ -458,19 +470,41 @@ class StaticObstacleLayer(Node):
             m.id = t.marker_id
             m.type = Marker.CYLINDER
             m.action = Marker.ADD
-            # the HELD position, not the live estimate (see publish_deadband_m)
-            if t.pub_x is None or t.pub_y is None:
-                t.pub_x, t.pub_y = t.x, t.y
-            elif math.hypot(t.x - t.pub_x, t.y - t.pub_y) > self.publish_deadband_m:
-                self.get_logger().info(
-                    f"[static_obs_layer] obstacle @({t.pub_x:.2f},{t.pub_y:.2f}) moved "
-                    f"{math.hypot(t.x - t.pub_x, t.y - t.pub_y):.2f} m "
-                    f"(> {self.publish_deadband_m:.2f}) -> republishing at "
-                    f"({t.x:.2f},{t.y:.2f})")
-                t.pub_x, t.pub_y = t.x, t.y
-            m.pose.position.x = t.pub_x
-            m.pose.position.y = t.pub_y
+            # the HELD position, not the live estimate (see publish_deadband_m) -- but only once
+            # the estimate has SETTLED. Freezing at confirmation froze the least-informed estimate
+            # the track will ever have and threw away every refinement inside the dead-band.
+            # While it is still settling the track is published LIVE and pub_x stays None, so the
+            # hold is seeded from the settled estimate whatever rate this timer happens to run at.
+            if t.hits < self.publish_seed_hits:
+                px, py = t.x, t.y
+            else:
+                if t.pub_x is None or t.pub_y is None:
+                    t.pub_x, t.pub_y = t.x, t.y
+                    self.get_logger().info(
+                        f"[static_obs_layer] obstacle @({t.x:.2f},{t.y:.2f}) settled after "
+                        f"{t.hits} sightings -> position held "
+                        f"(dead-band {self.publish_deadband_m:.2f} m)")
+                elif math.hypot(t.x - t.pub_x, t.y - t.pub_y) > self.publish_deadband_m:
+                    self.get_logger().info(
+                        f"[static_obs_layer] obstacle @({t.pub_x:.2f},{t.pub_y:.2f}) moved "
+                        f"{math.hypot(t.x - t.pub_x, t.y - t.pub_y):.2f} m "
+                        f"(> {self.publish_deadband_m:.2f}) -> republishing at "
+                        f"({t.x:.2f},{t.y:.2f})")
+                    t.pub_x, t.pub_y = t.x, t.y
+                px, py = t.pub_x, t.pub_y
+            m.pose.position.x = px
+            m.pose.position.y = py
             m.pose.orientation.w = 1.0
+            # ...and the LIVE estimate alongside it. points[] is unused by a CYLINDER marker and
+            # ignored by every existing consumer, so the pose contract is unchanged -- but a
+            # consumer that must not be fooled by the hold can have the un-frozen position.
+            # static_reopt_node's _clearance_drifted is exactly that: it asks "has this box
+            # drifted into the line I am following?" and was reading the frozen coordinate, so the
+            # cause of the drift and the measurement of it were the same stale number and the
+            # check could not fire by construction.
+            live = Point()
+            live.x, live.y = t.x, t.y
+            m.points = [live]
             m.scale.x = 2.0 * t.r
             m.scale.y = 2.0 * t.r
             m.scale.z = 0.3

@@ -4,6 +4,7 @@
 No ROS graph needed beyond rclpy init (no spin, no sim):
     source install/setup.bash && python3 planner/gb_optimizer/scripts/test_static_obstacle_layer.py
 """
+import math
 import sys
 import types
 
@@ -52,8 +53,10 @@ def arr(*obstacles):
     return m
 
 
-def confirm_obstacle(node, x=3.0, y=0.0, s=10.0):
-    for _ in range(node.confirm_hits):
+def confirm_obstacle(node, x=3.0, y=0.0, s=10.0, settle=False):
+    """`settle` also drives the track past publish_seed_hits, i.e. to where its published position
+    is HELD. Confirmation alone no longer freezes it -- see the seeding note in publish_cb."""
+    for _ in range(max(node.confirm_hits, node.publish_seed_hits if settle else 0)):
         node.obstacles_cb(arr(det(x, y, s)))
     assert node._tracks and node._tracks[0].confirmed, "obstacle should be confirmed"
     return node._tracks[0]
@@ -223,7 +226,7 @@ def test_publish_position_holds_still_under_estimate_noise():
     # downstream: 12 of 25 set changes in one run were nothing else, and each cost a re-solve, a
     # swap and a FrenetConverter rebuild in three consumers.
     node = make_node()
-    t = confirm_obstacle(node, x=3.0, y=0.0, s=10.0)
+    t = confirm_obstacle(node, x=3.0, y=0.0, s=10.0, settle=True)
     assert published_xy(node) == [(3.0, 0.0)], published_xy(node)
     for dx, dy in ((0.05, 0.02), (-0.04, 0.03), (0.06, -0.05), (0.03, 0.06)):
         for _ in range(6):                      # let the EMA settle on the wandered position
@@ -235,10 +238,80 @@ def test_publish_position_holds_still_under_estimate_noise():
           f"{max(np.hypot(*d) for d in ((0.05,0.02),(0.04,0.03),(0.06,0.05),(0.03,0.06))):.3f} m")
 
 
+def test_the_hold_seeds_only_once_the_estimate_has_settled():
+    # The hold used to be seeded the first time a CONFIRMED track was published -- at confirm_hits
+    # sightings, the moment the EMA has seen the least. With a = 0.3 the residual after k updates
+    # is 0.7^k, so 17% of the initial error was still in the number that then got frozen for good,
+    # and every later refinement inside the 0.12 m dead-band was discarded. The re-opt fits its
+    # humps to that number: floor 0.35 - 0.12 = 0.23 m of real clearance, under the state
+    # machine's 0.25 m static-GB requirement, i.e. TRAILING behind a box the line clears.
+    first, true = (3.00, 0.0), (3.10, 0.0)         # first sightings biased 0.10 m off
+    out = {}
+    for seed_hits in (5, 15):                      # 5 == confirm_hits, i.e. the old behaviour
+        node = make_node()
+        node.publish_seed_hits = seed_hits
+        for _ in range(node.confirm_hits):
+            node.obstacles_cb(arr(det(first[0], first[1], 10.0)))
+        assert node._tracks[0].confirmed
+        published_xy(node)                          # the publish timer ticks while it is settling
+        for _ in range(40):                         # the estimate converges on the true position
+            node.obstacles_cb(arr(det(true[0], true[1], 10.0)))
+            published_xy(node)
+        out[seed_hits] = published_xy(node)[0]
+    seeded_early, held = out[5], out[15]
+    assert abs(seeded_early[0] - first[0]) < 0.01, (
+        "the harness must reproduce the failure: seeding at confirm_hits freezes the biased "
+        f"estimate, got {seeded_early}")
+    assert abs(held[0] - true[0]) < 0.01, (
+        f"the published position froze at {seeded_early} and never learned the settled estimate "
+        f"{node._tracks[0].x:.3f}: got {held}")
+    # ...and once settled it IS held: further sub-dead-band noise does not move it
+    node = make_node()
+    for _ in range(node.publish_seed_hits + 5):
+        node.obstacles_cb(arr(det(true[0], true[1], 10.0)))
+        published_xy(node)
+    settled = published_xy(node)[0]
+    assert abs(settled[0] - true[0]) < 0.01, settled
+    for _ in range(20):
+        node.obstacles_cb(arr(det(true[0] + 0.05, true[1] + 0.03, 10.0)))
+        published_xy(node)
+    assert published_xy(node)[0] == settled, "after settling the dead-band must still hold"
+    print(f"PASS the hold seeds after the estimate settles "
+          f"(early seed {seeded_early} -> held {held}, true {true})")
+
+
+def test_the_live_estimate_is_published_alongside_the_held_pose():
+    # The hold is a dead-band on the SET -- it stops estimate noise re-arming a rebuild. But
+    # static_reopt_node._clearance_drifted asks "has this box drifted into the line I am
+    # following?", and reading the held pose made the cause of a drift and the measurement of it
+    # the same stale number: the safety net could not fire by construction. The live estimate now
+    # travels in points[0], which a CYLINDER marker does not use and no existing consumer reads.
+    node = make_node()
+    confirm_obstacle(node, x=3.0, y=0.0, s=10.0, settle=True)
+    assert published_xy(node) == [(3.0, 0.0)]             # settled -> the hold is seeded here
+    for _ in range(20):
+        node.obstacles_cb(arr(det(3.08, 0.05, 10.0)))     # inside the 0.12 m dead-band
+    pub = []
+    node.pub = types.SimpleNamespace(publish=lambda a: pub.append(a))
+    node.publish_cb()
+    marks = [m for m in pub[-1].markers if m.action == 0]
+    assert len(marks) == 1
+    m = marks[0]
+    assert (round(m.pose.position.x, 3), round(m.pose.position.y, 3)) == (3.0, 0.0), \
+        "the POSE must still be the held one"
+    assert m.points, "the live estimate must be published alongside it"
+    live = (m.points[0].x, m.points[0].y)
+    assert abs(live[0] - node._tracks[0].x) < 1e-9 and abs(live[1] - node._tracks[0].y) < 1e-9
+    assert math.hypot(live[0] - m.pose.position.x, live[1] - m.pose.position.y) > 0.05, \
+        "this fixture must actually separate the two"
+    print(f"PASS the live estimate ({live[0]:.2f}, {live[1]:.2f}) rides with the held pose "
+          f"({m.pose.position.x:.2f}, {m.pose.position.y:.2f})")
+
+
 def test_publish_position_follows_a_real_move_at_once():
     # A box that has actually been moved crosses the dead band immediately -- reactivity is kept.
     node = make_node()
-    confirm_obstacle(node, x=3.0, y=0.0, s=10.0)
+    confirm_obstacle(node, x=3.0, y=0.0, s=10.0, settle=True)
     published_xy(node)
     for _ in range(8):
         node.obstacles_cb(arr(det(3.51, -0.16, 10.0)))   # the 0.53 m move seen in the log
@@ -391,6 +464,8 @@ def main():
     try:
         for fn in (test_raw_detection_suppresses_the_streak_but_a_removed_box_still_unlatches,
                    test_publish_position_holds_still_under_estimate_noise,
+                   test_the_hold_seeds_only_once_the_estimate_has_settled,
+                   test_the_live_estimate_is_published_alongside_the_held_pose,
                    test_publish_position_follows_a_real_move_at_once,
                    test_confirm_and_unlatch, test_unlatch_demotes_and_keeps_the_identity,
                    test_demoted_track_decays_at_the_lap_boundary,
