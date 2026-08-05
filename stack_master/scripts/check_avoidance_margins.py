@@ -588,14 +588,20 @@ def main() -> int:
     # TRAILING while a perfectly good spline is on the wire, and nothing in either node says why.
     # It is the real floor under apex_bulge, which is otherwise pure comfort.
     build_reach = keepout + apex_bulge
-    _dp, dynpl = load_dynamic_planner_params()
-    lat_w = float(dynpl.get("lateral_width_m", 0.0))
+    # The SM judges a STATIC avoidance path through WaypointData(self, "static_avoidance_planner")
+    # -- its per-planner nested parameters, i.e. state_machine/config/planners/
+    # static_avoidance_planner.yaml. Reading the DYNAMIC planner's lateral_width_m here (0.15
+    # against the static 0.1) overstated the accept line by 5 cm and reported the reactive build
+    # as sitting exactly on it, with zero headroom, when it actually clears it by 0.050 m.
+    sm_planner_yaml = (STACK_MASTER.parent / "state_machine" / "config" / "planners"
+                       / "static_avoidance_planner.yaml")
+    lat_w = float(yaml.safe_load(sm_planner_yaml.read_text()).get("lateral_width_m", 0.0))
     sm_ot_accept = gb_ego_half + lat_w
     print(f"\nreactive build vs the SM's accept line for a published avoidance path:")
     print(f"  build = width_car/2 + safety_margin + apex_bulge = {width_car/2:.3f} + "
           f"{safety_margin:.3f} + {apex_bulge:.3f} = {build_reach:.3f} m")
     print(f"  SM accepts at gb_ego_width_m/2 + lateral_width_m = {gb_ego_half:.3f} + "
-          f"{lat_w:.3f} = {sm_ot_accept:.3f} m")
+          f"{lat_w:.3f} = {sm_ot_accept:.3f} m  ({sm_planner_yaml.name})")
     if build_reach < sm_ot_accept - 1e-9:
         ok = False
         print(f"FAIL: the reactive planner builds to {build_reach:.3f} m but the SM only accepts a "
@@ -605,6 +611,28 @@ def main() -> int:
     else:
         print(f"OK: the build ({build_reach:.3f}) clears the SM accept line ({sm_ot_accept:.3f}) "
               f"by {build_reach - sm_ot_accept:.3f} m.")
+
+    # --- (a2) the LATERAL keep-out vs the SM's static GB requirement ------------------------
+    # A dead band with a specific, reproducible failure. The planner skips the knot for any box the
+    # followed line already clears by the keep-out, and if that leaves NO knots it publishes an
+    # empty path (the "no avoidance needed" branch). The SM, meanwhile, calls the GB line blocked
+    # below gb_ego_width_m/2 + lateral_width_static_gb_m. If the keep-out sits UNDER that
+    # requirement, a line clearing a box by c with keep-out <= c < requirement makes the planner
+    # publish nothing and the SM read blocked at the same time -- permanent TRAILING, with both
+    # nodes behaving exactly as designed.
+    sm_static_need = gb_ego_half + float(sm_c["lateral_width_static_gb_m"])
+    print(f"  lateral keep-out = width_car/2 + safety_margin = {keepout:.3f} m vs the SM's static "
+          f"GB requirement gb_ego_width_m/2 + lateral_width_static_gb_m = {sm_static_need:.3f} m")
+    if keepout < sm_static_need - 1e-9:
+        ok = False
+        print(f"FAIL: the keep-out ({keepout:.3f}) is under the SM's static GB requirement "
+              f"({sm_static_need:.3f}). A line clearing a box by anything in between makes the "
+              f"planner publish an empty path (it sees no knot to place) while the SM reads the "
+              f"line as blocked -- permanent TRAILING. Raise safety_margin or lower "
+              f"lateral_width_static_gb_m.")
+    else:
+        print(f"OK: the lateral keep-out ({keepout:.3f}) covers the SM's static GB requirement "
+              f"({sm_static_need:.3f}).")
 
     # --- (b) obs_margin is also an S-WINDOW, so it must cover half the car's LENGTH ---------
     # The keep-out is inflated by obs_margin in s as well as in d (obs_ok widens the box's
