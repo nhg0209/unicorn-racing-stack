@@ -3,7 +3,11 @@ min_horizon: 0.0
 # validates the obstacle over the same window the SM commits in. The static commit itself no longer
 # uses this (it gates on a fresh on-spline path), so this is just consistency/future-proofing.
 max_horizon: 15.0
-lateral_width_m: 0.1
+# 0.10 -> 0.07, with the reactive build (width_car/2 + safety_margin + apex_bulge = 0.32).
+# Moved as part of the width-reduction SET -- the accept line has to stay under the build or the
+# planner's own best path reads NOT-free the moment it is published (checked by
+# stack_master/scripts/check_avoidance_margins.py).
+lateral_width_m: 0.07
 free_scaling_reference_distance_m: 2.0
 # The single-threaded state_machine executor runs ~0.3-0.5 s behind on the static-spline messages
 # (it re-runs the heavy vel profiler on every 20 Hz avoidance msg), so measured against the SM clock

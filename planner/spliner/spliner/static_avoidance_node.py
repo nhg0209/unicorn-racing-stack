@@ -146,7 +146,7 @@ class ObstacleSpliner(Node):
         self.a_long_max = 4.0        # [m/s^2] longitudinal DECEL for the backward pass (brake into the apex)
         self.a_long_accel = 3.0      # [m/s^2] longitudinal ACCEL for the forward pass (gentle exit ramp-up;
                                      # lower = more gradual "fast-out" acceleration off the apex)
-        self.safety_margin = 0.16    # [m] extra clearance around the obstacle box (beyond half car).
+        self.safety_margin = 0.14    # [m] extra clearance around the obstacle box (beyond half car).
         self.static_near_zero_mps = 0.15  # speed band for the near-stationary fallback
         self.static_promote_sec = 0.5     # how long it must hold before the fallback is believed
         self.static_demote_mps = 0.35     # clearly-moving band that ends the belief
@@ -200,7 +200,7 @@ class ObstacleSpliner(Node):
         # only where the corridor will not accept the offset over its full length; below this the
         # curvature cost (A/L^2) stops being worth the feasibility it buys.
         self.ramp_len_min_m = 2.5    # [m]
-        self.apex_bulge = 0.05       # [m] extra offset at the box CENTRE (apex) beyond the clearance
+        self.apex_bulge = 0.03       # [m] extra offset at the box CENTRE (apex) beyond the clearance
                                      # value: higher = car swings WIDER around the obstacle. 0 = flat hold.
         self.max_weave = 3           # max obstacles woven into one path (slalom); 1 = single-apex only
         self.width_car = 0.30        # [m]
@@ -380,7 +380,7 @@ class ObstacleSpliner(Node):
         self.declare_parameter('a_lat_max', 6.0, dbl(1.0, 20.0, "lateral-accel cap [m/s^2]"))
         self.declare_parameter('a_long_max', 4.0, dbl(0.5, 20.0, "longitudinal decel for backward speed pass [m/s^2]"))
         self.declare_parameter('a_long_accel', 3.0, dbl(0.5, 20.0, "longitudinal accel for forward pass (gentle exit) [m/s^2]"))
-        self.declare_parameter('safety_margin', 0.16, dbl(0.0, 1.0, "clearance around obstacle box [m]"))
+        self.declare_parameter('safety_margin', 0.14, dbl(0.0, 1.0, "clearance around obstacle box [m]"))
         self.declare_parameter('static_near_zero_mps', 0.15,
                                dbl(0.0, 1.0, "speed band for the near-stationary fallback [m/s]"))
         self.declare_parameter('static_promote_sec', 0.5,
@@ -412,7 +412,7 @@ class ObstacleSpliner(Node):
         self.declare_parameter('return_len', 4.5, dbl(0.5, 10.0, "ramp length back to the raceline [m]"))
         self.declare_parameter('ramp_len_min_m', 2.5,
                                dbl(0.5, 10.0, "floor for the adaptive ramp shortening [m]"))
-        self.declare_parameter('apex_bulge', 0.05, dbl(0.0, 1.0, "extra apex offset beyond clearance: higher=wider avoidance [m]"))
+        self.declare_parameter('apex_bulge', 0.03, dbl(0.0, 1.0, "extra apex offset beyond clearance: higher=wider avoidance [m]"))
         self.declare_parameter('max_weave', 3, intd(1, 5, "max obstacles woven into one path (slalom); 1=single-apex"))
         self.declare_parameter('width_car', 0.30, dbl(0.1, 1.0, "car width [m]"))
         self.declare_parameter('tail_m', 1.0, dbl(0.0, 20.0, "short raceline tail after the return [m]"))

@@ -133,7 +133,7 @@ class StaticReoptNode(Node):
         # See the reopt_relax_floor description in base_system.launch.xml: at least the reactive
         # keep-out (0.30), AND at least 5 cm above every consumer of the clearance it produces --
         # the reactive clear-gate entry (0.28) binds. The ladder lands exactly on this floor.
-        self.declare_parameter("relax_floor", 0.33)
+        self.declare_parameter("relax_floor", 0.34)
         # FINAL wall gate: every published point is checked against the eroded occupancy map before
         # the line is allowed to swap in. The corridor the fit works in is derived from the
         # waypoints' d_left/d_right, which are an estimate; the map is the only wall source that
@@ -304,7 +304,7 @@ class StaticReoptNode(Node):
         # [m] max |d| the recorded apex may fall SHORT of what the obstacle geometrically requires.
         # Symmetric with the long-standing overshoot clamp; without it a decaying tail reads as a
         # legitimately tighter apex.
-        self.declare_parameter("apex_undershoot_m", 0.12)
+        self.declare_parameter("apex_undershoot_m", 0.15)
         # [m] max along-track distance from the obstacle to the recorded point. 1.0 admitted the
         # polluted records (0.4-1.0 m) as readily as the healthy ones (all <= 0.1 m).
         self.declare_parameter("apex_abeam_gap_m", 0.5)

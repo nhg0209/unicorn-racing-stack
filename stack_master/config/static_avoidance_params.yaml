@@ -46,7 +46,7 @@ static_avoidance_planner:
     # blink whenever the tracked speed brushes the band.
     static_demote_mps: 0.35
     static_demote_sec: 0.3
-    safety_margin: 0.15     # [m]  extra clearance around the obstacle box. obs_margin = half_car(0.15)+
+    safety_margin: 0.14     # [m]  extra clearance around the obstacle box. obs_margin = half_car(0.15)+
                             #      safety must cover the SIM ego collision radius (0.29 m = half car
                             #      LENGTH in gym_bridge); 0.16 -> 0.31 clears it so the car no longer
                             #      grazes-then-teleports. Raise if the car still clips the box. Lowering
@@ -153,7 +153,23 @@ static_avoidance_planner:
     # DO NOT set 0. obs_ok's keep-out test is INCLUSIVE at the boundary, so a candidate sitting
     # exactly on the edge is rejected and the choice falls to the next sample further out: measured
     # mean peak 0.596 m and only 75 feasible stations -- wider AND less feasible than 0.05.
-    apex_bulge: 0.05
+    #
+    # 0.05 -> 0.03, as one of a SET (safety_margin 0.15 -> 0.14, the SM's lateral_width_m for this
+    # planner 0.10 -> 0.07, reopt relax_floor 0.33 -> 0.34, apex_undershoot_m 0.12 -> 0.15). Moving
+    # any one of them alone breaks a coupling: the reactive build has to stay above the SM's accept
+    # line for a published avoidance path, and the reopt floor has to stay 5 cm above every
+    # consumer of its clearance.
+    #
+    # TWO CONSTRAINTS LAND UNDER THIS and are what stop it going lower:
+    #   * the keep-out (width_car/2 + safety_margin = 0.29) must cover HALF THE CAR'S LENGTH
+    #     (0.29 m), because obs_ok inflates the box by the same isotropic margin in s as in d --
+    #     checked by check_avoidance_margins;
+    #   * the physical budget 0.150 (half car) + 0.084 + 0.080 = 0.314 m, below which the swept
+    #     body no longer clears the box.
+    # apex_bulge 0.02 or less breaks the second. 0.01 and 0 are worse than useless: obs_ok's
+    # keep-out test is INCLUSIVE at the boundary, so a candidate exactly on the edge is rejected
+    # and the choice falls to the next sample further out -- the line gets WIDER.
+    apex_bulge: 0.03
     # 2 -> 3. The node already supported 3; the yaml was the binding limit, and it does not merely
     # cost coverage of the third box -- it makes the whole plan infeasible. The feasibility filter
     # (obs_ok) tests EVERY obstacle inside the 15 m lookahead, while only max_weave of them get a

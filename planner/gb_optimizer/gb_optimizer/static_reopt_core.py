@@ -1165,9 +1165,16 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         # planner drove: keep-out (width_car/2 + safety_margin) + apex_bulge, i.e. its own design
         # clearance plus a deliberate extra swing. Replaying it makes the global line a copy of the
         # local one -- same offset, same lap-time cost, no reason to swap. What the global line
-        # actually owes the obstacle is r + obs_margin from its centre, which on the shipped
-        # numbers is 0.50 m against the reactive 0.55 m: a genuinely tighter line, and the whole
-        # point of re-optimizing at all.
+        # actually owes the obstacle is r + obs_margin from its centre.
+        #
+        # This used to say the global line comes out TIGHTER than the reactive one (0.50 vs
+        # 0.55 m). That stopped being true when apex_bulge came down: the reactive build is now
+        # width_car/2 + safety_margin + apex_bulge = 0.32 m off the box EDGE, i.e. r + 0.32 from
+        # its centre, against the global line's r + obs_margin = r + 0.35 -- the global line is
+        # the WIDER of the two by 3 cm. The reason to derive the amplitude from the box rather
+        # than replay the apex is unchanged and does not depend on which is tighter: an apex is
+        # what one reactive pass happened to drive, from a displaced car, at whatever margin that
+        # pass was solved with, while the box is what the obstacle actually requires.
         #
         # The recorded apex keeps two jobs it is uniquely good at: it says which SIDE the obstacle
         # was passed on (a decision that needs the corridor and the grid, which this function does
