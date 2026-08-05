@@ -1374,19 +1374,26 @@ class ObstacleSpliner(Node):
         scan_lo_s = knots[0][0] - self.ramp_len
         scan_hi_s = knots[-1][0] + self.return_len
         scan_s = np.arange(scan_lo_s, scan_hi_s + 1e-9, 0.5)
+        # ABSOLUTE stations for the corridor read. scan_s is path-local -- distance from the CAR,
+        # like knots[i][0] -- and _grid_corridor_batch treats its argument as an absolute station
+        # (`s_query % gb_max_s`). This is the same bug 6b8112e fixed for knot_cor, left behind in
+        # the ramp scan: the sampled points slid along the track as the car approached, so the
+        # ramp was shortened (or not) by a corridor belonging to somewhere else entirely.
+        # _ramp_limits keeps doing its ds arithmetic on the path-local scan_s.
+        scan_s_abs = (self.cur_s + scan_s) % self.gb_max_s
         scan_lo = scan_hi = None
         if self.trust_grid_bounds:
             # only as wide as the path can go: the sampled offsets plus the bulge and a cell
             scan_d_max = float(np.max(np.abs(d_ends))) + self.apex_bulge + 0.10
             scan_lo, scan_hi = self._grid_corridor_batch(
-                scan_s, d_max=max(scan_d_max, 0.5), d_step=max(self.grid_scan_step, 0.10),
+                scan_s_abs, d_max=max(scan_d_max, 0.5), d_step=max(self.grid_scan_step, 0.10),
                 wall_margin=wall_margin)
         if scan_lo is None:
             scan_lo = np.empty(len(scan_s)); scan_hi = np.empty(len(scan_s))
             scan_lo[:] = np.nan; scan_hi[:] = np.nan
         miss = ~np.isfinite(scan_lo)             # unmeasurable -> the waypoint corridor
         if miss.any():
-            jj = ((scan_s[miss] % self.gb_max_s) / wpnt_dist).astype(int) % self.gb_max_idx
+            jj = (scan_s_abs[miss] / wpnt_dist).astype(int) % self.gb_max_idx
             scan_lo[miss] = np.array([-(gb_wpnts[j].d_right - sample_margin) for j in jj])
             scan_hi[miss] = np.array([gb_wpnts[j].d_left - sample_margin for j in jj])
 
