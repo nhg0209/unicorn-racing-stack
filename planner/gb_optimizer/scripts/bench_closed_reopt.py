@@ -110,8 +110,8 @@ def main():
     n = len(ref)
     need = p.obs_margin + p.w_veh / 2.0
     print(f"map {MAP}: {n} stations | grid {p.grid_step_m} w {p.dev_weight} obs_margin "
-          f"{p.obs_margin} w_veh {p.w_veh} disc_allow {p.disc_allow_m} kappa(report) "
-          f"{p.kappa_report_only}")
+          f"{p.obs_margin} w_veh {p.w_veh} disc_allow {p.disc_allow_m} kappa_budget "
+          f"{p.kappa_budget} infl {p.infl_len_m}")
     print(f"    acceptance clearance = obs_margin + w_veh/2 = {need:.3f} m "
           f"(disc_allow_m is NOT in it)")
 

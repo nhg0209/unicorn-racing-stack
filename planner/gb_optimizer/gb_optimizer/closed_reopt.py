@@ -89,7 +89,20 @@ class ReoptParams:
     # obs_margin stays a safety number and this stays a numerical one -- the ACCEPTANCE check is
     # still obs_margin + w_veh/2, with none of this added.
     disc_allow_m: float = 0.010
-    kappa_report_only: float = 1.5   # [1/m] REPORTED against, never used to reject or to tune
+    # [m] LOCALITY, BOUGHT EXPLICITLY. Beyond this arc distance from every box the offset is
+    # pinned to exactly zero, so an avoidance cannot move the racing line on the far side of the
+    # lap. The hump pipeline gets this for free by laying a bump; a global objective does not, and
+    # measured without it the QP left a median 0.062 m and up to 0.150 m of offset more than 2.5 m
+    # from any box. The LOWER bound is the hold: two boxes 8.5 m apart need the envelope to still
+    # be open at the 4.25 m midpoint, and 4.0 m kills that hold outright (0.000).
+    infl_len_m: float = 6.0
+    # [1/m] the curvature the line is allowed to reach. NOT a rejection threshold -- it is a
+    # SPATIAL BUDGET: where the clean raceline already uses most of it, the envelope closes and
+    # the line is held near the raceline. On ifac the apex at station 227 is at 1.448 of this, so
+    # 3.5% of the budget is left there and the line is all but pinned; on a straight at 0.23 the
+    # budget is 85% free and the envelope is untouched. A box that cannot be cleared inside the
+    # budget is handed to the reactive layer by name, never cleared by less than it is owed.
+    kappa_budget: float = 1.5
 
 
 @dataclass
@@ -146,6 +159,13 @@ def int_k2(pts: np.ndarray) -> float:
     k = menger_closed(pts)
     el = _closed_el(pts)
     return float(np.sum(k * k * 0.5 * (el + np.roll(el, 1))))
+
+
+# How hard the curvature budget bites. 0.5 leaves a corner at half the budget 71% of its
+# corridor and one at 3.5% only 19% of it -- the budget is meant to bind near the limit and be
+# invisible on a straight. A module constant on purpose: it shapes the same trade-off infl_len_m
+# does, and two knobs for one trade-off is how the hump pipeline ended up with sixteen.
+_BUDGET_EXP = 0.5
 
 
 # ======================================================================================
@@ -229,6 +249,42 @@ def select_sides(pts: np.ndarray,
                        f"of the keep-out at that station")
         out.append(0 if blocked else (1 if room_hi >= room_lo else -1))
     return out
+
+
+def locality_envelope(s_c: np.ndarray,
+                      track_len: float,
+                      obstacles: Sequence[Obstacle],
+                      pts_fine: np.ndarray,
+                      s_fine: np.ndarray,
+                      k_clean_c: np.ndarray,
+                      params: ReoptParams) -> np.ndarray:
+    """g(s) in [0, 1]: the fraction of the corridor the offset may use at each station.
+
+    Two factors, multiplied, and both are HARD -- they enter the QP as bounds, not as weights:
+
+      LOCALITY. 1 within infl_len_m/2 of the nearest box, smoothstepped to 0 at infl_len_m. Where
+      it reaches 0 the offset is pinned to 0 and the avoidance simply cannot reach that far. This
+      is the property the hump pipeline has by construction and a global objective does not.
+
+      CURVATURE BUDGET. sqrt(the fraction of kappa_budget the clean line is NOT already using).
+      Minimising the OFFSET's bending says nothing about the TOTAL curvature: the offset's own
+      tail is smooth and still adds to a corner that is already at the limit, which is exactly how
+      the QP put 2.052 into ifac's apex while the hump stayed at 1.445. The exponent is a module
+      constant, not a knob -- 0.5 is chosen so a corner at half the budget keeps 71% of its
+      corridor rather than 50%, i.e. the budget bites hard only near the limit.
+    """
+    if not len(obstacles):
+        return np.zeros(len(s_c))
+    d_arc = np.full(len(s_c), np.inf)
+    for o in obstacles:
+        j = int(np.argmin(np.hypot(pts_fine[:, 0] - o.x, pts_fine[:, 1] - o.y)))
+        gap = np.abs(s_c - s_fine[j])
+        d_arc = np.minimum(d_arc, np.minimum(gap, track_len - gap))   # wrap-aware
+    half = 0.5 * max(params.infl_len_m, 1e-6)
+    t = np.clip((d_arc - half) / half, 0.0, 1.0)
+    g = 1.0 - (3.0 * t * t - 2.0 * t * t * t)
+    frac = np.clip((params.kappa_budget - k_clean_c) / max(params.kappa_budget, 1e-9), 0.0, 1.0)
+    return g * np.power(frac, _BUDGET_EXP)
 
 
 def corridor_deficit(pts: np.ndarray,
@@ -351,71 +407,116 @@ def reoptimize_closed(reftrack_fine: np.ndarray,
     rep.n_coarse = len(ci)
     pts_c = pts_fine[ci]
     _psi_c, nv_c, tan_c = _frame(pts_c)
-
-    # --- what the corridor genuinely cannot carry ---------------------------------------------
-    # An obstacle can pick a side at its own station and still be impossible a metre later, where
-    # the keep-out disc is still wide and the track has narrowed. Forcing it through would eat the
-    # wall margin for a clearance that was never available, so it is dropped from the QP and named
-    # -- with the station and the side and the metres -- for the reactive layer, which is the one
-    # that can still slow down or squeeze. The obstacles that ARE avoidable are solved as normal.
     ds = float(np.sum(el_fine)) / len(ci)
-    keep, keep_sides = [], []
-    for o, sd in zip(use, use_sides):
-        short, k, which = corridor_deficit(pts_c, nv_c, tan_c, o, sd, lo_f[ci], hi_f[ci], p, ds)
-        if short > 1e-6:
-            j = int(np.argmin(np.hypot(pts_fine[:, 0] - o.x, pts_fine[:, 1] - o.y)))
-            rep.infeasible.append(next(i for i, ob in enumerate(obstacles) if ob is o))
-            rep.infeasible_why.append(
-                f"box at station {j}: the {which} corridor is {short:.3f} m short of the keep-out "
-                f"at station {int(ci[k])}")
-        else:
-            keep.append(o)
-            keep_sides.append(sd)
-    if not keep:
+    s_fine = np.concatenate([[0.0], np.cumsum(el_fine)[:-1]])
+    L = float(np.sum(el_fine))
+    need = p.obs_margin + 0.5 * p.w_veh
+
+    def name(o):
+        return next(i for i, ob in enumerate(obstacles) if ob is o)
+
+    def station(o):
+        return int(np.argmin(np.hypot(pts_fine[:, 0] - o.x, pts_fine[:, 1] - o.y)))
+
+    # --- solve, then CHECK WHAT THE LINE ACTUALLY DELIVERED --------------------------------
+    # THE CONTRACT OF THIS LAYER: every box the global line claims is cleared by the margin it is
+    # owed. A box it cannot clear is handed to the reactive layer BY NAME -- that layer can still
+    # brake, squeeze or take a different side, and this one cannot. What is not allowed is
+    # claiming a box and clearing it by less, which is how a downstream fail-closed gate ends up
+    # re-avoiding a line that was published as safe.
+    d_c = d_fine = line = None
+    for _round in range(len(obstacles) + 2):
+        # the envelope follows the boxes still being avoided, so it is rebuilt every round
+        g = locality_envelope(s_fine[ci], L, use, pts_fine, s_fine, k_clean[ci], p)
+        env_hi = np.minimum(hi_f[ci], g * np.maximum(hi_f[ci], 0.0))
+        env_lo = np.maximum(lo_f[ci], g * np.minimum(lo_f[ci], 0.0))
+
+        # what the envelope, not the wall, makes impossible
+        keep, keep_sides = [], []
+        for o, sd in zip(use, use_sides):
+            raw, _k0, _w0 = corridor_deficit(pts_c, nv_c, tan_c, o, sd, lo_f[ci], hi_f[ci], p, ds)
+            env, k, which = corridor_deficit(pts_c, nv_c, tan_c, o, sd, env_lo, env_hi, p, ds)
+            if env <= 1e-6:
+                keep.append(o)
+                keep_sides.append(sd)
+                continue
+            j, kj = station(o), int(ci[k])
+            rep.infeasible.append(name(o))
+            if raw > 1e-6:
+                rep.infeasible_why.append(
+                    f"box at station {j}: the {which} corridor is {raw:.3f} m short of the "
+                    f"keep-out at station {kj}")
+            else:
+                used = 100.0 * min(k_clean[kj] / max(p.kappa_budget, 1e-9), 1.0)
+                gap = abs(s_fine[kj] - s_fine[j])
+                need_at = abs(env_hi[k] if which == "left" else env_lo[k]) + env
+                rep.infeasible_why.append(
+                    f"box at station {j}: the clean line is at {used:.1f}% of the curvature "
+                    f"budget {min(gap, L - gap):.1f} m from it; clearing it would need the line "
+                    f"moved {need_at:.3f} m where only {need_at - env:.3f} m of budget remains")
+        if len(keep) != len(use):
+            use, use_sides = keep, keep_sides
+            if not use:
+                break
+            continue
+
+        lo_c, hi_c = obstacle_bounds(pts_c, nv_c, tan_c, use, use_sides, env_lo, env_hi, p, ds)
+        empty = lo_c > hi_c
+        if np.any(empty):
+            # THE WALL WINS ONLY WHERE THE GEOMETRY IS THE PROBLEM. Two keep-outs that overlap in
+            # opposite directions leave a station with no interval at all, and something has to
+            # give; the corridor bound is kept and the keep-out relaxed to meet it. This path is
+            # NOT allowed to absorb a curvature-budget conflict -- that is a budget WE chose, and
+            # a box it makes unreachable is handed over above, named, rather than cleared short.
+            n_bad = int(np.count_nonzero(empty))
+            hi_c[empty] = np.maximum(lo_c[empty] + 1e-6, hi_c[empty])
+            lo_c[empty] = np.minimum(lo_c[empty], hi_c[empty] - 1e-6)
+            rep.reason = (f"{n_bad} station(s) could not have both the corridor and the keep-out; "
+                          f"the corridor won and the clearance below is what was achievable")
+
+        d_c = solve_offsets(lo_c, hi_c, ds, p.dev_weight)
+        if d_c is None:
+            rep.ok = False
+            rep.reason = rep.reason or "quadprog could not solve the box-constrained QP"
+            rep.solve_ms = (time.perf_counter() - t0) * 1e3
+            return pts_fine, np.zeros(n), rep
+
+        # PERIODIC CUBIC back to every station. A linear map puts a corner at every coarse node
+        # and the fine line inherits it: peak |kappa| 1.9-2.7 from the interpolation alone.
+        d_fine = CubicSpline(np.concatenate([s_fine[ci], [s_fine[ci][0] + L]]),
+                             np.concatenate([d_c, [d_c[0]]]), bc_type="periodic")(s_fine)
+        line = pts_fine + nv_fine * d_fine[:, None]
+
+        got = [float(np.min(np.hypot(line[:, 0] - o.x, line[:, 1] - o.y)) - o.r) for o in use]
+        short = [i for i, c in enumerate(got) if c < need - 1e-9]
+        if not short:
+            break
+        worst = min(short, key=lambda i: got[i])
+        o = use[worst]
+        j = station(o)
+        kj = int(ci[int(np.argmin(np.abs(s_fine[ci] - s_fine[j])))])
+        used = 100.0 * min(k_clean[kj] / max(p.kappa_budget, 1e-9), 1.0)
+        rep.infeasible.append(name(o))
+        rep.infeasible_why.append(
+            f"box at station {j}: the clean line is at {used:.1f}% of the curvature budget at it; "
+            f"the line clears it by {got[worst]:.3f} m where {need:.3f} m is owed, so it is the "
+            f"reactive layer's")
+        use = [x for i, x in enumerate(use) if i != worst]
+        use_sides = [x for i, x in enumerate(use_sides) if i != worst]
+        d_c = d_fine = line = None
+        if not use:
+            break
+
+    if not use or d_fine is None:
         rep.ok = True
-        rep.reason = "every obstacle is unavoidable"
+        rep.reason = rep.reason or "every obstacle is the reactive layer's"
         rep.peak_kappa, rep.peak_station = rep.clean_peak_kappa, rep.clean_peak_station
         rep.solve_ms = (time.perf_counter() - t0) * 1e3
         return pts_fine, np.zeros(n), rep
-    use, use_sides = keep, keep_sides
 
-    ds = float(np.sum(el_fine)) / len(ci)
-    lo_c, hi_c = obstacle_bounds(pts_c, nv_c, tan_c, use, use_sides, lo_f[ci], hi_f[ci], p, ds)
-
-    empty = lo_c > hi_c
-    if np.any(empty):
-        # THE WALL WINS AND THE OBSTACLE MARGIN GIVES. Where the corridor and the keep-out do not
-        # overlap the car cannot have both, and driving into a wall is worse than passing a box
-        # closer than intended -- the same degradation modulate_widths documents ("hugged against
-        # the wall furthest from the obstacle, and the station is flagged infeasible"). The
-        # corridor bound is kept, the keep-out is relaxed to meet it, and the clearance that comes
-        # out is reported so the caller can see what it actually got.
-        n_bad = int(np.count_nonzero(empty))
-        wall_is_lo = lo_c[empty] > hi_c[empty]
-        hi_c[empty] = np.where(wall_is_lo, lo_c[empty] + 1e-6, hi_c[empty])
-        lo_c[empty] = np.minimum(lo_c[empty], hi_c[empty] - 1e-6)
-        rep.reason = (f"{n_bad} station(s) could not have both the corridor and the keep-out; "
-                      f"the corridor won and the clearance below is what was achievable")
-
-    d_c = solve_offsets(lo_c, hi_c, ds, p.dev_weight)
-    if d_c is None:
-        rep.ok = False
-        rep.reason = rep.reason or "quadprog could not solve the box-constrained QP"
-        rep.solve_ms = (time.perf_counter() - t0) * 1e3
-        return pts_fine, np.zeros(n), rep
-
-    # --- back to every station ----------------------------------------------------------------
-    # PERIODIC CUBIC. A linear map puts a corner at every coarse node and the fine line inherits
-    # it: measured peak |kappa| 1.9-2.7 from the interpolation alone, on offsets that were smooth.
-    s_fine = np.concatenate([[0.0], np.cumsum(el_fine)[:-1]])
-    L = float(np.sum(el_fine))
-    d_fine = CubicSpline(np.concatenate([s_fine[ci], [s_fine[ci][0] + L]]),
-                         np.concatenate([d_c, [d_c[0]]]), bc_type="periodic")(s_fine)
-    line = pts_fine + nv_fine * d_fine[:, None]
-
-    # WHAT THE UPSAMPLE COSTS. The QP holds the keep-out exactly at its own stations; the periodic
-    # cubic through them dips between. Measured here against the very bounds that were solved, so a
-    # positive number is interpolation and nothing else -- it is what disc_allow_m has to cover.
+    # WHAT THE UPSAMPLE COSTS. The QP holds the keep-out at its own stations; the periodic cubic
+    # through them dips between. Measured against the very bounds that were solved, so a positive
+    # number is interpolation and nothing else -- it is what disc_allow_m has to cover.
     ko_lo, ko_hi = obstacle_bounds(pts_fine, nv_fine, _tan_f, use, use_sides, lo_f, hi_f, p)
     by_box = np.maximum(ko_lo - d_fine, d_fine - ko_hi)
     binds = (ko_lo > lo_f + 1e-9) | (ko_hi < hi_f - 1e-9)
@@ -432,8 +533,7 @@ def reoptimize_closed(reftrack_fine: np.ndarray,
                                line[rep.peak_station, 1] - o.y) for o in use])
     rep.peak_near_obstacle = bool(ds_peak < 2.0)
     if len(use) >= 2:
-        i0 = int(np.argmin(np.hypot(pts_fine[:, 0] - use[0].x, pts_fine[:, 1] - use[0].y)))
-        i1 = int(np.argmin(np.hypot(pts_fine[:, 0] - use[1].x, pts_fine[:, 1] - use[1].y)))
+        i0, i1 = station(use[0]), station(use[1])
         span = (np.arange(i0, i1 + 1) if i1 >= i0 else np.arange(i0, i1 + n + 1)) % n
         if len(span) > 10:
             rep.hold = float(np.min(np.abs(d_fine[span[5:-5]])))

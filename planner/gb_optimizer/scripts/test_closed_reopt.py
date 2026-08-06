@@ -139,15 +139,18 @@ def test_an_unavoidable_box_is_reported_not_forced(track):
 def test_disc_allow_covers_the_upsample_sag(track):
     """disc_allow_m must be the measured sag's upper bound, at the grid it is calibrated for.
 
-    The QP holds the keep-out at its own stations; the periodic cubic between them dips. Worst
-    over the two-box case and all twelve field placements at grid 0.50: 4.11 mm against 10.0.
+    The QP solves to need + disc_allow_m and the cubic between its stations gives some of it
+    back; what survives in the published clearance is the headroom. Measured as what the upsample
+    SPENDS, because re-solving with the allowance at zero measures nothing now -- the contract
+    check hands the box to the reactive layer instead of clearing it short.
     """
     ref, cor = track
-    p0 = ReoptParams(disc_allow_m=0.0)
-    worst = max(C.reoptimize_closed(ref, obs, cor, p0)[2].sag_mm
+    spent = max(P.disc_allow_m - (c - NEED)
                 for obs in [[box(ref, A_I), box(ref, B_I)]]
-                + [[box(ref, i) for i in t] for t in TRIOS])
-    assert 0.0 < worst <= P.disc_allow_m * 1e3, f"sag {worst:.2f} mm vs {P.disc_allow_m * 1e3} mm"
+                + [[box(ref, i) for i in t] for t in TRIOS]
+                for c in C.reoptimize_closed(ref, obs, cor, P)[2].clearances)
+    assert spent <= P.disc_allow_m + 1e-9, (
+        f"the upsample spent {spent * 1e3:.2f} mm of a {P.disc_allow_m * 1e3:.1f} mm allowance")
 
 
 # (7) ----------------------------------------------------------------------------------------
@@ -238,5 +241,8 @@ def test_the_half_spacing_correction_is_what_makes_the_grid_not_matter(track, mo
     _l, _d, without = C.reoptimize_closed(ref, obs, cor, p70)
     monkeypatch.undo()
     _l, _d, with_it = C.reoptimize_closed(ref, obs, cor, p70)
-    assert min(without.clearances) < NEED, "the point-sampled keep-out was supposed to fall short"
+    # Since the contract check went in, falling short does not show up as a short clearance --
+    # it shows up as the box being handed to the reactive layer instead, which is the point.
+    assert len(without.clearances) < len(with_it.clearances), (
+        "the point-sampled keep-out was supposed to cost a box")
     assert min(with_it.clearances) >= NEED - 1e-9

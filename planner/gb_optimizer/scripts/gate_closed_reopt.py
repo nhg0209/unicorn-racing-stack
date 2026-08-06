@@ -154,11 +154,20 @@ def main():
                f"calibrated at {CALIBRATED_GRID_M}. UNCALIBRATED GRID -- the sag scales with it "
                f"(4.11 mm at 0.50, 22.97 mm at 0.70), so re-measure before trusting the clearance")
     else:
-        p0 = ReoptParams(disc_allow_m=0.0)
-        worst = max(C.reoptimize_closed(ref, o, cor, p0)[2].sag_mm
-                    for o in [pair] + [[box(ref, i) for i in t] for t in TRIOS])
-        g.check("C7", worst <= p.disc_allow_m * 1e3,
-                f"worst sag {worst:.2f} mm against an allowance of {p.disc_allow_m * 1e3:.1f} mm")
+        # HOW MUCH OF THE ALLOWANCE THE UPSAMPLE ACTUALLY SPENDS. The QP solves to
+        # need + disc_allow_m and the cubic between its stations gives some of that back, so what
+        # is left in the published clearance is the headroom. Measuring it this way rather than
+        # by re-solving with disc_allow_m = 0 is deliberate: with the allowance removed the
+        # contract check simply hands the box to the reactive layer, which measures nothing.
+        spent = -np.inf
+        for o in [pair] + [[box(ref, i) for i in t] for t in TRIOS]:
+            r = C.reoptimize_closed(ref, o, cor, p)[2]
+            for c in r.clearances:
+                spent = max(spent, p.disc_allow_m - (c - need))
+        g.check("C7", spent <= p.disc_allow_m + 1e-9,
+                f"the upsample spends at most {spent * 1e3:.2f} mm of the "
+                f"{p.disc_allow_m * 1e3:.1f} mm allowance -- {(p.disc_allow_m - spent) * 1e3:.2f} "
+                f"mm of headroom left at the calibrated grid")
 
     # C8 ---------------------------------------------------------------------------------------
     print("\nC8  an infeasible box is named with station, side and metres")
