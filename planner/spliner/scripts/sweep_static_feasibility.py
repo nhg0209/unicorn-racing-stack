@@ -26,6 +26,7 @@ import argparse
 import json
 import math
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -46,6 +47,13 @@ MIN_FEASIBLE = 95                  # of the 123, at those gaps, for every tracki
 # precisely lookahead_min and the mean over them is exactly that number -- it read 15.00 with 22 of
 # 33 stations plannable and would still read 15.00 with one. The count is the quantity that moves.
 MIN_CORNERS_PLANNABLE = 22         # of the 33 ifac stations with |kappa| > CORNER_KAPPA
+# The corner grid the ramp ladder is FOR, and the cost of running it. The ladder is a re-plan per
+# rung, so its budget trades corner feasibility against loop time, and the loop period is 50 ms:
+# a planner that overruns it feeds the state machine's own staleness gate. Both sides are gated.
+CORNER_GAPS = (12.0, 8.0, 4.0)     # 33 stations x 3 = 99 cells
+SHIPPED_LADDER_MS = 20.0           # static_avoidance_params.yaml: ramp_search_max_ms
+MIN_CORNER_CELLS = 46
+MAX_LOOP_P95_MS = 40.0
 MIN_SPEED_CAP = 2.50               # [m/s] mean over the feasible cells
 A_LAT_MAX = 6.0
 CORNER_KAPPA = 0.8
@@ -168,9 +176,16 @@ class Harness:
         n.cur_vs, n.cur_d = 3.0, cur_d
         return n
 
-    def cell(self, i, gap, cur_d, ladder=True):
-        """One plan. None, or (peak |d|, peak |kappa|, squeezed)."""
+    def cell(self, i, gap, cur_d, ladder=True, max_ms=None):
+        """One plan. None, or (peak |d|, peak |kappa|, squeezed).
+
+        `max_ms` overrides the ladder's time budget. The feasibility grid runs it UNBUDGETED on
+        purpose -- it is there to judge the ladder, not the machine -- but any measurement of what
+        a cycle COSTS has to use the budget that actually ships.
+        """
         n = self._node(cur_d, ladder)
+        if max_ms is not None:
+            n.ramp_search_max_ms = float(max_ms)
         s_obs = self.wp[i]["s_m"]
         n.cur_s = (s_obs - gap) % self.L
         resp = self.converter.get_cartesian(np.array([n.cur_s]), np.array([cur_d]))
@@ -251,6 +266,25 @@ def main():
     if mean_cap < MIN_SPEED_CAP:
         fails.append(f"mean speed cap {mean_cap:.3f} m/s < {MIN_SPEED_CAP} "
                      f"(the ladder is escaping into ramps that are too short)")
+
+    # --- corners, and what the ladder costs to get them --------------------------------------
+    t_cell = []
+    n_corner_ok = 0
+    for i in H.corners:
+        for gap in CORNER_GAPS:
+            t0 = time.perf_counter()
+            got = H.cell(i, gap, 0.0, True, max_ms=SHIPPED_LADDER_MS)
+            t_cell.append((time.perf_counter() - t0) * 1e3)
+            n_corner_ok += 1 if got else 0
+    n_cells = len(H.corners) * len(CORNER_GAPS)
+    p95 = float(np.percentile(t_cell, 95)) if t_cell else 0.0
+    print(f"=== corners | {n_corner_ok}/{n_cells} feasible (gate {MIN_CORNER_CELLS}) | planner "
+          f"loop p50 {np.percentile(t_cell, 50):.1f} ms p95 {p95:.1f} ms "
+          f"(gate {MAX_LOOP_P95_MS}, period 50) ===")
+    if n_corner_ok < MIN_CORNER_CELLS:
+        fails.append(f"{n_corner_ok} of {n_cells} corner cells feasible < {MIN_CORNER_CELLS}")
+    if p95 > MAX_LOOP_P95_MS:
+        fails.append(f"planner loop p95 {p95:.1f} ms > {MAX_LOOP_P95_MS} (period 50 ms)")
 
     # --- earliness -------------------------------------------------------------------------
     first = {}

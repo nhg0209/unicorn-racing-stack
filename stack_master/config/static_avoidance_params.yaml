@@ -164,16 +164,24 @@ static_avoidance_planner:
     ramp_search_entry_m: [3.15, 2.5, 2.0, 1.5, 1.0]   # [m]
     ramp_search_exit_m: [4.5, 2.5, 1.5]               # [m]
     # [ms] budget for the whole ladder, checked before each rung; over it, fall through to the
-    # squeeze. MEASURE THIS ONE BEFORE TRUSTING IT: one rung is a full re-plan, ~5 ms on a
-    # development machine and slower on the car, so 8 ms buys one or two rungs of the fifteen.
-    # Offline on ifac (123 stations x {12,8,4,2} m x {0, 0.3} m of tracking error, 984 cells),
-    # feasible cells against the budget:
-    #     ladder off 611 | 8 ms 671 | 20 ms 727 | 40 ms 759 | unlimited 762
-    # i.e. 8 ms captures 40% of what the ladder can do and 40 ms captures 98%. The loop runs at
-    # 20 Hz (50 ms), and the ladder only runs in a cycle that was going to publish nothing at all,
-    # so there is room -- raise this if the corners still plan late on the car. It is
-    # live-reconfigurable; no rebuild needed to try.
-    ramp_search_max_ms: 8.0
+    # squeeze. One rung is a full re-plan (~5 ms here, slower on the car), so this is a count of
+    # rungs as much as a time.
+    #
+    # 8 -> 20. Where it matters is CORNERS; on the flat four-box scenario 8, 20 and 40 give
+    # identical results (every success is rung 1, 9.3 ms cumulative). Measured over the 33 ifac
+    # stations with |kappa| > 0.8, planning at 8 m, with the per-cycle wall time of the planner:
+    #        budget   corner feasible   loop p50   loop p95
+    #          8 ms        14/33         12.9 ms    14.4 ms
+    #         20 ms        19/33         20.2 ms    25.8 ms
+    #         40 ms        21/33         23.6 ms    43.2 ms
+    # 20 ms takes most of the corner gain; 40 ms buys two more stations and pushes p95 to 43 ms
+    # against a 50 ms loop period ON A DEVELOPMENT MACHINE -- the car is slower, and a planner
+    # that overruns its period feeds the state machine's own staleness gate. That trade is not
+    # worth two stations.
+    #
+    # Do NOT raise n_d_samples alongside it: that takes a rung from 4.31 to 6.53 ms, and the
+    # budget then cannot even afford rung 1.
+    ramp_search_max_ms: 20.0
     # [m] extra offset at the box CENTRE beyond the clearance value: the path peaks here (widest,
     # furthest from the obstacle). Limited by the corridor (a bulge past the wall is clipped to it).
     #

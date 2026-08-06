@@ -224,7 +224,7 @@ class ObstacleSpliner(Node):
         self.ramp_search_enable = True
         self.ramp_search_entry_m = [3.15, 2.5, 2.0, 1.5, 1.0]   # [m] deliberately below ramp_len_min_m
         self.ramp_search_exit_m = [4.5, 2.5, 1.5]               # [m] full first: shorten the entry alone
-        self.ramp_search_max_ms = 8.0                           # [ms] budget for the whole ladder
+        self.ramp_search_max_ms = 20.0                          # [ms] budget for the whole ladder
         self.apex_bulge = 0.05       # [m] extra offset at the box CENTRE (apex) beyond the clearance
                                      # value: higher = car swings WIDER around the obstacle. 0 = flat hold.
         self.max_weave = 3           # max obstacles woven into one path (slalom); 1 = single-apex only
@@ -461,7 +461,7 @@ class ObstacleSpliner(Node):
         self.declare_parameter('ramp_search_exit_m', [4.5, 2.5, 1.5],
                                ParameterDescriptor(type=ParameterType.PARAMETER_DOUBLE_ARRAY,
                                                    description="exit-ramp lengths tried on retry, longest first [m]"))
-        self.declare_parameter('ramp_search_max_ms', 8.0,
+        self.declare_parameter('ramp_search_max_ms', 20.0,
                                dbl(0.0, 100.0, "time budget for the whole ramp ladder; over it, fall through to the squeeze [ms]"))
         self.declare_parameter('apex_bulge', 0.05, dbl(0.0, 1.0, "extra apex offset beyond clearance: higher=wider avoidance [m]"))
         self.declare_parameter('max_weave', 3, intd(1, 5, "max obstacles woven into one path (slalom); 1=single-apex"))
