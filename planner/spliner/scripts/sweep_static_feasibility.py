@@ -129,6 +129,7 @@ class Harness:
         self.gbw = [types.SimpleNamespace(
             x_m=w["x_m"], y_m=w["y_m"], s_m=w["s_m"], d_left=w["d_left"], d_right=w["d_right"],
             vx_mps=w["vx_mps"], kappa_radpm=w["kappa_radpm"]) for w in self.wp]
+        self.nominal_ds = float(self.wp[1]["s_m"] - self.wp[0]["s_m"])
         self.stations = list(range(0, len(self.wp) - 1, STATION_STRIDE))
         self.corners = [i for i in range(len(self.wp) - 1)
                         if abs(self.wp[i]["kappa_radpm"]) > CORNER_KAPPA]

@@ -51,6 +51,15 @@ ENGAGE_SPACINGS = (3.0, 5.0, 7.0, 9.0, 12.0)
 ENGAGE_BIASES = (0.0, 0.3)
 MIN_ENGAGE_GAP_M = 6.0     # G7  how far out the second box is first shaped around
 MIN_ENGAGE_RAMP_M = 2.0    # G8  how much of that the hump's entry ramp gets
+# --- what the PUBLISHED path itself asks of the car -------------------------------------------
+# The planner's own profile is solved with the accel limits; these check the result, station by
+# station, so a change to the smoothing, the resample or the velocity pass cannot quietly hand the
+# controller a discontinuity. The station-spacing bound (G13) is the one that catches a harness or
+# a frame convention folding a path onto itself at the s seam.
+MAX_PATH_A_LONG = 6.0      # G9   [m/s^2] demanded by the published speed plan (ggv ax_max 5.0)
+MAX_PATH_DVX = 0.30        # G10  [m/s] between adjacent published stations
+MAX_PATH_DKAPPA = 0.80     # G11  [1/m] between adjacent published stations
+SPACING_LO, SPACING_HI = 0.5, 2.0   # G13  station gap, as a fraction of the nominal spacing
 
 
 class _Clock:
@@ -242,7 +251,25 @@ def run(H, verbose=False):
             k = int(np.argmin([abs(v - LOOK_M) for v in ds]))
             if abs(ds[k] - LOOK_M) < 0.6:
                 d_look = float(pts[k].d_m)
-        row = {"s": cur_s, "n": len(pts), "d_look": d_look,
+        # what the published path asks of the car, station by station (G9-G11, G13)
+        a_long = dvx = dkap = 0.0
+        gap_lo = gap_hi = None
+        if len(pts) > 2:
+            vx = np.array([x.vx_mps for x in pts])
+            kap = np.array([x.kappa_radpm for x in pts])
+            pxy2 = np.array([[x.x_m, x.y_m] for x in pts])
+            step = np.hypot(*np.diff(pxy2, axis=0).T)
+            ok = step > 1e-9
+            if ok.any():
+                a_long = float(np.max(np.abs(vx[1:][ok] ** 2 - vx[:-1][ok] ** 2)
+                                      / (2.0 * step[ok])))
+                gap_lo = float(np.min(step)) / H.nominal_ds
+                gap_hi = float(np.max(step)) / H.nominal_ds
+            dvx = float(np.max(np.abs(np.diff(vx))))
+            dkap = float(np.max(np.abs(np.diff(kap))))
+        row = {"a_long": a_long, "dvx": dvx, "dkap": dkap,
+               "gap_lo": gap_lo, "gap_hi": gap_hi,
+               "s": cur_s, "n": len(pts), "d_look": d_look,
                "fresh": rec["fresh"] > fresh0,
                "feas": rec["feas"][-1] if len(rec["feas"]) > nfeas0 else None,
                "d_end": float(pts[-1].d_m) if pts else None,
@@ -300,8 +327,21 @@ def report(out, label):
     print(f"  side flips committed   {flips:3d}     (gate {MAX_FLIPS})")
     print(f"  max d_end jump         {dend_jump:.3f} m   (gate {MAX_DEND_JUMP_M}, same knot set)")
     print(f"  blank publications     {len(blank):3d}     | exceptions {len(errs)}")
+    a_long = max((r.get("a_long") or 0.0) for r in out) if out else 0.0
+    dvx = max((r.get("dvx") or 0.0) for r in out) if out else 0.0
+    dkap = max((r.get("dkap") or 0.0) for r in out) if out else 0.0
+    los = [r["gap_lo"] for r in out if r.get("gap_lo") is not None]
+    his = [r["gap_hi"] for r in out if r.get("gap_hi") is not None]
+    gap_lo = min(los) if los else 1.0
+    gap_hi = max(his) if his else 1.0
+    print(f"  published |a_long| max {a_long:6.2f} m/s^2   (gate {MAX_PATH_A_LONG})")
+    print(f"  published |dvx|   max {dvx:6.3f} m/s     (gate {MAX_PATH_DVX})")
+    print(f"  published |dkappa| max {dkap:6.3f} 1/m    (gate {MAX_PATH_DKAPPA})")
+    print(f"  station gap        {gap_lo:5.3f}-{gap_hi:5.3f} x nominal (gate "
+          f"{SPACING_LO}-{SPACING_HI})")
     return {"step": max(steps) if steps else 0.0, "big": len(big), "toggles": toggles,
-            "fresh": len(fresh), "flips": flips, "dend": dend_jump, "err": len(errs)}
+            "fresh": len(fresh), "flips": flips, "dend": dend_jump, "err": len(errs),
+            "a_long": a_long, "dvx": dvx, "dkap": dkap, "gap_lo": gap_lo, "gap_hi": gap_hi}
 
 
 def engage_report(H):
@@ -346,6 +386,17 @@ def main():
         fails.append(f"G6 max d_end jump {m['dend']:.3f} m > {MAX_DEND_JUMP_M}")
     if m["err"]:
         fails.append(f"{m['err']} cycles raised")
+    if m["a_long"] > MAX_PATH_A_LONG:
+        fails.append(f"G9 the published speed plan demands {m['a_long']:.2f} m/s^2 "
+                     f"> {MAX_PATH_A_LONG}")
+    if m["dvx"] > MAX_PATH_DVX:
+        fails.append(f"G10 published |dvx| {m['dvx']:.3f} m/s between stations > {MAX_PATH_DVX}")
+    if m["dkap"] > MAX_PATH_DKAPPA:
+        fails.append(f"G11 published |dkappa| {m['dkap']:.3f} 1/m between stations "
+                     f"> {MAX_PATH_DKAPPA}")
+    if m["gap_lo"] < SPACING_LO or m["gap_hi"] > SPACING_HI:
+        fails.append(f"G13 published station gaps run {m['gap_lo']:.3f}-{m['gap_hi']:.3f} x "
+                     f"nominal, outside {SPACING_LO}-{SPACING_HI} -- a path folded on itself")
     min_gap, min_ramp, _rows = engage_report(H)
     if min_gap < MIN_ENGAGE_GAP_M:
         fails.append(f"G7 the second box is first shaped around at {min_gap:.2f} m "
