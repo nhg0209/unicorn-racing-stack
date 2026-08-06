@@ -150,6 +150,57 @@ def test_window_anchor():
           f"stays local beyond +-3 m")
 
 
+def test_aeb_engage_count_over_a_lap():
+    """G10. The clamp is latched, so a lap's worth of jitter around the bar must not produce a
+    clamp edge per cycle. Driven through the REAL AEB, with the distance dithering across the bar
+    the way a re-anchored local window does."""
+    C = _load_controller_slew()
+    n = C.__new__(C)
+    n.AEB_thres, n.AEB_thres_overtake, n.AEB_offline_d_thres = 0.5, 0.9, 0.1
+    n.AEB_release_hyst_m, n.AEB_min_hold_s, n.loop_rate = 0.25, 0.2, LOOP_RATE
+    n._aeb_engaged, n._aeb_cycles = False, 0
+    n.logger_warn = lambda *a, **k: None
+    n.position_in_map = np.array([[0.0, 0.0, 0.0]])
+    n.idx_nearest_waypoint = 0
+    n.state = "GB_TRACK"
+    rng = np.random.default_rng(0)
+    engaged, prev = [], False
+    for k in range(int(LOOP_RATE * 12)):          # ~12 s, one lap on ifac at racing pace
+        dist = 0.5 + 0.03 * np.sin(k / 3.0) + 0.01 * rng.standard_normal()
+        arr = np.zeros((5, 9))
+        arr[0, 0] = dist
+        n.waypoint_array_in_map = arr
+        out = n.AEB_for_weird_local_wpnt(6.0)
+        now = out < 6.0
+        if now != prev:
+            engaged.append(k)
+        prev = now
+    edges = len(engaged)
+    assert edges <= 2, f"the AEB toggled {edges} times in a lap of jitter around the bar"
+    print(f"PASS the AEB produces {edges} edge(s) over a lap of 3 cm jitter across its threshold")
+
+
+def test_no_published_step_exceeds_the_accel_limit():
+    """G10. Whatever the sources do, the PUBLISHED command may not move faster than the car can."""
+    C = _load_controller_slew()
+
+    class Stub:
+        loop_rate, max_accel_mps2, max_decel_mps2 = LOOP_RATE, GGV_AX_MAX, GGV_AX_MAX
+        _speed_cmd_prev = None
+        _slew_limit_speed = C._slew_limit_speed
+
+    s = Stub()
+    step = GGV_AX_MAX / LOOP_RATE
+    # the four discontinuities the run log has: a trailing handoff, an AEB engage, an AEB release
+    # and a squeeze cap arriving
+    demands = ([3.47] + [5.13] * 20 + [2.0] * 10 + [5.13] * 20 + [2.5] * 10 + [5.0] * 20)
+    out = [s._slew_limit_speed(v) for v in demands]
+    d = np.diff(out)
+    assert d.max() <= step + 1e-9 and d.min() >= -step - 1e-9, \
+        f"published step {max(abs(d.max()), abs(d.min())):.3f} m/s > {step:.3f} per cycle"
+    print(f"PASS no published step exceeds {step:.3f} m/s per cycle across four discontinuities")
+
+
 def check_bag(path):
     """Replay a recording's published command through the limiter and report before/after."""
     import rosbag2_py
@@ -197,6 +248,8 @@ def main() -> int:
     test_slew_limit()
     test_trailing_handoff()
     test_window_anchor()
+    test_aeb_engage_count_over_a_lap()
+    test_no_published_step_exceeds_the_accel_limit()
     ok = True
     if args.bag:
         ok = check_bag(args.bag)
