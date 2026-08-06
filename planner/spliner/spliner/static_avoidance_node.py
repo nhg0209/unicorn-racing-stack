@@ -1182,7 +1182,7 @@ class ObstacleSpliner(Node):
             self._mem_cands_obs = [o for _, o in cands_obs]
             self._mem_cands_time = now
         elif self._mem_cands_obs and self._mem_cands_time is not None and \
-                (now - self._mem_cands_time).nanoseconds * 1e-9 < self.obs_memory_sec:
+                (now.nanoseconds - self._mem_cands_time.nanoseconds) * 1e-9 < self.obs_memory_sec:
             cands_obs = self._gather_obstacles_ahead(self._mem_cands_obs, gather)
         obs_reach = [o for _, o in cands_obs]                     # everything the path can reach
         obs_ahead = [o for g, o in cands_obs if g <= lookahead]   # the driving horizon

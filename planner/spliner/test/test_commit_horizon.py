@@ -208,6 +208,19 @@ def test_the_release_does_not_fire_on_the_boxes_it_was_planned_around():
     print("PASS the release does not fire on the obstacles the commit was planned around")
 
 
+def test_a_tracker_dropout_does_not_crash_the_gather():
+    # The obstacle-memory branch subtracted two clock objects. rclpy.time.Time supports that; a
+    # stub does not, and every offline harness in this repo uses a stub -- so a single cycle with
+    # nothing in the gather horizon raised TypeError and the sweeps counted it as a planner
+    # failure (six phantom failures in one variant measurement). Subtracting the nanoseconds is
+    # numerically identical on the real type.
+    p = Planner([box(20.0, -0.35, 1)], commit_enable=False)
+    p.step(8.0)                                   # populates the memory
+    p.n.obstacles = []                            # a tracker dropout: nothing gathered this cycle
+    p.step(8.05)                                  # must not raise
+    print("PASS a tracker dropout runs the obstacle-memory branch without a clock subtraction")
+
+
 def test_the_gather_horizon_reaches_as_far_as_the_path():
     # obs_ok used to be filtered by the LOOKAHEAD while the path itself runs return_len + tail_m
     # past the last knot, so a candidate could be certified while its own exit ramp went through a
@@ -328,6 +341,7 @@ def test_no_infeasible_cycle_while_the_second_box_is_still_ahead():
 if __name__ == "__main__":
     test_a_box_that_comes_into_reach_releases_the_commit()
     test_the_release_does_not_fire_on_the_boxes_it_was_planned_around()
+    test_a_tracker_dropout_does_not_crash_the_gather()
     test_the_gather_horizon_reaches_as_far_as_the_path()
     test_the_commit_records_every_box_the_release_will_ask_about()
     test_a_box_past_the_lookahead_takes_only_a_LEFTOVER_weave_slot()
