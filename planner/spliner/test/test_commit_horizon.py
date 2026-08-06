@@ -234,6 +234,35 @@ def test_the_gather_horizon_reaches_as_far_as_the_path():
     print("PASS the gather horizon covers the exit ramp, so obs_ok sees the box the path reaches")
 
 
+def test_the_commit_records_every_box_the_release_will_ask_about():
+    # THE bug behind "the planner re-plans every single cycle". The release condition compares the
+    # commit's own obs list against everything inside the GATHER horizon, so the commit has to
+    # record that same set. It recorded obs_enforce instead -- the boxes the path was shaped
+    # around -- and a box that found no free max_weave slot is in the first set and not the
+    # second. It therefore read as "never planned around" on the very next cycle, every cycle,
+    # for as long as it stayed in the horizon: the commit was released as fast as it was made.
+    # Run log, four boxes: 64 fresh plans in two laps, with runs of 10 and 9 consecutive cycles.
+    near = [box(20.0, -0.35, 1), box(22.0, -0.35, 2), box(24.0, -0.35, 3)]
+    far = box(26.0, -0.35, 4)                       # inside the gather horizon, no slot left
+    p = Planner(near + [far], max_weave=3)
+    p.step(9.0)
+    n = p.n
+    gather = (max(n.lookahead_min, n.lookahead_k * n.cur_vs) + n.obs_gather_extra_m)
+    reachable = {int(o.id) for _g, o in n._gather_obstacles_ahead(n.obstacles, gather)}
+    assert 4 in reachable, "the fixture must put a box in the gather band with no slot for it"
+    stored = p.committed_ids()
+    missing = sorted(reachable - stored)
+    assert not missing, (
+        f"the commit does not record {missing}, which the release will then see as a box it was "
+        f"never planned around -- on this cycle and every cycle after it")
+    # ...and that is exactly what the release asks, so it must not fire on a fresh commit
+    p.log.msgs.clear()
+    p.step(9.05)
+    assert not any("came into the" in m for m in p.log.msgs), \
+        f"the commit was released one cycle after it was made: {p.log.msgs[:2]}"
+    print(f"PASS a fresh commit records every box inside the gather horizon ({sorted(stored)})")
+
+
 def test_a_box_past_the_lookahead_takes_only_a_LEFTOVER_weave_slot():
     # Enforcing a box without shaping around it rejects every candidate, so a box in the extended
     # band must be able to take a knot -- but never one a box in the driving horizon needed. The
@@ -299,6 +328,7 @@ if __name__ == "__main__":
     test_a_box_that_comes_into_reach_releases_the_commit()
     test_the_release_does_not_fire_on_the_boxes_it_was_planned_around()
     test_the_gather_horizon_reaches_as_far_as_the_path()
+    test_the_commit_records_every_box_the_release_will_ask_about()
     test_a_box_past_the_lookahead_takes_only_a_LEFTOVER_weave_slot()
     test_a_box_is_planned_around_as_soon_as_it_is_reachable()
     test_no_infeasible_cycle_while_the_second_box_is_still_ahead()

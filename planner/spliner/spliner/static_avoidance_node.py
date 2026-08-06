@@ -1867,7 +1867,16 @@ class ObstacleSpliner(Node):
                                   kappa=kappa_[i], wpnts=wpnts))
 
         if self.commit_enable:
-            self._store_commit(obs_enforce, s_mod, d_sel, xy, v_arr, psi_pub, kappa_,
+            # obs_reach, NOT obs_enforce. The release condition compares this list against
+            # everything inside the GATHER horizon, so it has to BE that set. obs_enforce is the
+            # boxes the path was shaped around, and a box that found no free max_weave slot is in
+            # the gather set and not in that one -- so it read as "never planned around" on the
+            # next cycle, and the one after, for as long as it stayed in the horizon. The commit
+            # was released as fast as it was made: 64 fresh plans in two laps of the four-box run,
+            # with runs of 10 and 9 consecutive cycles. A longer list is the conservative
+            # direction for the only other reader (the freshness check, which asks whether a
+            # recorded box has moved).
+            self._store_commit(obs_reach, s_mod, d_sel, xy, v_arr, psi_pub, kappa_,
                                obs_margin=obs_margin_d, obs_margin_s=obs_margin_s, squeeze=squeeze,
                                s_entry0=float(s_local[cand_entry_i[best_k]]))
         self._publish_feasible(True)
