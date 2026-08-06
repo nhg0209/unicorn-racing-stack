@@ -100,6 +100,7 @@ def planner(obstacles, cur_s, cur_d=0.0):
     n.w_d, n.w_k, n.w_c, n.w_obs, n.obs_sigma = 1.0, 0.1, 5.0, 2.0, 0.5
     n.shift_min, n.shift_buffer, n.hold_after = 1.0, 0.5, 0.5
     n._d_end_prev = 0.0
+    n._last_pub = None    # last path handed to the controller (handover blend)
     n.use_grid_check, n.trust_grid_bounds = False, False
     n.grid_scan_max, n.grid_scan_step, n.bounds_warn_m = 3.0, 0.05, 0.5
     n.clear_gate_enable, n.clear_margin_m, n.clear_hyst_m = True, 0.10, 0.03

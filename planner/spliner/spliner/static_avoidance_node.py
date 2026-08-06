@@ -28,6 +28,11 @@ from grid_filter.grid_filter import GridFilter
 import trajectory_planning_helpers as tph
 
 # --- Evasion path kappa smoothing ---
+# [s] how old the last published path may be and still be blended onto. Not a tuning knob: the
+# loop runs at 20 Hz, so this is five cycles -- past that the "previous reference" is not what the
+# controller is holding and matching it would be inventing continuity that does not exist.
+_BLEND_MAX_AGE_S = 0.25
+
 SMOOTH_OTWPNTS = True
 # Savitzky-Golay window for the kappa profile (odd, in waypoints; 0.1 m spacing -> 11 = ~1.1 m).
 # Big enough to kill the point-to-point numeric-curvature noise, small enough to preserve the
@@ -106,6 +111,10 @@ class ObstacleSpliner(Node):
         self.gb_scaled_wpnts = None
         self.waypoints = None
         self._d_end_prev = 0.0       # last selected terminal offset (chatter damping)
+        # (s_mod, d, t) of the last path handed to the controller -- fresh plan or committed
+        # slice. A fresh plan is blended onto it so the reference does not step (see the handover
+        # blend in do_spline).
+        self._last_pub = None
         self._last_feasible = False
         self._marker_i = 0           # candidate-marker publish decimation counter
         self._emit_markers = True    # build+publish candidate markers only on decimated cycles
@@ -1825,6 +1834,61 @@ class ObstacleSpliner(Node):
         self._d_end_prev = float(d_ends[best_k])
         xy, psi_, kappa_ = best
 
+        # --- HANDOVER BLEND ---------------------------------------------------------------
+        # A fresh plan replaces the reference the controller is currently tracking, in one cycle,
+        # with geometry that starts wherever the CAR is. The pre-ramp decays cur_d, but cur_d is
+        # not the previous reference -- it is the previous reference minus a tracking lag (~0.3 s
+        # of first-order error). So every commit release (past-end, box moved, new obstacle, slice
+        # no longer clear) handed over a step the size of that lag, at the point the controller
+        # steers for.
+        #
+        # Same correction _reanchor_commit makes to a committed path, applied to a new one: match
+        # the value the last published path had AT THE CAR, and fade that offset out over
+        # commit_reanchor_len_m with the same smootherstep (C2 at both ends, so no kink). Past the
+        # blend the new plan is untouched -- apex, clearance and exit ramp are exactly what was
+        # chosen. Measured on ifac at 2.0 m against 4.0: 0.126 vs 0.146 m of worst step, so the
+        # shorter fade also wins on the metric it exists for.
+        #
+        # The blended geometry is re-checked: a blend is a path the planner CHOSE, so it answers
+        # to the same corridor and body gates as any candidate. If either refuses, the unblended
+        # plan is published -- which is what would have been published anyway.
+        prev_pub = self._last_pub
+        now_pub = self.get_clock().now().nanoseconds * 1e-9
+        if prev_pub is not None and (now_pub - prev_pub[2]) <= _BLEND_MAX_AGE_S:
+            blend_len = max(float(self.commit_reanchor_len_m), 1e-3)
+            L = self.gb_max_s
+            g_prev = ((np.asarray(prev_pub[0], float) - self.cur_s + L / 2.0) % L) - L / 2.0
+            order = np.argsort(g_prev)
+            d_prev_car = float(np.interp(0.0, g_prev[order], np.asarray(prev_pub[1], float)[order]))
+            d_new = d_cands[best_k]
+            delta0 = d_prev_car - float(d_new[0])
+            if abs(delta0) > 1e-4:
+                t_b = np.clip(gap_wp / blend_len, 0.0, 1.0)
+                w_b = 1.0 - t_b * t_b * t_b * (10.0 + t_b * (-15.0 + 6.0 * t_b))
+                d_b = d_new + delta0 * w_b
+                touched = np.flatnonzero(np.abs(d_b - d_new) > 1e-6)
+                resp_b = self.converter.get_cartesian(s_mod, d_b)
+                xy_b = (resp_b.T if resp_b.ndim == 2 else resp_b).reshape(-1, 2)
+                chk = xy_b[touched]
+                bad = self._path_body_unsafe(chk)
+                if self.use_grid_check and not bad:
+                    bad = self._path_off_track(chk)
+                if bad:
+                    self.get_logger().warn(
+                        f"[{self.name}] handover blend REFUSED: matching the previous reference "
+                        f"({delta0:+.2f} m at the car, faded over {blend_len:.1f} m) leaves the "
+                        f"drivable area — publishing the unblended plan",
+                        throttle_duration_sec=1.0)
+                else:
+                    psi_b, kappa_b = tph.calc_head_curv_num.calc_head_curv_num(
+                        path=xy_b, el_lengths=wpnt_dist * np.ones(len(xy_b) - 1), is_closed=False)
+                    d_cands[best_k] = d_b
+                    xy, psi_, kappa_ = xy_b, psi_b, kappa_b
+                    self.get_logger().info(
+                        f"[{self.name}] handover blend: the previous reference was {delta0:+.2f} m "
+                        f"from this plan at the car; faded out over {blend_len:.1f} m",
+                        throttle_duration_sec=1.0)
+
         # Diagnostic (throttled): which side did we take, how many feasible candidates were on each
         # side, how were the samples split, and what killed the rejects. On map f this exposes a
         # "wrong side" pick as either 0 feasible on the free side (sampling) or that side being eaten
@@ -1879,6 +1943,7 @@ class ObstacleSpliner(Node):
             self._store_commit(obs_reach, s_mod, d_sel, xy, v_arr, psi_pub, kappa_,
                                obs_margin=obs_margin_d, obs_margin_s=obs_margin_s, squeeze=squeeze,
                                s_entry0=float(s_local[cand_entry_i[best_k]]))
+        self._note_published(s_mod, d_sel)
         self._publish_feasible(True)
         return wpnts, self._candidate_markers(xy_all, status, best_k)
 
@@ -2101,8 +2166,14 @@ class ObstacleSpliner(Node):
 
         # --- OK: republish the committed forward slice ---
         wpnts = self._commit_to_msg(c, sel)
+        self._note_published(c['s_mod'][sel], c['d'][sel])
         self._publish_feasible(True)
         return wpnts, self._commit_markers(c, sel)
+
+    def _note_published(self, s_mod, d):
+        """Remember the path just handed to the controller, for the handover blend in do_spline."""
+        self._last_pub = (np.asarray(s_mod, float).copy(), np.asarray(d, float).copy(),
+                          self.get_clock().now().nanoseconds * 1e-9)
 
     def _reanchor_commit(self, c, car_prog, s_local) -> bool:
         """Bend the START of the committed path onto the car, keeping the apex where it is.
