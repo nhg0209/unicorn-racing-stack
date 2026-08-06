@@ -117,7 +117,14 @@ class Harness:
         self.converter = FrenetConverter(xy[:, 0], xy[:, 1])
         self.map_filter = _Grid(self.mapdir, name, 3)
         self.body_filter = _Grid(self.mapdir, name, 7)
-        self.L = float(self.wp[-1]["s_m"] + (self.wp[1]["s_m"] - self.wp[0]["s_m"]))
+        # THE LAP LENGTH THE NODE USES: wpnts[-1].s_m. global_waypoints.json closes the loop by
+        # repeating point 0 byte-for-byte as the last entry (checked on ifac, map_test and f), so
+        # the last station IS the lap length -- adding one more spacing to it, as this harness did,
+        # makes every wrap-around one station long. Paths crossing the s seam then fold back on
+        # themselves: 41 of 96 measured paths had a station gap under half the nominal spacing,
+        # the worst 2.7 mm. Every number this harness has ever produced was measured through that
+        # fold.
+        self.L = float(self.wp[-1]["s_m"])
         self.s_arr = np.array([w["s_m"] for w in self.wp])
         self.gbw = [types.SimpleNamespace(
             x_m=w["x_m"], y_m=w["y_m"], s_m=w["s_m"], d_left=w["d_left"], d_right=w["d_right"],
@@ -175,7 +182,9 @@ class Harness:
         n._publish_feasible = lambda ok: None
         n._candidate_markers = lambda *a, **k: san.MarkerArray()
         n._store_commit = lambda *a, **k: None
-        n.gb_max_s, n.gb_max_idx = self.L, len(self.wp)
+        # ...and the index count the node uses: wpnts[-1].id, not len(). The closing duplicate is
+        # not a station of its own.
+        n.gb_max_s, n.gb_max_idx = self.L, int(self.wp[-1]["id"])
         n.cur_vs, n.cur_d = 3.0, cur_d
         return n
 
