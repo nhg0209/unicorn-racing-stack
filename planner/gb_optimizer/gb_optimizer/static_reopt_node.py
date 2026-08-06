@@ -67,6 +67,15 @@ from .readwrite_global_waypoints import read_global_waypoints
 from . import static_reopt_core as core
 from . import closed_reopt_bridge as cqb
 
+# [m] line-centre to obstacle EDGE: what the REACTIVE layer needs to see before it will go (and
+# stay) idle about a box -- width_car/2 + clear_margin_m + clear_hyst_m from
+# static_avoidance_params.yaml, currently 0.15 + 0.10 + 0.03. Mirrored here for one purpose: to
+# say, at publish time, how much headroom the line being published actually has over it. If a
+# claimed box is published nearer than this, the reactive layer will avoid it AGAIN on top of the
+# global line -- the double avoidance this whole subsystem exists to remove. The chain itself is
+# enforced by stack_master/scripts/check_avoidance_margins.py, not here; this is a diagnostic.
+_REACTIVE_IDLE_CLEARANCE_M = 0.28
+
 
 class _Bundle:
     """The full set of messages the republisher emits (mirrors global_trajectory_publisher)."""
@@ -597,6 +606,40 @@ class StaticReoptNode(Node):
                 return (f"obstacle @({c['x']:.2f},{c['y']:.2f}) would go from covered to "
                         f"'{c['status']}'")
         return None
+
+    def _log_publish_margins(self, bundle) -> None:
+        """At publish time, what the line that is about to drive clears each box by, and by how
+        much it beats the reactive layer's idle requirement. One line per claimed box, one line
+        for everything handed over.
+
+        Printed here rather than at solve time on purpose: a bundle can be built and never
+        commit, and the number that matters is the one on the wire.
+        """
+        cov = getattr(bundle, "coverage", None) or []
+        if not cov:
+            return
+        claimed = [c for c in cov if not c["status"].startswith("dropped")
+                   and c["status"] != "no_apex"]
+        handed = [c for c in cov if c not in claimed]
+        for c in claimed:
+            gap = float(c.get("clearance_m", float("nan")))
+            head = gap - _REACTIVE_IDLE_CLEARANCE_M
+            msg = (f"[static_reopt] PUBLISH @({c['x']:.2f},{c['y']:.2f}) clears {gap:+.3f} m, "
+                   f"headroom {head:+.3f} m over the reactive idle requirement "
+                   f"{_REACTIVE_IDLE_CLEARANCE_M:.2f}")
+            if head < 0.0:
+                self.get_logger().warning(
+                    msg + " <- NEGATIVE: the reactive layer will avoid this box again on top of "
+                    "the global line")
+            elif head < 0.05:
+                self.get_logger().warning(
+                    msg + " <- THIN: less than 5 cm against tracker EMA and localisation error")
+            else:
+                self.get_logger().info(msg)
+        if handed:
+            self.get_logger().info(
+                f"[static_reopt] PUBLISH hands {len(handed)} obstacle(s) to the reactive layer: "
+                + "; ".join(f"@({c['x']:.2f},{c['y']:.2f}) {c['status']}" for c in handed))
 
     def _publish_coverage(self, bundle) -> None:
         """/static_reopt/coverage — one marker per confirmed obstacle, coloured by status, with the
@@ -1433,6 +1476,39 @@ class StaticReoptNode(Node):
             return [("id", i) for i in ids]
         return [self._quant_key(o) for o in obs]
 
+    def _warn_double_avoidance(self, wps) -> None:
+        """The reactive layer has just started avoiding. Is it avoiding a box the ACTIVE global
+        line says it already covers?
+
+        That is the failure this subsystem exists to remove, and until now it was only visible by
+        reading two logs side by side: the re-opt says "3/3 covered" while the reactive planner
+        avoids one of them on every lap. It is a WARNING and nothing else -- no gate, no rebuild,
+        no state change -- because the reactive layer is always allowed to act; what is wrong is
+        the global line's claim, and that is what this names.
+        """
+        try:
+            cov = getattr(self.active, "coverage", None) or []
+            claimed = [c for c in cov if c["status"].startswith("laid")
+                       or c["status"] == "already_clear"]
+            if not claimed or not wps:
+                return
+            j = int(np.argmax([abs(w.d_m) for w in wps]))       # the apex of this maneuver
+            ax, ay = float(wps[j].x_m), float(wps[j].y_m)
+            near = min(claimed, key=lambda c: (c["x"] - ax) ** 2 + (c["y"] - ay) ** 2)
+            d = float(np.hypot(near["x"] - ax, near["y"] - ay))
+            if d > 1.5:                                          # not about one of our boxes
+                return
+            self.get_logger().warning(
+                f"[static_reopt] DOUBLE AVOIDANCE: the reactive layer is avoiding "
+                f"@({near['x']:.2f},{near['y']:.2f}) — a box the ACTIVE global line claims to "
+                f"cover ({near['status']}, published clearance "
+                f"{float(near.get('clearance_m', float('nan'))):+.3f} m against the reactive idle "
+                f"requirement {_REACTIVE_IDLE_CLEARANCE_M:.2f}). The global line's margin is not "
+                f"reaching the reactive layer's threshold; see /static_reopt/coverage",
+                throttle_duration_sec=5.0)
+        except Exception:
+            pass                     # a diagnostic must never break the 20 Hz callback
+
     def otwpnts_cb(self, msg: OTWpntArray):
         """Record each confirmed obstacle's apex from the reactive avoidance path. For each
         obstacle we take the spline point NEAREST it (the point beside it = its apex) and keep the
@@ -1449,6 +1525,8 @@ class StaticReoptNode(Node):
         went_idle = self._reactive_active and not active
         if went_idle:
             self._reactive_idle_t = now
+        if active and not self._reactive_active:
+            self._warn_double_avoidance(wps)
         self._reactive_active = active
         # ARM THE REBUILD ONLY WHEN THE MANEUVER IS OVER. A new/better apex is a reason to
         # rebuild -- without it an obstacle set collected BEFORE its apex existed leaves the solve
@@ -2156,6 +2234,7 @@ class StaticReoptNode(Node):
         self.get_logger().info(f"[static_reopt] swapped to {kind} at s={s:.2f} m")
         self._publish_active(bundle)             # publish now, don't wait for the republish tick
         self._publish_coverage(bundle)
+        self._log_publish_margins(bundle)
         self._publish_clearance()                # the new line clears the boxes by new amounts
         self.pub_update_map.publish(Bool(data=True))   # /global_waypoints already latched above
 

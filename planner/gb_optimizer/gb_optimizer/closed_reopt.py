@@ -123,6 +123,18 @@ class Report:
     sides: List[int] = field(default_factory=list)
     max_offset: float = 0.0
     sag_mm: float = float("nan")  # worst keep-out violation the cubic upsample introduces [mm]
+    # peak |kappa| AT THE QP's OWN STATIONS -- where the envelope is actually enforced, so this is
+    # what the curvature budget contracts for. peak_kappa above is over every published station
+    # and therefore also carries whatever the periodic cubic adds BETWEEN nodes; the difference of
+    # the two is the interpolation excess, and the two are gated separately for that reason.
+    peak_kappa_nodes: float = 0.0
+    # [m] how far the UPSAMPLED offset steps outside the envelope between QP stations. The bound
+    # is enforced at the nodes; the periodic cubic through them is not bound to anything in
+    # between, and where the envelope is nearly shut -- at an apex the curvature budget has closed
+    # down to millimetres -- that overshoot is the entire story. Metres, not curvature, for the
+    # same reason disc_allow_m is metres: it is a property of the interpolation, and what it costs
+    # in curvature depends on which corner it lands in.
+    env_overshoot_m: float = 0.0
 
 
 # ======================================================================================
@@ -549,7 +561,14 @@ def reoptimize_closed(reftrack_fine: np.ndarray,
     binds = (ko_lo > lo_f + 1e-9) | (ko_hi < hi_f - 1e-9)
     rep.sag_mm = float(np.max(by_box[binds])) * 1e3 if np.any(binds) else 0.0
 
+    g_f = locality_envelope(np.arange(n), L, use, pts_fine, s_fine, k_clean, p)
+    env_hi_f = np.minimum(hi_f, g_f * np.maximum(hi_f, 0.0))
+    env_lo_f = np.maximum(lo_f, g_f * np.minimum(lo_f, 0.0))
+    rep.env_overshoot_m = float(max(0.0, np.max(np.maximum(d_fine - env_hi_f,
+                                                           env_lo_f - d_fine))))
+
     k_new = np.abs(menger_closed(line))
+    rep.peak_kappa_nodes = float(np.max(k_new[ci]))
     rep.peak_kappa = float(np.max(k_new))
     rep.peak_station = int(np.argmax(k_new))
     rep.max_offset = float(np.max(np.abs(d_fine)))
