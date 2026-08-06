@@ -147,6 +147,7 @@ class Harness:
         n.ramp_search_exit_m = [4.5, 2.5, 1.5]
         n.ramp_search_max_ms = 1e6               # offline: judge the ladder, not the machine
         n.obs_gather_extra_m, n.commit_drop_on_new_obstacle = 4.5, True
+        n.commit_replan_gap_m = 7.0
         # tail_m from static_avoidance_params.yaml, not the node default: a harness that plans a
         # metre of tail the car never gets is not measuring the shipped planner.
         n.tail_m, n.apex_bulge, n.preramp_len_m = 0.0, 0.05, 3.0

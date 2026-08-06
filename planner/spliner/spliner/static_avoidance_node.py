@@ -312,6 +312,11 @@ class ObstacleSpliner(Node):
         # the lookahead. Freezing a path is a statement about the obstacles that were known when it
         # was frozen, and "a new box appeared" was not among the release conditions.
         self.commit_drop_on_new_obstacle = True
+        # [m] a box the commit KNEW ABOUT but never shaped the path around -- one that found no
+        # free max_weave slot -- is re-planned for once it is this close. Sized as the maneuver
+        # itself: ramp_len 4.5 + shift_min 1.0 + 1.5 of headroom, i.e. the shortest range at which
+        # a hump can still be laid for it. MUST stay <= lookahead_min (see the release).
+        self.commit_replan_gap_m = 7.0
         # [m] deviation at which the committed path's ENTRY is re-anchored onto the car (it is no
         # longer a drop -- see _reanchor_commit). Must sit ABOVE the controller's steady-state
         # tracking error (~0.5 m, documented in state_machine_params.yaml recovery_exit_d_m), or
@@ -356,7 +361,7 @@ class ObstacleSpliner(Node):
             'clear_latch_ttl_s', 'squeeze_enable', 'squeeze_steps', 'squeeze_safety_floor_m',
             'squeeze_wall_floor_m', 'squeeze_max_speed_mps', 'relax_hold_s',
             'commit_enable', 'commit_dev_max', 'commit_obs_ds', 'commit_obs_dd',
-            'commit_drop_on_new_obstacle',
+            'commit_drop_on_new_obstacle', 'commit_replan_gap_m',
             'commit_reanchor_len_m', 'commit_reanchor_max_m', 'preramp_len_m',
         ]))
         self.add_on_set_parameters_callback(self.dyn_param_cb)
@@ -501,6 +506,9 @@ class ObstacleSpliner(Node):
         self.declare_parameter('commit_enable', True,
                                ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
                                                    description="Commit to a chosen evasion path and reuse it (temporal consistency) instead of re-solving every cycle"))
+        self.declare_parameter('commit_replan_gap_m', 7.0,
+                               dbl(0.0, 15.0, "re-plan for a known-but-unshaped box once it is "
+                                              "this close [m]"))
         self.declare_parameter('commit_drop_on_new_obstacle', True,
                                ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
                                                    description="Release the committed path when an obstacle it was not planned around enters the lookahead"))
@@ -644,6 +652,12 @@ class ObstacleSpliner(Node):
                     self._committed = None
             elif n == 'commit_drop_on_new_obstacle':
                 self.commit_drop_on_new_obstacle = bool(p.value)
+            elif n == 'commit_replan_gap_m':
+                # CLAMPED at lookahead_min, and that clamp is the whole safety argument: the
+                # shaped set contains every box inside the lookahead, so a trigger that fires
+                # within it re-plans while the box can still be given a knot -- and the plan that
+                # follows records it as shaped, so it cannot fire twice for the same box.
+                self.commit_replan_gap_m = min(float(p.value), self.lookahead_min)
             elif n == 'commit_dev_max':
                 self.commit_dev_max = float(p.value)
             elif n == 'commit_reanchor_len_m':
@@ -1951,7 +1965,8 @@ class ObstacleSpliner(Node):
             # recorded box has moved).
             self._store_commit(obs_reach, s_mod, d_sel, xy, v_arr, psi_pub, kappa_,
                                obs_margin=obs_margin_d, obs_margin_s=obs_margin_s, squeeze=squeeze,
-                               s_entry0=float(s_local[cand_entry_i[best_k]]))
+                               s_entry0=float(s_local[cand_entry_i[best_k]]),
+                               shaped=obs_enforce)
         self._note_published(s_mod, d_sel)
         self._publish_feasible(True)
         return wpnts, self._candidate_markers(xy_all, status, best_k)
@@ -2016,7 +2031,8 @@ class ObstacleSpliner(Node):
         return bool((o.is_static or self._near_zero_static(o)) and o.is_visible)
 
     def _store_commit(self, obs_ahead, s_mod, d_sel, xy, v_arr, psi_pub, kappa_,
-                      obs_margin=None, obs_margin_s=None, squeeze=False, s_entry0=0.0):
+                      obs_margin=None, obs_margin_s=None, squeeze=False, s_entry0=0.0,
+                      shaped=None):
         """Snapshot the freshly chosen path (+ the obstacles it was planned around) so later
         cycles republish it verbatim instead of re-solving from the moving car.
 
@@ -2035,6 +2051,10 @@ class ObstacleSpliner(Node):
             # a path accepted here is rejected on its first reuse and the car flaps back out.
             's_entry0': float(s_entry0),
             'obs': [(int(o.id), float(o.s_center), float(o.d_center)) for o in obs_ahead],
+            # ...and, separately, the ones the path was actually SHAPED around. 'obs' is what the
+            # planner knew about; a box that found no free max_weave slot is in it and not here,
+            # and the difference is what the late-replan trigger looks for.
+            'obs_shaped': [int(o.id) for o in (obs_ahead if shaped is None else shaped)],
             's_mod': np.asarray(s_mod, dtype=float).copy(),
             'd':     np.asarray(d_sel, dtype=float).copy(),
             'xy':    np.asarray(xy, dtype=float).copy(),
@@ -2136,10 +2156,28 @@ class ObstacleSpliner(Node):
         # An id NOT in the commit's own list is precisely "never planned around": that list is
         # every obstacle the plan was built against (see _store_commit). Releasing here costs one
         # re-plan and gives the new box an apex at the range where an apex is still worth having.
+        # TWO different failures, so two branches.
+        #
+        # NEW: an id the plan never knew about. Released immediately at any range -- it may need a
+        # knot right now, and the plan has nothing to say about it.
+        #
+        # KNOWN BUT UNSHAPED: an id the plan collected and then could not shape around, because
+        # every max_weave slot was taken. The plan is correct about it -- obs_ok proved the path
+        # clears it -- so there is no hurry, and releasing at 19 m would just re-plan into the
+        # same full slot set. It is released once the box is close enough that a hump can still be
+        # laid for it, by which time the nearer boxes it lost the slot to have been passed.
+        # commit_replan_gap_m <= lookahead_min is what stops this repeating: the shaped set
+        # contains every box inside the lookahead, so the re-plan that follows records this box as
+        # shaped and the trigger cannot fire for it twice.
         if self.commit_drop_on_new_obstacle:
             planned = {oid for (oid, _s, _d) in c['obs']}
-            fresh = [o for _g, o in self._gather_obstacles_ahead(self.obstacles, gather)
-                     if int(o.id) not in planned]
+            shaped = set(c.get('obs_shaped') or planned)
+            fresh, late = [], []
+            for g, o in self._gather_obstacles_ahead(self.obstacles, gather):
+                if int(o.id) not in planned:
+                    fresh.append(o)
+                elif int(o.id) not in shaped and g <= self.commit_replan_gap_m:
+                    late.append((g, o))
             if fresh:
                 self.get_logger().info(
                     f"[static_avoidance] commit released: "
@@ -2147,6 +2185,16 @@ class ObstacleSpliner(Node):
                                 for o in fresh)
                     + f" came into the {gather:.1f} m gather horizon and this path was never "
                       f"planned around it -- re-planning so it gets an apex",
+                    throttle_duration_sec=1.0)
+                self._committed = None
+                return None
+            if late:
+                self.get_logger().info(
+                    f"[static_avoidance] commit released: "
+                    + ", ".join(f"box {int(o.id)} at {g:.1f} m" for g, o in late)
+                    + f" was known to this path but never shaped around it (no free weave slot); "
+                      f"inside {self.commit_replan_gap_m:.1f} m a hump can still be laid for it "
+                      f"-- re-planning",
                     throttle_duration_sec=1.0)
                 self._committed = None
                 return None

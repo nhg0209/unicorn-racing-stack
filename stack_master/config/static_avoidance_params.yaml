@@ -365,6 +365,14 @@ static_avoidance_planner:
     preramp_len_m: 3.0
     commit_obs_ds: 0.75     # [m] drop the commit if the triggering box's s drifts this far (re-plan apex)
     commit_obs_dd: 0.40     # [m] ... or its d drifts this far
+    # [m] a box the commit KNEW ABOUT but never shaped the path around -- one that found no free
+    # max_weave slot -- is re-planned for once it is this close. The commit records the collected
+    # set and the SHAPED set separately, and this trigger is the difference between them.
+    # Sized as the maneuver: ramp_len 4.5 + shift_min 1.0 + 1.5 m of headroom, i.e. the shortest
+    # range at which a hump can still be laid. It is clamped at lookahead_min on load, and that
+    # clamp is the safety argument: the shaped set contains every box inside the lookahead, so the
+    # re-plan this trigger causes records the box as shaped and it cannot fire twice.
+    commit_replan_gap_m: 7.0
 
     # --- cost weights  J = w_d*Σ|d| + w_k*Σκ² + w_c*|d_end-d_end_prev| + w_obs*Σexp(-dist/σ) ---
     w_d: 1.0                # raceline deviation

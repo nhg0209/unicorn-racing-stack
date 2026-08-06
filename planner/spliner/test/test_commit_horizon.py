@@ -113,6 +113,7 @@ class Planner:
         n._clear_latch, n._line_clear = {}, False
         n.commit_enable, n._committed = True, None
         n.commit_drop_on_new_obstacle = True
+        n.commit_replan_gap_m = 7.0
         n.commit_dev_max, n.commit_reanchor_len_m, n.commit_reanchor_max_m = 0.6, 2.0, 1.0
         n.commit_obs_ds, n.commit_obs_dd = 0.75, 0.40
         n.squeeze_enable = False
@@ -206,6 +207,69 @@ def test_the_release_does_not_fire_on_the_boxes_it_was_planned_around():
     released = [m for m in p.log.msgs[n_before:] if "came into the" in m]
     assert not released, f"the commit was released without a new box: {released[:2]}"
     print("PASS the release does not fire on the obstacles the commit was planned around")
+
+
+def test_the_commit_records_shaped_apart_from_collected():
+    # 2a6427c made the commit record the COLLECTED set, which fixed a release that fired every
+    # cycle -- and silenced it for a box that was collected and then never shaped, because every
+    # max_weave slot was taken. Such a box is in c['obs'], reads as "already planned around", and
+    # can be driven past without a hump. The two sets are now recorded separately, and their
+    # difference is what the late-replan trigger keys on.
+    near = [box(20.0, -0.35, 1), box(22.0, -0.35, 2), box(24.0, -0.35, 3)]
+    far = box(26.0, -0.35, 4)                      # inside the gather horizon, no slot left
+    p = Planner(near + [far], max_weave=3)
+    p.step(9.0)
+    c = p.n._committed
+    assert {oid for (oid, _s, _d) in c['obs']} == {1, 2, 3, 4}, c['obs']
+    assert set(c['obs_shaped']) == {1, 2, 3}, (
+        f"box 4 lost the slot race, so it must NOT be in the shaped set: {c['obs_shaped']}")
+    print("PASS the commit records what it shaped ({1,2,3}) apart from what it knew ({1,2,3,4})")
+
+
+def test_a_known_but_unshaped_box_close_ahead_releases_the_commit():
+    # Driven straight at _reuse_committed, because in every driving scenario built for this
+    # another release (the car running off the path's end) frees the commit first -- see the
+    # commit message. This is the branch itself: a box the commit knew about, never shaped, and
+    # now close enough that a hump can still be laid for it.
+    p = Planner([box(20.0, -0.35, 1), box(24.0, -0.35, 2)], max_weave=3)
+    p.step(9.0)
+    c = p.n._committed
+    assert c is not None
+    c['obs_shaped'] = [1]                          # box 2 was known but never shaped
+    p.log.msgs.clear()
+    p.n.cur_s = 24.0 - 6.0                         # box 2 now 6 m ahead, inside the 7 m trigger
+    p.n.cur_x, p.n.cur_y = p.n.cur_s, 0.0
+    out = p.n._reuse_committed(gb_wpnts(), 0.1, 0.30, 0.15, 0.30,
+                               gather=p.n.lookahead_min + p.n.obs_gather_extra_m)
+    assert out is None and p.n._committed is None, "the commit must be released"
+    assert any("never shaped around it" in m for m in p.log.msgs), p.log.msgs[:2]
+    # ...and the far side of the trigger: the same box further away is left alone
+    p2 = Planner([box(20.0, -0.35, 1), box(24.0, -0.35, 2)], max_weave=3)
+    p2.step(9.0)
+    p2.n._committed['obs_shaped'] = [1]
+    p2.log.msgs.clear()
+    out2 = p2.n._reuse_committed(gb_wpnts(), 0.1, 0.30, 0.15, 0.30,
+                                 gather=p2.n.lookahead_min + p2.n.obs_gather_extra_m)
+    assert not any("never shaped around it" in m for m in p2.log.msgs), \
+        "at 15 m there is no hurry -- the slots are still full and the re-plan changes nothing"
+    print("PASS a known-but-unshaped box releases the commit inside the trigger range, not outside")
+
+
+def test_the_late_replan_cannot_fire_twice_for_one_box():
+    # The invariant behind commit_replan_gap_m <= lookahead_min: the shaped set contains every box
+    # inside the lookahead, so the re-plan this trigger causes records the box as shaped. Without
+    # that, this is 2a6427c's bug in a new place -- a release every cycle.
+    p = Planner([box(20.0, -0.35, 1), box(24.0, -0.35, 2)], max_weave=3)
+    assert p.n.commit_replan_gap_m <= p.n.lookahead_min, "the invariant itself"
+    p.step(9.0)
+    p.n._committed['obs_shaped'] = [1]
+    fires = 0
+    for k in range(0, 60):
+        p.log.msgs.clear()
+        p.step(18.0 + 0.1 * k)                     # box 2 from 6 m ahead inward
+        fires += sum(1 for m in p.log.msgs if "never shaped around it" in m)
+    assert fires <= 1, f"the late-replan trigger fired {fires} times for one box"
+    print(f"PASS the late re-plan fires {fires} time(s) for a box, not once per cycle")
 
 
 def test_a_short_lap_does_not_collect_boxes_it_can_never_shape():
@@ -360,6 +424,9 @@ def test_no_infeasible_cycle_while_the_second_box_is_still_ahead():
 if __name__ == "__main__":
     test_a_box_that_comes_into_reach_releases_the_commit()
     test_the_release_does_not_fire_on_the_boxes_it_was_planned_around()
+    test_the_commit_records_shaped_apart_from_collected()
+    test_a_known_but_unshaped_box_close_ahead_releases_the_commit()
+    test_the_late_replan_cannot_fire_twice_for_one_box()
     test_a_short_lap_does_not_collect_boxes_it_can_never_shape()
     test_a_tracker_dropout_does_not_crash_the_gather()
     test_the_gather_horizon_reaches_as_far_as_the_path()

@@ -124,6 +124,7 @@ def planner(obstacles, cur_s=8.0, cur_d=0.0, **over):
     n.commit_dev_max, n.commit_reanchor_len_m, n.commit_reanchor_max_m = 0.6, 2.0, 1.0
     n.commit_obs_ds, n.commit_obs_dd = 0.75, 0.40
     n.commit_drop_on_new_obstacle = True
+    n.commit_replan_gap_m = 7.0
     n.squeeze_enable = False
     n.squeeze_steps, n.squeeze_safety_floor_m = 2, 0.05
     n.squeeze_wall_floor_m, n.squeeze_max_speed_mps = 0.08, 3.0
