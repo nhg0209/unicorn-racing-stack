@@ -1243,8 +1243,17 @@ class StaticReoptNode(Node):
         """
         self._obstacles_dirty = True
         self._dirty_since = self.get_clock().now().nanoseconds * 1e-9
-        self._solve_epoch += 1                   # anything in flight was solved for the old set
         if not keep_pending:
+            # THE EPOCH AND THE PENDING BUNDLE ARE INVALIDATED BY THE SAME EVENTS, and that is the
+            # invariant. keep_pending means "this change is small enough that the queued line is
+            # still the line I want" -- a minor apex refinement, or a set that only shrank. An
+            # in-flight SOLVE for that same state is good for exactly the same reason, and it is
+            # the more expensive thing to throw away: it takes 200-850 ms, while the apex path
+            # arms this every time the reactive layer goes idle. Bumping the epoch here
+            # unconditionally meant a refinement landing during a solve discarded it, the discard
+            # re-armed the trigger, the next solve met the next refinement, and no obstacle-aware
+            # line was ever installed.
+            self._solve_epoch += 1               # anything in flight was solved for the old set
             self._pending = None
             self._pending_dev = None
 

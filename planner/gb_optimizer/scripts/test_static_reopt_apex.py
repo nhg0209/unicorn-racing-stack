@@ -883,6 +883,50 @@ def test_an_empty_set_can_only_install_the_clean_line():
     print("PASS an empty obstacle set can only install the clean line")
 
 
+def test_a_minor_refinement_does_not_discard_the_solve_in_flight():
+    # THE STARVATION. The epoch guard exists so a solve submitted for an old obstacle set cannot
+    # install a line describing a world that no longer exists. Bumping it on EVERY _mark_dirty made
+    # it fire for changes that invalidate nothing: the apex path arms _mark_dirty(keep_pending=True)
+    # every time the reactive layer goes idle with a refined apex, a solve takes 200-850 ms, and a
+    # refinement landing inside that window discarded it. The discard re-arms the trigger, the next
+    # solve meets the next refinement, and no obstacle-aware line is EVER installed.
+    #
+    # The invariant: the epoch and the pending bundle are invalidated by the same events. If the
+    # change is small enough to keep a queued LINE, it is small enough to keep a running SOLVE.
+    from concurrent.futures import ThreadPoolExecutor
+    n = make_node()
+    n._solve_pool = ThreadPoolExecutor(max_workers=1)
+    n.reopt_method = "local_window"
+    n._obstacles = [core.Obstacle(5.0, -0.2, 0.15)]
+    n._obs_ids = [7]
+    n._apex_by_obs = {("id", 7): (5.0, 0.4, 0.4)}
+    n._build_obstacle_bundle = lambda obstacles, pairs=None: straight_bundle()
+    collected = []
+    n._finish_rebuild = lambda b, o, r, t: collected.append(r)
+
+    n._obstacles_dirty = True
+    n._rebuild_and_swap("first")
+    assert n._solve_future is not None, "the fixture must submit a solve"
+    n._mark_dirty(keep_pending=True)                 # a MINOR apex refinement while it runs
+    n._solve_future.result(timeout=5.0)
+    n._collect_solve()
+    assert collected == ["first"], (
+        "a minor refinement discarded the solve in flight -- with the apex path arming one every "
+        "time the reactive layer goes idle, that is a line that is never installed")
+
+    # ...and a change that DOES invalidate still discards it
+    collected.clear()
+    n._obstacles_dirty = True
+    n._rebuild_and_swap("second")
+    n._mark_dirty()                                  # the set moved or grew
+    n._solve_future.result(timeout=5.0)
+    n._collect_solve()
+    assert collected == [], "a real set change must still discard the solve it invalidated"
+    assert n._obstacles_dirty, "...and must re-arm the trigger"
+    n._solve_pool.shutdown(wait=True)
+    print("PASS a minor refinement keeps the solve in flight; a real change still discards it")
+
+
 def test_a_finished_solve_is_collected_before_the_next_is_submitted():
     # A FINISHED but uncollected result was overwritten by the next submit and silently lost -- and
     # its trigger had already been burned, so the work vanished with nothing re-arming.
@@ -1702,6 +1746,7 @@ if __name__ == "__main__":
     test_knot_side_comes_from_the_map_not_the_waypoint_bounds()
     test_a_stale_solve_cannot_undo_a_clean_swap()
     test_an_empty_set_can_only_install_the_clean_line()
+    test_a_minor_refinement_does_not_discard_the_solve_in_flight()
     test_a_finished_solve_is_collected_before_the_next_is_submitted()
     test_solve_runs_off_the_executor_and_is_collected_later()
     test_swap_gate_tally_names_the_gate_that_held_the_swap()
