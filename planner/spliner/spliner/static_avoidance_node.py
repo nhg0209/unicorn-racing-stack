@@ -57,7 +57,13 @@ def _savgol_safe(arr: np.ndarray, window: int) -> np.ndarray:
         win -= 1
     if win <= SMOOTH_OTWPNTS_POLYORDER:
         return arr
-    return savgol_filter(arr, win, SMOOTH_OTWPNTS_POLYORDER)
+    # mode='nearest' at the ENDS. The default ('interp') fits a polynomial to the last `win`
+    # samples and evaluates it at the edge, which on a curvature array whose own endpoints are
+    # already one-sided-stencil estimates turns two artifacts into one bigger one: measured p95
+    # 0.464, max 0.631 rad/m at index 0 and -1. Nothing consumes those two samples today
+    # (update_velocity clamps vx[0] to v_start, the controller reads idx+10..+20), but they are
+    # exactly the "kappa spike at the join" that shows up in RViz.
+    return savgol_filter(arr, win, SMOOTH_OTWPNTS_POLYORDER, mode="nearest")
 
 
 class ObstacleSpliner(Node):
@@ -2272,7 +2278,14 @@ class ObstacleSpliner(Node):
                 psi_, kappa_ = tph.calc_head_curv_num.calc_head_curv_num(
                     path=c['xy'], el_lengths=el, is_closed=False)
                 c['psi'] = psi_ + np.pi / 2.0
-                c['kappa'] = kappa_
+                # SMOOTHED, like every other published curvature. A fresh plan runs kappa through
+                # _savgol_safe before publishing and a republished commit slice carries whatever
+                # was stored -- so without this the smoothness of what the controller reads
+                # depended on which branch the cycle happened to take. On the same geometry:
+                # |kappa_raw - kappa_savgol| p50 0.087, max 0.301, and up to +0.207 rad/m of extra
+                # station-to-station jump.
+                c['kappa'] = _savgol_safe(kappa_, SMOOTH_OTWPNTS_WINDOW) if SMOOTH_OTWPNTS \
+                    else kappa_
             self.get_logger().info(
                 f"[{self.name}] commit re-anchored: entry bent {delta:+.2f} m over {blend:.1f} m; "
                 f"apex and clearance kept", throttle_duration_sec=1.0)
