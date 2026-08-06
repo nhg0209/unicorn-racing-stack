@@ -161,11 +161,22 @@ def int_k2(pts: np.ndarray) -> float:
     return float(np.sum(k * k * 0.5 * (el + np.roll(el, 1))))
 
 
-# How hard the curvature budget bites. 0.5 leaves a corner at half the budget 71% of its
-# corridor and one at 3.5% only 19% of it -- the budget is meant to bind near the limit and be
-# invisible on a straight. A module constant on purpose: it shapes the same trade-off infl_len_m
-# does, and two knobs for one trade-off is how the hump pipeline ended up with sixteen.
-_BUDGET_EXP = 0.5
+# How hard the curvature budget bites: the corridor at a station keeps this power of the budget
+# fraction still free there. A module constant on purpose -- it shapes the same trade-off
+# infl_len_m does, and two knobs for one trade-off is how the hump pipeline ended up with sixteen.
+#
+# 1.0 rather than 0.5, measured on the four cases where the QP was still raising ifac's apex
+# (peak |kappa| / boxes covered of 36):
+#
+#     q = 0.50   1.591 1.572 1.574 1.746   32/36
+#     q = 1.00   1.410 1.451 1.406 1.417   29/36
+#
+# Three more boxes go to the reactive layer, which handles them every lap -- that is lap 1's
+# normal behaviour and functionally whole. The alternative is 1.746 at station 227, which
+# _cap_speed_to_published_curvature reads straight into the speed plan and which slows an
+# obstacle-free corner for the whole stint, while asking the speed planner for a curvature
+# outside its own curvlim of 1.5. Local and temporary against global and persistent.
+_BUDGET_EXP = 1.0
 
 
 # ======================================================================================
@@ -251,12 +262,12 @@ def select_sides(pts: np.ndarray,
     return out
 
 
-def locality_envelope(s_c: np.ndarray,
+def locality_envelope(ci: np.ndarray,
                       track_len: float,
                       obstacles: Sequence[Obstacle],
                       pts_fine: np.ndarray,
                       s_fine: np.ndarray,
-                      k_clean_c: np.ndarray,
+                      k_clean: np.ndarray,
                       params: ReoptParams) -> np.ndarray:
     """g(s) in [0, 1]: the fraction of the corridor the offset may use at each station.
 
@@ -274,17 +285,33 @@ def locality_envelope(s_c: np.ndarray,
       corridor rather than 50%, i.e. the budget bites hard only near the limit.
     """
     if not len(obstacles):
-        return np.zeros(len(s_c))
-    d_arc = np.full(len(s_c), np.inf)
+        return np.zeros(len(ci))
+    d_arc = np.full(len(s_fine), np.inf)
     for o in obstacles:
         j = int(np.argmin(np.hypot(pts_fine[:, 0] - o.x, pts_fine[:, 1] - o.y)))
-        gap = np.abs(s_c - s_fine[j])
+        gap = np.abs(s_fine - s_fine[j])
         d_arc = np.minimum(d_arc, np.minimum(gap, track_len - gap))   # wrap-aware
     half = 0.5 * max(params.infl_len_m, 1e-6)
     t = np.clip((d_arc - half) / half, 0.0, 1.0)
     g = 1.0 - (3.0 * t * t - 2.0 * t * t * t)
-    frac = np.clip((params.kappa_budget - k_clean_c) / max(params.kappa_budget, 1e-9), 0.0, 1.0)
-    return g * np.power(frac, _BUDGET_EXP)
+    frac = np.clip((params.kappa_budget - k_clean) / max(params.kappa_budget, 1e-9), 0.0, 1.0)
+    g = g * np.power(frac, _BUDGET_EXP)
+    # READ AT THE STATION, NOT OVER ITS INTERVAL -- unlike the keep-out, and measured, not assumed.
+    # The keep-out's half-spacing correction is nearly free; the same correction here is not. It
+    # fixes a real 2 mm overshoot (ifac's apex sits BETWEEN two nodes, so the cubic carries 11 mm
+    # of offset where the budget there allows 9, which is what puts four cases 6/1000 of curvature
+    # over the clean line) and it costs, on the same twenty-case matrix:
+    #
+    #     reduction   boxes covered   peak <= clean+0.005   hold across the 8.5 m pair
+    #     pointwise      29/38             16/20                   0.475
+    #     interval       25/38             20/20                   none -- a box is handed over
+    #
+    # The tightest station in a 0.5 m cell then governs the whole cell, and on ifac even a
+    # "straight" is at 16% of the budget, so the corridor available to a keep-out that needs
+    # 0.46 m falls under it and the box goes to the reactive layer. Buying a curvature gate with
+    # the hold that this whole formulation exists to produce is the wrong trade, so the overshoot
+    # is reported instead of paid for.
+    return g[ci]
 
 
 def corridor_deficit(pts: np.ndarray,
@@ -427,7 +454,7 @@ def reoptimize_closed(reftrack_fine: np.ndarray,
     d_c = d_fine = line = None
     for _round in range(len(obstacles) + 2):
         # the envelope follows the boxes still being avoided, so it is rebuilt every round
-        g = locality_envelope(s_fine[ci], L, use, pts_fine, s_fine, k_clean[ci], p)
+        g = locality_envelope(ci, L, use, pts_fine, s_fine, k_clean, p)
         env_hi = np.minimum(hi_f[ci], g * np.maximum(hi_f[ci], 0.0))
         env_lo = np.maximum(lo_f[ci], g * np.minimum(lo_f[ci], 0.0))
 
