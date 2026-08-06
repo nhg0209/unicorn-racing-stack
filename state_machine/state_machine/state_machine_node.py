@@ -233,6 +233,11 @@ class StateMachine(Node):
         self.reframe_warn_m = self.params.reframe_warn_m
         self.squeeze_speed_cap_mps = self.params.squeeze_speed_cap_mps
         self.avoidance_ay_max = self.params.avoidance_ay_max
+        # MIRRORED ONTO THE NODE, like every other name in _NODE_MIRRORED_PARAMS. Without this the
+        # loop reads an attribute that only exists on self.params, raises AttributeError, and rclpy
+        # lets that out of the timer callback -- which takes the whole state machine down.
+        self.local_window_accel_limit_enable = self.params.local_window_accel_limit_enable
+        self.local_window_a_long_mps2 = self.params.local_window_a_long_mps2
         self.static_invisible_grace_sec = self.params.static_invisible_grace_sec
         # Frenet frame of the line the car is ACTUALLY following (/global_waypoints), rebuilt
         # whenever static_reopt swaps it. Incoming obstacles are re-anchored through this; see
