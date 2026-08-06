@@ -27,8 +27,8 @@ no obstacle the answer is d = 0 exactly, and every metre of offset has to be pai
   far|d| 0.190  0.094  0.055  0.038  0.024  0.017
 
   peak |kappa| over that whole sweep is 1.427-1.435 against a clean line that is already 1.448, so
-  curvature does not choose w -- it is 0.02 because that is the lowest peak among the w that still
-  hold 0.40, and it also leaves the least offset lying around the rest of the lap. reach, span,
+  curvature does not choose w -- it is 0.010 because that keeps the widest margin
+  over the 0.40 hold floor while still bringing the line home (see the field above). reach, span,
   ramp curvature, hold bridges and cluster merges are all gone; their job is done by this number.
 
 THE KEEP-OUT IS ANALYTIC, NOT WINDOWED BY STATION. A station-window exclusion (modulate_widths'
@@ -68,7 +68,13 @@ from .static_reopt_core import Obstacle  # noqa: F401  (re-exported for callers)
 class ReoptParams:
     """Five numbers. There is no sixth."""
     grid_step_m: float = 0.50        # QP station spacing; the answer is mapped back to every station
-    dev_weight: float = 0.02         # w: the hold-vs-return knob (see the module docstring)
+    # 0.010, not the 0.020 the "lowest peak that still holds 0.40" rule picks: peak |kappa| over
+    # the whole sweep is 1.425-1.447 and does not discriminate, so what is left is hold margin
+    # against offset left lying around the lap. 0.01 holds 0.499 (+25% over the 0.40 floor) and
+    # leaves 5.8 cm; 0.02 holds 0.469 (+17%) and leaves 4.0 cm. Losing the hold is the QUALITATIVE
+    # failure this whole rewrite exists to fix -- a straight pair drawn as a W -- and 1.8 cm of
+    # residual offset is a quantitative one. The asymmetry points down.
+    dev_weight: float = 0.010         # w: the hold-vs-return knob (see the module docstring)
     obs_margin: float = 0.15         # [m] lateral clearance owed to an obstacle, beyond its radius
     w_veh: float = 0.30              # [m] vehicle width, reserved on both sides
     # [m] SOLVED-FOR ONLY, never part of the safety requirement. The QP enforces the keep-out at
