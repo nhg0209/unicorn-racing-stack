@@ -145,8 +145,15 @@ def engage_run(H, spacing, bias, anchor_s=29.0, start_back_m=25.0):
 
 
 def _driver_node(H, clock, stamp):
-    """A node wired for a driving run: real commit machinery, stubbed clock and publisher."""
+    """A node wired for a driving run: real commit machinery, stubbed clock and publisher.
+
+    The feasibility harness stubs _store_commit out -- it plans one cycle at a time and has no use
+    for a commit -- so a driving run has to put the real one back. Without it `_committed` stays
+    None, `_reuse_committed` never runs, and every cycle is a fresh plan: the exact opposite of
+    what a commit-behaviour measurement is for.
+    """
     n = H._node(0.0, ladder=True)
+    n._store_commit = types.MethodType(H.san.ObstacleSpliner._store_commit, n)
     n.get_clock = lambda: types.SimpleNamespace(
         now=lambda: types.SimpleNamespace(nanoseconds=int(clock.t * 1e9), to_msg=lambda: stamp))
     n.commit_enable = True
