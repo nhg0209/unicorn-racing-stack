@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """Does the closed-track minimum-curvature re-opt do what the hump pipeline could not?
 
-  (1) NO-OP      no obstacles -> is the input returned untouched?
-  (2) HOLD       two boxes on the ifac straight (275, 360) -> does the line hold the offset
-                 between them instead of coming home, and at what clearance / peak |kappa| /
-                 int_k2?
-  (3) LOCALITY   the same pair PLUS a corner box -> how far does the straight pair's own offset
-                 move? A whole-lap solve cannot promise zero, so the number itself is the result.
-  (4) GRID       0.30 / 0.50 / 0.70 m -- the conditioning claim behind grid_step_m.
-  (5) COST       iterations, wall clock, and whether each iterate was acceptable.
+  (1) NO-OP      no obstacles -> is d exactly 0 and the input returned untouched?
+  (2) HOLD       two boxes on the ifac straight (275, 360) -> hold >= 0.40 m, clearance >= 0.30 m
+  (3) LOCALITY   a corner box OUTSIDE the pair (60/120/200) -> |B-A| over the pair span [mm]
+  (4) GRID       0.10 / 0.30 / 0.50 / 0.70 m -> clearance >= 0.30 at every one of them
+  (5) FIELD      twelve three-box placements: clearance, peak |kappa|, hold
 
   ~/miniforge3/envs/unicorn/bin/python3 planner/gb_optimizer/scripts/bench_closed_reopt.py
 """
@@ -28,7 +25,7 @@ from gb_optimizer.closed_reopt import Obstacle, ReoptParams  # noqa: E402
 MAP = "ifac"
 BOX_R = 0.15
 A_I, B_I = 275, 360
-CORNERS = (120, 60, 200, 300)
+CORNERS = (60, 120, 200)   # OUTSIDE the pair: 300 sits BETWEEN 275 and 360
 
 
 def load_ifac():
@@ -56,7 +53,7 @@ def corridor_from_map(ref):
     er = cv2.erode(base, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)))
     res, org = meta["resolution"], (meta["origin"][0], meta["origin"][1])
     pts = ref[:, :2]
-    _psi, nv = C._frame(pts)
+    _psi, nv, _tan = C._frame(pts)
     d = np.arange(-3.0, 3.0 + 1e-9, 0.05)
     i0 = int(np.argmin(np.abs(d)))
     xy = pts[:, None, :] + d[None, :, None] * nv[:, None, :]
@@ -90,69 +87,65 @@ def main():
     cor = corridor_from_map(ref)
     p = ReoptParams()
     n = len(ref)
-    print(f"map {MAP}: {n} stations | ReoptParams grid {p.grid_step_m} iters {p.iters_min}.."
-          f"{p.max_iters} step_tol {p.step_tol_m} kappa {p.kappa_bound} w_veh {p.w_veh} "
-          f"obs_margin {p.obs_margin}")
+    print(f"map {MAP}: {n} stations | ReoptParams grid {p.grid_step_m} w {p.dev_weight} "
+          f"obs_margin {p.obs_margin} w_veh {p.w_veh} kappa(report) {p.kappa_report_only}")
+    need = p.obs_margin + p.w_veh / 2.0
 
     # (1) -------------------------------------------------------------------------------------
-    line0, off0, r0 = C.reoptimize_closed(ref, [], cor, p)
-    print(f"\n(1) NO-OP      returned the input object: {line0 is ref[:, :2] or np.shares_memory(line0, ref)}"
-          f" | max |offset| {np.max(np.abs(off0)):.3e} | ok={r0.ok} '{r0.reason}'")
+    line0, d0, r0 = C.reoptimize_closed(ref, [], cor, p)
+    same = line0 is ref[:, :2] or np.shares_memory(line0, ref)
+    print(f"\n(1) NO-OP      input object returned: {same} | max |d| {np.max(np.abs(d0)):.3e} | "
+          f"clean peak|kappa| {r0.clean_peak_kappa:.3f} @ station {r0.clean_peak_station}")
 
     # (2) -------------------------------------------------------------------------------------
     obsA = [box(ref, A_I), box(ref, B_I)]
-    t = time.perf_counter()
-    lineA, offA, rA = C.reoptimize_closed(ref, obsA, cor, p)
-    msA = (time.perf_counter() - t) * 1e3
-    span = pair_span(n)
-    inner = span[5:-5]
-    holdA = float(np.min(np.abs(offA[inner])))
-    print(f"\n(2) HOLD       ok={rA.ok} '{rA.reason}' | {msA:.0f} ms | iters {rA.iters} | "
-          f"sides {rA.sides}")
-    print(f"    int_k2 {rA.int_k2:.3f}  peak|kappa| {rA.peak_kappa:.3f}  "
-          f"clearances {[round(c, 3) for c in rA.clearances]} (need {p.obs_margin + p.w_veh/2:.2f})")
-    print(f"    min |offset| between the boxes = {holdA:.3f} m "
-          f"({'HELD' if holdA > 0.25 else 'comes home -- W'})")
+    lineA, dA, rA = C.reoptimize_closed(ref, obsA, cor, p)
+    print(f"\n(2) HOLD       ok={rA.ok} '{rA.reason}' | {rA.solve_ms:.1f} ms | {rA.n_coarse} coarse")
+    print(f"    hold {rA.hold:.3f} m (need >= 0.40) | clearances "
+          f"{[round(c,3) for c in rA.clearances]} (need >= {need:.2f}) | max|d| {rA.max_offset:.3f}")
+    print(f"    peak|kappa| {rA.peak_kappa:.3f} @ {rA.peak_station} "
+          f"(clean {rA.clean_peak_kappa:.3f} @ {rA.clean_peak_station}; "
+          f"near an obstacle: {rA.peak_near_obstacle})")
 
     # (3) -------------------------------------------------------------------------------------
-    print(f"\n(3) LOCALITY   the straight pair's offset when a corner box is added")
-    print("    corner station | ok | max |B-A| over the pair span | hold | clearances")
+    span = pair_span(n)
+    print(f"\n(3) LOCALITY   corner box added OUTSIDE the pair")
+    print("    corner | ok | max |B-A| over the pair span | hold | min clearance")
     for cs in CORNERS:
-        obsB = obsA + [box(ref, cs)]
-        lineB, offB, rB = C.reoptimize_closed(ref, obsB, cor, p)
+        _lB, dB, rB = C.reoptimize_closed(ref, obsA + [box(ref, cs)], cor, p)
         if not rB.ok:
-            print(f"    {cs:14d} | NO | -- ({rB.reason[:44]})")
+            print(f"    {cs:6d} | NO | {rB.reason[:40]}")
             continue
-        dmm = float(np.max(np.abs(offB[span] - offA[span]))) * 1e3
-        holdB = float(np.min(np.abs(offB[inner])))
-        print(f"    {cs:14d} | ok | {dmm:24.2f} mm | {holdB:.3f} | "
-              f"{[round(c,3) for c in rB.clearances]}")
+        dmm = float(np.max(np.abs(dB[span] - dA[span]))) * 1e3
+        print(f"    {cs:6d} | ok | {dmm:24.3f} mm | {rB.hold:.3f} | {min(rB.clearances):+.3f}")
 
     # (4) -------------------------------------------------------------------------------------
-    print(f"\n(4) GRID       sensitivity (2 boxes / 3 boxes with the corner at {CORNERS[0]})")
-    print("    step | 2 boxes: ok peak|k| clear        | 3 boxes: ok peak|k| clear")
-    for step in (0.30, 0.50, 0.70):
+    print(f"\n(4) GRID       clearance must hold at every spacing (need >= {need:.2f})")
+    print("    step | ok | min clearance | hold  | peak|kappa| | ms")
+    for step in (0.10, 0.30, 0.50, 0.70):
         pg = ReoptParams(grid_step_m=step)
-        _l2, _o2, r2 = C.reoptimize_closed(ref, obsA, cor, pg)
-        _l3, _o3, r3 = C.reoptimize_closed(ref, obsA + [box(ref, CORNERS[0])], cor, pg)
-        def fmt(r):
-            if not r.ok:
-                return f"NO  {r.reason[:34]}"
-            return (f"yes {r.peak_kappa:5.3f} "
-                    f"{min(r.clearances) if r.clearances else float('nan'):+.3f}")
-        print(f"    {step:4.2f} | {fmt(r2):36s} | {fmt(r3)}")
+        _l, _d, rg = C.reoptimize_closed(ref, obsA, cor, pg)
+        mc = min(rg.clearances) if rg.clearances else float("nan")
+        flag = "ok" if (rg.ok and mc >= need - 1e-9) else "NO"
+        print(f"    {step:4.2f} | {flag} | {mc:+13.3f} | {rg.hold:.3f} | {rg.peak_kappa:11.3f} | "
+              f"{rg.solve_ms:.1f}")
 
     # (5) -------------------------------------------------------------------------------------
-    print(f"\n(5) COST")
-    times = []
-    for _ in range(5):
-        t = time.perf_counter()
-        C.reoptimize_closed(ref, obsA, cor, p)
-        times.append((time.perf_counter() - t) * 1e3)
-    print(f"    2 boxes: p50 {np.percentile(times,50):.0f} ms  p95 {np.percentile(times,95):.0f} ms"
-          f"  | {rA.n_coarse} coarse stations")
-    print(f"    steps by iteration: {[round(s,4) for s in rA.steps]} (tol {p.step_tol_m})")
-    print(f"    acceptable by iteration: {rA.accepted}")
+    print(f"\n(5) FIELD      twelve three-box placements")
+    print("    boxes            | ok | min clear | peak|kappa| | near obs | hold  | ms")
+    fails = 0
+    for trio in ((275, 360, 60), (275, 360, 120), (275, 360, 200),
+                 (20, 60, 200), (40, 120, 300), (100, 160, 260),
+                 (150, 210, 330), (200, 260, 40), (250, 310, 90),
+                 (300, 20, 140), (330, 30, 180), (10, 90, 190)):
+        obs = [box(ref, i) for i in trio]
+        _l, _d, r = C.reoptimize_closed(ref, obs, cor, p)
+        mc = min(r.clearances) if r.clearances else float("nan")
+        ok = r.ok and mc >= need - 1e-9
+        fails += 0 if ok else 1
+        print(f"    {str(trio):16s} | {'ok' if ok else 'NO'} | {mc:+9.3f} | {r.peak_kappa:11.3f} | "
+              f"{str(r.peak_near_obstacle):8s} | {r.hold:5.3f} | {r.solve_ms:.1f}")
+    print(f"    -> {12 - fails}/12 clear every box by {need:.2f} m")
     return 0
 
 

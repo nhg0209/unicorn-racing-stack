@@ -1,37 +1,38 @@
-"""Closed-track minimum-curvature re-optimization around static obstacles.
+"""Static-obstacle avoidance as one convex QP over the lateral offset from the raceline.
 
-WHAT THIS REPLACES. static_reopt_core builds an avoidance line by GUESSING ITS SHAPE: a quintic
-hump per obstacle, a reach chosen by search, a hold bridge, a cluster pre-merge, a side
-unification, a span budget -- and sixteen refusal reasons when the guess does not fit. Here the
-shape is not guessed. The corridor is narrowed around each obstacle and the line is the
-minimum-curvature solution inside it, the same objective the offline raceline is built with. A
-hold across two boxes is not a special case to be offered and gated; it is what minimum curvature
-does when the corridor allows it.
+THE PROBLEM, IN FULL:
 
-WHY THE WHOLE LAP AND NOT A WINDOW. The windowed attempt (6be2564) died on a constraint that only
-existed because it was windowed: a window has two seams, and pinning them to the clean line to
-keep "everything outside unchanged" was a third constraint that emptied the feasible set. A closed
-track has no seam and no window-formation policy, so both problems disappear at once. What is
-given up is "byte-identical outside the obstacles" -- the whole line is re-solved. With no
-obstacles at all the input is returned untouched, so the clean case still costs nothing.
+    minimize   || D2 d ||^2  +  w || d ||^2
+    subject to lo(s) <= d(s) <= hi(s)
 
-WHY IT ITERATES, AND WHY IT KEEPS THE BEST ITERATE. opt_min_curv linearises curvature about the
-reference line; one call is not the answer. tph.iqp_handler is the loop for that, and is not
-usable here: its `while True` has no iteration cap, its tolerance sits under this track's
-discretisation noise floor, and it re-interpolates every iteration, which breaks the alignment
-between A, the normals and the width arrays. Measured on ifac, its error goes 0.911 -> 0.0185
-(iter 4) -> 0.0116 (iter 7) -> 0.117 (iter 14) -> 2.699 (iter 29, diverged). So: our own loop,
-with a hard cap, and the best iterate wins rather than the last.
+d is the lateral offset from the CLEAN raceline on a fixed station grid, D2 the periodic second
+difference over arc length, and [lo, hi] the track corridor intersected with each obstacle's
+keep-out. It is exactly quadratic in d and box-constrained, so it has one solution and there is
+nothing to iterate.
 
-THE GRID IS A CONDITIONING REQUIREMENT, NOT A KNOB. The published raceline is sampled at 0.1 m and
-opt_min_curv's second derivative over segments that short is noise. Measured on ifac:
-    0.30 m   diverges (clearances -0.06 .. -0.17, and "constraints are inconsistent" with a
-             third box)
-    0.50 m   converges in 2 iterations, peak |kappa| 0.98, clearance 0.312
-    0.70 m   worse again (-0.12 .. -0.20)
-0.50 m it is, and the answer is mapped back onto every 0.1 m station with a PERIODIC cubic --
-linear interpolation puts a corner at every grid node and the fine line inherits it (measured peak
-|kappa| 1.9-2.7 from the interpolation alone, on solutions that satisfied the bound).
+WHY THIS AND NOT MINIMUM CURVATURE OF THE LINE. Minimising the lap's own curvature re-solves the
+whole raceline instead of laying an avoidance on it: with no obstacles at all that objective still
+moves the line, taking ifac's int_k2 from 7.487 to 4.647. Everything that went wrong with the
+previous two attempts follows from that -- there was no reason to hold an offset (the raceline is
+not the reference), the corridor left the objective nearly flat so the iteration oscillated, and a
+box in one corner moved the global optimum everywhere. Here the clean line IS the reference: with
+no obstacle the answer is d = 0 exactly, and every metre of offset has to be paid for.
+
+  w is the hold-vs-return knob, and the only shape knob there is. Measured on ifac with two boxes
+  8.5 m apart on the straight: w = 0.00 holds 0.416 m between them, w = 0.01 holds 0.404, w = 0.05
+  holds 0.227. Low w keeps the offset across the gap; high w brings the line home between the
+  boxes. reach, span, ramp curvature, hold bridges and cluster merges are all gone -- their job is
+  done by one number.
+
+THE KEEP-OUT IS ANALYTIC, NOT WINDOWED BY STATION. A station-window exclusion (modulate_widths'
+`obs.r + long_taper` band) depends on where the grid happens to fall: at 0.30 m spacing the same
+obstacle produced a clearance of -0.14 m where 0.10 and 0.50 m gave +0.300. Here each station asks
+the obstacle directly how much lateral room it takes at that longitudinal distance,
+sqrt(max(0, R^2 - dt^2)) with R = r + obs_margin + w_veh/2, which is grid-independent and exact.
+
+Solved with quadprog -- the same dual method opt_min_curv uses internally, present in both the
+conda env and the ROS runtime. scipy.optimize.lsq_linear solves the same problem in 0.1-9.3 s
+against quadprog's 0.5 ms.
 
 Pure functions, no ROS. The caller supplies the corridor it already measures.
 """
@@ -42,42 +43,39 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
+import quadprog
 import trajectory_planning_helpers as tph
 from scipy.interpolate import CubicSpline
 
-from .static_reopt_core import (  # noqa: F401  (re-exported for callers)
-    Obstacle,
-    ModulationParams,
-    modulate_widths,
-)
+from .static_reopt_core import Obstacle  # noqa: F401  (re-exported for callers)
 
 
 @dataclass
 class ReoptParams:
-    """Every knob this module has. Seven, and no more."""
-    grid_step_m: float = 0.50     # QP grid: a conditioning requirement (see the module docstring)
-    max_iters: int = 8            # hard cap -- iqp_handler has none and diverges without one
-    iters_min: int = 2            # never accept before this many
-    step_tol_m: float = 0.005     # converged once the iteration moves the line less than this
-    kappa_bound: float = 1.5      # [1/m] the vehicle's steering limit (veh_dyn curvlim)
-    w_veh: float = 0.30           # [m] width the QP reserves inside the corridor
-    obs_margin: float = 0.17      # [m] 0.15 + 0.02 to absorb the 0.5 m grid's discretisation
+    """Five numbers. There is no sixth."""
+    grid_step_m: float = 0.50        # QP station spacing; the answer is mapped back to every station
+    dev_weight: float = 0.01         # w: the hold-vs-return knob (see the module docstring)
+    obs_margin: float = 0.15         # [m] lateral clearance owed to an obstacle, beyond its radius
+    w_veh: float = 0.30              # [m] vehicle width, reserved on both sides
+    kappa_report_only: float = 1.5   # [1/m] REPORTED against, never used to reject or to tune
 
 
 @dataclass
 class Report:
     ok: bool = False
     reason: str = ""
-    iters: int = 0
-    steps: List[float] = field(default_factory=list)      # max|a| per iteration
-    accepted: List[bool] = field(default_factory=list)    # was each iterate a candidate?
-    int_k2: float = float("nan")
-    peak_kappa: float = float("nan")
-    clearances: List[float] = field(default_factory=list)
-    infeasible: List[int] = field(default_factory=list)   # obstacles with no drivable side
-    sides: List[int] = field(default_factory=list)
-    n_coarse: int = 0
     solve_ms: float = 0.0
+    n_coarse: int = 0
+    hold: float = float("nan")            # min |d| between the first two obstacles, when there are two
+    clearances: List[float] = field(default_factory=list)
+    peak_kappa: float = float("nan")      # Menger, on the published fine line
+    peak_station: int = -1
+    clean_peak_kappa: float = float("nan")
+    clean_peak_station: int = -1
+    peak_near_obstacle: bool = False      # is the worst curvature ours, or the raceline's own?
+    infeasible: List[int] = field(default_factory=list)
+    sides: List[int] = field(default_factory=list)
+    max_offset: float = 0.0
 
 
 # ======================================================================================
@@ -88,21 +86,20 @@ def _closed_el(pts: np.ndarray) -> np.ndarray:
     return np.hypot(seg[:, 0], seg[:, 1])
 
 
-def _frame(pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """(psi, normvec) of a closed line. +normvec is the +w_tr_right side, which is the convention
-    modulate_widths and opt_min_curv both use, so widths and normals live in one frame."""
-    psi, _ = tph.calc_head_curv_num.calc_head_curv_num(
-        path=pts, el_lengths=_closed_el(pts), is_closed=True)
-    return psi, tph.calc_normal_vectors.calc_normal_vectors(psi)
+def _frame(pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(psi, normvec, tangent) of a closed line. +normvec is the +w_tr_right side, matching the
+    reftrack's own width columns."""
+    el = _closed_el(pts)
+    psi, _ = tph.calc_head_curv_num.calc_head_curv_num(path=pts, el_lengths=el, is_closed=True)
+    nv = tph.calc_normal_vectors.calc_normal_vectors(psi)
+    tan = np.roll(pts, -1, axis=0) - pts
+    tan = tan / np.maximum(np.hypot(tan[:, 0], tan[:, 1]), 1e-9)[:, None]
+    return psi, nv, tan
 
 
 def menger_closed(pts: np.ndarray) -> np.ndarray:
-    """Signed curvature of a CLOSED polyline from circumscribed circles.
-
-    Menger rather than a differentiated numeric heading: the latter amplifies the raceline's own
-    micro-noise (~5-8x on this track), and every curvature VERDICT in this stack is taken on real
-    geometry.
-    """
+    """Signed curvature of a CLOSED polyline from circumscribed circles. Menger rather than a
+    differentiated numeric heading, which amplifies this raceline's own micro-noise ~5-8x."""
     p = np.asarray(pts, float)
     a, b, c = np.roll(p, 1, axis=0), p, np.roll(p, -1, axis=0)
     v1, v2 = b - a, c - b
@@ -111,68 +108,115 @@ def menger_closed(pts: np.ndarray) -> np.ndarray:
     return 2.0 * cross / np.maximum(denom, 1e-12)
 
 
-def _int_k2(pts: np.ndarray) -> float:
-    """Integral of kappa^2 around the lap -- the objective, measured on the result."""
+def int_k2(pts: np.ndarray) -> float:
     k = menger_closed(pts)
     el = _closed_el(pts)
-    ds = 0.5 * (el + np.roll(el, 1))
-    return float(np.sum(k * k * ds))
+    return float(np.sum(k * k * 0.5 * (el + np.roll(el, 1))))
 
 
 # ======================================================================================
-# sides
+# corridor + keep-out
 # ======================================================================================
-def select_sides(reftrack: np.ndarray,
-                 obstacles: Sequence[Obstacle],
-                 corridor: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-                 params: Optional[ReoptParams] = None) -> List[int]:
-    """Which side of each obstacle the line passes: +1 (toward +w_tr_right), -1, or 0.
+def obstacle_bounds(pts: np.ndarray,
+                    nv: np.ndarray,
+                    tan: np.ndarray,
+                    obstacles: Sequence[Obstacle],
+                    sides: Sequence[int],
+                    lo: np.ndarray,
+                    hi: np.ndarray,
+                    params: ReoptParams) -> Tuple[np.ndarray, np.ndarray]:
+    """Narrow [lo, hi] by each obstacle's keep-out, analytically and per station.
 
-    A box ON the raceline splits the corridor into two disconnected intervals, and a QP cannot
-    choose between them -- so the choice is made here and the corridor handed to the QP is the
-    connected one. 0 means neither side fits: that obstacle is dropped and named in
-    Report.infeasible for the reactive layer. This never raises; an unavoidable box is a fact
-    about the track, not an error in the request.
+    At longitudinal distance dt from the obstacle centre, a disc of radius R blocks a lateral band
+    of half-width sqrt(max(0, R^2 - dt^2)) about the obstacle's own offset. R carries the radius,
+    the margin owed to it and half the car, so what is returned is a CAR-CENTRE bound.
 
-    Room is read from the corridor the caller measured (the eroded grid intersected with the
-    waypoint bounds), because that is the space the car actually has -- the waypoint bounds alone
-    overstate it, which is why a wall gate exists downstream at all.
+    Which side the line passes on has already been decided (see select_sides): passing on +normvec
+    means the offset must stay above the band's upper edge, so only `lo` moves, and the corridor
+    stays a single interval -- which is what makes the problem a box-constrained QP at all.
     """
-    p = params or ReoptParams()
-    pts = np.asarray(reftrack, float)[:, :2]
-    _psi, nv = _frame(pts)
-    if corridor is not None:
-        lo = np.asarray(corridor[0], float)
-        hi = np.asarray(corridor[1], float)
-    else:
-        lo = -(np.asarray(reftrack, float)[:, 3] - 0.5 * p.w_veh)
-        hi = np.asarray(reftrack, float)[:, 2] - 0.5 * p.w_veh
+    lo = lo.copy()
+    hi = hi.copy()
+    for o, sd in zip(obstacles, sides):
+        if sd == 0:
+            continue
+        rel = np.array([o.x, o.y])[None, :] - pts
+        du = np.einsum("ij,ij->i", rel, nv)
+        dt = np.einsum("ij,ij->i", rel, tan)
+        R = float(o.r) + params.obs_margin + 0.5 * params.w_veh
+        h = np.sqrt(np.maximum(R * R - dt * dt, 0.0))
+        touched = h > 0.0
+        if sd > 0:
+            lo[touched] = np.maximum(lo[touched], du[touched] + h[touched])
+        else:
+            hi[touched] = np.minimum(hi[touched], du[touched] - h[touched])
+    return lo, hi
+
+
+def select_sides(pts: np.ndarray,
+                 nv: np.ndarray,
+                 obstacles: Sequence[Obstacle],
+                 lo: np.ndarray,
+                 hi: np.ndarray,
+                 params: ReoptParams) -> List[int]:
+    """Which side of each obstacle the line passes: +1 (toward +normvec), -1, or 0 for neither.
+
+    A box on the raceline splits the corridor into two disconnected intervals and a box-constrained
+    QP cannot choose between them, so the choice is made here and the QP is handed the connected
+    one. 0 means the car does not fit either side; that obstacle is dropped and named in
+    Report.infeasible for the reactive layer. Never raises -- an unavoidable box is a fact about
+    the track.
+    """
     out: List[int] = []
     for o in obstacles:
         j = int(np.argmin(np.hypot(pts[:, 0] - o.x, pts[:, 1] - o.y)))
-        d_obs = float((np.array([o.x, o.y]) - pts[j]) @ nv[j])
-        need = float(o.r) + p.obs_margin
-        room_hi = (hi[j] if np.isfinite(hi[j]) else np.inf) - (d_obs + need)
-        room_lo = (d_obs - need) - (lo[j] if np.isfinite(lo[j]) else -np.inf)
-        if room_hi < 0.0 and room_lo < 0.0:
-            out.append(0)
-        else:
-            out.append(1 if room_hi >= room_lo else -1)
+        du = float((np.array([o.x, o.y]) - pts[j]) @ nv[j])
+        R = float(o.r) + params.obs_margin + 0.5 * params.w_veh
+        room_hi = (hi[j] if np.isfinite(hi[j]) else np.inf) - (du + R)
+        room_lo = (du - R) - (lo[j] if np.isfinite(lo[j]) else -np.inf)
+        out.append(0 if (room_hi < 0.0 and room_lo < 0.0) else (1 if room_hi >= room_lo else -1))
     return out
 
 
 # ======================================================================================
 # the solve
 # ======================================================================================
+def _second_difference(n: int, ds: float) -> np.ndarray:
+    """Periodic second difference over a uniform station grid."""
+    D2 = (np.diag(-2.0 * np.ones(n))
+          + np.diag(np.ones(n - 1), 1) + np.diag(np.ones(n - 1), -1))
+    D2[0, -1] = 1.0
+    D2[-1, 0] = 1.0
+    return D2 / (ds * ds)
+
+
+def solve_offsets(lo: np.ndarray, hi: np.ndarray, ds: float, w: float) -> Optional[np.ndarray]:
+    """The QP itself: minimize ||D2 d||^2 + w||d||^2 subject to lo <= d <= hi.
+
+    quadprog minimises 1/2 x'Gx - a'x subject to C'x >= b, so the two box sides go in as
+    C = [I, -I] and b = [lo, -hi]. The 1e-9 ridge is for strict convexity only -- D2'D2 is singular
+    (a constant offset has no second difference) and w alone may be zero.
+    """
+    n = len(lo)
+    D2 = _second_difference(n, ds)
+    G = 2.0 * (D2.T @ D2 + w * np.eye(n)) + 1e-9 * np.eye(n)
+    C = np.hstack([np.eye(n), -np.eye(n)])
+    b = np.concatenate([lo, -hi])
+    try:
+        return quadprog.solve_qp(G, np.zeros(n), C, b, 0)[0]
+    except Exception:
+        return None
+
+
 def reoptimize_closed(reftrack_fine: np.ndarray,
                       obstacles: Sequence[Obstacle],
                       corridor: Optional[Tuple[np.ndarray, np.ndarray]] = None,
                       params: Optional[ReoptParams] = None
                       ) -> Tuple[np.ndarray, np.ndarray, Report]:
-    """Minimum-curvature line around the whole lap, inside the obstacle-narrowed corridor.
+    """Lay a minimum-bending avoidance offset on the clean raceline, around the whole lap.
 
-    Returns (line_fine[N,2], offset_fine[N], report). With no obstacles the input points are
-    returned as they are -- not copied, not re-splined, not resampled.
+    Returns (line_fine[N,2], offset_fine[N], report). With no obstacle to avoid the input points
+    are returned as they are -- not copied, not re-splined, not resampled.
     """
     p = params or ReoptParams()
     t0 = time.perf_counter()
@@ -181,102 +225,94 @@ def reoptimize_closed(reftrack_fine: np.ndarray,
     n = len(pts_fine)
     rep = Report()
 
-    live = list(obstacles)
-    rep.sides = select_sides(full, live, corridor, p) if live else []
+    # --- the corridor, as CAR-CENTRE limits ---------------------------------------------------
+    # min(waypoint, eroded grid). The waypoint bounds alone overstate the drivable space -- on ifac
+    # the grid is the binding one at p10 (0.15/0.20 m against 0.25/0.26) -- and the wall gate
+    # downstream exists because of that gap. The kernel-7 erosion already reserves half a car, so
+    # only the waypoint side has w_veh/2 taken off it.
+    hi_f = full[:, 2] - 0.5 * p.w_veh
+    lo_f = -(full[:, 3] - 0.5 * p.w_veh)
+    if corridor is not None:
+        g_lo = np.asarray(corridor[0], float)
+        g_hi = np.asarray(corridor[1], float)
+        ok = np.isfinite(g_hi)
+        hi_f[ok] = np.minimum(hi_f[ok], g_hi[ok])
+        ok = np.isfinite(g_lo)
+        lo_f[ok] = np.maximum(lo_f[ok], g_lo[ok])
+
+    _psi_f, nv_fine, _tan_f = _frame(pts_fine)
+    rep.sides = select_sides(pts_fine, nv_fine, obstacles, lo_f, hi_f, p) if len(obstacles) else []
     rep.infeasible = [i for i, sd in enumerate(rep.sides) if sd == 0]
-    use = [o for i, o in enumerate(live) if rep.sides[i] != 0]
+    use = [o for i, o in enumerate(obstacles) if rep.sides[i] != 0]
+    use_sides = [sd for sd in rep.sides if sd != 0]
+
+    k_clean = np.abs(menger_closed(pts_fine))
+    rep.clean_peak_kappa = float(np.max(k_clean))
+    rep.clean_peak_station = int(np.argmax(k_clean))
     if not use:
         rep.ok = True
-        rep.reason = "no obstacle to avoid" if not live else "every obstacle is unavoidable"
+        rep.reason = "no obstacle to avoid" if not len(obstacles) else "every obstacle is unavoidable"
+        rep.peak_kappa, rep.peak_station = rep.clean_peak_kappa, rep.clean_peak_station
         rep.solve_ms = (time.perf_counter() - t0) * 1e3
         return pts_fine, np.zeros(n), rep
 
-    # --- the corridor the QP is allowed to use ------------------------------------------------
-    # min(waypoint, eroded grid), both expressed as CAR-CENTRE limits and handed to opt_min_curv
-    # as widths (it subtracts w_veh/2 itself). The waypoint bounds alone overstate the drivable
-    # space -- measured on ifac, the grid is the binding one at p10 (0.15/0.20 m against
-    # 0.25/0.26) -- and the wall gate downstream exists because of exactly that gap.
-    ref_in = full.copy()
-    if corridor is not None:
-        lo = np.asarray(corridor[0], float)
-        hi = np.asarray(corridor[1], float)
-        okh = np.isfinite(hi)
-        ref_in[okh, 2] = np.minimum(ref_in[okh, 2] - 0.5 * p.w_veh, hi[okh]) + 0.5 * p.w_veh
-        okl = np.isfinite(lo)
-        ref_in[okl, 3] = np.minimum(ref_in[okl, 3] - 0.5 * p.w_veh, -lo[okl]) + 0.5 * p.w_veh
-
     # --- coarse grid --------------------------------------------------------------------------
     el_fine = _closed_el(pts_fine)
-    spacing = float(np.median(el_fine))
-    stride = max(1, int(round(p.grid_step_m / max(spacing, 1e-6))))
+    stride = max(1, int(round(p.grid_step_m / max(float(np.median(el_fine)), 1e-6))))
     ci = np.arange(0, n, stride)
     rep.n_coarse = len(ci)
-    coarse = ref_in[ci]
-    mod, _mrep = modulate_widths(
-        coarse, use, params=ModulationParams(obs_margin=p.obs_margin), recenter=False)
-    w_r0, w_l0 = mod[:, 2].copy(), mod[:, 3].copy()
+    pts_c = pts_fine[ci]
+    _psi_c, nv_c, tan_c = _frame(pts_c)
+    lo_c, hi_c = obstacle_bounds(pts_c, nv_c, tan_c, use, use_sides, lo_f[ci], hi_f[ci], p)
 
-    clean_c = coarse[:, :2].copy()
-    _psi_c, nv0_c = _frame(clean_c)
+    empty = lo_c > hi_c
+    if np.any(empty):
+        # THE WALL WINS AND THE OBSTACLE MARGIN GIVES. Where the corridor and the keep-out do not
+        # overlap the car cannot have both, and driving into a wall is worse than passing a box
+        # closer than intended -- the same degradation modulate_widths documents ("hugged against
+        # the wall furthest from the obstacle, and the station is flagged infeasible"). The
+        # corridor bound is kept, the keep-out is relaxed to meet it, and the clearance that comes
+        # out is reported so the caller can see what it actually got.
+        n_bad = int(np.count_nonzero(empty))
+        wall_is_lo = lo_c[empty] > hi_c[empty]
+        hi_c[empty] = np.where(wall_is_lo, lo_c[empty] + 1e-6, hi_c[empty])
+        lo_c[empty] = np.minimum(lo_c[empty], hi_c[empty] - 1e-6)
+        rep.reason = (f"{n_bad} station(s) could not have both the corridor and the keep-out; "
+                      f"the corridor won and the clearance below is what was achievable")
+
+    ds = float(np.sum(el_fine)) / len(ci)
+    d_c = solve_offsets(lo_c, hi_c, ds, p.dev_weight)
+    if d_c is None:
+        rep.ok = False
+        rep.reason = rep.reason or "quadprog could not solve the box-constrained QP"
+        rep.solve_ms = (time.perf_counter() - t0) * 1e3
+        return pts_fine, np.zeros(n), rep
+
+    # --- back to every station ----------------------------------------------------------------
+    # PERIODIC CUBIC. A linear map puts a corner at every coarse node and the fine line inherits
+    # it: measured peak |kappa| 1.9-2.7 from the interpolation alone, on offsets that were smooth.
     s_fine = np.concatenate([[0.0], np.cumsum(el_fine)[:-1]])
     L = float(np.sum(el_fine))
-    s_c = s_fine[ci]
-    _psi_f, nv_fine = _frame(pts_fine)
+    d_fine = CubicSpline(np.concatenate([s_fine[ci], [s_fine[ci][0] + L]]),
+                         np.concatenate([d_c, [d_c[0]]]), bc_type="periodic")(s_fine)
+    line = pts_fine + nv_fine * d_fine[:, None]
 
-    def upsample(off_c: np.ndarray) -> np.ndarray:
-        """Coarse offsets -> every fine station, PERIODIC cubic (see the module docstring)."""
-        sc = np.concatenate([s_c, [s_c[0] + L]])
-        oc = np.concatenate([off_c, [off_c[0]]])
-        return CubicSpline(sc, oc, bc_type="periodic")(s_fine)
-
-    # --- the loop -----------------------------------------------------------------------------
-    pts = clean_c.copy()
-    best_off, best_int = None, float("inf")
-    w2 = 0.5 * p.w_veh
-    need_clear = p.obs_margin + w2
-
-    for it in range(p.max_iters):
-        off = np.einsum("ij,ij->i", pts - clean_c, nv0_c)
-        w_r_it = w_r0 - off
-        w_l_it = w_l0 + off
-        if np.any((w_r_it - w2) + (w_l_it - w2) < 0.0):
-            rep.reason = ("the corridor closed on the moving line: no lateral room left at "
-                          f"{int(np.count_nonzero((w_r_it - w2) + (w_l_it - w2) < 0.0))} stations")
-            break
-        try:
-            cx, cy, A, nv = tph.calc_splines.calc_splines(path=np.vstack([pts, pts[0]]))
-            a = tph.opt_min_curv.opt_min_curv(
-                reftrack=np.column_stack([pts, w_r_it, w_l_it]), normvectors=nv, A=A,
-                kappa_bound=p.kappa_bound, w_veh=p.w_veh, closed=True)[0]
-        except Exception as exc:                       # never raise: a hard track is a fact
-            rep.reason = f"{type(exc).__name__}: {str(exc)[:80]}"
-            break
-
-        pts = pts + nv * a[:, None]
-        step = float(np.max(np.abs(a)))
-        rep.steps.append(step)
-        rep.iters = it + 1
-
-        off_fine = upsample(np.einsum("ij,ij->i", pts - clean_c, nv0_c))
-        line = pts_fine + nv_fine * off_fine[:, None]
-        peak = float(np.max(np.abs(menger_closed(line))))
-        clears = [float(np.min(np.hypot(line[:, 0] - o.x, line[:, 1] - o.y)) - o.r) for o in use]
-        good = peak <= p.kappa_bound + 1e-9 and all(c >= need_clear - 1e-9 for c in clears)
-        rep.accepted.append(bool(good))
-        if good:
-            score = _int_k2(line)
-            if score < best_int:
-                best_int, best_off = score, off_fine.copy()
-                rep.int_k2, rep.peak_kappa, rep.clearances = score, peak, clears
-        if it + 1 >= p.iters_min and step < p.step_tol_m:
-            break
-
-    rep.solve_ms = (time.perf_counter() - t0) * 1e3
-    if best_off is None:
-        rep.ok = False
-        if not rep.reason:
-            rep.reason = (f"no iterate cleared every obstacle by {need_clear:.2f} m inside "
-                          f"|kappa| <= {p.kappa_bound}")
-        return pts_fine, np.zeros(n), rep
+    k_new = np.abs(menger_closed(line))
+    rep.peak_kappa = float(np.max(k_new))
+    rep.peak_station = int(np.argmax(k_new))
+    rep.max_offset = float(np.max(np.abs(d_fine)))
+    rep.clearances = [float(np.min(np.hypot(line[:, 0] - o.x, line[:, 1] - o.y)) - o.r)
+                      for o in use]
+    # is the worst curvature ours or the raceline's own? "Ours" = within a keep-out radius of a box
+    ds_peak = np.min([np.hypot(line[rep.peak_station, 0] - o.x,
+                               line[rep.peak_station, 1] - o.y) for o in use])
+    rep.peak_near_obstacle = bool(ds_peak < 2.0)
+    if len(use) >= 2:
+        i0 = int(np.argmin(np.hypot(pts_fine[:, 0] - use[0].x, pts_fine[:, 1] - use[0].y)))
+        i1 = int(np.argmin(np.hypot(pts_fine[:, 0] - use[1].x, pts_fine[:, 1] - use[1].y)))
+        span = (np.arange(i0, i1 + 1) if i1 >= i0 else np.arange(i0, i1 + n + 1)) % n
+        if len(span) > 10:
+            rep.hold = float(np.min(np.abs(d_fine[span[5:-5]])))
     rep.ok = True
-    return pts_fine + nv_fine * best_off[:, None], best_off, rep
+    rep.solve_ms = (time.perf_counter() - t0) * 1e3
+    return line, d_fine, rep
