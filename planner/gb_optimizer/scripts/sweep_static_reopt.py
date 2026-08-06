@@ -269,16 +269,6 @@ def multi_case(m, cfg_dir, wall_margin, fit_tol, anchor, n_obs, gap_m):
 HOLD_ANCHOR = 290
 HOLD_GAPS_M = (4.1, 6.1)
 HOLD_MAX_EXCURSIONS = 1
-# ...and the case the two above cannot see. Both are 2-box and both are inside hold_max_gap_m
-# (8.0), so an explicit hold bridge covers them: the pair holds whether or not the ramp-stretching
-# stages ever run. A pair WIDER than that bridge holds only through the ramp overlap those stages
-# create -- and a third box in a CORNER can own the ramp-curvature tiebreak and block them, which
-# breaks the pair into a W. Three boxes, 8.5 m apart, corner box at station 120.
-HOLD_CORNER_ANCHOR = 275
-HOLD_CORNER_GAP_M = 8.5
-HOLD_CORNER_STATION = 120
-HOLD_CORNER_MIN_ABS_ALPHA = 0.25      # half the 0.500 apex offset: the line must NOT come home
-HOLD_CORNER_REACH_FRAC = 0.8          # of the reach the same pair gets with no corner box
 
 
 def _excursions(alpha, tol=0.02):
@@ -342,94 +332,6 @@ def check_hold(maps, cfg_dir, wall_margin, fit_tol) -> bool:
         if clears and min(clears) < OBS_MARGIN_M - 1e-6:
             ok = False
             print(f"    FAIL: a held line still owes each box obs_margin; got {min(clears):+.3f}.")
-    return ok
-
-
-def _solve_boxes(m, cfg_dir, wall_margin, fit_tol, idxs, pair_side_n=2):
-    """Solve for boxes at the given station indices; the first `pair_side_n` share a side."""
-    xy = m["xy"]
-    nvec = core._wrap_normals(xy)
-    hi = np.maximum(core._cyclic_smooth(m["dr"] - 0.15 - wall_margin, 7), 0.0)
-    lo = np.minimum(core._cyclic_smooth(-(m["dl"] - 0.15 - wall_margin), 7), 0.0)
-    side0 = 1.0 if hi[idxs[0]] >= -lo[idxs[0]] else -1.0
-    apexes, obstacles = [], []
-    for k, i in enumerate(idxs):
-        sd = side0 if k < pair_side_n else (1.0 if hi[i] >= -lo[i] else -1.0)
-        apexes.append(tuple(xy[i] + sd * APEX_OFFSET_M * nvec[i]))
-        obstacles.append((float(xy[i][0]), float(xy[i][1]), OBS_RADIUS_M))
-    return core.reoptimize_local_window(
-        xy, m["dr"], m["dl"], m["reftrack"], apexes, cfg_dir,
-        params=core.ModulationParams(obs_margin=OBS_MARGIN_M),
-        w_veh=0.30, clean_vx=m["vx"], wall_margin=wall_margin,
-        reach_time=0.0, reach_min=1.0, reach_max=6.0, clean_kappa=m["kappa"],
-        fit_tol=fit_tol, apex_obstacles=obstacles)
-
-
-def check_hold_with_corner(maps, cfg_dir, wall_margin, fit_tol) -> bool:
-    """A straight pair WIDER than the hold bridge, with a third box in a corner.
-
-    hold_max_gap_m (8.0) is how far apart two boxes may be and still get an explicit hold bridge.
-    Past it the pair holds only because the ramp-stretching stages grow the two humps' ramps until
-    they overlap -- and those stages accept a stretch only if it lowers the ramp-curvature
-    tiebreak, which was a single max over EVERY hump. A corner hump pinned by its own corridor owns
-    that max, no stretch can lower it, and the straight pair comes home between the boxes: a W,
-    with two extra merge inflections and a speed dip, at a lap cost measured here at 0.485 s.
-    """
-    ok = True
-    m = maps.get("ifac")
-    if m is None:
-        return ok
-    xy = m["xy"]
-    lap0 = clean_metrics(m)[0]
-    seg = np.roll(xy, -1, axis=0) - xy
-    el = np.hypot(seg[:, 0], seg[:, 1])
-    step = int(round(HOLD_CORNER_GAP_M / max(float(np.mean(el)), 1e-6)))
-    a_i = HOLD_CORNER_ANCHOR % (len(xy) - 1)
-    b_i = (HOLD_CORNER_ANCHOR + step) % (len(xy) - 1)
-    real_gap = float(np.sum(el[a_i:a_i + step]))
-    print(f"\n--- hold gate: a {real_gap:.2f} m straight pair (anchor {HOLD_CORNER_ANCHOR}) "
-          f"WITH a corner box at station {HOLD_CORNER_STATION} ---")
-    pair = _solve_boxes(m, cfg_dir, wall_margin, fit_tol, [a_i, b_i])
-    res = _solve_boxes(m, cfg_dir, wall_margin, fit_tol,
-                       [a_i, b_i, HOLD_CORNER_STATION % (len(xy) - 1)])
-    alpha = np.asarray(res["alpha"], float)
-    span = (np.arange(a_i, b_i + 1) if b_i >= a_i
-            else np.arange(a_i, b_i + len(xy) - 1 + 1)) % (len(xy) - 1)
-    aa = np.abs(alpha[span])
-    on = aa > 0.02
-    exc = int(np.count_nonzero(np.diff(on.astype(int)) == 1)) + int(on[0])
-    laid = res["apex_laid"]
-    clears = [float(a.get("clear", float("nan"))) for a in laid]
-    reach = min((min(a["r_in"], a["r_out"]) for a in laid), default=0.0)
-    pair_reach = min((min(a["r_in"], a["r_out"]) for a in pair["apex_laid"]), default=0.0)
-    print("  laid | pair excursions | min|alpha| in the pair | min clear | pair reach | lap loss")
-    print(f"  {res['n_windows']:4d} | {exc:15d} | {float(np.min(aa)):21.3f} | "
-          f"{(min(clears) if clears else float('nan')):9.3f} | {reach:10.2f} | "
-          f"{res['main'][3] - lap0:+8.3f}")
-    if res["n_windows"] != 3:
-        print(f"    FAIL: all three boxes must get a hump, got {res['n_windows']}.")
-        return False
-    if exc > HOLD_MAX_EXCURSIONS or float(np.min(aa)) < HOLD_CORNER_MIN_ABS_ALPHA:
-        ok = False
-        print(f"    FAIL: the straight pair leaves the raceline {exc} time(s) and comes back to "
-              f"{float(np.min(aa)):.3f} m between the boxes. A pair this far apart holds only "
-              f"through ramp overlap, so this is the corner hump blocking the stretch that makes "
-              f"it -- the W.")
-    if reach < HOLD_CORNER_REACH_FRAC * pair_reach - 1e-9:
-        ok = False
-        print(f"    FAIL: the pair's reach fell to {reach:.2f} m against {pair_reach:.2f} m "
-              f"without the corner box (floor {HOLD_CORNER_REACH_FRAC:.1f}x).")
-    if clears and min(clears) < OBS_MARGIN_M - 1e-6:
-        ok = False
-        print(f"    FAIL: a held line still owes each box obs_margin; got {min(clears):+.3f}.")
-    if float(res.get("clip_bite", 0.0)) > fit_tol + 1e-9:
-        ok = False
-        print(f"    FAIL: the corridor clip bit {res['clip_bite']:.4f} m, past fit_tol {fit_tol}.")
-    if not res.get("kappa_published_ok", True):
-        ok = False
-        print(f"    FAIL: the published line exceeds what the car can steer "
-              f"({res.get('kappa_published_max', float('nan')):.2f} against "
-              f"{res.get('kappa_published_allow', float('nan')):.2f}).")
     return ok
 
 
@@ -891,8 +793,6 @@ def main() -> int:
                            args.lap_loss_per_apex, enforce_laptime=args.enforce_laptime):
             ok = False
         if not check_seam(loaded, cfg_dir, args.wall_margin[0], args.fit_tol[0]):
-            ok = False
-        if not check_hold_with_corner(loaded, cfg_dir, args.wall_margin[0], args.fit_tol[0]):
             ok = False
         if not check_hold(loaded, cfg_dir, args.wall_margin[0], args.fit_tol[0]):
             ok = False

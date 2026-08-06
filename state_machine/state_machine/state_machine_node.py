@@ -233,11 +233,6 @@ class StateMachine(Node):
         self.reframe_warn_m = self.params.reframe_warn_m
         self.squeeze_speed_cap_mps = self.params.squeeze_speed_cap_mps
         self.avoidance_ay_max = self.params.avoidance_ay_max
-        # MIRRORED ONTO THE NODE, like every other name in _NODE_MIRRORED_PARAMS. Without this the
-        # loop reads an attribute that only exists on self.params, raises AttributeError, and rclpy
-        # lets that out of the timer callback -- which takes the whole state machine down.
-        self.local_window_accel_limit_enable = self.params.local_window_accel_limit_enable
-        self.local_window_a_long_mps2 = self.params.local_window_a_long_mps2
         self.static_invisible_grace_sec = self.params.static_invisible_grace_sec
         # Frenet frame of the line the car is ACTUALLY following (/global_waypoints), rebuilt
         # whenever static_reopt swaps it. Incoming obstacles are re-anchored through this; see
@@ -1929,61 +1924,6 @@ class StateMachine(Node):
         nearest = int(cand[int(np.argmin(d2))])
         return max(0, nearest - int(back_pts))
 
-    def _limit_window_accel(self, wpnts):
-        """Bound the longitudinal acceleration the ASSEMBLED window demands (returns a new list).
-
-        Every piece of this window has a feasible speed plan of its own, and the JOINS between them
-        have none. Two of them, measured over 896 windows on the real map:
-
-          the avoidance path -> global padding splice, up to 0.894 m/s between adjacent stations
-          (41-55 m/s^2 at the spacing they sit at), and
-
-          the global raceline's OWN velocity seam at s = 0, 0.867 m/s = 35.6 m/s^2, which affects
-          about 22% of the lap because the window straddles it for that long. 104 of the 137
-          stations demanding more than 6 m/s^2 were that seam, not the planner. It comes from
-          vel_planner's closed backward pass returning a last element with no successor to
-          decelerate toward -- a solver defect, not a map one (ifac 0.867, map_test 0.335, f 0.041),
-          and fixing it there would change every map's global_waypoints.json. This pass is the
-          defence line in the meantime.
-
-        Assembled window before: |a_long| p50 4.88, p95 35.6, max 56.8 against a 5.0 ggv ax_max.
-
-        THE COPY IS NOT OPTIONAL. GlobalTracking and get_splini_wpts return the very Wpnt objects
-        held in cur_gb_wpnts.list; writing vx_mps in place would permanently poison the cached
-        global line one station per cycle.
-        """
-        if not wpnts or not self.local_window_accel_limit_enable or len(wpnts) < 2:
-            return wpnts
-        a_max = float(self.local_window_a_long_mps2)
-        if a_max <= 0.0:
-            return wpnts
-        try:
-            v = np.array([float(w.vx_mps) for w in wpnts])
-            xy = np.array([[float(w.x_m), float(w.y_m)] for w in wpnts])
-        except Exception:
-            return wpnts
-        ds = np.maximum(np.hypot(*np.diff(xy, axis=0).T), 1e-6)
-        if not (np.all(np.isfinite(v)) and np.all(np.isfinite(ds))):
-            return wpnts
-        out = v.copy()
-        # backward: brake early enough to make the next station's speed
-        for i in range(len(out) - 2, -1, -1):
-            out[i] = min(out[i], float(np.sqrt(out[i + 1] ** 2 + 2.0 * a_max * ds[i])))
-        # forward, seeded at the car's CURRENT speed: the head of the window is what the
-        # controller is about to serve, and a step there is a step in the command
-        if self.cur_vs is not None and np.isfinite(self.cur_vs):
-            out[0] = min(out[0], float(self.cur_vs))
-        for i in range(1, len(out)):
-            out[i] = min(out[i], float(np.sqrt(out[i - 1] ** 2 + 2.0 * a_max * ds[i - 1])))
-        if np.allclose(out, v):
-            return wpnts
-        lim = []
-        for w, vx in zip(wpnts, out):
-            c = copy.copy(w)                      # NEVER in place -- see the note above
-            c.vx_mps = float(vx)
-            lim.append(c)
-        return lim
-
     def _splice_index(self, tail, tag: str, search_m: float = 3.0) -> int:
         """Index of the GLOBAL waypoint that continues from `tail`, found by POSITION.
 
@@ -2515,7 +2455,6 @@ class StateMachine(Node):
         self.behavior_strategy.overtaking_targets = self.get_overtaking_target()
 
         local_wpnts = self.states[self.local_wpnts_src](self)
-        local_wpnts = self._limit_window_accel(local_wpnts)
 
         if self.cur_state == StateType.LOSTLINE:
             self.cur_state = StateType.GB_TRACK

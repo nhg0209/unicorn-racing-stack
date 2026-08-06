@@ -214,49 +214,6 @@ def _rank_cost(est_s: float, span_over_m: float, n_dropped: int) -> float:
             + _DROP_PENALTY_S * int(n_dropped))
 
 
-class _RampCurv(float):
-    """The ramp-curvature tiebreak, carrying its PER-HUMP breakdown.
-
-    It is a float, so every existing consumer -- the early `return 0.0` paths, `float(ek)`, the
-    comparisons in stage 1 -- keeps working unchanged. What it adds is the breakdown the
-    stretching stages need: see _ramp_improves.
-    """
-    __slots__ = ("per_hump",)
-
-    def __new__(cls, value, per_hump=None):
-        obj = super().__new__(cls, value)
-        obj.per_hump = dict(per_hump or {})
-        return obj
-
-
-def _ramp_improves(new, old) -> bool:
-    """Is `new` a better ramp-curvature outcome than `old`?
-
-    The scalar version of this question is `new < old`, and it is the wrong question for more than
-    one hump. ent_k is a MAX over every hump's ramps, so a corner hump pinned by its own corridor
-    owns that max, and no amount of stretching another hump's ramps can lower it -- the stretch is
-    refused, and with it the ramp overlap that HOLDS a straight pair together. Measured on ifac
-    (anchor 275, gap 8.5, corner at station 120): the pair broke into two excursions with a return
-    to the raceline between them, a W where a single hold belonged, and the candidate table showed
-    two rows that made the hold AND ranked cheaper being rejected for exactly this.
-    So compare PER HUMP, and accept when no hump is worse and at least one is better -- a Pareto
-    improvement. When the hump SET differs (a stretch dropped one) the breakdown is not comparable
-    and the scalar answer is the honest one.
-    """
-    pn = getattr(new, "per_hump", None)
-    po = getattr(old, "per_hump", None)
-    if not pn or not po or set(pn) != set(po):
-        return float(new) < float(old)
-    better = False
-    for k, v_old in po.items():
-        v_new = pn[k]
-        if v_new > v_old + 1e-12:
-            return False
-        if v_new < v_old - 1e-12:
-            better = True
-    return better
-
-
 def _reach_floor(track_len: float) -> float:
     """Smallest reach the corridor fit may bisect down to [m]. Well BELOW reach_min: on a tight
     track the corridor often admits only a ~1-2 m ramp, and a floor at reach_min would make the fit
@@ -1856,7 +1813,6 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
     # `laid` entry's kappa_peak — the GEOMETRIC max |kappa| of the laid line over its own span, so
     # the caller logs what was really laid instead of inferring it from the reach.
     ent_k = 0.0
-    ramp_k = {}                       # per hump, keyed by its u station -- see _ramp_improves
     by_u = {round(e["_u"], 6): e for e in laid if "_u" in e}
     xy_laid = clean_xy + d_global[:, None] * nvec_rl
     try:
@@ -1882,10 +1838,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         idx = idx[np.argsort(u_stn[idx])]
         seg = d_global[idx]
         h = float(np.median(np.abs(np.diff(u_stn[idx])))) or 1.0
-        k_this = float(np.abs(np.diff(seg, 2)).max() / max(h * h, 1e-9))
-        ent_k = max(ent_k, k_this)
-        key = round(float(u), 6)
-        ramp_k[key] = max(ramp_k.get(key, 0.0), k_this)
+        ent_k = max(ent_k, float(np.abs(np.diff(seg, 2)).max() / max(h * h, 1e-9)))
         rec = by_u.get(round(float(u), 6))
         if rec is not None:
             # The reach can have been cut twice since it was recorded (global span budget, then
@@ -1907,7 +1860,7 @@ def build_offset_profile(clean_xy: np.ndarray, s_loop: np.ndarray, track_len: fl
         rec["clear"] = min(
             float(np.min(np.hypot(xy_laid[:, 0] - o[0], xy_laid[:, 1] - o[1]))) - float(o[2])
             for o, _ki in members)
-    return d_global, len(kn_u), _RampCurv(ent_k, ramp_k), dropped, laid
+    return d_global, len(kn_u), ent_k, dropped, laid
 
 
 def _cap_speed_to_published_curvature(traj: np.ndarray, ggv, axm) -> None:
@@ -2411,14 +2364,14 @@ def _reopt_local_window_impl(
             best_e = 1.0
             for e_scale in _STRETCH_SCALES:
                 d_try, n_try, est_try, ek_try, drp_try, lay_try = _try(best_r, e_scale, hold=hold)
-                if n_try and est_try <= best_est + tol and _ramp_improves(ek_try, best_ek):
+                if n_try and est_try <= best_est + tol and ek_try < best_ek:
                     d_g, n_s, best_ek, best_e, cost_fin = d_try, n_try, ek_try, e_scale, est_try
                     drp_b, lay_b = drp_try, lay_try
             tol_exit = 0.05                               # [s] merge smoothness is worth a bit more
             for x_scale in _STRETCH_SCALES:
                 d_try, n_try, est_try, ek_try, drp_try, lay_try = _try(best_r, best_e, x_scale,
                                                                        hold=hold)
-                if n_try and est_try <= best_est + tol_exit and _ramp_improves(ek_try, best_ek):
+                if n_try and est_try <= best_est + tol_exit and ek_try < best_ek:
                     d_g, n_s, best_ek, cost_fin = d_try, n_try, ek_try, est_try
                     drp_b, lay_b = drp_try, lay_try
         return d_g, n_s, cost_fin, drp_b, lay_b, best_r
