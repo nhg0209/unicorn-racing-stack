@@ -38,15 +38,24 @@ class _Log:
 
 
 class _Solver:
-    """Stand-in for calc_vel_profile that records how often (and with what ggv) it was called."""
+    """Stand-in for calc_vel_profile that records how often (and with what ggv) it was called.
+
+    It HONOURS v_start and v_max, because that is the contract the caller now relies on: the cap
+    is handed to the solver as a bound rather than applied to its output, so a stub that ignores
+    v_max would make the cap look like it had stopped working.
+    """
     def __init__(self):
         self.calls = 0
         self.ggv_seen = []
+        self.vmax_seen = []
 
     def __call__(self, **kw):
         self.calls += 1
         self.ggv_seen.append(np.array(kw["ggv"], copy=True))
-        return np.full(len(kw["kappa"]), 5.0)
+        self.vmax_seen.append(kw.get("v_max"))
+        top = min(5.0, float(kw.get("v_max") or 5.0))
+        start = float(kw.get("v_start") if kw.get("v_start") is not None else top)
+        return np.linspace(start, top, len(kw["kappa"]))
 
 
 def path(n=10, kappa=0.1, dx=0.1):
@@ -120,12 +129,20 @@ def test_cap_and_ay_max_are_honoured_and_keyed():
     smn.calc_vel_profile = solver
     msg = path()
     n.update_velocity(msg, cache_key="static")
-    assert abs(msg.wpnts[0].vx_mps - 5.0) < 1e-9
+    assert abs(msg.wpnts[-1].vx_mps - 5.0) < 1e-9
     # the cap applies, and it is part of the key (so it cannot be served a stale uncapped profile)
     msg2 = path()
     n.update_velocity(msg2, v_cap=2.5, cache_key="static")
     assert solver.calls == 2, "a different cap must re-solve"
-    assert abs(msg2.wpnts[0].vx_mps - 2.5) < 1e-9, msg2.wpnts[0].vx_mps
+    assert abs(solver.vmax_seen[-1] - 2.5) < 1e-9, \
+        f"the cap must reach the solver as a bound, not be applied to its output: {solver.vmax_seen}"
+    assert abs(msg2.wpnts[-1].vx_mps - 2.5) < 1e-9, msg2.wpnts[-1].vx_mps
+    # ...and THE HEAD OF THE PROFILE IS THE CAR'S CURRENT SPEED. Applied as np.minimum to the
+    # solved profile the cap rewrote vx[0] -- the solver's own v_start -- from cur_vs to the cap,
+    # so the reference began with a step the controller's slew limiter then took ~300 ms to serve.
+    assert abs(msg2.wpnts[0].vx_mps - n.cur_vs) < 1e-9, (
+        f"the profile starts at {msg2.wpnts[0].vx_mps:.3f} against a current speed of "
+        f"{n.cur_vs:.3f}: that difference is a step in the reference")
     # ay_max replaces the ggv's lateral column for this path only
     n.update_velocity(path(), ay_max=5.0, cache_key="static")
     assert np.allclose(solver.ggv_seen[-1][:, 2], 5.0), solver.ggv_seen[-1]

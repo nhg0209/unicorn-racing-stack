@@ -1729,18 +1729,20 @@ class StateMachine(Node):
                 m_veh=self.pars["veh_params"]["mass"],
                 b_ax_max_machines=b_ax_max_machines_sf,
                 ggv=ggv,
-                v_max=self.pars["veh_params"]["v_max"],
+                # The squeeze cap goes IN, not on afterwards. Applied as np.minimum to the solved
+                # profile it rewrote vx[0] -- which is the solver's v_start, i.e. the speed the car
+                # is doing right now -- from cur_vs to the cap, so the reference began with a step
+                # that the controller's slew limiter then took ~300 ms to serve. Handed to the
+                # solver as v_max it is a BOUND the profile is built to: v_start is still the
+                # current speed, and what comes out is the deceleration this comment claimed.
+                v_max=(min(float(self.pars["veh_params"]["v_max"]), float(v_cap))
+                       if (v_cap is not None and v_cap > 0.0)
+                       else self.pars["veh_params"]["v_max"]),
                 filt_window=self.pars["vel_calc_opts"]["vel_profile_conv_filt_window"],
                 dyn_model_exp=self.pars["vel_calc_opts"]["dyn_model_exp"],
                 v_start=self.cur_vs,
                 v_end=v_end,
             )
-
-            # Applied BEFORE ax so the accelerations describe the speeds actually published. The
-            # solver's v_start is the current speed, so a cap below it yields a decelerating
-            # profile rather than a step -- which is what a reduced-clearance path wants.
-            if v_cap is not None and v_cap > 0.0:
-                vx_profile = np.minimum(vx_profile, float(v_cap))
 
             ax_profile = tph.calc_ax_profile.calc_ax_profile(
                 vx_profile=vx_profile, el_lengths=el_lengths, eq_length_output=False
