@@ -44,6 +44,13 @@ CAR_V = 2.5                # [m/s]
 TRACK_TAU = 0.30           # [s] first-order lag of the car's lateral position onto the reference
 RATE_HZ = 20.0
 N_BOX, BOX_GAP_M, LAPS = 4, 6.0, 2.0
+SHIPPED_LADDER_MS = 20.0   # static_avoidance_params.yaml: ramp_search_max_ms
+# --- ENGAGE scenario (G7/G8): a pair of boxes on the ifac straight ------------------------------
+ENGAGE_ANCHOR_S = 29.0
+ENGAGE_SPACINGS = (3.0, 5.0, 7.0, 9.0, 12.0)
+ENGAGE_BIASES = (0.0, 0.3)
+MIN_ENGAGE_GAP_M = 6.0     # G7  how far out the second box is first shaped around
+MIN_ENGAGE_RAMP_M = 2.0    # G8  how much of that the hump's entry ramp gets
 
 
 class _Clock:
@@ -51,6 +58,108 @@ class _Clock:
     def now(self):
         return types.SimpleNamespace(nanoseconds=int(self.t * 1e9),
                                      to_msg=lambda: F.load_node_module.__self__ if False else None)
+
+
+def _boxes(H, anchor_s, spacings, d=0.0, r=0.15):
+    """Boxes on the raceline at `anchor_s` and `anchor_s + cumulative(spacings)`."""
+    L, wp = H.L, H.wp
+    s_arr = H.s_arr
+    out, s_here = [], float(anchor_s)
+    for k, gap in enumerate([0.0] + list(spacings)):
+        s_here = (s_here + gap) % L
+        j = int(np.argmin(np.abs(s_arr - s_here)))
+        w = wp[j]
+        out.append(types.SimpleNamespace(
+            id=k + 1, s_start=(w["s_m"] - r) % L, s_end=(w["s_m"] + r) % L, s_center=w["s_m"],
+            d_center=d, d_right=d - r, d_left=d + r, size=2 * r, vs=0.0, vd=0.0,
+            is_static=True, is_visible=True, x_m=w["x_m"], y_m=w["y_m"], is_actually_a_gap=False))
+    return out
+
+
+def engage_run(H, spacing, bias, anchor_s=29.0, start_back_m=25.0):
+    """Drive up to a PAIR of boxes and report when the second one is first shaped around.
+
+    ENGAGE GAP is the distance to box 2 when the published path first bends around it, and ENGAGE
+    RAMP is how much of that the hump's own entry ramp occupies. Both are what the driver feels as
+    "it reacted late": a plan that appears 1.5 m from a box is a plan that arrives after the
+    braking decision, however feasible it is.
+    """
+    san = H.san
+    stamp = san.OTWpntArray().header.stamp
+    clock = _Clock()
+    n = _driver_node(H, clock, stamp)
+    n.cur_d = bias
+    boxes = _boxes(H, anchor_s, [spacing], d=0.0)
+    n.obstacles = boxes
+    n._promoted = {b.id for b in boxes}
+    L = H.L
+    s2 = boxes[1].s_center
+    keep_out = n.width_car / 2.0 + n.safety_margin_d + 0.15      # box half-width + lateral keep-out
+    dt = 1.0 / RATE_HZ
+    cur_s = (boxes[0].s_center - start_back_m) % L
+    cur_d = bias
+    engage_gap = engage_ramp = None
+    for _ in range(int((start_back_m + spacing + 4.0) / (CAR_V * dt))):
+        clock.t += dt
+        n.cur_s, n.cur_d = cur_s % L, cur_d
+        resp = H.converter.get_cartesian(np.array([n.cur_s]), np.array([cur_d]))
+        pxy = (resp.T if resp.ndim == 2 else resp).reshape(-1, 2)[0]
+        n.cur_x, n.cur_y = float(pxy[0]), float(pxy[1])
+        j = int(np.argmin(np.abs(H.s_arr - n.cur_s)))
+        j2 = (j + 1) % (len(H.wp) - 1)
+        n.cur_yaw = float(np.arctan2(H.wp[j2]["y_m"] - H.wp[j]["y_m"],
+                                     H.wp[j2]["x_m"] - H.wp[j]["x_m"]))
+        try:
+            res = n.do_spline(H.gbw)
+        except Exception:
+            cur_s += CAR_V * dt
+            continue
+        pts = res[0].wpnts if res and res[0] is not None else []
+        if pts and engage_gap is None:
+            # SHAPED means the path would actually pass box 2: its offset at box 2's station is
+            # outside that box's keep-out. Any looser test (some offset carried over from box 1's
+            # hump, say) reports a merged pair as engaged when nothing was planned for box 2.
+            near = [x for x in pts
+                    if abs(((x.s_m - s2 + L / 2.0) % L) - L / 2.0) <= 0.30]
+            if near and max(abs(x.d_m) for x in near) > keep_out:
+                engage_gap = ((s2 - n.cur_s) % L)
+                # box 2's OWN entry ramp: walk back from it while the path still carries offset,
+                # stopping at box 1 so a merged pair does not report the whole excursion
+                cap = min(spacing, L / 2.0)
+                back = sorted((((s2 - x.s_m) % L), abs(x.d_m)) for x in pts
+                              if ((s2 - x.s_m) % L) <= cap)
+                engage_ramp = 0.0
+                for ds, ad in back:
+                    if ad <= 0.02:
+                        break
+                    engage_ramp = ds
+        target = 0.0
+        if pts:
+            ds = [((x.s_m - n.cur_s) % L) for x in pts]
+            k = int(np.argmin([abs(v - LOOK_M) for v in ds]))
+            if abs(ds[k] - LOOK_M) < 0.6:
+                target = float(pts[k].d_m)
+        cur_d += (target - cur_d) * min(1.0, dt / TRACK_TAU)
+        cur_s += CAR_V * dt
+    return engage_gap, engage_ramp
+
+
+def _driver_node(H, clock, stamp):
+    """A node wired for a driving run: real commit machinery, stubbed clock and publisher."""
+    n = H._node(0.0, ladder=True)
+    n.get_clock = lambda: types.SimpleNamespace(
+        now=lambda: types.SimpleNamespace(nanoseconds=int(clock.t * 1e9), to_msg=lambda: stamp))
+    n.commit_enable = True
+    n._committed = None
+    n.commit_dev_max = 0.6
+    n.commit_reanchor_len_m, n.commit_reanchor_max_m = 2.0, 1.0
+    n.commit_obs_ds, n.commit_obs_dd = 0.75, 0.40
+    n.commit_drop_on_new_obstacle = True
+    n.commit_replan_gap_m = getattr(n, "commit_replan_gap_m", 7.0)
+    n.ramp_search_max_ms = SHIPPED_LADDER_MS
+    n.cur_vs = CAR_V
+    n._publish_feasible = lambda ok: None
+    return n
 
 
 def run(H, verbose=False):
@@ -188,6 +297,26 @@ def report(out, label):
             "fresh": len(fresh), "flips": flips, "dend": dend_jump, "err": len(errs)}
 
 
+def engage_report(H):
+    """G7/G8: how early the SECOND of a pair is reacted to, across spacings and tracking bias."""
+    rows, gaps, ramps = [], [], []
+    for spacing in ENGAGE_SPACINGS:
+        for bias in ENGAGE_BIASES:
+            g, r = engage_run(H, spacing, bias)
+            rows.append((spacing, bias, g, r))
+            if g is not None:
+                gaps.append(g)
+                ramps.append(r if r is not None else 0.0)
+    print(f"=== engage | pair on the straight (s={ENGAGE_ANCHOR_S}), "
+          f"{len(ENGAGE_SPACINGS)} spacings x {len(ENGAGE_BIASES)} biases ===")
+    print("  spacing  bias |  engage gap   entry ramp")
+    for spacing, bias, g, r in rows:
+        print(f"   {spacing:5.1f} {bias:5.2f} | "
+              + (f"{g:9.2f} m {r:10.2f} m" if g is not None
+                 else "     never          -   "))
+    return (min(gaps) if gaps else 0.0), (min(ramps) if ramps else 0.0), rows
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--map", default="ifac")
@@ -210,6 +339,12 @@ def main():
         fails.append(f"G6 max d_end jump {m['dend']:.3f} m > {MAX_DEND_JUMP_M}")
     if m["err"]:
         fails.append(f"{m['err']} cycles raised")
+    min_gap, min_ramp, _rows = engage_report(H)
+    if min_gap < MIN_ENGAGE_GAP_M:
+        fails.append(f"G7 the second box is first shaped around at {min_gap:.2f} m "
+                     f"< {MIN_ENGAGE_GAP_M} (a plan that late arrives after the braking decision)")
+    if min_ramp < MIN_ENGAGE_RAMP_M:
+        fails.append(f"G8 its entry ramp gets {min_ramp:.2f} m < {MIN_ENGAGE_RAMP_M}")
     if fails:
         print("\nFAILED:")
         for f in fails:

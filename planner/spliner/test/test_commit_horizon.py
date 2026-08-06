@@ -208,6 +208,25 @@ def test_the_release_does_not_fire_on_the_boxes_it_was_planned_around():
     print("PASS the release does not fire on the obstacles the commit was planned around")
 
 
+def test_a_short_lap_does_not_collect_boxes_it_can_never_shape():
+    # Collection measures the FORWARD gap, (s - cur_s) % L; the knot loop measures the SIGNED gap
+    # and skips anything at or behind the car. On a lap shorter than 2 * (lookahead + extra) those
+    # disagree, and a box between L/2 and the gather horizon is collected but can never be
+    # knotted. Since the commit records what was collected, that box also silences the release
+    # that would have re-planned for it -- so it is never shaped around at all. ifac is 36.70 m
+    # against a 39.0 m threshold: a 1.15 m band of stations.
+    p = Planner([box(8.0, -0.35, 1), box(17.0, -0.35, 2)])
+    n = p.n
+    n.gb_max_s, n.gb_max_idx = 30.0, 300               # a lap shorter than 2*(15 + 4.5)
+    p.step(0.0)
+    ids = p.committed_ids()
+    assert 1 in ids, ids
+    assert 2 not in ids, (
+        "box 2 sits past L/2, where no knot can ever be assigned to it -- recording it in the "
+        "commit is what makes the release stay silent for as long as it is there")
+    print("PASS a box past L/2 on a short lap is not collected, so the release can still fire")
+
+
 def test_a_tracker_dropout_does_not_crash_the_gather():
     # The obstacle-memory branch subtracted two clock objects. rclpy.time.Time supports that; a
     # stub does not, and every offline harness in this repo uses a stub -- so a single cycle with
@@ -341,6 +360,7 @@ def test_no_infeasible_cycle_while_the_second_box_is_still_ahead():
 if __name__ == "__main__":
     test_a_box_that_comes_into_reach_releases_the_commit()
     test_the_release_does_not_fire_on_the_boxes_it_was_planned_around()
+    test_a_short_lap_does_not_collect_boxes_it_can_never_shape()
     test_a_tracker_dropout_does_not_crash_the_gather()
     test_the_gather_horizon_reaches_as_far_as_the_path()
     test_the_commit_records_every_box_the_release_will_ask_about()

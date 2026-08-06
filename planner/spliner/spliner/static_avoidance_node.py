@@ -1149,7 +1149,16 @@ class ObstacleSpliner(Node):
         # How far obstacles are COLLECTED: as far as the path reaches (see the gather below). The
         # commit release uses the same horizon, so "a box the plan never knew about" and "a box
         # the next plan would shape around" are the same set.
-        gather = lookahead + max(0.0, self.obs_gather_extra_m)
+        #
+        # CLAMPED AT HALF A LAP, because the two sides of that sentence use different conventions.
+        # Collection measures the FORWARD gap, (s - cur_s) % L, which never wraps to negative; the
+        # knot loop measures the SIGNED gap and skips anything at or behind the car
+        # (gap_c <= 0.0). On a lap shorter than 2 * (lookahead + extra) those disagree: a box
+        # between L/2 and the gather horizon is collected, is never knottable, and -- since the
+        # commit records what was collected -- silences the release that would have re-planned for
+        # it. ifac is 36.70 m against a 39.0 m threshold, i.e. a 1.15 m band of stations that can
+        # never be shaped around; map_test (88.5) and f (76.5) are unaffected.
+        gather = min(lookahead + max(0.0, self.obs_gather_extra_m), self.gb_max_s / 2.0)
 
         # --- committed-path reuse: follow the SAME world-fixed evasion path we already chose ---
         # (see the commit_* notes in __init__). Re-solving from the instantaneous pose every cycle
