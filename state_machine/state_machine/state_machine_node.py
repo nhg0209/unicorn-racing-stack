@@ -171,6 +171,11 @@ class StateMachine(Node):
         # commanded head speed tracks the car, coarse enough that a frozen path is solved once.
         self._vel_cache = {}
         self.vel_cache_quant_mps = 0.25
+        # How many points of the path's TAIL identify its geometry for the profile cache. The tail
+        # is what a forward re-slice leaves alone (the head is consumed as the car drives), so it
+        # is what the key can be built from. It is only a PREFILTER -- the reuse is confirmed by
+        # comparing the cached geometry against this one -- so 40 points (4 m) is enough.
+        self.vel_cache_sig_pts = 40
         # obstacle id -> last time it was reported is_visible (STATIC obstacles only); see
         # obstacle_perception_cb's debounce.
         self._last_visible_t = {}
@@ -1692,22 +1697,52 @@ class StateMachine(Node):
         # built on top of that lag is what then blocked the OVERTAKE commit -- so the cost of the
         # recomputation was not lost time, it was a lost maneuver.
         #
-        # The profile is NOT a pure function of the geometry -- it is solved from the current speed
-        # -- so v_start/v_end are part of the key, QUANTIZED: within a quarter of a m/s the
-        # resulting profile does not meaningfully differ, and beyond it we re-solve. One slot per
-        # source, because the static and dynamic planners both publish at 20 Hz and a single-entry
-        # cache would just thrash between them.
-        key = (hash(np.asarray(kappa, dtype=np.float64).tobytes()),
-               hash(np.asarray(el_lengths, dtype=np.float64).tobytes()),
-               round(float(self.cur_vs) / self.vel_cache_quant_mps),
+        # The key has to survive the FORWARD RE-SLICE, or it never hits at all. A committed path is
+        # frozen, but the planner republishes only the part still ahead of the car, so the array
+        # loses points from the FRONT: at 3 m/s a 0.1 m station is passed every 34 ms against this
+        # node's 50 ms cycle, so the length changed nearly every cycle. Hashing the raw float64
+        # bytes of the whole array therefore missed every single time -- a cache with a 0% hit rate,
+        # which is why the 0.3-0.5 s of executor lag it was added to remove was still in the log
+        # (`age=1.41(<1.0)`).
+        #
+        # So the signature is the TAIL, which a forward re-slice does not touch, quantized below
+        # the solver's own sensitivity rather than compared bit-for-bit. The head is handled by
+        # VALIDATION instead of by the key: a cached profile is reused only if, sliced to the
+        # current window, it starts within one quantum of the speed the car is actually doing --
+        # exactly the tolerance the old key claimed for v_start, but checked against the profile
+        # that is about to be published instead of against the inputs.
+        # The key is a FIXED-LENGTH tail signature -- a count that shrank with the array would be
+        # exactly as length-sensitive as the old whole-array hash -- and it is only a prefilter.
+        # What makes a reuse correct is the explicit comparison below: the cached geometry, sliced
+        # to this window, must actually equal this one, so two paths that happen to share a tail
+        # cannot be confused. That comparison is a few array ops; the solve it avoids is milliseconds.
+        n_now = len(kappa)
+        # A path at least sig points long is signed by its LAST sig points, which a forward
+        # re-slice does not touch. A shorter one is signed by all of it -- there the count cannot
+        # be fixed, but such a path is below the local window anyway.
+        tail = min(n_now, int(self.vel_cache_sig_pts))
+        key = (hash(np.round(np.asarray(kappa[-tail:], dtype=np.float64), 3).tobytes()),
+               hash(np.round(np.asarray(el_lengths[-tail:], dtype=np.float64), 4).tobytes()),
                round(float(v_end) / self.vel_cache_quant_mps),
                round(float(safety_factor), 3),
                None if v_cap is None else round(float(v_cap), 3),
                None if ay_max is None else round(float(ay_max), 3))
         hit = self._vel_cache.get(cache_key)
-        if hit is not None and hit[0] == key:
-            vx_profile, ax_profile = hit[1], hit[2]
-        else:
+        vx_profile = ax_profile = None
+        if (hit is not None and hit[0] == key
+                and len(hit[1]) >= n_now and len(hit[3]) >= n_now and n_now > 1):
+            same = (np.allclose(kappa, hit[3][-n_now:], atol=1e-3, rtol=0.0)
+                    and np.allclose(el_lengths, hit[4][-(n_now - 1):], atol=1e-4, rtol=0.0))
+            if same:
+                vx_try = hit[1][-n_now:]
+                ax_try = hit[2][-(n_now - 1):]
+                # ...and the profile must still start where the CAR is. The head is validated
+                # rather than keyed: a cached profile is a function of the v_start it was solved
+                # with, and reusing it after the car has left that speed publishes a reference the
+                # car is not on.
+                if abs(float(vx_try[0]) - float(self.cur_vs)) <= self.vel_cache_quant_mps:
+                    vx_profile, ax_profile = vx_try, ax_try
+        if vx_profile is None:
             ax_max_machines_sf = self.ax_max_machines.copy()
             b_ax_max_machines_sf = self.b_ax_max_machines.copy()
             ax_max_machines_sf[:, 1] *= safety_factor
@@ -1747,7 +1782,9 @@ class StateMachine(Node):
             ax_profile = tph.calc_ax_profile.calc_ax_profile(
                 vx_profile=vx_profile, el_lengths=el_lengths, eq_length_output=False
             )
-            self._vel_cache[cache_key] = (key, vx_profile, ax_profile)
+            self._vel_cache[cache_key] = (key, vx_profile, ax_profile,
+                                          np.asarray(kappa, float).copy(),
+                                          np.asarray(el_lengths, float).copy())
 
         # THE OUTPUT IS CHECKED TOO. The inputs are validated above, but the solver can still
         # return a non-finite profile (a zero el_length, a degenerate kappa run), and writing NaN

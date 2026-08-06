@@ -73,6 +73,7 @@ def sm(cur_vs=3.0):
     n.wpnt_dist = 0.1
     n._vel_cache = {}
     n.vel_cache_quant_mps = 0.25
+    n.vel_cache_sig_pts = 40       # tail points that identify the geometry (re-slice invariant)
     n.ggv = np.array([[0.0, 5.0, 4.5], [10.0, 5.0, 4.5]])
     n.ax_max_machines = np.array([[0.0, 5.0], [10.0, 5.0]])
     n.b_ax_max_machines = np.array([[0.0, 5.0], [10.0, 5.0]])
@@ -124,6 +125,51 @@ def test_sources_do_not_evict_each_other():
     print("PASS static and dynamic paths get their own cache slot")
 
 
+def test_a_forward_reslice_still_hits_the_cache():
+    # THE reason the cache measured 0%. A committed path is frozen, but the planner republishes
+    # only the part still ahead of the car, so the array loses points from the FRONT -- at 3 m/s a
+    # 0.1 m station is passed every 34 ms against this node's 50 ms cycle. Hashing the whole
+    # array's float64 bytes therefore missed every cycle, and the 0.3-0.5 s of executor lag the
+    # cache exists to remove was still in the log.
+    n, solver = sm(), _Solver()
+    smn.calc_vel_profile = solver
+    full = path(n=60)
+    n.update_velocity(full, cache_key="static")
+    assert solver.calls == 1
+    for k in range(1, 12):                       # the car eats one station per cycle
+        msg = types.SimpleNamespace(wpnts=[w for w in path(n=60).wpnts[k:]])
+        n.update_velocity(msg, cache_key="static")
+        n.cur_vs = msg.wpnts[0].vx_mps           # ...and drives the reference it was given
+    assert solver.calls == 1, (
+        f"a forward re-slice of a frozen path re-solved {solver.calls - 1} times: the key is not "
+        f"invariant to the head being consumed")
+    print("PASS a frozen path re-sliced forward 11 times is solved once")
+
+
+def test_a_reslice_whose_head_left_the_car_behind_re_solves():
+    # The head is validated rather than keyed: a cached profile is reused only if, sliced to the
+    # current window, it starts within one quantum of the speed the car is actually doing.
+    n, solver = sm(cur_vs=3.0), _Solver()
+    smn.calc_vel_profile = solver
+    n.update_velocity(path(n=60), cache_key="static")
+    assert solver.calls == 1
+    n.cur_vs = 3.0 + 4.0 * n.vel_cache_quant_mps       # the car is now far off the cached head
+    n.update_velocity(types.SimpleNamespace(wpnts=path(n=60).wpnts[3:]), cache_key="static")
+    assert solver.calls == 2, "a profile whose head no longer matches the car must be re-solved"
+    print("PASS a cached profile is dropped once its head no longer matches the car's speed")
+
+
+def test_a_changed_tail_is_a_different_path():
+    n, solver = sm(), _Solver()
+    smn.calc_vel_profile = solver
+    n.update_velocity(path(n=60), cache_key="static")
+    other = path(n=60)
+    other.wpnts[-1].kappa_radpm += 0.5                 # a genuinely different geometry
+    n.update_velocity(other, cache_key="static")
+    assert solver.calls == 2, "a path with a different tail must re-solve"
+    print("PASS a different tail geometry is a different path")
+
+
 def test_cap_and_ay_max_are_honoured_and_keyed():
     n, solver = sm(), _Solver()
     smn.calc_vel_profile = solver
@@ -156,5 +202,8 @@ if __name__ == "__main__":
     test_geometry_change_invalidates()
     test_speed_drift_invalidates_past_the_quantum()
     test_sources_do_not_evict_each_other()
+    test_a_forward_reslice_still_hits_the_cache()
+    test_a_reslice_whose_head_left_the_car_behind_re_solves()
+    test_a_changed_tail_is_a_different_path()
     test_cap_and_ay_max_are_honoured_and_keyed()
     print("ALL PASS")
