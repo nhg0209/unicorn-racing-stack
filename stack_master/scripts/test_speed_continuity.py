@@ -201,6 +201,58 @@ def test_no_published_step_exceeds_the_accel_limit():
     print(f"PASS no published step exceeds {step:.3f} m/s per cycle across four discontinuities")
 
 
+def test_assembled_local_window_accel():
+    """G12. The window the controller is handed is ASSEMBLED from pieces, and the joins between
+    them are not bound by anything.
+
+    Two joins, both measured on the real map: the avoidance path -> global padding splice (up to
+    0.894 m/s between adjacent stations) and the global raceline's OWN velocity seam at s = 0
+    (0.867 m/s = 35.6 m/s^2, straddled by about 22% of the lap -- 104 of the 137 stations
+    demanding more than 6 m/s^2 were that seam, not the planner). Assembled window before the
+    limiting pass: |a_long| p50 4.88, p95 35.6, max 56.8 against a 5.0 ggv ax_max.
+
+    This drives the REAL StateMachine._limit_window_accel over the REAL global line, seam included.
+    """
+    import json
+    SM = _load_state_machine()
+    wp = json.load(open(os.path.join(STACK_MASTER, "maps", "ifac", "global_waypoints.json")))
+    gb = wp["global_traj_wpnts_iqp"]["wpnts"]
+
+    def window(start, n=80):
+        return [types.SimpleNamespace(x_m=gb[(start + i) % len(gb)]["x_m"],
+                                      y_m=gb[(start + i) % len(gb)]["y_m"],
+                                      vx_mps=gb[(start + i) % len(gb)]["vx_mps"])
+                for i in range(n)]
+
+    def demand(w):
+        v = np.array([x.vx_mps for x in w])
+        xy = np.array([[x.x_m, x.y_m] for x in w])
+        ds = np.maximum(np.hypot(*np.diff(xy, axis=0).T), 1e-6)
+        return np.max(np.abs(v[1:] ** 2 - v[:-1] ** 2) / (2.0 * ds))
+
+    f = types.SimpleNamespace(
+        local_window_accel_limit_enable=True, local_window_a_long_mps2=GGV_AX_MAX,
+        cur_vs=gb[0]["vx_mps"], _limit_window_accel=None)
+    starts = list(range(0, len(gb) - 1, 4))
+    worst_before = max(demand(window(s0)) for s0 in starts)
+    worst_after = 0.0
+    for s0 in starts:
+        w = window(s0)
+        f.cur_vs = w[0].vx_mps
+        out = SM._limit_window_accel(f, w)
+        worst_after = max(worst_after, demand(out))
+        # the pass may only ever slow the plan down
+        assert all(b.vx_mps <= a.vx_mps + 1e-9 for a, b in zip(w, out)), \
+            "the accel limit raised a speed"
+        # ...and it must not mutate the caller's objects: those are the cached global line
+        assert all(x.vx_mps == gb[(s0 + i) % len(gb)]["vx_mps"] for i, x in enumerate(w)), \
+            "the pass wrote through to the cached global waypoints"
+    assert worst_after <= 6.0, (
+        f"the assembled window still demands {worst_after:.1f} m/s^2 (was {worst_before:.1f})")
+    print(f"PASS the assembled local window demands at most {worst_after:.2f} m/s^2 "
+          f"over {len(starts)} windows of the real ifac line (was {worst_before:.1f})")
+
+
 def check_bag(path):
     """Replay a recording's published command through the limiter and report before/after."""
     import rosbag2_py
@@ -250,6 +302,7 @@ def main() -> int:
     test_window_anchor()
     test_aeb_engage_count_over_a_lap()
     test_no_published_step_exceeds_the_accel_limit()
+    test_assembled_local_window_accel()
     ok = True
     if args.bag:
         ok = check_bag(args.bag)

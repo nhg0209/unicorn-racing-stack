@@ -41,6 +41,8 @@ class StateMachineParams:
         "reframe_warn_m",
         "squeeze_speed_cap_mps",
         "avoidance_ay_max",
+        "local_window_accel_limit_enable",
+        "local_window_a_long_mps2",
         "static_invisible_grace_sec",
         "overtaking_horizon_m",
         "getting_closer_rel_vel_mps",
@@ -206,6 +208,34 @@ class StateMachineParams:
             ),
         )
         self.avoidance_ay_max: float = node.get_parameter("avoidance_ay_max").value
+
+        self._declare(
+            "local_window_accel_limit_enable", True,
+            ParameterDescriptor(
+                description="Bound the longitudinal acceleration the ASSEMBLED local window "
+                            "demands. Every piece of that window has a feasible speed plan; the "
+                            "joins between them have none -- the avoidance-to-global splice, and "
+                            "the global raceline's own velocity seam at s = 0. Measured over 896 "
+                            "windows: |a_long| p95 35.6, max 56.8 against a 5.0 ggv ax_max.",
+                type=ParameterType.PARAMETER_BOOL,
+            ),
+        )
+        self.local_window_accel_limit_enable: bool = node.get_parameter(
+            "local_window_accel_limit_enable").value
+
+        self._declare(
+            "local_window_a_long_mps2", 5.0,
+            ParameterDescriptor(
+                description="Longitudinal accel/decel bound [m/s^2] for the window pass above. "
+                            "The vehicle's own limit (veh_dyn_info ggv ax_max / ax_max_machines), "
+                            "not a comfort setting -- it is what the trajectory the window is "
+                            "assembled from was planned with.",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=0.5, to_value=15.0, step=0.1)],
+            ),
+        )
+        self.local_window_a_long_mps2: float = node.get_parameter(
+            "local_window_a_long_mps2").value
 
         self._declare(
             "static_invisible_grace_sec", 1.5,

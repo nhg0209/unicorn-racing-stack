@@ -42,6 +42,13 @@ state_machine:
     # the raceline limit was silently undoing the planner's own intent and making the spline crawl.
     # 5.0 splits the difference. The global line is unaffected.
     avoidance_ay_max: 5.0
+    # Bound the longitudinal acceleration the ASSEMBLED local window demands. Every piece of that
+    # window has a feasible speed plan of its own; the JOINS between them have none -- the
+    # avoidance-to-global splice (up to 0.894 m/s between adjacent stations) and the global
+    # raceline's own velocity seam at s = 0 (0.867 m/s, about 22% of the lap). Measured over 896
+    # windows: |a_long| p50 4.88 / p95 35.6 / max 56.8 against a 5.0 ggv ax_max.
+    local_window_accel_limit_enable: true
+    local_window_a_long_mps2: 5.0   # [m/s^2] the vehicle's own limit, not a comfort setting
     # [s] how long a STATIC obstacle stays in the interest list after it was last reported
     # is_visible. The flag is a per-frame lidar verdict that drops out on occlusion, at the FOV
     # edge, and on sparse returns at range -- while a static obstacle cannot actually leave. Acting
