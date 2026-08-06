@@ -32,8 +32,10 @@ def wd(xy, s, d=None):
     xy = np.asarray(xy, float)
     s = np.asarray(s, float)
     d = np.zeros(len(s)) if d is None else np.asarray(d, float)
-    return types.SimpleNamespace(array=np.column_stack([xy[:, 0], xy[:, 1], s, d]),
-                                 list=[types.SimpleNamespace(s_m=float(v)) for v in s])
+    return types.SimpleNamespace(
+        array=np.column_stack([xy[:, 0], xy[:, 1], s, d]),
+        list=[types.SimpleNamespace(s_m=float(v), x_m=float(a), y_m=float(b))
+              for v, a, b in zip(s, xy[:, 0], xy[:, 1])])
 
 
 def sm(cur_s, pos):
@@ -112,7 +114,50 @@ def test_s_window_is_wrap_aware():
     print("PASS the s-window is wrap-aware across the start/finish seam")
 
 
+def test_the_splice_joins_by_position_not_by_s():
+    # The two arrays are only lined up by s when they are parameterised by the SAME line, and they
+    # are not whenever static_reopt has swapped one: the cached avoidance path carries the s of the
+    # line it was planned on, cur_gb_wpnts comes from the swapped one, and an obstacle-aware line
+    # has a different arc length (measured +0.95 m per lap). The run log shows what that does to
+    # the join: 0.595 m of step against a 0.1 m spacing, plus two of 0.303 m.
+    x = np.arange(0.0, 40.0, 0.1)
+    gb = wd(np.column_stack([x, np.zeros(len(x))]), x)          # global: s == x
+    n = sm(cur_s=10.0, pos=(10.0, 0.0))
+    n.cur_gb_wpnts = gb
+    n.wpnt_dist = 0.1
+    # the avoidance path ENDS at x = 12.0, but its s was stamped on a line 0.6 m longer
+    tail = types.SimpleNamespace(x_m=12.0, y_m=0.0, s_m=12.6)
+    # what the s question answers, correctly, about the wrong parameterisation
+    s_idx = int(np.searchsorted(gb.array[:, 2], tail.s_m, side="right"))
+    s_step = float(np.hypot(gb.array[s_idx, 0] - tail.x_m, gb.array[s_idx, 1] - tail.y_m))
+    assert s_step > 1.5 * n.wpnt_dist, \
+        f"the harness must reproduce the failure: the s-spliced join only steps {s_step:.3f} m"
+    idx = n._splice_index(tail, "avoidance")
+    step = float(np.hypot(gb.array[idx, 0] - tail.x_m, gb.array[idx, 1] - tail.y_m))
+    assert step <= 1.5 * n.wpnt_dist, (
+        f"the join steps {step:.3f} m: the padding was spliced by an s that belongs to a different "
+        f"line (the s answer starts at x={gb.array[s_idx, 0]:.2f} for a path ending at "
+        f"x={tail.x_m:.2f})")
+    # ...and it continues FORWARD from the tail, never on top of it
+    assert gb.array[idx, 0] > tail.x_m - 1e-9, "the padding restarted behind the path's end"
+    print(f"PASS the splice joins by position: {step:.3f} m of step where the s answer gives "
+          f"{s_step:.3f} m (budget {1.5 * n.wpnt_dist:.3f} m)")
+
+
+def test_the_splice_still_works_without_geometry():
+    # A tail with no x/y (an older cached array) must not crash the splice.
+    x = np.arange(0.0, 40.0, 0.1)
+    n = sm(cur_s=10.0, pos=(10.0, 0.0))
+    n.cur_gb_wpnts = wd(np.column_stack([x, np.zeros(len(x))]), x)
+    n.wpnt_dist = 0.1
+    idx = n._splice_index(types.SimpleNamespace(s_m=12.0), "avoidance")
+    assert 118 <= idx <= 122, idx
+    print("PASS a tail with no geometry falls back to the s question")
+
+
 if __name__ == "__main__":
+    test_the_splice_joins_by_position_not_by_s()
+    test_the_splice_still_works_without_geometry()
     test_s_window_beats_a_self_close_path()
     test_back_margin_is_small_and_clamped()
     test_anchor_follows_the_car_not_the_path_start()

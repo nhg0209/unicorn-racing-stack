@@ -1887,21 +1887,46 @@ class StateMachine(Node):
         nearest = int(cand[int(np.argmin(d2))])
         return max(0, nearest - int(back_pts))
 
-    def _splice_index(self, last_s: float, tag: str) -> int:
-        """Index of the first GLOBAL waypoint past `last_s`, found by SEARCH not by division.
+    def _splice_index(self, tail, tag: str, search_m: float = 3.0) -> int:
+        """Index of the GLOBAL waypoint that continues from `tail`, found by POSITION.
 
-        `int(s / wpnt_dist)` assumes the global array is uniformly spaced from s = 0 and that the
-        `s` in hand belongs to it. Neither survives a static_reopt swap: the obstacle-aware line
-        has a different arc length (a 0.5 m hump adds about a metre), so a cached path's last s --
-        stamped on the PREVIOUS line -- names a station up to half a metre away on the new one, and
-        the padding that follows is spliced 4-5 waypoints off. searchsorted asks the array where
-        that s actually falls.
+        Two arrays are being joined here, and s only lines them up when they are parameterised by
+        the SAME line. They are not, whenever static_reopt has swapped one: the cached avoidance
+        path carries the s of the line it was planned on, cur_gb_wpnts comes from
+        /global_waypoints_scaled (sector_tuner's 0.5 s timer), and an obstacle-aware line has a
+        different arc length -- measured at +0.95 m per lap. searchsorted then answers a question
+        about the wrong parameterisation, correctly, and the padding starts several waypoints from
+        where the path actually ends. The run log: `the padded join steps 0.595 m
+        (> 1.5 x wpnt_dist = 0.152)`, plus two of 0.303 m -- three to six times the nominal
+        spacing, i.e. a hole in the published local waypoints.
+
+        (x, y) is frame-independent, so the nearest global waypoint to the path's LAST POINT is the
+        right continuation whatever either array's s means. The search is restricted to an s-window
+        around the tail for the same reason _splini_anchor_index restricts its own: a free XY argmin
+        snaps to the wrong branch wherever the line runs close to itself. The s used for the window
+        may be off by the arc-length difference; a 3 m window absorbs that.
         """
         arr = self.cur_gb_wpnts.array
-        try:
-            return int(np.searchsorted(arr[:, 2], float(last_s), side="right"))
-        except Exception:
-            return int(float(last_s) / self.wpnt_dist) + 1
+        n = len(arr)
+        if n == 0:
+            return 0
+        last_s = float(getattr(tail, "s_m", 0.0))
+        x, y = getattr(tail, "x_m", None), getattr(tail, "y_m", None)
+        if x is None or y is None:                      # no geometry -> the old s question
+            try:
+                return int(np.searchsorted(arr[:, 2], last_s, side="right"))
+            except Exception:
+                return int(last_s / self.wpnt_dist) + 1
+        L = self.track_length if self.track_length else self.max_s
+        cand = np.arange(n)
+        if L:
+            ds = (arr[:, 2] - last_s + L / 2.0) % L - L / 2.0
+            near = np.flatnonzero(np.abs(ds) <= search_m)
+            if near.size:
+                cand = near
+        d2 = (arr[cand, 0] - float(x)) ** 2 + (arr[cand, 1] - float(y)) ** 2
+        nearest = int(cand[int(np.argmin(d2))])
+        return (nearest + 1) % n
 
     def _warn_splice_step(self, tail, head, tag: str) -> None:
         """A splice is a JOIN: if the two ends are further apart than one waypoint spacing, the
@@ -1927,7 +1952,7 @@ class StateMachine(Node):
         avoidance_wpnts = wpnts.list[min_idx:min_idx + self.n_loc_wpnts]
 
         if len(avoidance_wpnts) < self.n_loc_wpnts:
-            glb_start_idx = self._splice_index(wpnts.list[-1].s_m, "avoidance")
+            glb_start_idx = self._splice_index(wpnts.list[-1], "avoidance")
             extra_wpnts = [
                 self.cur_gb_wpnts.list[(glb_start_idx + i) % len(self.cur_gb_wpnts.list)]
                 for i in range(self.n_loc_wpnts - len(avoidance_wpnts))
@@ -1945,7 +1970,7 @@ class StateMachine(Node):
             if len(wpnts) < self.n_loc_wpnts:
                 # NB the missing +1: this one restarted the padding ON the last point it already
                 # had, so the joined path carried a duplicated waypoint.
-                glb_start_idx = self._splice_index(self.cur_recovery_wpnts.list[-1].s_m, "recovery")
+                glb_start_idx = self._splice_index(self.cur_recovery_wpnts.list[-1], "recovery")
                 extra_wpnts = [
                     self.cur_gb_wpnts.list[(glb_start_idx + i) % len(self.cur_gb_wpnts.list)]
                     for i in range(self.n_loc_wpnts - len(wpnts))
@@ -1961,7 +1986,7 @@ class StateMachine(Node):
             min_idx = np.argmin(diff)
             start_wpnts = self.cur_start_wpnts.list[min_idx:min_idx + self.n_loc_wpnts]
             if len(start_wpnts) < self.n_loc_wpnts:
-                glb_start_idx = self._splice_index(self.cur_start_wpnts.list[-1].s_m, "start")
+                glb_start_idx = self._splice_index(self.cur_start_wpnts.list[-1], "start")
                 extra_wpnts = [
                     self.cur_gb_wpnts.list[(glb_start_idx + i) % len(self.cur_gb_wpnts.list)]
                     for i in range(self.n_loc_wpnts - len(start_wpnts))
