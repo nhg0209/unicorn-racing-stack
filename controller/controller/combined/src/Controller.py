@@ -110,6 +110,15 @@ class Controller:
         self.AEB_thres_overtake = AEB_thres   # manager overrides from yaml after construction
         self.AEB_offline_d_thres = 0.1        # [m] max|d| above which the local window counts
                                               #     as an OFFSET line -> use AEB_thres_overtake
+        # AEB LATCH (see AEB_for_weird_local_wpnt). A single threshold with no hysteresis and no
+        # minimum hold turns any jitter around it into a per-cycle 2 m/s clamp toggling on and
+        # off -- the sawtooth this function's own docstring records as 2.87 -> 2.00 -> 3.24 in two
+        # cycles, and 86.8 m/s^2 on the real car. Release needs the distance to fall
+        # AEB_release_hyst_m below the bar AND the clamp to have been held AEB_min_hold_s.
+        self.AEB_release_hyst_m = 0.25        # [m] overridden from the yaml by the manager
+        self.AEB_min_hold_s = 0.2             # [s]
+        self._aeb_engaged = False
+        self._aeb_cycles = 0                  # cycles the clamp has been held (this loop is fixed-rate)
         self.l1_lat_err_cap = t_clip_max      # manager overrides from yaml (uncapped by default)
         self.converter = converter
         # Longitudinal limits of the PUBLISHED speed command. Defaults mirror the ggv the global
@@ -120,6 +129,7 @@ class Controller:
         self.max_decel_mps2 = 5.0
         self._speed_cmd_prev = None           # last PUBLISHED command, for the slew limit
         self._trailing_handoff = None         # ramp state while merging out of TRAILING
+        self._trailing_entry = None           # ...and while merging INTO it (see calc_speed_command)
 
         # Parameters in the controller
         self.curr_steering_angle = 0
@@ -287,15 +297,35 @@ class Controller:
         offline_d = float(np.max(np.abs(d_col))) if d_col.size else 0.0
         off_line = offline_d > self.AEB_offline_d_thres
         thres = self.AEB_thres_overtake if off_line else self.AEB_thres
-        if local_wpnt_dist >= thres:
-            self.logger_warn(
-                f"[Controller] AEB: nearest local wpnt {local_wpnt_dist:.2f} m away "
-                f"(state={self.state}, max|d|={offline_d:.2f}, thres={thres:.2f}) "
-                f"-> clamping speed to 2.0 m/s",
-                throttle_duration_sec=1.0)
-            return 2.0
+
+        # LATCHED, with hysteresis and a minimum hold. A bare threshold makes every wobble of
+        # local_wpnt_dist around the bar a fresh engage/release: measured on the real car at 20 Hz
+        # that is the 2.87 -> 2.00 -> 3.24 sawtooth in this function's own docstring, and it fired
+        # under OVERTAKE, TRAILING and GB_TRACK alike -- once at 4.60 m against a 0.9 m bar.
+        # Splitting the bar in two (0.5 / 0.9) widened it; it did not add hysteresis.
+        # time is counted in CYCLES: this loop is fixed-rate, and the controller has no clock
+        min_hold = int(round(self.AEB_min_hold_s * max(self.loop_rate, 1.0)))
+        if not self._aeb_engaged:
+            if local_wpnt_dist >= thres:
+                self._aeb_engaged = True
+                self._aeb_cycles = 0
+                self.logger_warn(
+                    f"[Controller] AEB ENGAGED: nearest local wpnt {local_wpnt_dist:.2f} m away "
+                    f"(state={self.state}, max|d|={offline_d:.2f}, thres={thres:.2f}) "
+                    f"-> capping speed at 2.0 m/s",
+                    throttle_duration_sec=1.0)
         else:
-            return speed
+            self._aeb_cycles += 1
+            if (local_wpnt_dist < thres - self.AEB_release_hyst_m
+                    and self._aeb_cycles >= min_hold):
+                self._aeb_engaged = False
+                self.logger_warn(
+                    f"[Controller] AEB released: nearest local wpnt {local_wpnt_dist:.2f} m "
+                    f"(< {thres - self.AEB_release_hyst_m:.2f}) after {self._aeb_cycles} cycles",
+                    throttle_duration_sec=1.0)
+        # A CAP, not an assignment. `return 2.0` raised the command whenever the car was already
+        # slower than the cap -- an emergency brake that accelerates.
+        return min(speed, 2.0) if self._aeb_engaged else speed
 
     def calc_steering_angle_for_future(self, future_L1_point, L1_distance, yaw, furture_lat_e_norm, v):
         """
@@ -466,6 +496,22 @@ class Controller:
 
         if ((self.state == "TRAILING") and (self.opponent is not None)):  # Trailing controller
             speed_command = self.trailing_controller(global_speed)
+            # ENTRY ramp, mirroring the exit ramp below. Leaving TRAILING has been ramped since the
+            # +1.7 m/s handoff steps were measured; ENTERING it assigned the PID output outright.
+            # Against a stationary box that output is not a small correction: d_value = v_diff *
+            # trailing_d_gain is the ego's own speed with the shipped gain of 1.0, so the command
+            # collapses from the path speed to ~0 in a single 20 ms cycle -- the same discontinuity
+            # in the other direction, and the one that arrives with a box in front of the car.
+            # Bounded by the same longitudinal limit the trajectory is planned with (decel here).
+            if self._trailing_entry is None:
+                self._trailing_entry = self._speed_cmd_prev
+            if self._trailing_entry is not None:
+                step = self.max_decel_mps2 / max(self.loop_rate, 1.0)
+                self._trailing_entry = max(speed_command, self._trailing_entry - step)
+                if self._trailing_entry <= speed_command + 1e-3:
+                    self._trailing_entry = None         # merged onto the PID
+                else:
+                    speed_command = self._trailing_entry
             self._trailing_handoff = speed_command      # where the handoff below must start from
         else:
             # HANDOFF out of TRAILING. The gap PID has been holding the car down at the opponent's
@@ -488,6 +534,7 @@ class Controller:
                 speed_command = global_speed
             self.trailing_speed = global_speed
             self.i_gap = 0
+            self._trailing_entry = None                 # re-armed for the next entry
 
         speed_command = self.speed_adjust_lat_err(speed_command, lat_e_norm)
 

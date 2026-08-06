@@ -34,7 +34,7 @@ L1_PARAMS = [
     'trailing_d_gain', 'blind_trailing_speed', 'curvature_factor',
     'speed_factor_for_lat_err', 'speed_factor_for_curvature', 'KP', 'KI', 'KD',
     'heading_error_thres', 'steer_gain_for_speed', 'future_constant', 'AEB_thres',
-    'AEB_thres_overtake', 'AEB_offline_d_thres',
+    'AEB_thres_overtake', 'AEB_offline_d_thres', 'AEB_release_hyst_m', 'AEB_min_hold_s',
     'speed_diff_thres', 'start_speed', 'start_curvature_factor',
     'l1_lat_err_cap', 'max_accel_mps2', 'max_decel_mps2',
 ]
@@ -208,6 +208,8 @@ class ControllerManager(Node):
         # not part of the positional Controller signature; delivered like the live-tuned params
         self.controller.AEB_thres_overtake = self.AEB_thres_overtake
         self.controller.AEB_offline_d_thres = self.AEB_offline_d_thres
+        self.controller.AEB_release_hyst_m = self.AEB_release_hyst_m
+        self.controller.AEB_min_hold_s = self.AEB_min_hold_s
         self.controller.l1_lat_err_cap = self.l1_lat_err_cap
         self.controller.max_accel_mps2 = self.max_accel_mps2
         self.controller.max_decel_mps2 = self.max_decel_mps2

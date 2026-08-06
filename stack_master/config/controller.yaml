@@ -40,6 +40,13 @@ controller_manager:
     # 0.5 m bar fired and released repeatedly, i.e. a sawtooth in the speed command.
     AEB_thres_overtake: 0.9
     AEB_offline_d_thres: 0.1
+    # The bar is LATCHED. Without hysteresis every wobble of the measured distance around it is a
+    # fresh engage and release, i.e. a 2 m/s clamp toggling at the loop rate -- measured on the
+    # real car as 2.87 -> 2.00 -> 3.24 in two cycles and 86.8 m/s^2 of published acceleration.
+    # Release needs the distance to fall this far BELOW the bar, and the clamp to have been held
+    # at least AEB_min_hold_s.
+    AEB_release_hyst_m: 0.25
+    AEB_min_hold_s: 0.2
     speed_diff_thres: 0.1
     start_speed: 10.0
     start_curvature_factor: 1.5
