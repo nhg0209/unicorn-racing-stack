@@ -171,17 +171,6 @@ class StaticReoptNode(Node):
         # which have evidence this node does not.
         self.declare_parameter("obs_forget_s", 1.5)
         self.declare_parameter("side_hint_margin_m", 0.15)
-        self.declare_parameter("apex_merge_gap_m", 2.0)
-        # HOLD BRIDGE. Two boxes on the SAME side, close together on a STRAIGHT, do not need the
-        # line to come back to the raceline between them: returning costs two merge inflections and
-        # a speed dip, and buys a stretch of racing line the car is about to leave again. Where
-        # both gates hold, the search additionally evaluates a variant that holds the offset across
-        # the pair, and the ordinary ranking picks the winner. 0 disables it entirely.
-        self.declare_parameter("hold_max_gap_m", 8.0)     # [m] widest pair that may be held across
-        # [1/m] and only where the RACELINE is straight: in a corner the line between two boxes is
-        # the apex, and holding an offset across it gives that away. Bounds |kappa_clean| over the
-        # bridged span.
-        self.declare_parameter("hold_kappa_max", 0.3)
         self.declare_parameter("default_obs_radius", 0.15)
         self.declare_parameter("republish_period", 1.0)     # [s] keep-alive republish
         # `update_map` re-notify period. MUST stay below sector_tuner's 0.5 s scale timer so a
@@ -200,17 +189,6 @@ class StaticReoptNode(Node):
         # Must stay between that requirement and obs_margin — check_avoidance_margins.py verifies.
         self.declare_parameter("clearance_dirty_m", 0.30)
         self.declare_parameter("compute_sp", True)
-        # re-optimization method:
-        #   "local_window" (default) — fast ONLINE windowed min-curvature QP stitched into the
-        #                    clean raceline (ms/solve); the intended lap-2+ obstacle-aware line.
-        #   "global"       — legacy whole-track mincurv_iqp (minutes/solve; offline only).
-        #   "closed_qp"    — the closed-track convex QP over the lateral offset (closed_reopt):
-        #                    one solve, no reactive apex needed, ~3 ms. NOT the default: it covers
-        #                    more boxes and holds an offset between them, but it is unproven in
-        #                    sim, so the switch is opt-in until it is. "hump" is accepted as a
-        #                    synonym for "local_window" -- the launch file ships the latter and
-        #                    changing that string would change the default path.
-        self.declare_parameter("reopt_method", "local_window")
         # closed_qp's own tuning. These reach closed_reopt.ReoptParams, which keeps its own
         # dataclass defaults so the module still runs with no ROS at all (every offline gate
         # depends on that) -- these are declared with the SAME values, and the YAML overrides
@@ -225,15 +203,6 @@ class StaticReoptNode(Node):
         self.declare_parameter("closed_qp_infl_len_m", _cq.infl_len_m)
         self.declare_parameter("closed_qp_kappa_budget", _cq.kappa_budget)
         self.declare_parameter("closed_qp_budget_exp", cqb.cq._BUDGET_EXP)
-        # The avoidance is a smooth WIDE arc: a smootherstep bump peaking at the required clearance
-        # over a half-width R = clip(reach_time * local_speed, reach_min, reach_max). Bigger R =
-        # gentler, faster arc that reaches toward the adjacent corners (carries speed, steers less).
-        self.declare_parameter("reach_time", 1.2)            # [s] DEPRECATED (lap-time search owns
-                                                             # the reach; kept for param compat)
-        self.declare_parameter("reach_min", 1.0)             # [m] MIN arc half-width SEARCHED
-                                                             # (must stay below the locality cap
-                                                             # ~0.1*lap or the search is empty)
-        self.declare_parameter("reach_max", 10.0)            # [m] MAX arc half-width searched
         self.declare_parameter("qp_veh_width", 0.30)         # [m] vehicle width for the corridor/
                                                              # clearance floor (obstacle clearance
                                                              # is obs_margin, separate)
@@ -266,9 +235,6 @@ class StaticReoptNode(Node):
         self.wall_gate_kernel = int(self.get_parameter("wall_gate_kernel").value)
         self.obs_forget_s = float(self.get_parameter("obs_forget_s").value)
         self.side_hint_margin_m = float(self.get_parameter("side_hint_margin_m").value)
-        self.apex_merge_gap_m = float(self.get_parameter("apex_merge_gap_m").value)
-        self.hold_max_gap_m = float(self.get_parameter("hold_max_gap_m").value)
-        self.hold_kappa_max = float(self.get_parameter("hold_kappa_max").value)
         self.default_obs_radius = float(self.get_parameter("default_obs_radius").value)
         self.republish_period = float(self.get_parameter("republish_period").value)
         self.notify_period = float(self.get_parameter("notify_period").value)
@@ -278,7 +244,6 @@ class StaticReoptNode(Node):
         self.obs_change_tol = float(self.get_parameter("obs_change_tol").value)
         self.clearance_dirty_m = float(self.get_parameter("clearance_dirty_m").value)
         self.compute_sp = bool(self.get_parameter("compute_sp").value)
-        self.reopt_method = str(self.get_parameter("reopt_method").value)
         # _BUDGET_EXP is a module constant by design (it shapes the same trade-off infl_len_m
         # does, and two knobs for one trade-off is how the hump pipeline ended up with sixteen).
         # It is settable here only so the value lives with the others in one file; changing it is
@@ -292,9 +257,6 @@ class StaticReoptNode(Node):
             infl_len_m=float(self.get_parameter("closed_qp_infl_len_m").value),
             kappa_budget=float(self.get_parameter("closed_qp_kappa_budget").value),
             w_veh=float(self.get_parameter("qp_veh_width").value))
-        self.reach_time = float(self.get_parameter("reach_time").value)
-        self.reach_min = float(self.get_parameter("reach_min").value)
-        self.reach_max = float(self.get_parameter("reach_max").value)
         self.qp_veh_width = float(self.get_parameter("qp_veh_width").value)
         self.wall_margin = float(self.get_parameter("wall_margin").value)
         self.fit_tol = float(self.get_parameter("fit_tol").value)
@@ -322,7 +284,7 @@ class StaticReoptNode(Node):
         self._clean_kappa = np.array([w.kappa_radpm for w in gw], dtype=float)
         self.get_logger().info(
             f"[static_reopt] loaded clean bundle ({len(gw)} raceline pts) + reftrack "
-            f"({self.reftrack.shape[0]} pts) for '{self.map_name}'; reopt_method={self.reopt_method}")
+            f"({self.reftrack.shape[0]} pts) for '{self.map_name}'")
 
         # --- state ------------------------------------------------------------------------
         # BATCH workflow: obstacles are just COLLECTED during a lap; the re-opt is solved ONCE and
@@ -1021,29 +983,21 @@ class StaticReoptNode(Node):
         otwpnts_cb at 20 Hz, so they are resolved on the caller's thread and handed over."""
         if pairs is None:
             pairs = self._apex_pairs(obstacles)
-        if self.reopt_method == "closed_qp":
-            # ONE convex QP over the lateral offset, whole lap, no apex required. The bridge
-            # returns the same dict local_window does, so every gate below this line -- clearance
-            # veto, wall gate, published-curvature gate, coverage regression, publish deadband --
-            # runs unchanged and cannot tell which solver produced the geometry.
-            corr = self._grid_corridor_lap() if self.reopt_grid_corridor else None
-            corr_lo, corr_hi = corr if corr is not None else (None, None)
-            res = cqb.reoptimize_closed_window(
-                self._clean_xy, self._clean_dr, self._clean_dl, self.reftrack,
-                obstacles, self.input_path,
-                params=self.closed_qp_params,
-                w_veh=self.qp_veh_width, clean_vx=self._clean_vx,
-                clean_kappa=self._clean_kappa, corridor_lo=corr_lo, corridor_hi=corr_hi)
-        else:
-            # ONE SOLVER. reopt_method used to fall through to a whole-track mincurv_iqp that its
-            # own comment called an offline tool taking MINUTES -- reached not by name but by
-            # ANY value that was not closed_qp or local_window, so a typo selected something that
-            # starves the control loop. Unknown values now say so and use the real solver.
-            self.get_logger().error(
-                f"[static_reopt] unknown reopt_method '{self.reopt_method}' -- the only solver is "
-                f"'closed_qp'. Using it.")
+        # ONE convex QP over the lateral offset, whole lap, no apex required. There is no branch
+        # here any more: reopt_method used to choose between this, the hump pipeline and -- by
+        # FALLTHROUGH, not by name -- a whole-track mincurv_iqp its own comment called an offline
+        # tool taking minutes, so any typo in the method string selected something that starves
+        # the control loop.
+        corr = self._grid_corridor_lap() if self.reopt_grid_corridor else None
+        corr_lo, corr_hi = corr if corr is not None else (None, None)
+        res = cqb.reoptimize_closed_window(
+            self._clean_xy, self._clean_dr, self._clean_dl, self.reftrack,
+            obstacles, self.input_path,
+            params=self.closed_qp_params,
+            w_veh=self.qp_veh_width, clean_vx=self._clean_vx,
+            clean_kappa=self._clean_kappa, corridor_lo=corr_lo, corridor_hi=corr_hi)
         traj, br, bl, est = res["main"]
-        if "d_right" in res:                    # local_window returns exact widths
+        if "d_right" in res:                    # the bridge returns exact widths
             d_r, d_l = res["d_right"], res["d_left"]
         else:
             d_r, d_l = core.dist_to_bounds(traj[:, 1:3], br, bl)  # traj is [s,x,y,...]
@@ -1062,50 +1016,49 @@ class StaticReoptNode(Node):
         clearance_by_key = {}
         floor_by_key = {}
         coverage = []
-        if self.reopt_method == "closed_qp":
-            n_obs = len(obstacles)
-            gaps = self._line_clearances(traj, obstacles)
-            coverage = cqb.coverage_records(obstacles, res, gaps)
-            floor = float(res.get("clearance_floor", self.obs_margin))
-            dropped = res.get("apex_dropped", [])
-            crep = res.get("closed_report")
-            info.data = (f"[static_reopt] obstacle-aware (closed QP) est {est:.3f}s; "
-                         f"{res.get('n_windows', 0)}/{n_obs} obstacle(s) covered by the global "
-                         f"line, {len(dropped)} handed to the reactive layer")
-            # SAME LINE SHAPE AS THE HUMP PATH so the two can be diffed straight out of a bag:
-            # solve time, coverage, peak curvature, worst clearance.
-            self.get_logger().info(
-                f"[static_reopt] closed_qp solved in "
-                f"{getattr(crep, 'solve_ms', float('nan')):.1f} ms; covered "
-                f"{res.get('n_windows', 0)}/{n_obs}; max|kappa| "
-                f"{getattr(crep, 'peak_kappa', float('nan')):.3f} (clean "
-                f"{getattr(crep, 'clean_peak_kappa', float('nan')):.3f}); worst clearance "
-                f"{min(gaps) if gaps else float('nan'):+.3f} m against a floor of {floor:.2f}")
-            if dropped:
-                # THE HANDOVER, said out loud as well as published on /static_reopt/coverage. A
-                # box the global line will not claim is the reactive layer's for every lap, and
-                # the reason carries the station, the side and the metres it fell short by.
-                self.get_logger().warning(
-                    f"[static_reopt] {len(dropped)} obstacle(s) NOT covered by the global line "
-                    f"(the reactive layer keeps handling them): "
-                    + "; ".join(str(d.get("detail", d.get("reason", "?"))) for d in dropped))
-            keys = self._keys_for(obstacles, self._obs_ids)
-            clearance_by_key = dict(zip(keys, gaps))
-            floor_by_key = {k: floor for k, c in zip(keys, coverage) if c["status"] == "laid"}
-            floors_by_id = {id(o): floor for o, c in zip(obstacles, coverage)
-                            if c["status"] == "laid"}
-            # the SAME three vetoes the hump path answers to, in the same order
-            clearance_ok = self._check_line_clearance(traj, obstacles, res.get("apex_laid", []),
-                                                      apex_obs=list(obstacles),
-                                                      floors=floors_by_id)
-            clearance_ok = self._wall_gate_ok(traj) and clearance_ok
-            if not res.get("kappa_published_ok", True):
-                self.get_logger().warning(
-                    f"[static_reopt] REFUSED: published max|kappa| "
-                    f"{res.get('kappa_published_max', float('nan')):.3f} exceeds what the car can "
-                    f"steer there ({res.get('kappa_published_allow', float('nan')):.3f} = "
-                    f"max(curvlim, the clean line's own curvature))")
-                clearance_ok = False
+        n_obs = len(obstacles)
+        gaps = self._line_clearances(traj, obstacles)
+        coverage = cqb.coverage_records(obstacles, res, gaps)
+        floor = float(res.get("clearance_floor", self.obs_margin))
+        dropped = res.get("apex_dropped", [])
+        crep = res.get("closed_report")
+        info.data = (f"[static_reopt] obstacle-aware (closed QP) est {est:.3f}s; "
+                     f"{res.get('n_windows', 0)}/{n_obs} obstacle(s) covered by the global "
+                     f"line, {len(dropped)} handed to the reactive layer")
+        # SAME LINE SHAPE AS THE HUMP PATH so the two can be diffed straight out of a bag:
+        # solve time, coverage, peak curvature, worst clearance.
+        self.get_logger().info(
+            f"[static_reopt] closed_qp solved in "
+            f"{getattr(crep, 'solve_ms', float('nan')):.1f} ms; covered "
+            f"{res.get('n_windows', 0)}/{n_obs}; max|kappa| "
+            f"{getattr(crep, 'peak_kappa', float('nan')):.3f} (clean "
+            f"{getattr(crep, 'clean_peak_kappa', float('nan')):.3f}); worst clearance "
+            f"{min(gaps) if gaps else float('nan'):+.3f} m against a floor of {floor:.2f}")
+        if dropped:
+            # THE HANDOVER, said out loud as well as published on /static_reopt/coverage. A
+            # box the global line will not claim is the reactive layer's for every lap, and
+            # the reason carries the station, the side and the metres it fell short by.
+            self.get_logger().warning(
+                f"[static_reopt] {len(dropped)} obstacle(s) NOT covered by the global line "
+                f"(the reactive layer keeps handling them): "
+                + "; ".join(str(d.get("detail", d.get("reason", "?"))) for d in dropped))
+        keys = self._keys_for(obstacles, self._obs_ids)
+        clearance_by_key = dict(zip(keys, gaps))
+        floor_by_key = {k: floor for k, c in zip(keys, coverage) if c["status"] == "laid"}
+        floors_by_id = {id(o): floor for o, c in zip(obstacles, coverage)
+                        if c["status"] == "laid"}
+        # the SAME three vetoes the hump path answers to, in the same order
+        clearance_ok = self._check_line_clearance(traj, obstacles, res.get("apex_laid", []),
+                                                  apex_obs=list(obstacles),
+                                                  floors=floors_by_id)
+        clearance_ok = self._wall_gate_ok(traj) and clearance_ok
+        if not res.get("kappa_published_ok", True):
+            self.get_logger().warning(
+                f"[static_reopt] REFUSED: published max|kappa| "
+                f"{res.get('kappa_published_max', float('nan')):.3f} exceeds what the car can "
+                f"steer there ({res.get('kappa_published_allow', float('nan')):.3f} = "
+                f"max(curvlim, the clean line's own curvature))")
+            clearance_ok = False
         lap = Float32(); lap.data = float(est)
 
         # centerline + trackbounds are map-fixed -> reuse the clean ones

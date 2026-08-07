@@ -21,7 +21,6 @@
   <arg name="opp_spawn"  default="false" description="(virtual) spawn the kinematic opponent at startup on the map centerline; otherwise spawn it with RViz 2D Goal Pose or stack_master/scripts/spawn_opponent.py"/>
   <arg name="opp_mode"   default="manual" description="(virtual) opponent driving mode: manual | path (pure-pursuit on the centerline at a constant speed -- deterministic, use for regression runs) | ftg (reactive from its own lidar)"/>
   <arg name="reopt"        default="false" description="Obstacle-aware global line: run static_reopt_node + static_obstacle_layer instead of the plain global_trajectory_publisher (IFAC static-obstacle re-optimization)"/>
-  <arg name="reopt_method" default="closed_qp" description="obstacle-aware line optimizer. closed_qp (DEFAULT) = one convex QP over the lateral offset around the whole lap, solved once at every published station (~200 ms, off the executor): needs no reactive apex, so a box is covered on the lap it is confirmed, holds an offset between two boxes instead of weaving back, and hands anything it cannot clear to the reactive layer BY NAME on /static_reopt/coverage. Measured against local_window over 20 scenarios: 29/38 boxes covered against 30/38, better/equal/worse 1/17/2, solve p95 196 ms against 808, and it clears a box by 0.320 m where the hump clears 0.350. | local_window = the C2 quintic hump per RECORDED reactive apex, the previous default and still fully wired -- set this to fall back. | global = legacy whole-track mincurv_iqp, minutes/solve, offline-grade."/>
 
   <!-- sim -> SIM config folder, real hardware -> CAR config folder -->
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/SIM" if="$(var sim)"/>
@@ -99,7 +98,6 @@
            `reopt_method` stay arguments because those are per-run choices. There is no
            reconfigure callback: values are read once at construction. -->
       <param from="$(find-pkg-share stack_master)/config/static_reopt_params.yaml"/>
-      <param name="reopt_method" value="$(var reopt_method)"/>
     </node>
     <node pkg="gb_optimizer" exec="static_obstacle_layer" name="static_obstacle_layer" output="screen"/>
   </group>

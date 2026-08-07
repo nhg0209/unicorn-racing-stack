@@ -36,7 +36,6 @@
   <arg name="use_livox"  default="true"  description="(real) start the Livox MID-360 driver (/livox/lidar + /livox/imu for kiss 3D localization + detection)"/>
   <arg name="rviz"       default="false" description="(real) also start RViz with the pitwall config (2D Pose Estimate seeds kiss via /initialpose)"/>
   <arg name="reopt" default="false" description="Obstacle-aware global line (IFAC static re-optimization): static_reopt_node + static_obstacle_layer instead of plain global_trajectory_publisher"/>
-  <arg name="reopt_method" default="closed_qp" description="obstacle-aware line optimizer. closed_qp (DEFAULT) = one convex QP over the lateral offset around the whole lap, solved once at every published station (~200 ms, off the executor): needs no reactive apex, so a box is covered on the lap it is confirmed, holds an offset between two boxes instead of weaving back, and hands anything it cannot clear to the reactive layer BY NAME on /static_reopt/coverage. Measured against local_window over 20 scenarios: 29/38 boxes covered against 30/38, better/equal/worse 1/17/2, solve p95 196 ms against 808, and it clears a box by 0.320 m where the hump clears 0.350. | local_window = the C2 quintic hump per RECORDED reactive apex, the previous default and still fully wired -- set this to fall back. | global = legacy whole-track mincurv_iqp, minutes/solve, offline-grade."/>
   <!-- Detection front-end used effectively: sim has no Livox, so force the 2D 'scan' path there;
        the real car honours detection_source. -->
   <let name="det_src" value="scan" if="$(var sim)"/>
@@ -61,7 +60,6 @@
     <arg name="opp_spawn"    value="$(var opp_spawn)"/>
     <arg name="opp_mode"     value="$(var opp_mode)"/>
     <arg name="reopt"   value="$(var reopt)"/>
-    <arg name="reopt_method" value="$(var reopt_method)"/>
     <arg name="use_hokuyo" value="$(var use_hokuyo)"/>
     <arg name="use_livox"  value="$(var use_livox)"/>
   </include>

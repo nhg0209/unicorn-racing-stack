@@ -294,13 +294,10 @@ def check_closed_qp_chain(cfg, args) -> bool:
 # runbook, so the names survive the move even though the source did not.
 REOPT_YAML_ALIASES = {
     "safety_width": "reopt_safety_width", "obs_change_tol": "reopt_obs_change_tol",
-    "clearance_dirty_m": "reopt_clearance_dirty", "compute_sp": "reopt_compute_sp",
-    "reach_time": "reopt_reach_time", "reach_min": "reopt_reach_min",
-    "reach_max": "reopt_reach_max", "qp_veh_width": "reopt_qp_veh_width",
+    "clearance_dirty_m": "reopt_clearance_dirty", "compute_sp": "reopt_compute_sp", "qp_veh_width": "reopt_qp_veh_width",
     "wall_margin": "reopt_wall_margin", "obs_margin": "reopt_obs_margin",
-    "relax_floor": "reopt_relax_floor", "apex_merge_gap_m": "reopt_apex_merge_gap",
+    "relax_floor": "reopt_relax_floor",
     "swap_min_gain_m": "reopt_swap_min_gain", "wall_gate_kernel": "reopt_wall_gate_kernel",
-    "hold_max_gap_m": "reopt_hold_max_gap", "hold_kappa_max": "reopt_hold_kappa_max",
     "fit_tol": "reopt_fit_tol", "reopt_grid_corridor": "reopt_grid_corridor",
 }
 STATIC_REOPT_NODE = "static_reopt_node"
@@ -342,8 +339,7 @@ def check_declare_yaml_symmetry() -> bool:
     survive the move, though -- a name that does not match falls back to a default in silence.
     One character wrong in either file and the node runs on a number nobody chose.
 
-    Per-run values (map, racecar_version, reopt_method) are launch arguments by design and are
-    excluded.
+    Per-run values (map, racecar_version) are launch arguments by design and are excluded.
     """
     p, y = load_static_reopt_yaml()
     node_path, node_def = load_reopt_declared_names()
@@ -352,7 +348,7 @@ def check_declare_yaml_symmetry() -> bool:
         print(f"FAIL: {p.name} has no '{STATIC_REOPT_NODE}: ros__parameters:' block -- the node "
               f"would silently run on its declare_parameter defaults.")
         return False
-    launch_owned = {"map", "racecar_version", "reopt_method"}
+    launch_owned = {"map", "racecar_version"}
     declared = set(node_def) - launch_owned
     in_yaml = set(y) - launch_owned
     missing = sorted(k for k in in_yaml if k not in declared)
@@ -952,21 +948,12 @@ def main() -> int:
     if not check_declare_yaml_symmetry():
         ok = False
 
-    # WHICH CHAIN IS ACTUALLY ENFORCED. Everything above holds the HUMP path's floor; the closed
-    # QP's floor is a dataclass default the launch files never see. Both are always reported, and
-    # only the one the shipped reopt_method selects can fail this script -- otherwise a solver
-    # nobody runs would break the gate for everyone, and a solver everyone runs could go
-    # unchecked. The line below says which is which, out loud, on every run.
-    method = str(args.get("reopt_method", "local_window"))
-    closed_ok = check_closed_qp_chain(cfg, args)
-    active = "closed_qp" if method == "closed_qp" else "hump (local_window)"
-    print(f"\nreopt_method default = '{method}' -> the {active} chain is the one in force.")
-    if method == "closed_qp":
-        if not closed_ok:
-            ok = False
-    elif not closed_ok:
-        print("      Not fatal today because closed_qp is opt-in. It becomes fatal the moment "
-              "reopt_method's default changes, which is the point at which it must be answered.")
+    # ONE CHAIN. This used to print which of two solvers the shipped reopt_method selected, and
+    # to make only that one fatal -- a hump path nobody ran must not have broken the gate for
+    # everyone, and a path everyone ran must not have gone unchecked. There is one solver now, so
+    # its chain is simply enforced, exception and all.
+    if not check_closed_qp_chain(cfg, args):
+        ok = False
 
     return 0 if ok else 1
 
