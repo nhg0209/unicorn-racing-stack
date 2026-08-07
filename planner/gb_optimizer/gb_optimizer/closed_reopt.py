@@ -66,8 +66,25 @@ from .static_reopt_core import Obstacle  # noqa: F401  (re-exported for callers)
 
 @dataclass
 class ReoptParams:
-    """Five numbers. There is no sixth."""
-    grid_step_m: float = 0.50        # QP station spacing; the answer is mapped back to every station
+    """Six numbers, and the sixth is why: locality is free to a hump and has to be bought here."""
+    # [m] the station spacing the QP solves on. 0.10 IS the published spacing, so stride is 1: the
+    # solver constrains every point that goes on the wire and no interpolation stands between the
+    # two. Measured over the whole pipeline (ripple = max |kappa_new - kappa_clean| where the
+    # offset is under 2 mm; flips = sign changes of the offset's second difference over the merge
+    # tail):
+    #
+    #     grid   ripple   flips   hold    clearance   ms
+    #     0.50   0.2457     21    0.442     0.320      4-6
+    #     0.30   0.4281     19    0.442     0.321      9-16
+    #     0.20   0.0859     21    0.454     0.330     20-22
+    #     0.10   0.0634      2    0.454     0.327    178-209
+    #
+    # 0.20 is the fallback if 200 ms ever matters: same ripple magnitude at a tenth of the time,
+    # but the sign oscillation stays. peak |kappa| is 1.441-1.448 at EVERY spacing -- the 7.98 a
+    # fine grid produced in an earlier round predates the envelope and the curvature budget, and a
+    # solution this constrained no longer has room to ripple. 200 ms is faster than the hump
+    # pipeline (395-822 ms) and runs off the executor either way.
+    grid_step_m: float = 0.10
     # 0.010, not the 0.020 the "lowest peak that still holds 0.40" rule picks: peak |kappa| over
     # the whole sweep is 1.425-1.447 and does not discriminate, so what is left is hold margin
     # against offset left lying around the lap. 0.01 holds 0.499 (+25% over the 0.40 floor) and
@@ -89,18 +106,21 @@ class ReoptParams:
     # answers it -- it fires the moment the reactive layer touches a box this line claims.
     obs_margin: float = 0.16
     w_veh: float = 0.30              # [m] vehicle width, reserved on both sides
-    # [m] SOLVED-FOR ONLY, never part of the safety requirement. The QP enforces the keep-out at
-    # its own stations; the periodic cubic that maps the answer back to every 0.1 m station sags
-    # between them, so the published line grazes a millimetre or two inside what was solved. This
-    # covers that sag, measured (bench section 6) at 4.17 mm worst on a 0.50 m grid over the
-    # two-box case and the twelve-placement field; 0.010 is 2.4x that. IT IS CALIBRATED TO
-    # grid_step_m = 0.50 AND ONLY TO IT -- the same sweep measures 5.4 mm at 0.30 m and 22.6 mm at
-    # 0.70 m, so a different grid needs a different allowance. It buys the headroom for nothing
-    # measurable: 0.005 / 0.010 / 0.020 all clear 12/12 of the field with the same two boxes
-    # unavoidable, at a worst clearance of 0.301 / 0.305 / 0.314.
-    # obs_margin stays a safety number and this stays a numerical one -- the ACCEPTANCE check is
-    # still obs_margin + w_veh/2, with none of this added.
-    disc_allow_m: float = 0.010
+    # [m] SOLVED-FOR ONLY, never part of the safety requirement: it covers the sag the periodic
+    # cubic introduces between QP stations. AT grid_step_m = 0.10 THERE ARE NO STATIONS BETWEEN
+    # QP STATIONS -- stride is 1, the upsample is skipped entirely, and the measured sag over the
+    # two-box case and all twelve field placements is exactly 0.0000 mm. So this is 0.0, and it is
+    # kept rather than deleted because it is the correct value for any coarser grid (4.11 mm at
+    # 0.50, 5.40 at 0.30, 22.97 at 0.70 -- roughly 2x those as an allowance).
+    #
+    # It is NOT quietly left at 0.010 as free margin. At stride 1 that number no longer corrects
+    # anything; it would simply be a centimetre of extra clearance wearing an interpolation's
+    # name, and mixing those two is exactly what splitting it off obs_margin was for. The cost is
+    # honest and measured: the delivered clearance goes 0.320 -> 0.310 and the margin-chain
+    # headroom over the reactive idle entry goes +0.040 -> +0.030, i.e. back under what
+    # check_avoidance_margins.py asks for. Raising obs_margin to recover it is a separate
+    # decision, on the evidence in scripts/sweep_obs_margin.py.
+    disc_allow_m: float = 0.0
     # [m] LOCALITY, BOUGHT EXPLICITLY. Beyond this arc distance from every box the offset is
     # pinned to exactly zero, so an avoidance cannot move the racing line on the far side of the
     # lap. The hump pipeline gets this for free by laying a bump; a global objective does not, and
@@ -532,10 +552,22 @@ def reoptimize_closed(reftrack_fine: np.ndarray,
             rep.solve_ms = (time.perf_counter() - t0) * 1e3
             return pts_fine, np.zeros(n), rep
 
-        # PERIODIC CUBIC back to every station. A linear map puts a corner at every coarse node
-        # and the fine line inherits it: peak |kappa| 1.9-2.7 from the interpolation alone.
-        d_fine = CubicSpline(np.concatenate([s_fine[ci], [s_fine[ci][0] + L]]),
-                             np.concatenate([d_c, [d_c[0]]]), bc_type="periodic")(s_fine)
+        if stride == 1:
+            # THE QP ALREADY SOLVED EVERY STATION. Interpolating here would be the identity in
+            # exact arithmetic and is not in floating point, so the spline is skipped rather than
+            # trusted to be a no-op -- and with it goes the entire ringing mechanism below.
+            d_fine = d_c
+        else:
+            # PERIODIC CUBIC back to every station. A linear map puts a corner at every coarse node
+            # and the fine line inherits it: peak |kappa| 1.9-2.7 from the interpolation alone.
+            # The cubic has its own failure though, and it is what drove grid_step_m to 0.10: the
+            # QP minimises a second difference over 0.5 m while the PUBLISHED curvature is the
+            # cubic's second derivative over 0.1 m, and those are different quantities. Where the
+            # envelope shuts (d pinned to 0) and meets a ramp, the cubic rings -- offsets under a
+            # millimetre alternating sign, which at ds = 0.0997 is 0.7 mm of second difference and
+            # therefore 0.07 1/m of curvature the solver never asked for.
+            d_fine = CubicSpline(np.concatenate([s_fine[ci], [s_fine[ci][0] + L]]),
+                                 np.concatenate([d_c, [d_c[0]]]), bc_type="periodic")(s_fine)
         line = pts_fine + nv_fine * d_fine[:, None]
 
         got = [float(np.min(np.hypot(line[:, 0] - o.x, line[:, 1] - o.y)) - o.r) for o in use]

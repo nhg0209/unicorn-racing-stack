@@ -28,6 +28,12 @@ no place in a unit suite.
   C7  disc_allow_m covers the measured upsample sag -- ASSERTED ONLY at the grid it is calibrated
       for (0.50 m). At any other grid this SKIPS with a warning rather than passing quietly.
   C8  an infeasible classification says which station, which side, and how many metres short
+  C9  THE MERGE TAIL. Where the avoidance rejoins the raceline the offset is under a millimetre
+      and its SIGN oscillates, and at ds = 0.0997 a 0.7 mm second difference is 0.07 1/m of
+      published curvature -- visible in sim as ripple on a straight. Two measurements on the
+      stations carrying less than 2 mm of offset: the worst |kappa_new - kappa_clean| there, and
+      how many times the offset's second difference changes sign. Both fail at grid 0.50, which
+      is checked here rather than assumed.
 """
 import argparse
 import sys
@@ -53,6 +59,18 @@ CALIBRATED_GRID_M = 0.50   # the grid disc_allow_m was measured against
 # 0.009 m. 2 mm of offset, 0.0112 of curvature, 0.38% of a corner speed. Calibrated to
 # grid_step_m = 0.50 like every other interpolation number here.
 INTERP_PEAK_ALLOW = 0.023
+# C9's two limits, both set from the measured spread rather than from the value that passes.
+# Where the offset is under 2 mm the line IS the raceline, so any curvature difference there is
+# manufactured: 0.0634 at grid 0.10 against 0.2457 at 0.50, and 0.10 sits between them so the
+# gate can see the failure it was written for. Sign flips run 2-6 at stride 1 and 19-21 above it.
+RIPPLE_KAPPA_MAX = 0.10
+RIPPLE_FLIPS_MAX = 8
+# [ms] C6's ceiling. It was 20 when the QP solved 74 stations; at stride 1 it solves 367 and the
+# measured p95 is ~200 ms. Raised to 400 because that is still HALF the hump pipeline's measured
+# p95 of 822 ms on the same twenty cases, and because the solve runs on a worker thread, never on
+# the executor. Not raised to make a number pass: 200 vs 400 is the same 2x headroom 4 ms had
+# against 20.
+SOLVE_MS_MAX = 400.0
 
 
 class Gate:
@@ -170,12 +188,22 @@ def main():
     print("\nC6  solve time")
     ts = sorted(times)
     p95 = ts[min(len(ts) - 1, int(0.95 * len(ts)))]
-    g.check("C6", p95 <= 20.0, f"p50 {ts[len(ts) // 2]:.1f} ms | p95 {p95:.1f} ms | "
-            f"max {ts[-1]:.1f} ms over {len(ts)} solves (limit 20 ms)")
+    g.check("C6", p95 <= SOLVE_MS_MAX, f"p50 {ts[len(ts) // 2]:.1f} ms | p95 {p95:.1f} ms | "
+            f"max {ts[-1]:.1f} ms over {len(ts)} solves (limit {SOLVE_MS_MAX:.0f} ms, against the "
+            f"hump pipeline's measured 822 ms p95)")
 
     # C7 ---------------------------------------------------------------------------------------
     print("\nC7  disc_allow_m covers the measured upsample sag")
-    if abs(p.grid_step_m - CALIBRATED_GRID_M) > 1e-9:
+    stride = max(1, int(round(p.grid_step_m / 0.0997)))
+    if stride == 1:
+        worst = max(C.reoptimize_closed(ref, o, cor, p)[2].sag_mm
+                    for o in [pair] + [[box(ref, i) for i in t] for t in TRIOS])
+        g.check("C7", worst <= 1e-9,
+                f"stride is 1 -- the QP solves every published station and the upsample is "
+                f"skipped, so there is nothing between nodes to sag. Measured over the two-box "
+                f"case and all twelve field placements: {worst:.4f} mm. disc_allow_m is "
+                f"{p.disc_allow_m} and this check is only meaningful above stride 1.")
+    elif abs(p.grid_step_m - CALIBRATED_GRID_M) > 1e-9:
         g.skip("C7", f"grid_step_m is {p.grid_step_m}, and disc_allow_m = {p.disc_allow_m} was "
                f"calibrated at {CALIBRATED_GRID_M}. UNCALIBRATED GRID -- the sag scales with it "
                f"(4.11 mm at 0.50, 22.97 mm at 0.70), so re-measure before trusting the clearance")
@@ -207,6 +235,41 @@ def main():
             g.check(f"C8 {trio}", ok, why)
     if not seen:
         g.check("C8", False, "no infeasible case in the matrix -- the classification is untested")
+
+    # C9 ---------------------------------------------------------------------------------------
+    print("\nC9  the merge tail: ripple where the line has all but rejoined the raceline")
+    k_cln = np.abs(C.menger_closed(ref[:, :2]))
+
+    def ripple(obs, params):
+        line, d, r = C.reoptimize_closed(ref, obs, cor, params)
+        if not r.ok:
+            return float("nan"), 0
+        quiet = np.abs(d) < 2e-3
+        k_new = np.abs(C.menger_closed(line))
+        worst = float(np.max(np.abs(k_new[quiet] - k_cln[quiet]))) if np.any(quiet) else 0.0
+        d2 = np.roll(d, -1) - 2.0 * d + np.roll(d, 1)
+        sg = np.sign(np.where(np.abs(d2) < 1e-9, 0.0, d2))[quiet]
+        sg = sg[sg != 0]
+        return worst, int(np.count_nonzero(np.diff(sg) != 0)) if len(sg) else 0
+
+    CASES9 = [("1box straight 310", [310]), ("2box straight pair", [A_I, B_I]),
+              ("3box (275,360,200)", [275, 360, 200])]
+    for label, stations in CASES9:
+        obs = [box(ref, i) for i in stations]
+        w, flips = ripple(obs, p)
+        g.check(f"C9 {label}", w <= RIPPLE_KAPPA_MAX and flips <= RIPPLE_FLIPS_MAX,
+                f"worst |dkappa| where |d| < 2 mm = {w:.4f} (limit {RIPPLE_KAPPA_MAX:.2f}) | "
+                f"second-difference sign flips {flips} (limit {RIPPLE_FLIPS_MAX})")
+    print("         the same measurement across grid spacings -- the gate must SEE 0.50 fail:")
+    print("         grid | ripple | flips | hold  | clearance | ms")
+    for step in (0.50, 0.30, 0.20, 0.10):
+        pg = ReoptParams(grid_step_m=step)
+        w, flips = ripple([box(ref, 310)], pg)
+        _l, _d, r2 = C.reoptimize_closed(ref, [box(ref, A_I), box(ref, B_I)], cor, pg)
+        verdict = "would FAIL" if (w > RIPPLE_KAPPA_MAX or flips > RIPPLE_FLIPS_MAX) else "ok"
+        print(f"         {step:4.2f} | {w:6.4f} | {flips:5d} | {r2.hold:5.3f} | "
+              f"{min(r2.clearances) if r2.clearances else float('nan'):9.3f} | {r2.solve_ms:5.1f}"
+              f"  <- {verdict}")
 
     # BRIDGE -------------------------------------------------------------------------------------
     # Not one of C1-C8: this checks the WIRING, i.e. that closed_reopt_bridge hands

@@ -69,14 +69,17 @@ def test_no_obstacle_is_a_no_op(track):
 
 # (2) ----------------------------------------------------------------------------------------
 def test_two_boxes_hold_the_offset_between_them(track):
-    """0.488 m held across the 8.5 m gap where the hump pipeline drew a W back to the raceline."""
+    """0.48 m held across the 8.5 m gap where the hump pipeline drew a W back to the raceline."""
     ref, cor = track
     _l, d, rep = C.reoptimize_closed(ref, [box(ref, A_I), box(ref, B_I)], cor, P)
     assert rep.ok
     assert rep.hold >= 0.40, f"hold {rep.hold:.3f}"
     assert _clear(rep) >= NEED - 1e-9, f"clearances {rep.clearances}"
     assert excursions(d, pair_span(len(ref))) == 0, "the line crosses back between the boxes"
-    assert rep.solve_ms < 100.0
+    # 400 ms, not the 100 this asserted when the QP solved 74 stations. At grid 0.10 it solves
+    # every published station (367) to kill the merge-tail ripple, and the measured p95 is ~200 ms
+    # -- still HALF the hump pipeline's measured 822 ms on the same cases, and off the executor.
+    assert rep.solve_ms < 400.0
 
 
 # (3) ----------------------------------------------------------------------------------------
