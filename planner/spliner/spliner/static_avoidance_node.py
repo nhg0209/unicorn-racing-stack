@@ -57,7 +57,12 @@ def _savgol_safe(arr: np.ndarray, window: int) -> np.ndarray:
         win -= 1
     if win <= SMOOTH_OTWPNTS_POLYORDER:
         return arr
-    return savgol_filter(arr, win, SMOOTH_OTWPNTS_POLYORDER)
+    # mode='nearest', not the default 'interp'. The default fits a separate polynomial to each
+    # edge window and evaluates it AT the edge, which on curvature that already has a one-sided
+    # stencil there turns the two end samples into artefacts: measured p95 0.464 and max 0.631
+    # rad/m of difference from the interior estimate, and it is what the "kappa spikes at the
+    # join" in RViz actually is. 'nearest' extends the edge value instead of extrapolating it.
+    return savgol_filter(arr, win, SMOOTH_OTWPNTS_POLYORDER, mode="nearest")
 
 
 class ObstacleSpliner(Node):
@@ -2271,8 +2276,15 @@ class ObstacleSpliner(Node):
                 el = np.maximum(np.diff(s_local), 1e-3)
                 psi_, kappa_ = tph.calc_head_curv_num.calc_head_curv_num(
                     path=c['xy'], el_lengths=el, is_closed=False)
+                # ...and SMOOTHED like a fresh plan's is. A new plan runs kappa through
+                # _savgol_safe and this path did not, so the same geometry was published two ways:
+                # measured on one commit, |k_raw - k_savgol| p50 0.087 and max 0.301, with
+                # station-to-station jumps differing by up to 0.207 rad/m. The controller's
+                # lookahead reads this, so a re-anchor changed the speed plan for no reason
+                # anyone could see.
                 c['psi'] = psi_ + np.pi / 2.0
-                c['kappa'] = kappa_
+                c['kappa'] = _savgol_safe(kappa_, SMOOTH_OTWPNTS_WINDOW) if SMOOTH_OTWPNTS \
+                    else kappa_
             self.get_logger().info(
                 f"[{self.name}] commit re-anchored: entry bent {delta:+.2f} m over {blend:.1f} m; "
                 f"apex and clearance kept", throttle_duration_sec=1.0)

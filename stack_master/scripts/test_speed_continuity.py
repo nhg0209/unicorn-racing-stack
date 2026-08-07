@@ -201,6 +201,95 @@ def test_no_published_step_exceeds_the_accel_limit():
     print(f"PASS no published step exceeds {step:.3f} m/s per cycle across four discontinuities")
 
 
+def _assembled_windows(vx, el, n_loc):
+    """Every local window the state machine can assemble from a lap, as (vx, ds) pairs.
+
+    A window is n_loc stations from any start, wrapping -- which is exactly how the s = 0 seam
+    ends up inside one, in 21.5% of them on ifac.
+    """
+    n = len(vx)
+    for i in range(n):
+        idx = (np.arange(n_loc) + i) % n
+        yield vx[idx], el[idx][:-1]
+
+
+def _required_accel(v, ds):
+    return np.abs((v[1:] ** 2 - v[:-1] ** 2) / (2.0 * np.maximum(ds, 1e-6)))
+
+
+def test_local_window_accel_limit():
+    """G12. The ASSEMBLED local window must not command more longitudinal accel than the car has.
+
+    Two seams meet here and neither is bounded anywhere else:
+
+      the avoidance-to-global-padding join, measured |dvx| up to 0.894 m/s over one station
+      (41-55 m/s^2);
+
+      the GLOBAL raceline's own s = 0 discontinuity, 0.867 m/s = 35.6 m/s^2, which sits inside
+      21.5% of all windows. Its root is the vendored tph __solver_fb_closed running its backward
+      pass over a doubled array and returning the second lap, whose last element has no successor
+      and is never decelerated. That is not fixed here -- it would rewrite every map's raceline --
+      and this limit is the defence.
+
+    Driven through the REAL StateMachine.limit_local_window_accel, on the shipped ifac profile,
+    so the shipped method is the thing under test rather than a copy of its arithmetic.
+    """
+    import json
+    from f110_msgs.msg import Wpnt
+    d = json.load(open(os.path.join(STACK_MASTER, "maps", "ifac", "global_waypoints.json")))
+    wp = d["global_traj_wpnts_iqp"]["wpnts"][:-1]
+    vx = np.array([w["vx_mps"] for w in wp])
+    xy = np.array([[w["x_m"], w["y_m"]] for w in wp])
+    seg = np.roll(xy, -1, axis=0) - xy
+    el = np.hypot(seg[:, 0], seg[:, 1])
+    n_loc = 80
+
+    raw = np.array([_required_accel(v, ds).max() for v, ds in _assembled_windows(vx, el, n_loc)])
+    over = int((raw > 6.0).sum())
+
+    SM = _load_state_machine()
+    sm = types.SimpleNamespace(
+        local_window_accel_limit_enable=True, local_window_a_long_mps2=GGV_AX_MAX,
+        wpnt_dist=0.1)
+    # ...and the same windows with the limit switched OFF, so the gate is shown to SEE the
+    # failure it guards against rather than being assumed to.
+    off = types.SimpleNamespace(local_window_accel_limit_enable=False,
+                                local_window_a_long_mps2=GGV_AX_MAX, wpnt_dist=0.1)
+    lim, mean_raw, mean_lim, unlimited = [], [], [], []
+    for v, ds in _assembled_windows(vx, el, n_loc):
+        s_m = np.concatenate([[0.0], np.cumsum(np.append(ds, ds[-1]))])[:len(v)]
+        wpts = []
+        for vi, si in zip(v, s_m):
+            w = Wpnt()
+            w.vx_mps = float(vi)
+            w.s_m = float(si)
+            wpts.append(w)
+        out = SM.limit_local_window_accel(sm, wpts, float(v[0]))
+        passthru = SM.limit_local_window_accel(off, wpts, float(v[0]))
+        unlimited.append(_required_accel(np.array([w.vx_mps for w in passthru]), ds).max())
+        assert all(a is not b for a, b in zip(out, wpts)), (
+            "the limiter returned the caller's own Wpnt objects -- editing those in place "
+            "poisons the cached global line one station per cycle")
+        vo = np.array([w.vx_mps for w in out])
+        lim.append(_required_accel(vo, ds).max())
+        mean_raw.append(float(np.mean(v)))
+        mean_lim.append(float(np.mean(vo)))
+    lim = np.array(lim)
+    unlimited = np.array(unlimited)
+    loss = 100.0 * (1.0 - float(np.mean(mean_lim)) / float(np.mean(mean_raw)))
+
+    assert unlimited.max() > 6.0, (
+        "with the limit disabled the assembled window was already inside the bound -- this gate "
+        "is not measuring what it claims to")
+    assert lim.max() <= 6.0, (
+        f"assembled local window still demands {lim.max():.2f} m/s^2 (was {raw.max():.2f} raw)")
+    print(f"PASS local window accel: required |a_long| max {raw.max():.2f} -> {lim.max():.2f} "
+          f"m/s^2 over {len(raw)} windows; p95 {np.percentile(raw, 95):.2f} -> "
+          f"{np.percentile(lim, 95):.2f}; windows over 6.0 m/s^2 {over} -> "
+          f"{int((lim > 6.0).sum())}; mean commanded speed {loss:+.2f}%; "
+          f"disabled it still reads {unlimited.max():.2f} m/s^2")
+
+
 def check_bag(path):
     """Replay a recording's published command through the limiter and report before/after."""
     import rosbag2_py
@@ -250,6 +339,7 @@ def main() -> int:
     test_window_anchor()
     test_aeb_engage_count_over_a_lap()
     test_no_published_step_exceeds_the_accel_limit()
+    test_local_window_accel_limit()
     ok = True
     if args.bag:
         ok = check_bag(args.bag)

@@ -11,6 +11,14 @@ state_machine:
     track_length: 1.0
     # geometry / horizons
     gb_ego_width_m: 0.4
+    # Bound d(vx)/ds over the ASSEMBLED local window before it is published: one backward
+    # pass, then one forward pass seeded with the car's current speed. The two seams it
+    # covers -- the avoidance-to-global padding join and the raceline's own s = 0
+    # discontinuity -- are bounded nowhere else. Measured off: |a_long| p50/p95/max
+    # 4.88/35.6/56.8 m/s^2 against a ggv ax_max of 5.0, in 21.5% of windows.
+    local_window_accel_limit_enable: true
+    local_window_a_long_mps2: 5.0
+
     # |d| below which the car counts as back on the raceline when LEAVING a non-GB_TRACK state.
     # Lower half of the RECOVERY hysteresis band: entry uses gb_ego_width_m (0.4), exit uses this,
     # so it must stay < gb_ego_width_m or RECOVERY chatters. Was hardcoded at 0.05 m -- tighter

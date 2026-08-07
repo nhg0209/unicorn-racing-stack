@@ -13,6 +13,7 @@ trailing & overtaking targets). The race_stack ROS2 template was used only for t
 ament/rclpy structural idioms.
 """
 import copy
+import math
 import os
 import time
 import json
@@ -160,6 +161,12 @@ class StateMachine(Node):
         # already converged to its only fixed point (v = 0).
         self._static_deadlock_counter = 0
         self.static_deadlock_speed_mps = 0.3
+        # Mirrored so limit_local_window_accel can read them off the node like every other
+        # _check_* condition does. Both are in StateMachineParams._NODE_MIRRORED_PARAMS; the alias
+        # here is the half that was missing last time this pair went in, and its absence was an
+        # AttributeError out of a timer callback that took the whole state machine down.
+        self.local_window_accel_limit_enable = self.params.local_window_accel_limit_enable
+        self.local_window_a_long_mps2 = self.params.local_window_a_long_mps2
         self.static_deadlock_timeout_s = 1.5
         # Rate limit for the /planner/avoidance/relax request the deadlock raises. Re-sent (not
         # one-shot) because the planner may not be able to act on the first one; rate-limited (not
@@ -2038,6 +2045,55 @@ class StateMachine(Node):
     #######
     # VIZ #
     #######
+    def limit_local_window_accel(self, wpts, v_seed):
+        """Bound d(vx)/ds over the ASSEMBLED window: one backward pass, then one forward pass.
+
+        RETURNS COPIES, ALWAYS. states.GlobalTracking and get_splini_wpts hand back the very Wpnt
+        objects held by cur_gb_wpnts.list -- editing vx_mps in place would poison the cached
+        global line one station per cycle, permanently, and the damage would look like a speed
+        profile that decays over a session rather than like this function.
+
+        The backward pass makes every deceleration reachable; the forward pass, seeded with the
+        car's CURRENT speed, makes every acceleration reachable from where the car actually is.
+        Forward can only lower speeds, so it cannot undo the backward pass.
+
+        This is a defence, not a cure, for one of the two seams it covers: the s = 0 discontinuity
+        is written into every map's global_waypoints.json by the vendored tph's __solver_fb_closed,
+        which runs its backward pass over a doubled array and returns the second lap -- whose last
+        element has no successor and is therefore never decelerated. Fixing that would rewrite
+        every map's raceline and is deliberately NOT done here.
+        """
+        if not self.local_window_accel_limit_enable or not wpts or len(wpts) < 2:
+            return wpts
+        a_max = float(self.local_window_a_long_mps2)
+        if a_max <= 0.0:
+            return wpts
+        out = [copy.copy(w) for w in wpts]
+        v = np.array([float(w.vx_mps) for w in out], dtype=float)
+        s = np.array([float(w.s_m) for w in out], dtype=float)
+        ds = np.diff(s)
+        # the window can wrap the start/finish line; a negative or absurd step there is the wrap,
+        # not a reversal, so fall back to the nominal spacing rather than to a huge ds that would
+        # make any jump look reachable
+        nominal = float(getattr(self, "wpnt_dist", 0.1)) or 0.1
+        ds = np.where((ds > 1e-6) & (ds < 10.0 * nominal), ds, nominal)
+        two_a = 2.0 * a_max
+        for i in range(len(v) - 2, -1, -1):
+            lim = math.sqrt(v[i + 1] * v[i + 1] + two_a * ds[i])
+            if v[i] > lim:
+                v[i] = lim
+        seed = max(float(v_seed), 0.0)
+        lim0 = math.sqrt(seed * seed + two_a * ds[0])
+        if v[0] > lim0:
+            v[0] = lim0
+        for i in range(1, len(v)):
+            lim = math.sqrt(v[i - 1] * v[i - 1] + two_a * ds[i - 1])
+            if v[i] > lim:
+                v[i] = lim
+        for w, vi in zip(out, v):
+            w.vx_mps = float(vi)
+        return out
+
     def _pub_local_wpnts(self, wpts):
         # DELETEALL as the first element of the SAME array (atomic clear+draw in
         # one message) instead of a separate publish, so RViz2 doesn't flicker.
@@ -2455,6 +2511,13 @@ class StateMachine(Node):
         self.behavior_strategy.overtaking_targets = self.get_overtaking_target()
 
         local_wpnts = self.states[self.local_wpnts_src](self)
+        # ONE PLACE, EVERY STATE. The assembled window has seams nothing else bounds: the
+        # avoidance-to-global-padding join (measured |dvx| up to 0.894 m/s = 41-55 m/s^2) and the
+        # global raceline's own s = 0 seam (0.867 m/s = 35.6 m/s^2, in 21.5% of windows). Applying
+        # the limit HERE covers /behavior_strategy (which the controller reads) and
+        # /local_waypoints together, and covers GB_TRACK, OVERTAKE, RECOVERY and START without
+        # four copies of the same pass.
+        local_wpnts = self.limit_local_window_accel(local_wpnts, self.cur_vs)
 
         if self.cur_state == StateType.LOSTLINE:
             self.cur_state = StateType.GB_TRACK

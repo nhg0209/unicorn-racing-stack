@@ -44,6 +44,8 @@ class StateMachineParams:
         "static_invisible_grace_sec",
         "overtaking_horizon_m",
         "getting_closer_rel_vel_mps",
+        "local_window_accel_limit_enable",
+        "local_window_a_long_mps2",
         "min_dwell_sec",
         "ot_free_lost_sec",
         "free_check_predict_dynamic",
@@ -117,6 +119,38 @@ class StateMachineParams:
             ),
         )
         self.gb_ego_width_m: float = node.get_parameter("gb_ego_width_m").value
+
+        # The assembled local window is where the two speed seams meet -- the avoidance-to-global
+        # padding join and the global raceline's own s = 0 discontinuity -- and nothing downstream
+        # bounds d(vx)/ds. The state machine does it once, on the copy it publishes.
+        self._declare(
+            "local_window_accel_limit_enable", True,
+            ParameterDescriptor(
+                description=(
+                    "Bound d(vx)/ds over the ASSEMBLED local window (one backward + one forward "
+                    "pass) before publishing. Measured with it off: required |a_long| p50/p95/max "
+                    "4.88/35.6/56.8 m/s^2 against a ggv ax_max of 5.0, and 104 of the 137 "
+                    "stations over 6 m/s^2 come from the raceline's s = 0 seam alone. False "
+                    "publishes the seams as assembled."),
+                type=ParameterType.PARAMETER_BOOL,
+            ),
+        )
+        self.local_window_accel_limit_enable: bool = node.get_parameter(
+            "local_window_accel_limit_enable").value
+
+        self._declare(
+            "local_window_a_long_mps2", 5.0,
+            ParameterDescriptor(
+                description=(
+                    "[m/s^2] the longitudinal bound the pass above enforces. 5.0 is the ggv / "
+                    "ax_max_machines limit the velocity profile is itself solved to, so this only "
+                    "removes what the ASSEMBLY introduced and never re-shapes a feasible "
+                    "profile."),
+                type=ParameterType.PARAMETER_DOUBLE,
+            ),
+        )
+        self.local_window_a_long_mps2: float = node.get_parameter(
+            "local_window_a_long_mps2").value
 
         self._declare(
             "recovery_exit_d_m", 0.2,
