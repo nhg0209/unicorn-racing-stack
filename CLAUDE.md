@@ -40,7 +40,7 @@ system python3 has no trajectory_planning_helpers.
 - Margins/launch agreement: `python3 stack_master/scripts/check_avoidance_margins.py` (exit 0)
 - Speed continuity: `python3 stack_master/scripts/test_speed_continuity.py`
 - Track bounds: `python3 stack_master/scripts/check_track_bounds.py --all` — **exit 1 today**: map f ships with d_left/d_right SWAPPED (402 stations vs 0). ifac and map_test are correct. Do NOT run `--fix` casually, and treat any sweep result taken on map f as measured through an inverted corridor.
-- Unit tests (151): `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest state_machine/test planner/spliner/test planner/lane_change_planner/test controller/test planner/gb_optimizer/scripts perception/scripts -q`
+- Unit tests: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest state_machine/test planner/spliner/test planner/lane_change_planner/test controller/test planner/gb_optimizer/scripts perception/scripts race_utils/unicorn_gym/f1tenth_gym_ros/test/test_ego_footprint.py -q`
   (the env var is REQUIRED: launch_testing_ros's pytest entrypoint aborts collection in this env)
   The gb_optimizer and perception suites are ALSO runnable standalone, which is how they report their own measurements:
   `~/miniforge3/envs/unicorn/bin/python3 planner/gb_optimizer/scripts/test_static_reopt_apex.py` (53 checks),
