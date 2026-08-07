@@ -63,7 +63,7 @@ static_avoidance_planner:
     # Equal to safety_margin here on purpose -- the split shipped as a pure refactor, verified
     # bit-identical over 1656 planning cases. Move it, not safety_margin, to narrow the avoidance.
     safety_margin_d: 0.15
-    wall_margin: 0.1        # [m]  how close to the wall a candidate may reach (corridor room).
+    wall_margin: 0.15        # [m]  how close to the wall a candidate may reach (corridor room).
                             #   NOT a feasibility knob either, despite what the safety_margin note above
                             #   implies about tight sections: measured over the same grid, feasible
                             #   stations at a 12 m gap go 40 -> 38 -> 38 for wall_margin 0.10 -> 0.05 ->
@@ -118,7 +118,7 @@ static_avoidance_planner:
     # rejecting, so every candidate died and the path went empty. A box the car is already past no
     # longer takes a knot at all (it still keeps its keep-out), so this window only ever merges
     # boxes genuinely ahead.
-    knot_merge_s_m: 0.4
+    knot_merge_s_m: 1.2
     shift_min: 1.0          # [m]  min apex arc length (keeps the apex ahead of the car when very close)
     shift_buffer: 1.0       # [m]  (unused in apex-loaded profile; kept for param compatibility)
     # Ramp lengths 3.0 -> 4.5. The maneuver's peak curvature scales as amplitude/length^2, so

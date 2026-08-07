@@ -18,6 +18,16 @@ the SM's static requirement, and the whole chain must be ordered:
 
     SM requirement  <=  clear-gate stay  <=  enforced floor - slack
 
+FIFTH member, and it does NOT live in a launch file: with reopt_method:=closed_qp the enforced
+floor is closed_reopt.ReoptParams' own obs_margin, a dataclass default inside the module, and what
+the line delivers is obs_margin + w_veh/2. The chain above is blind to it -- every threshold here
+is parsed from base_system.launch.xml, so switching solvers would leave this script verifying a
+margin nothing uses. check_closed_qp_chain() reads the dataclass the same way
+load_reopt_node_defaults() reads declare_parameter, and holds the delivered clearance to the
+REACTIVE IDLE ENTRY (width_car/2 + clear_margin_m + clear_hyst_m) rather than the clear-gate stay:
+idle entry is the binding one, because a box the global line CLAIMS must be far enough out that
+the reactive layer stays down about it, not merely far enough to stop avoiding.
+
 Between the first two thresholds sits a DEAD BAND: an obstacle clearing by more than the planner
 needs to idle but less than the SM needs to call the line free leaves both sides standing down,
 i.e. TRAILING behind a line that already drives around the obstacle. The re-opt's drift triggers
@@ -157,6 +167,62 @@ def load_reopt_node_defaults():
         return p, {}
     pat = re.compile(r'self\.declare_parameter\(\s*"([A-Za-z_0-9]+)"\s*,\s*([-+]?\d+(?:\.\d+)?)\s*\)')
     return p, {m.group(1): float(m.group(2)) for m in pat.finditer(p.read_text())}
+
+
+def load_closed_reopt_defaults():
+    """{field: default} from closed_reopt.ReoptParams (numeric only).
+
+    A FIFTH place parameters live in this subsystem: not a yaml, not a launch arg, not a
+    declare_parameter -- a dataclass default in the module. Parsed rather than imported so this
+    script keeps running under the system python, which has no trajectory_planning_helpers.
+    """
+    p = (STACK_MASTER.parent / "planner" / "gb_optimizer" / "gb_optimizer" / "closed_reopt.py")
+    if not p.is_file():
+        return p, {}
+    txt = p.read_text()
+    m = re.search(r"class ReoptParams:(.*?)(?:\n@|\nclass |\ndef )", txt, re.S)
+    if not m:
+        return p, {}
+    pat = re.compile(r"^\s{4}([a-z_0-9]+)\s*:\s*float\s*=\s*([-+]?\d+(?:\.\d+)?)", re.M)
+    return p, {k: float(v) for k, v in pat.findall(m.group(1))}
+
+
+def check_closed_qp_chain(cfg, args) -> bool:
+    """The margin chain for reopt_method:=closed_qp, whose floor is not in any launch file.
+
+    HEADROOM IS FLOOR_CONSUMER_SLACK_M, the same 0.05 this file already requires between the
+    lowest clearance the hump may settle for and every consumer that judges it. It is the same
+    question -- how far a published clearance must sit above a threshold that reads it -- so it
+    gets the same answer, and it was NOT chosen to let the current value through.
+    """
+    p, q = load_closed_reopt_defaults()
+    if not q:
+        print(f"\nclosed_qp chain: could not read ReoptParams from {p} — SKIPPED")
+        return True
+    width_car = float(cfg["width_car"])
+    idle_need = (width_car / 2.0 + float(cfg.get("clear_margin_m", 0.10))
+                 + float(cfg.get("clear_hyst_m", 0.0)))
+    delivers = q.get("obs_margin", 0.0) + q.get("w_veh", width_car) / 2.0
+    head = delivers - idle_need
+    print(f"\nclosed_qp chain ({p.name} ReoptParams — a dataclass default, not a launch arg):")
+    print(f"  delivers   obs_margin + w_veh/2 = {q.get('obs_margin', 0.0):.3f} + "
+          f"{q.get('w_veh', width_car) / 2:.3f} = {delivers:.3f} m")
+    print(f"  must beat  reactive IDLE entry = width_car/2 + clear_margin_m + clear_hyst_m = "
+          f"{idle_need:.3f} m")
+    print(f"  headroom   {head:+.3f} m against a required {FLOOR_CONSUMER_SLACK_M:.2f} m")
+    if head < FLOOR_CONSUMER_SLACK_M:
+        print(f"  FAIL: {head:.3f} m of headroom is under the {FLOOR_CONSUMER_SLACK_M:.2f} m this "
+              f"file requires of every published clearance. A box the global line CLAIMS can be "
+              f"re-avoided by the reactive layer once tracker EMA and localisation error eat the "
+              f"difference — the double avoidance this subsystem exists to remove.")
+        print(f"        Raising closed_reopt's obs_margin to {idle_need + FLOOR_CONSUMER_SLACK_M - q.get('w_veh', width_car) / 2:.2f} "
+              f"would close it, and measured on ifac costs 7 of 38 boxes and every hold "
+              f"(planner/gb_optimizer/scripts/sweep_obs_margin.py). KNOWN RISK, carried "
+              f"deliberately; static_reopt_node's DOUBLE AVOIDANCE warning is what decides it "
+              f"in sim.")
+        return False
+    print(f"  OK: a claimed box is published far enough out for the reactive layer to stay idle.")
+    return True
 
 
 def load_reopt_arg_bindings():
@@ -738,6 +804,22 @@ def main() -> int:
         ok = False
     if not check_launch_agreement():
         ok = False
+
+    # WHICH CHAIN IS ACTUALLY ENFORCED. Everything above holds the HUMP path's floor; the closed
+    # QP's floor is a dataclass default the launch files never see. Both are always reported, and
+    # only the one the shipped reopt_method selects can fail this script -- otherwise a solver
+    # nobody runs would break the gate for everyone, and a solver everyone runs could go
+    # unchecked. The line below says which is which, out loud, on every run.
+    method = str(args.get("reopt_method", "local_window"))
+    closed_ok = check_closed_qp_chain(cfg, args)
+    active = "closed_qp" if method == "closed_qp" else "hump (local_window)"
+    print(f"\nreopt_method default = '{method}' -> the {active} chain is the one in force.")
+    if method == "closed_qp":
+        if not closed_ok:
+            ok = False
+    elif not closed_ok:
+        print("      Not fatal today because closed_qp is opt-in. It becomes fatal the moment "
+              "reopt_method's default changes, which is the point at which it must be answered.")
 
     return 0 if ok else 1
 

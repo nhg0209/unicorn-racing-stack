@@ -75,7 +75,19 @@ class ReoptParams:
     # failure this whole rewrite exists to fix -- a straight pair drawn as a W -- and 1.8 cm of
     # residual offset is a quantitative one. The asymmetry points down.
     dev_weight: float = 0.010         # w: the hold-vs-return knob (see the module docstring)
-    obs_margin: float = 0.15         # [m] lateral clearance owed to an obstacle, beyond its radius
+    # [m] lateral clearance owed to an obstacle beyond its radius. What the line DELIVERS is
+    # obs_margin + w_veh/2 = 0.310, and what it has to beat is the reactive layer's idle entry
+    # (width_car/2 + clear_margin_m + clear_hyst_m = 0.28): below that the reactive layer avoids a
+    # box the global line already claims, which is the double avoidance this subsystem exists to
+    # remove. 3.3 cm of headroom IS THIN against the tracker's EMA and localisation error, and it
+    # is not ideal -- but the sweep (scripts/sweep_obs_margin.py) says 0.18 is what buys 5 cm and
+    # it costs seven of 38 boxes and every hold on ifac, because a keep-out radius of 0.49 m no
+    # longer fits inside the curvature budget's envelope on a "straight" that is already at 16% of
+    # it. Losing the hold is the failure this formulation exists to fix. 0.16 over 0.15 is free:
+    # +1 cm of headroom at the same 29/38 coverage and the same holds. Whether 3.3 cm is actually
+    # enough is a sim question, and the DOUBLE AVOIDANCE warning in static_reopt_node is what
+    # answers it -- it fires the moment the reactive layer touches a box this line claims.
+    obs_margin: float = 0.16
     w_veh: float = 0.30              # [m] vehicle width, reserved on both sides
     # [m] SOLVED-FOR ONLY, never part of the safety requirement. The QP enforces the keep-out at
     # its own stations; the periodic cubic that maps the answer back to every 0.1 m station sags
