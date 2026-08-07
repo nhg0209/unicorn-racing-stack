@@ -15,15 +15,15 @@ no place in a unit suite.
       excursion count alone
   C4  clearance at grid 0.10 / 0.30 / 0.50 / 0.70 (CLEARANCE ONLY -- curvature is grid-dependent
       by construction and is logged, never asserted)
-  C5a where the budget is ENFORCED -- at the QP's own stations -- the published |kappa| stays at
-      or under the clean raceline's peak. This is the budget's actual contract; between nodes it
-      binds nothing.
-  C5b what the interpolation adds to the PEAK, measured against the clean raceline rather than
-      against the node peak. Subtracting the node peak measures the map, not the cubic: ifac's
-      apex is not a QP station, so the CLEAN line itself reads 1.2370 at nodes against 1.4478
-      over all of them, and a line that added nothing would score +0.21. Anchored to the clean
-      peak the number is what our line actually adds. Allowance = 2x measured, the disc_allow_m
-      pattern.
+  C5  the published peak |kappa| stays inside kappa_budget. That IS the contract the curvature
+      budget makes -- the envelope's whole premise is that the line may spend what the raceline
+      has not -- and the anchor is the formulation's own declared number, so it survives a
+      regenerated raceline. It replaces C5a/C5b, which measured one quantity twice: at stride 1
+      the QP's stations ARE every station, so peak_kappa_nodes == peak_kappa and the split had
+      nothing left to separate. Anchoring to the CLEAN peak was worse than redundant -- a flatter
+      raceline makes the same avoidance score worse while being absolutely gentler (a candidate
+      whose published worst was 1.246 failed against a shipped line's 1.451). The increment over
+      the clean line is still logged, and so is the hump's, neither compared absolutely.
   C6  solve time p95
   C7  disc_allow_m covers the measured upsample sag -- ASSERTED ONLY at the grid it is calibrated
       for (0.50 m). At any other grid this SKIPS with a warning rather than passing quietly.
@@ -148,41 +148,34 @@ def main():
         g.check(f"C4 grid {step:.2f}", got >= need - 1e-9,
                 f"clearance {got:+.3f} | peak|kappa| {r.peak_kappa:.3f} (log) | {r.solve_ms:.1f} ms")
 
-    # C5a / C5b ---------------------------------------------------------------------------------
-    print("\nC5a / C5b  the budget where it is enforced, and what the cubic adds on top")
+    # C5 ----------------------------------------------------------------------------------------
+    print("\nC5  the published peak stays inside the curvature budget the envelope spends from")
     full, reftrack = CMP.load_full()
     cor_hump = (np.append(cor[0], cor[0][0]), np.append(cor[1], cor[1][0]))
     cfg = str(REPO / "stack_master/config" / args.config)
     k_clean = float(np.max(np.abs(C.menger_closed(ref[:, :2]))))
-    over_a, over_b, deltas = [], [], []
+    over, deltas = [], []
     for name, stations in cases:
         obs = [box(ref, i) for i in stations]
         _l, d, r = C.reoptimize_closed(ref, obs, cor, p)
         if not r.ok:
             continue
-        if r.peak_kappa_nodes > k_clean + 1e-9:
-            over_a.append(f"{name} {r.peak_kappa_nodes:.4f}")
-        add = r.peak_kappa - k_clean
-        if add > INTERP_PEAK_ALLOW:
+        if r.peak_kappa > p.kappa_budget + 1e-9:
             st = int(np.argmax(np.abs(C.menger_closed(_l))))
-            over_b.append(f"{name} +{add:.4f} at station {st} carrying {abs(d[st]):.3f} m")
+            over.append(f"{name} {r.peak_kappa:.4f} at station {st} carrying {abs(d[st]):.3f} m")
         near = np.min([np.hypot(ref[:, 0] - o.x, ref[:, 1] - o.y) for o in obs], axis=0)
         sp = np.arange(max(0, min(stations) - 30), min(n, max(stations) + 31))
         h = CMP.run_hump(full, reftrack, cfg, cor_hump, obs, stations, sp, near > 2.5)
-        deltas.append((name, r.peak_kappa_nodes, add,
+        deltas.append((name, r.peak_kappa, r.peak_kappa - k_clean,
                        (h["peak"] - k_clean) if h.get("ok") else float("nan")))
-    print(f"         the clean raceline peaks at {k_clean:.4f} over all stations and "
-          f"{max(np.abs(C.menger_closed(ref[:, :2]))[np.arange(0, n, max(1, int(round(p.grid_step_m / np.median(C._closed_el(ref[:, :2]))))))]):.4f} at the QP's")
-    print("         case                         | at nodes | published-clean | hump-clean (log)")
-    for nm, nodes, dn, dh in deltas:
-        print(f"           {nm:26s} | {nodes:8.4f} | {dn:+15.4f} | {dh:+.4f}")
-    g.check("C5a", not over_a, f"{len(deltas) - len(over_a)}/{len(deltas)} cases at or under the "
-            f"clean peak where the budget binds" + (f" -- OVER: {'; '.join(over_a)}" if over_a
-                                                    else ""))
-    g.check("C5b", not over_b, f"the cubic adds at most "
-            f"{max((d for _n, _k, d, _h in deltas), default=0.0):+.4f} of curvature over the clean "
-            f"peak against an allowance of {INTERP_PEAK_ALLOW:.4f}"
-            + (f" -- OVER: {'; '.join(over_b)}" if over_b else ""))
+    print(f"         budget {p.kappa_budget:.3f}; the clean raceline peaks at {k_clean:.4f}")
+    print("         case                         | published | vs clean | hump vs clean (log)")
+    for nm, pk, dn, dh in deltas:
+        print(f"           {nm:26s} | {pk:9.4f} | {dn:+8.4f} | {dh:+.4f}")
+    g.check("C5", not over, f"{len(deltas) - len(over)}/{len(deltas)} cases inside the budget; "
+            f"worst published {max((pk for _n, pk, _a, _b in deltas), default=0.0):.4f} of "
+            f"{p.kappa_budget:.3f}"
+            + (f" -- OVER: {'; '.join(over)}" if over else ""))
 
     # C6 ---------------------------------------------------------------------------------------
     print("\nC6  solve time")

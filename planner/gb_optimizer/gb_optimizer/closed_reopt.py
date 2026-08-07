@@ -92,19 +92,24 @@ class ReoptParams:
     # failure this whole rewrite exists to fix -- a straight pair drawn as a W -- and 1.8 cm of
     # residual offset is a quantitative one. The asymmetry points down.
     dev_weight: float = 0.010         # w: the hold-vs-return knob (see the module docstring)
-    # [m] lateral clearance owed to an obstacle beyond its radius. What the line DELIVERS is
-    # obs_margin + w_veh/2 = 0.310, and what it has to beat is the reactive layer's idle entry
-    # (width_car/2 + clear_margin_m + clear_hyst_m = 0.28): below that the reactive layer avoids a
-    # box the global line already claims, which is the double avoidance this subsystem exists to
-    # remove. 3.3 cm of headroom IS THIN against the tracker's EMA and localisation error, and it
-    # is not ideal -- but the sweep (scripts/sweep_obs_margin.py) says 0.18 is what buys 5 cm and
-    # it costs seven of 38 boxes and every hold on ifac, because a keep-out radius of 0.49 m no
-    # longer fits inside the curvature budget's envelope on a "straight" that is already at 16% of
-    # it. Losing the hold is the failure this formulation exists to fix. 0.16 over 0.15 is free:
-    # +1 cm of headroom at the same 29/38 coverage and the same holds. Whether 3.3 cm is actually
-    # enough is a sim question, and the DOUBLE AVOIDANCE warning in static_reopt_node is what
-    # answers it -- it fires the moment the reactive layer touches a box this line claims.
-    obs_margin: float = 0.16
+    # [m] lateral clearance owed to an obstacle beyond its radius. The line DELIVERS
+    # obs_margin + w_veh/2 = 0.320 and now PROMISES the same, which is the point of it being 0.17
+    # rather than 0.16: the tenth of a centimetre that used to arrive as disc_allow_m was real
+    # clearance under an interpolation's name, and the margin chain was told the smaller number.
+    # The keep-out radius is bit-identical either way -- (0.16, disc_allow 0.010) and (0.17,
+    # disc_allow 0.0) were measured to give the same coverage 29/38, the same clearances to six
+    # decimals, the same holds, the same peaks and the same sum of |d| -- so this is a renaming,
+    # not a loosening.
+    #
+    # What it has to beat is the reactive layer's idle entry (width_car/2 + clear_margin_m +
+    # clear_hyst_m = 0.28): below that the reactive layer avoids a box the global line already
+    # claims. 0.320 leaves 4 cm where check_avoidance_margins.py asks for 5, and that check still
+    # FAILS -- deliberately, and not papered over. The next centimetre is not available here:
+    # sweep_obs_margin.py measures 0.18 costing seven of 38 boxes and every hold on ifac, because
+    # a keep-out radius of 0.49 m no longer fits inside the curvature budget's envelope on a
+    # "straight" that is already at 16% of it. Whether 4 cm is enough is a sim question, and the
+    # DOUBLE AVOIDANCE warning in static_reopt_node is what answers it.
+    obs_margin: float = 0.17
     w_veh: float = 0.30              # [m] vehicle width, reserved on both sides
     # [m] SOLVED-FOR ONLY, never part of the safety requirement: it covers the sag the periodic
     # cubic introduces between QP stations. AT grid_step_m = 0.10 THERE ARE NO STATIONS BETWEEN
@@ -115,11 +120,10 @@ class ReoptParams:
     #
     # It is NOT quietly left at 0.010 as free margin. At stride 1 that number no longer corrects
     # anything; it would simply be a centimetre of extra clearance wearing an interpolation's
-    # name, and mixing those two is exactly what splitting it off obs_margin was for. The cost is
-    # honest and measured: the delivered clearance goes 0.320 -> 0.310 and the margin-chain
-    # headroom over the reactive idle entry goes +0.040 -> +0.030, i.e. back under what
-    # check_avoidance_margins.py asks for. Raising obs_margin to recover it is a separate
-    # decision, on the evidence in scripts/sweep_obs_margin.py.
+    # name, and mixing those two is exactly what splitting it off obs_margin was for. The
+    # centimetre itself was not thrown away -- it moved into obs_margin (0.16 -> 0.17), which is
+    # where a safety margin belongs, so the keep-out radius is unchanged at r + 0.320 and only the
+    # PROMISE moved: the margin chain is now told 0.320, the number actually delivered.
     disc_allow_m: float = 0.0
     # [m] LOCALITY, BOUGHT EXPLICITLY. Beyond this arc distance from every box the offset is
     # pinned to exactly zero, so an avoidance cannot move the racing line on the far side of the
