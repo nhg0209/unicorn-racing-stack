@@ -292,8 +292,6 @@ class StaticReoptNode(Node):
             infl_len_m=float(self.get_parameter("closed_qp_infl_len_m").value),
             kappa_budget=float(self.get_parameter("closed_qp_kappa_budget").value),
             w_veh=float(self.get_parameter("qp_veh_width").value))
-        if self.reopt_method == "hump":
-            self.reopt_method = "local_window"
         self.reach_time = float(self.get_parameter("reach_time").value)
         self.reach_min = float(self.get_parameter("reach_min").value)
         self.reach_max = float(self.get_parameter("reach_max").value)
@@ -1036,36 +1034,14 @@ class StaticReoptNode(Node):
                 params=self.closed_qp_params,
                 w_veh=self.qp_veh_width, clean_vx=self._clean_vx,
                 clean_kappa=self._clean_kappa, corridor_lo=corr_lo, corridor_hi=corr_hi)
-        elif self.reopt_method == "local_window":
-            # Reshape the recorded reactive apexes into the global line (keep apex, gentle ramps).
-            # The apex's OWN obstacle goes with it: obs_margin is a hard acceptance floor in the
-            # core, so a hump that would not clear its box is grown once and then dropped for the
-            # reactive layer rather than laid short (which used to pass the amplitude-ratio test
-            # at 0.90 x apex = ~0.345 m of edge clearance, under the 0.35 m everything downstream
-            # assumes the line is built to).
-            apexes = [xy for xy, _o, _src in pairs]
-            apex_obs = [(float(o.x), float(o.y), float(o.r)) for _xy, o, _src in pairs]
-            corr = self._grid_corridor_lap() if self.reopt_grid_corridor else None
-            corr_lo, corr_hi = corr if corr is not None else (None, None)
-            res = core.reoptimize_local_window(
-                self._clean_xy, self._clean_dr, self._clean_dl, self.reftrack,
-                apexes, self.input_path,
-                params=core.ModulationParams(obs_margin=self.obs_margin),
-                w_veh=self.qp_veh_width, clean_vx=self._clean_vx, wall_margin=self.wall_margin,
-                reach_time=self.reach_time, reach_min=self.reach_min, reach_max=self.reach_max,
-                clean_kappa=self._clean_kappa, fit_tol=self.fit_tol,
-                apex_obstacles=apex_obs, relax_floor=self.relax_floor,
-                apex_merge_gap_m=self.apex_merge_gap_m,
-                hold_max_gap_m=self.hold_max_gap_m, hold_kappa_max=self.hold_kappa_max,
-                corridor_lo=corr_lo, corridor_hi=corr_hi)
         else:
-            # Legacy whole-track mincurv_iqp (offline-grade; minutes/solve).
-            res = core.reoptimize_with_obstacles(
-                self.reftrack, obstacles, self.input_path,
-                params=core.ModulationParams(obs_margin=self.obs_margin),
-                safety_width=self.safety_width, safety_width_sp=self.safety_width_sp,
-                compute_sp=self.compute_sp)
-
+            # ONE SOLVER. reopt_method used to fall through to a whole-track mincurv_iqp that its
+            # own comment called an offline tool taking MINUTES -- reached not by name but by
+            # ANY value that was not closed_qp or local_window, so a typo selected something that
+            # starves the control loop. Unknown values now say so and use the real solver.
+            self.get_logger().error(
+                f"[static_reopt] unknown reopt_method '{self.reopt_method}' -- the only solver is "
+                f"'closed_qp'. Using it.")
         traj, br, bl, est = res["main"]
         if "d_right" in res:                    # local_window returns exact widths
             d_r, d_l = res["d_right"], res["d_left"]
@@ -1130,156 +1106,6 @@ class StaticReoptNode(Node):
                     f"steer there ({res.get('kappa_published_allow', float('nan')):.3f} = "
                     f"max(curvlim, the clean line's own curvature))")
                 clearance_ok = False
-        elif self.reopt_method == "local_window":
-            n_ap = res.get("n_windows", 0)
-            dropped = res.get("apex_dropped", [])
-            n_obs = len(obstacles)
-            # PER-OBSTACLE STATUS, by identity. n_no_apex used to be inferred arithmetically
-            # (n_obs - laid - dropped), which counted every obstacle the core skipped as
-            # already-clear as if its apex were missing -- exactly backwards, since those are the
-            # ones needing nothing. Attribute each obstacle instead.
-            coverage = self._coverage(obstacles, pairs, res, gaps_by_id=None, traj=traj)
-            n_no_apex = sum(1 for c in coverage if c["status"] == "no_apex")
-            n_clear = sum(1 for c in coverage if c["status"] == "already_clear")
-            info.data = (f"[static_reopt] obstacle-aware (apex reshape) est {est:.3f}s; "
-                         f"{n_ap}/{n_obs} obstacle apex(es) reshaped, {len(dropped)} rejected, "
-                         f"{n_clear} already clear, {n_no_apex} without a recorded reactive apex")
-            # PER-APEX shape log. Without this a collapsed reach is invisible: the summary above
-            # reports the hump as "reshaped" whether it was laid at the 5 m reach the search asked
-            # for or bisected down to 1.2 m by the corridor fit — and the sharp one costs >1 s/lap
-            # and exceeds curvlim. Log what was actually laid, and WARN when the reach came back
-            # less than half of what was requested or the geometry is near the curvature limit.
-            curvlim = float(res.get("curvlim", 0.0))
-            # SPAN ACCOUNTING. Not one line of this node's output mentioned span, budget or
-            # give-back, so a budget that had quietly halved every ramp left no trace at all -- the
-            # per-apex lines below reported "100% of requested" throughout, because the request had
-            # already been cut to fit.
-            span_m = float(res.get("span_m", 0.0))
-            span_b = float(res.get("span_budget_m", 0.0))
-            over = max(0.0, span_m - span_b)
-            self.get_logger().info(
-                f"[static_reopt] span {span_m:.2f} m of budget {span_b:.2f} "
-                + (f"(over {over:.2f} -> penalty {over:.2f} s)" if over > 1e-9 else "(within)")
-                + f"; chose reach {float(res.get('span_reach_m', 0.0)):.2f} m for {n_ap} hump(s)")
-            for a in res.get("apex_laid", []):
-                # Against what the CORRIDOR AND CURVATURE would have allowed, not against r_req --
-                # r_req is the already-budgeted request, so measuring the shrink against it reads
-                # 100% however hard the span budget squeezed. That is precisely how a 5.0 -> 2.5 m
-                # collapse across three humps went unreported for a whole session.
-                r_req = max(a.get("r_allow", a.get("r_req", 0.0)), 1e-6)
-                shrink = min(a["r_in"], a["r_out"]) / r_req
-                kp, kmsg = a.get("kappa_peak", 0.0), ""
-                if curvlim > 0.0:
-                    kmsg = f" ({kp / curvlim:.0%} of curvlim {curvlim:.2f})"
-                # Clearance of the WOVEN profile — the number the acceptance floor is about, and
-                # the one the reactive planner and the SM will independently re-derive downstream.
-                gap = float(a.get("clear", float("nan")))
-                # The floor this hump was ACCEPTED at, which the coverage ladder may have walked
-                # below obs_margin -- printing the design margin there claimed a clearance the hump
-                # never promised, and the publish veto and drift trigger both judge it by the
-                # accepted floor, not by the design one.
-                floor = float(a.get("floor", self.obs_margin))
-                fmsg = f" (floor {floor:.2f}"
-                fmsg += ")" if abs(floor - self.obs_margin) < 1e-9 else \
-                    f", RELAXED from {self.obs_margin:.2f})"
-                cmsg = "" if gap != gap else f"; clears {gap:+.3f} m{fmsg}"
-                # Which SIDE was actually used. The recorded apex only proposes one; the ladder is
-                # free to take the mirror, and a hump on the opposite side of the box from the one
-                # the car drove reactively is the single most surprising thing this line can do.
-                smsg = (f"; SIDE FLIPPED to d={a['d_used']:+.3f} (apex proposed {a['want']:+.3f})"
-                        if a.get("flipped") else "")
-                if a.get("side_unified"):
-                    smsg += ("; SIDE UNIFIED with its neighbours (this obstacle's own reactive "
-                             "apex proposed the other side)")
-                line = (f"[static_reopt] apex @({a['xy'][0]:.2f},{a['xy'][1]:.2f}) "
-                        f"laid d={a['laid']:+.3f} (want {a['want']:+.3f}) "
-                        f"reach {a['r_in']:.2f}/{a['r_out']:.2f} m of {r_req:.2f} allowed "
-                        f"({shrink:.0%}); max|kappa| {kp:.2f}{kmsg}{cmsg}{smsg}")
-                if shrink < 0.5 or (curvlim > 0.0 and kp > 0.9 * curvlim):
-                    self.get_logger().warning(
-                        line + " <- SHARP: the corridor fit shrank this hump. Check "
-                        "reopt_wall_margin / reopt_fit_tol and the reactive apex_bulge.")
-                else:
-                    self.get_logger().info(line)
-            if dropped:
-                # All-or-nothing: a hump that cannot be laid clear of its obstacle would NOT
-                # relieve the reactive layer — the shrunken line got re-avoided every lap. Those
-                # obstacles stay reactive-only, and this says so per apex, with the measured
-                # clearance where the acceptance floor is what rejected it.
-                def _det(d):
-                    # Per SIDE, and at the LOWEST rung the ladder actually reached. The old line
-                    # mixed three different attempts into one sentence -- `want` from the primary
-                    # side, `max` from whichever attempt ran last (usually the mirrored side), and
-                    # a floor the ladder had already walked away from -- so it read as a rejection
-                    # at a clearance nobody was still asking for.
-                    s = f"@({d['xy'][0]:.2f},{d['xy'][1]:.2f}) [{d.get('reason', 'corridor')}]"
-                    sides = d.get("sides") or []
-                    if sides:
-                        s += " tried " + " | ".join(
-                            f"d={t['aim']:+.2f} -> {t['fit']:+.2f}"
-                            + ("" if t.get("clear") is None else f" clears {t['clear']:+.3f}")
-                            + (f" [{t['why']}]" if t.get("why") else "")
-                            for t in sides)
-                    else:
-                        s += f" want {d['want']:+.2f} max {d['fit']:+.2f}"
-                    if "clear" in d:
-                        s += (f"; floor walked {d.get('floor_asked', self.obs_margin):.2f} -> "
-                              f"{d['need']:.2f} and still short")
-                    return s
-                self.get_logger().warning(
-                    f"[static_reopt] {len(dropped)} apex(es) REJECTED (reason 'corridor' = track "
-                    f"too tight, 'curvature' = the hump would exceed curvlim, 'clearance' = even "
-                    f"grown wider it does not clear the box by obs_margin; reactive layer keeps "
-                    f"handling them): {'; '.join(_det(d) for d in dropped)}")
-            if n_no_apex:
-                self.get_logger().warning(
-                    f"[static_reopt] {n_no_apex} obstacle(s) had no recorded reactive apex yet — "
-                    f"the reactive static-avoidance layer handles them until an apex is captured")
-            # The floor each hump was ACCEPTED at travels with the bundle: the coverage ladder can
-            # settle below obs_margin, and judging such a hump against obs_margin afterwards would
-            # veto exactly the coverage the ladder just bought. Built BEFORE the veto so the veto
-            # holds every hump to what it actually promised.
-            obs_key = {id(o): k for o, k in zip(obstacles,
-                                                self._keys_for(obstacles, self._obs_ids))}
-            floors_by_id = {}
-            for a in res.get("apex_laid", []):
-                i_a = a.get("obs_i")
-                if i_a is None or i_a >= len(pairs):
-                    continue
-                o_a = pairs[i_a][1]
-                floors_by_id[id(o_a)] = float(a.get("floor", self.obs_margin))
-                k = obs_key.get(id(o_a))
-                if k is not None:
-                    floor_by_key[k] = floors_by_id[id(o_a)]
-            clearance_ok = self._check_line_clearance(traj, obstacles, res.get("apex_laid", []),
-                                                      apex_obs=[o for _xy, o, _src in pairs],
-                                                      floors=floors_by_id)
-            # ...and the wall, which no upstream check consults directly. Same refusal path.
-            clearance_ok = self._wall_gate_ok(traj) and clearance_ok
-            # ...and curvlim on the geometry that actually goes on the wire. Both upstream
-            # curvature gates run on the analytic offset profile, before the uniform resample; the
-            # resample moves the points, and nothing re-checked them. A line that steers harder
-            # than the car can is not fixed by slowing down -- _cap_speed_to_published_curvature
-            # keeps the SPEED inside the friction budget, but curvlim is a STEERING limit, so the
-            # car simply understeers out of the apex. Same refusal path as the other two.
-            if not res.get("kappa_published_ok", True):
-                self.get_logger().warning(
-                    f"[static_reopt] REFUSED: published max|kappa| "
-                    f"{res.get('kappa_published_max', float('nan')):.3f} exceeds what the car can "
-                    f"steer there ({res.get('kappa_published_allow', float('nan')):.3f} = "
-                    f"max(curvlim, the clean line's own curvature)). The upstream curvature gates "
-                    f"run on the pre-resample analytic profile; this one reads the points that "
-                    f"would be published")
-                clearance_ok = False
-            # Baseline for the drift trigger: what THIS line clears each box by, at the positions
-            # it was built from. Travels with the bundle so the comparison is always against the
-            # line that is actually active (a pending bundle may never commit).
-            clearance_by_key = dict(zip(self._keys_for(obstacles, self._obs_ids),
-                                        self._line_clearances(traj, obstacles)))
-        else:
-            info.data = (f"[static_reopt] obstacle-aware (mincurv_iqp) est {est:.3f}s; "
-                         f"affected {rep.n_affected}, infeasible {rep.n_infeasible}, "
-                         f"min_halfwidth {rep.min_halfwidth_seen:.3f}m")
         lap = Float32(); lap.data = float(est)
 
         # centerline + trackbounds are map-fixed -> reuse the clean ones

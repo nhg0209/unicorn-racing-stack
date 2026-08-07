@@ -787,51 +787,6 @@ def test_wrap_normals_has_no_seam_artifact():
     print(f"PASS a constant offset is a constant curvature: spread {k.max() - k.min():.2e} "
           f"(shipped basis: {k_cf.max() - k_cf.min():.2e})")
 
-def _mixed_case(gap_m, hold_gap=8.0, half=1.2, pinch=None, pinch_neg=None, n_st=900, merge=0.0):
-    """Two boxes `gap_m` apart, both ON the raceline, with OPPOSITE-side recorded apexes.
-
-    `pinch` / `pinch_neg` = (x_lo, x_hi, limit) bring the + / - wall in over a band, so a test can
-    say which sides are actually available where."""
-    xy = np.column_stack([np.arange(n_st) * 0.1, np.zeros(n_st)])
-    s_l = np.arange(n_st) * 0.1
-    nv = np.column_stack([np.zeros(n_st), -np.ones(n_st)])
-    hi, lo = np.full(n_st, half), np.full(n_st, -half)
-    if pinch is not None:
-        x_lo, x_hi, lim = pinch
-        hi[(s_l >= x_lo) & (s_l <= x_hi)] = lim
-    if pinch_neg is not None:
-        x_lo, x_hi, lim = pinch_neg
-        lo[(s_l >= x_lo) & (s_l <= x_hi)] = -lim
-    x0 = 30.0
-    apex = [(x0, -0.55), (x0 + gap_m, +0.55)]                     # OPPOSITE sides
-    obs = [(x0, 0.0, 0.15), (x0 + gap_m, 0.0, 0.15)]
-    d, nn, _e, drp, lay = core.build_offset_profile(
-        xy, s_l, float(n_st * 0.1), nv, apex, None, 0.0, 2.0, 2.0, hi_inc=hi, lo_inc=lo,
-        obstacles=obs, obs_margin=0.35, relax_floor=0.30, curvlim=1.5, clean_kappa=None,
-        apex_merge_gap_m=merge, hold_bridge=hold_gap > 0.0, hold_max_gap_m=hold_gap,
-        hold_kappa_max=0.3)
-    return d, nn, lay, drp
-
-def test_common_side_prepass_follows_the_corridor_and_the_gates():
-    # It picks the side that FITS, not the majority: pinching the wall beside the first box on the
-    # + side moves the whole group to the - side instead.
-    _d, nn, lay, _drp = _mixed_case(6.0, pinch=(29.0, 31.0, 0.30))
-    assert nn == 2 and all(a["laid"] < 0 for a in lay), \
-        f"a pinched + side must send the group to the - side, got {[a['laid'] for a in lay]}"
-    # TOO FAR APART: outside the hold window the two obstacles are not a group at all.
-    d_far, _nn, lay_far, _drp = _mixed_case(6.0, hold_gap=4.0)
-    assert lay_far[0]["laid"] * lay_far[1]["laid"] < 0, "a pair wider than the window is left alone"
-    assert _excursions(d_far) == 2
-    # NEITHER SIDE FITS: a GENUINE slalom -- each box's own recorded side is the only one it has,
-    # and they are opposite. Blocking the - wall beside box 1 and the + wall beside box 2 leaves no
-    # common side, and the crossing between them is real geometry, not an accident.
-    _d, nn_b, lay_b, _drp = _mixed_case(6.0, pinch=(34.0, 38.0, 0.30),
-                                        pinch_neg=(28.0, 32.0, 0.30))
-    assert nn_b == 2 and all(not a.get("side_unified") for a in lay_b), \
-        "with no feasible common side the recorded sides must stand"
-    assert lay_b[0]["laid"] * lay_b[1]["laid"] < 0, "…and the real slalom is still laid as one"
-    print("PASS the common-side pre-pass follows the corridor and its gates")
-
 def test_breaker_refuses_poisoned_pending():
     n = make_node()
     sa = np.arange(0.0, 40.0, 0.1)

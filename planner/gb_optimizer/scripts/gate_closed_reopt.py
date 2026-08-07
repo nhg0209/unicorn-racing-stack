@@ -36,6 +36,7 @@ no place in a unit suite.
       is checked here rather than assumed.
 """
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -49,7 +50,6 @@ from gb_optimizer import closed_reopt as C                    # noqa: E402
 from gb_optimizer.closed_reopt import ReoptParams             # noqa: E402
 from bench_closed_reopt import (A_I, B_I, TRIOS, box, corridor_from_map,  # noqa: E402
                                 excursions, load_ifac, pair_span)
-import compare_reopt as CMP                                   # noqa: E402
 
 CALIBRATED_GRID_M = 0.50   # the grid disc_allow_m was measured against
 # [1/m] C5b's allowance: twice the measured worst case, the same rule disc_allow_m follows. The
@@ -72,6 +72,55 @@ RIPPLE_FLIPS_MAX = 8
 # against 20.
 SOLVE_MS_MAX = 400.0
 
+
+
+# --- from the deleted compare_reopt.py ---------------------------------------------------
+# The head-to-head against the hump pipeline went with the hump; the SCENARIO MATRIX it
+# defined did not, and this gate is built on it. Moved here rather than left in a file whose
+# other arm no longer exists.
+MAP = "ifac"
+BOX_R = 0.15
+# the reactive apex the hump pipeline reshapes: obstacle radius + the reactive keep-out
+# (width_car/2 + safety_margin_d = 0.15 + 0.15) + the spliner's apex bulge 0.10
+APEX_OFFSET_M = 0.55
+# base_system.launch.xml, verbatim
+HUMP = dict(obs_margin=0.35, relax_floor=0.33, wall_margin=0.05, w_veh=0.30,
+            reach_time=0.0, reach_min=1.0, reach_max=6.0, fit_tol=0.005,
+            apex_merge_gap_m=2.0, hold_max_gap_m=8.0, hold_kappa_max=0.3)
+
+# ifac at 0.0997 m/station. Classified by |kappa| smoothed over +-0.5 m: the four flattest
+# well-separated stations and the four sharpest (1.14 / 0.56 / 0.42 / 0.39 against 0.23).
+STRAIGHT = (0, 99, 135, 273)
+CORNER = (227, 119, 63, 186)
+GAP_STATIONS = {3.0: 30, 6.0: 60, 8.5: 85}
+TRIOS6 = ((275, 360, 200), (100, 160, 260), (200, 260, 40),
+          (250, 310, 90), (330, 30, 180), (10, 90, 190))   # last two carry an unavoidable box
+
+
+def load_full():
+    """The published raceline WITH its duplicated closing point -- the hump core wants the loop
+    closed, closed_reopt wants it open, and the difference is one row."""
+    d = json.load(open(REPO / "stack_master/maps" / MAP / "global_waypoints.json"))
+    wp = d["global_traj_wpnts_iqp"]["wpnts"]
+    a = np.array([[w["x_m"], w["y_m"], w["d_right"], w["d_left"], w["kappa_radpm"], w["vx_mps"]]
+                  for w in wp], float)
+    reftrack = np.genfromtxt(REPO / "stack_master/maps" / MAP / "centerline.csv",
+                             delimiter=",", skip_header=1)
+    return a, reftrack
+
+def build_cases(n):
+    cases = []
+    for s in STRAIGHT:
+        cases.append((f"1box straight {s}", [s]))
+    for s in CORNER:
+        cases.append((f"1box corner   {s}", [s]))
+    for gap, dst in GAP_STATIONS.items():
+        cases.append((f"2box straight gap {gap:.1f}m", [273, (273 + dst) % n]))
+    for a, b in ((227, 257), (119, 149), (63, 103)):
+        cases.append((f"2box corner+straight {a}", [a, b % n]))
+    for t in TRIOS6:
+        cases.append((f"3box {t}", list(t)))
+    return cases
 
 class Gate:
     def __init__(self):
@@ -113,7 +162,7 @@ def main():
 
     # C2 ---------------------------------------------------------------------------------------
     print(f"\nC2  cleared by {need:.3f} m or classified infeasible, over the whole matrix")
-    cases = CMP.build_cases(n)
+    cases = build_cases(n)
     bad = []
     for name, stations in cases:
         obs = [box(ref, i) for i in stations]
@@ -150,7 +199,7 @@ def main():
 
     # C5 ----------------------------------------------------------------------------------------
     print("\nC5  the published peak stays inside the curvature budget the envelope spends from")
-    full, reftrack = CMP.load_full()
+    full, reftrack = load_full()
     cor_hump = (np.append(cor[0], cor[0][0]), np.append(cor[1], cor[1][0]))
     cfg = str(REPO / "stack_master/config" / args.config)
     k_clean = float(np.max(np.abs(C.menger_closed(ref[:, :2]))))
@@ -163,17 +212,13 @@ def main():
         if r.peak_kappa > p.kappa_budget + 1e-9:
             st = int(np.argmax(np.abs(C.menger_closed(_l))))
             over.append(f"{name} {r.peak_kappa:.4f} at station {st} carrying {abs(d[st]):.3f} m")
-        near = np.min([np.hypot(ref[:, 0] - o.x, ref[:, 1] - o.y) for o in obs], axis=0)
-        sp = np.arange(max(0, min(stations) - 30), min(n, max(stations) + 31))
-        h = CMP.run_hump(full, reftrack, cfg, cor_hump, obs, stations, sp, near > 2.5)
-        deltas.append((name, r.peak_kappa, r.peak_kappa - k_clean,
-                       (h["peak"] - k_clean) if h.get("ok") else float("nan")))
+        deltas.append((name, r.peak_kappa, r.peak_kappa - k_clean))
     print(f"         budget {p.kappa_budget:.3f}; the clean raceline peaks at {k_clean:.4f}")
-    print("         case                         | published | vs clean | hump vs clean (log)")
-    for nm, pk, dn, dh in deltas:
-        print(f"           {nm:26s} | {pk:9.4f} | {dn:+8.4f} | {dh:+.4f}")
+    print("         case                         | published | vs clean (log only)")
+    for nm, pk, dn in deltas:
+        print(f"           {nm:26s} | {pk:9.4f} | {dn:+8.4f}")
     g.check("C5", not over, f"{len(deltas) - len(over)}/{len(deltas)} cases inside the budget; "
-            f"worst published {max((pk for _n, pk, _a, _b in deltas), default=0.0):.4f} of "
+            f"worst published {max((pk for _n, pk, _a in deltas), default=0.0):.4f} of "
             f"{p.kappa_budget:.3f}"
             + (f" -- OVER: {'; '.join(over)}" if over else ""))
 
@@ -274,7 +319,7 @@ def main():
     try:
         from gb_optimizer import closed_reopt_bridge as cqb
         from gb_optimizer import static_reopt_core as core
-        full, _rt = CMP.load_full()
+        full, _rt = load_full()
         obs = [core.Obstacle(float(ref[i, 0]), float(ref[i, 1]), 0.15) for i in (275, 360, 200)]
         res = cqb.reoptimize_closed_window(
             full[:, :2], full[:, 2], full[:, 3], np.zeros((4, 4)), obs,
