@@ -210,6 +210,20 @@ class StaticReoptNode(Node):
         #                    synonym for "local_window" -- the launch file ships the latter and
         #                    changing that string would change the default path.
         self.declare_parameter("reopt_method", "local_window")
+        # closed_qp's own tuning. These reach closed_reopt.ReoptParams, which keeps its own
+        # dataclass defaults so the module still runs with no ROS at all (every offline gate
+        # depends on that) -- these are declared with the SAME values, and the YAML overrides
+        # them. The one field deliberately absent is w_veh: it is the same physical quantity as
+        # qp_veh_width and is passed from there, because two keys for one width is how they drift.
+        # Rationale for each number lives in stack_master/config/static_reopt_params.yaml.
+        _cq = cqb.cq.ReoptParams()
+        self.declare_parameter("closed_qp_grid_step_m", _cq.grid_step_m)
+        self.declare_parameter("closed_qp_dev_weight", _cq.dev_weight)
+        self.declare_parameter("closed_qp_obs_margin", _cq.obs_margin)
+        self.declare_parameter("closed_qp_disc_allow_m", _cq.disc_allow_m)
+        self.declare_parameter("closed_qp_infl_len_m", _cq.infl_len_m)
+        self.declare_parameter("closed_qp_kappa_budget", _cq.kappa_budget)
+        self.declare_parameter("closed_qp_budget_exp", cqb.cq._BUDGET_EXP)
         # The avoidance is a smooth WIDE arc: a smootherstep bump peaking at the required clearance
         # over a half-width R = clip(reach_time * local_speed, reach_min, reach_max). Bigger R =
         # gentler, faster arc that reaches toward the adjacent corners (carries speed, steers less).
@@ -264,6 +278,19 @@ class StaticReoptNode(Node):
         self.clearance_dirty_m = float(self.get_parameter("clearance_dirty_m").value)
         self.compute_sp = bool(self.get_parameter("compute_sp").value)
         self.reopt_method = str(self.get_parameter("reopt_method").value)
+        # _BUDGET_EXP is a module constant by design (it shapes the same trade-off infl_len_m
+        # does, and two knobs for one trade-off is how the hump pipeline ended up with sixteen).
+        # It is settable here only so the value lives with the others in one file; changing it is
+        # a modelling decision, not tuning.
+        cqb.cq._BUDGET_EXP = float(self.get_parameter("closed_qp_budget_exp").value)
+        self.closed_qp_params = cqb.cq.ReoptParams(
+            grid_step_m=float(self.get_parameter("closed_qp_grid_step_m").value),
+            dev_weight=float(self.get_parameter("closed_qp_dev_weight").value),
+            obs_margin=float(self.get_parameter("closed_qp_obs_margin").value),
+            disc_allow_m=float(self.get_parameter("closed_qp_disc_allow_m").value),
+            infl_len_m=float(self.get_parameter("closed_qp_infl_len_m").value),
+            kappa_budget=float(self.get_parameter("closed_qp_kappa_budget").value),
+            w_veh=float(self.get_parameter("qp_veh_width").value))
         if self.reopt_method == "hump":
             self.reopt_method = "local_window"
         self.reach_time = float(self.get_parameter("reach_time").value)
@@ -974,7 +1001,7 @@ class StaticReoptNode(Node):
             res = cqb.reoptimize_closed_window(
                 self._clean_xy, self._clean_dr, self._clean_dl, self.reftrack,
                 obstacles, self.input_path,
-                params=cqb.cq.ReoptParams(w_veh=self.qp_veh_width),
+                params=self.closed_qp_params,
                 w_veh=self.qp_veh_width, clean_vx=self._clean_vx,
                 clean_kappa=self._clean_kappa, corridor_lo=corr_lo, corridor_hi=corr_hi)
         elif self.reopt_method == "local_window":

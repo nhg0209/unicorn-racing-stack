@@ -21,25 +21,7 @@
   <arg name="opp_spawn"  default="false" description="(virtual) spawn the kinematic opponent at startup on the map centerline; otherwise spawn it with RViz 2D Goal Pose or stack_master/scripts/spawn_opponent.py"/>
   <arg name="opp_mode"   default="manual" description="(virtual) opponent driving mode: manual | path (pure-pursuit on the centerline at a constant speed -- deterministic, use for regression runs) | ftg (reactive from its own lidar)"/>
   <arg name="reopt"        default="false" description="Obstacle-aware global line: run static_reopt_node + static_obstacle_layer instead of the plain global_trajectory_publisher (IFAC static-obstacle re-optimization)"/>
-  <arg name="reopt_safety_width" default="0.5" description="safety_width for the obstacle-aware re-optimizer (incl. car width). NB: the tight ifac centerline only solves plain mincurv_iqp at 0.25 or lower"/>
-  <arg name="reopt_obs_change_tol" default="0.05" description="min obstacle move [m] to re-trigger the re-opt QP (larger = detection jitter does not thrash it). Bounded ABOVE by the margin chain: the line is built to reopt_obs_margin (0.35) and the SM calls it blocked below gb_ego_width_m/2 + lateral_width_static_gb_m (0.25), so a drift this tolerance ignores must not eat that 0.10 m of headroom. It was 0.25 — a box could walk 25 cm, take the followed line under the SM requirement, and never re-trigger anything. Verified by stack_master/scripts/check_avoidance_margins.py."/>
-  <arg name="reopt_clearance_dirty" default="0.30" description="[m] CONSEQUENCE rebuild trigger: re-optimize as soon as the ACTIVE line's clearance to a box it used to clear falls below this, whatever the box moved. reopt_obs_change_tol only measures the cause. Set at the SM's static requirement (0.25) + slack, i.e. rebuild before the free-check would call the line blocked. Must stay between that requirement and reopt_obs_margin."/>
-  <arg name="reopt_compute_sp" default="true" description="also re-optimize the shortest_path line (ot_interpolator consumes it); false only if the OT line is unused"/>
   <arg name="reopt_method" default="closed_qp" description="obstacle-aware line optimizer. closed_qp (DEFAULT) = one convex QP over the lateral offset around the whole lap, solved once at every published station (~200 ms, off the executor): needs no reactive apex, so a box is covered on the lap it is confirmed, holds an offset between two boxes instead of weaving back, and hands anything it cannot clear to the reactive layer BY NAME on /static_reopt/coverage. Measured against local_window over 20 scenarios: 29/38 boxes covered against 30/38, better/equal/worse 1/17/2, solve p95 196 ms against 808, and it clears a box by 0.320 m where the hump clears 0.350. | local_window = the C2 quintic hump per RECORDED reactive apex, the previous default and still fully wired -- set this to fall back. | global = legacy whole-track mincurv_iqp, minutes/solve, offline-grade."/>
-  <arg name="reopt_reach_time" default="0.0" description="[s] DEPRECATED seed for the old speed-scaled reach; the reach is now chosen by a lap-time search over [reach_min, reach_max]. Ignored."/>
-  <arg name="reopt_reach_min" default="1.0" description="[m] MIN arc half-width searched. The reach is picked to MINIMISE estimated lap time, not by local speed."/>
-  <arg name="reopt_reach_max" default="6.0" description="[m] MAX arc half-width searched. On a short tight track a wide arc is SLOW (ifac: R=10 m costs ~2x the time a reactive line loses); raise only on long open tracks."/>
-  <arg name="reopt_qp_veh_width" default="0.30" description="[m] vehicle width for the windowed QP corridor + floor (obstacle clearance is obs_margin, separate)"/>
-  <arg name="reopt_wall_margin" default="0.05" description="[m] wall reserve of the re-optimized detour. Aligned with the reactive spliner's wall reserve — the recorded apex was DRIVEN at that reserve; a larger value here shrinks the hump below the proven clearance and the all-or-nothing fit rejects it (obstacle stays reactive-only)."/>
-  <arg name="reopt_obs_margin" default="0.35" description="[m] clearance of the re-optimized line off each obstacle's edge. MUST be >= the reactive keep-out (width_car/2 + safety_margin in static_avoidance_params.yaml, currently 0.30) or the re-opt line sits inside the reactive planner's own keep-out and gets re-avoided every lap. Run stack_master/scripts/check_avoidance_margins.py after tuning either side."/>
-  <arg name="reopt_relax_floor" default="0.33" description="[m] lowest clearance a hump may be ACCEPTED at when reopt_obs_margin is unreachable on either side of the box (coverage ladder). Two constraints, and the higher wins: it must be at least the REACTIVE keep-out (width_car/2 + safety_margin = 0.30) so a relaxed hump still clears the box by what the reactive planner would itself have driven, AND it must sit at least 5 cm above every consumer of that clearance -- the reactive clear-gate entry (width_car/2 + clear_margin_m + clear_hyst_m = 0.28) is the binding one. The ladder lands exactly on this floor by construction, so a smaller gap is read by a fail-closed consumer as NOT clear and the line gets re-avoided. 0.33 satisfies both; measured on ifac and map f it costs no coverage at all (identical laid counts and drop reasons vs 0.30). Set equal to reopt_obs_margin to disable the ladder."/>
-  <arg name="reopt_apex_merge_gap" default="2.0" description="[m] apex spacing below which two obstacles are treated as ONE cluster by the re-optimizer: same side -> merged into a single hump (weaving back to the raceline between boxes 2 m apart is motion the corridor pays for twice), opposite sides -> dropped as a pair when no reach can swing between them inside the curvature budget. 0 disables the pre-pass."/>
-  <arg name="reopt_swap_min_gain" default="0.05" description="[m] a rebuilt line whose geometry differs from the ACTIVE one by less than this everywhere, and which still leaves every obstacle cleared by the floor its humps were accepted at, is not queued for a swap at all. Re-measurement noise in the obstacle positions produced rebuilds the car cannot tell from the line it is already on -- 6 of 16 swaps in one run moved the line by at most 0.054 m -- and each still costs a /global_waypoints publish and a FrenetConverter rebuild in the controller, the state machine and the planner. Same scale as the commit gate's horizon agreement tolerance, because it is the same question. 0 queues every rebuild."/>
-  <arg name="reopt_wall_gate_kernel" default="7" description="[cells] erosion kernel of the FINAL wall gate on the re-optimized line: every published point is checked against the map eroded by floor(k/2) cells before the swap is allowed. A published point is a CAR CENTRE, so this must reserve at least half a car -- 7 cells at 0.05 m/px = 0.15 m = width_car/2, matching the reactive planner body_kernel_size. It was 3 (0.05 m), i.e. the line the car follows for every lap after the swap was held to a third of the clearance the reactive planner demands of itself. Never lower it to make a refusal go away: a refusal means a hump the waypoint corridor accepted puts the car body into a wall, and on maps that ship d_left/d_right exchanged this is the only check that can see it. 0 disables the gate."/>
-  <arg name="reopt_hold_max_gap" default="8.0" description="[m] widest gap between two SAME-SIDE obstacles the re-optimized line may HOLD its offset across instead of returning to the raceline between them. Returning costs two merge inflections and a speed dip, and buys a stretch of racing line the car leaves again immediately; beyond this gap the stretch is long enough to be worth taking. The held shape is offered to the reach search as an extra CANDIDATE -- the ordinary lap-time ranking still picks the winner. 0 disables it."/>
-  <arg name="reopt_hold_kappa_max" default="0.3" description="[1/m] the hold above is only offered where the RACELINE is straight: max |kappa_clean| over the bridged span. In a corner the line between two boxes is the apex, and holding an offset across it gives that away."/>
-  <arg name="reopt_fit_tol" default="0.005" description="[m] corridor-fit tolerance of the re-optimizer. The corridor is a smoothed estimate rippling ~2 mm between stations while the amplitude cap parks the hump peak exactly on it, so a zero tolerance rejects every wide reach over a sub-mm violation and collapses the hump (ifac: reach 5.00 -> 1.24 m, +1.62 s/lap, curvlim exceeded). Spent out of reopt_wall_margin."/>
-  <arg name="reopt_grid_corridor" default="true" description="Intersect the re-optimizer's corridor with the one MEASURED in the eroded occupancy map (min(waypoint, grid)). The waypoint bounds are optimistic by 5-44 mm where a corner hump's exit ramp runs, and the final wall gate was rejecting whole bundles over it (14 of 15 live refusals). An intersection can only tighten, and a station the map cannot answer for keeps its waypoint bound. false reproduces the old corridor."/>
 
   <!-- sim -> SIM config folder, real hardware -> CAR config folder -->
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/SIM" if="$(var sim)"/>
@@ -111,26 +93,13 @@
       <env name="OMP_NUM_THREADS" value="1"/>
       <param name="map" value="$(var map)"/>
       <param name="racecar_version" value="$(var racecar_version)"/>
-      <param name="safety_width" value="$(var reopt_safety_width)"/>
-      <param name="safety_width_sp" value="$(var reopt_safety_width)"/>
-      <param name="obs_change_tol" value="$(var reopt_obs_change_tol)"/>
-      <param name="clearance_dirty_m" value="$(var reopt_clearance_dirty)"/>
-      <param name="compute_sp" value="$(var reopt_compute_sp)"/>
+      <!-- Every tuning value: stack_master/config/static_reopt_params.yaml. It was
+           twenty <arg> declarations duplicated across this file and race.launch.xml,
+           and it could not reach closed_qp's own six at all. `reopt` and
+           `reopt_method` stay arguments because those are per-run choices. There is no
+           reconfigure callback: values are read once at construction. -->
+      <param from="$(find-pkg-share stack_master)/config/static_reopt_params.yaml"/>
       <param name="reopt_method" value="$(var reopt_method)"/>
-      <param name="reach_time" value="$(var reopt_reach_time)"/>
-      <param name="reach_min" value="$(var reopt_reach_min)"/>
-      <param name="reach_max" value="$(var reopt_reach_max)"/>
-      <param name="qp_veh_width" value="$(var reopt_qp_veh_width)"/>
-      <param name="wall_margin" value="$(var reopt_wall_margin)"/>
-      <param name="obs_margin" value="$(var reopt_obs_margin)"/>
-      <param name="relax_floor" value="$(var reopt_relax_floor)"/>
-      <param name="apex_merge_gap_m" value="$(var reopt_apex_merge_gap)"/>
-      <param name="swap_min_gain_m" value="$(var reopt_swap_min_gain)"/>
-      <param name="wall_gate_kernel" value="$(var reopt_wall_gate_kernel)"/>
-      <param name="hold_max_gap_m" value="$(var reopt_hold_max_gap)"/>
-      <param name="hold_kappa_max" value="$(var reopt_hold_kappa_max)"/>
-      <param name="fit_tol" value="$(var reopt_fit_tol)"/>
-      <param name="reopt_grid_corridor" value="$(var reopt_grid_corridor)"/>
     </node>
     <node pkg="gb_optimizer" exec="static_obstacle_layer" name="static_obstacle_layer" output="screen"/>
   </group>

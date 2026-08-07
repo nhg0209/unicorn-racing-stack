@@ -104,13 +104,24 @@ def load_reactive_params():
 
 
 def load_launch_args():
+    """base_system's <arg> defaults, PLUS the re-opt tuning values under their old arg names.
+
+    The tuning left the launch files for config/static_reopt_params.yaml; the checks below were
+    written against `reopt_*` names and those names are still what a runbook or a bag search uses,
+    so the YAML is mapped back onto them here. One place makes the substitution; nothing
+    downstream had to learn about it.
+    """
     p = STACK_MASTER / "launch" / "base_system.launch.xml"
     root = ET.parse(p).getroot()
     args = {a.get("name"): a.get("default") for a in root.iter("arg")}
+    _yp, y = load_static_reopt_yaml()
+    for prm, arg in REOPT_YAML_ALIASES.items():
+        if prm in y and arg not in args:
+            args[arg] = y[prm]
     return p, args
 
 
-def check_launch_agreement() -> bool:
+def _unused_check_launch_agreement() -> bool:
     """race.launch.xml and base_system.launch.xml must agree on every reopt_* default.
 
     This exists because of a real miss: reopt_wall_margin was 0.05 in base_system.launch.xml (and
@@ -219,6 +230,17 @@ def check_closed_qp_chain(cfg, args) -> bool:
     the hump path is held to the full 0.05 and clears it by 0.070.
     """
     p, q = load_closed_reopt_defaults()
+    # The YAML is what the node actually runs on; the dataclass is only the fallback for a key it
+    # does not set (and for the offline gates, which have no ROS). Read both, let the YAML win,
+    # and say so if they disagree -- a silent divergence between the two is the whole reason this
+    # file parses source instead of trusting a comment.
+    yp, y = load_static_reopt_yaml()
+    disagree = []
+    for field, key in (("obs_margin", "closed_qp_obs_margin"), ("w_veh", "qp_veh_width")):
+        if key in y:
+            if field in q and abs(float(y[key]) - float(q[field])) > 1e-12:
+                disagree.append(f"{field}: {p.name} {q[field]} vs {yp.name} {y[key]}")
+            q[field] = float(y[key])
     if not q:
         print(f"\nclosed_qp chain: could not read ReoptParams from {p} — SKIPPED")
         return True
@@ -227,7 +249,9 @@ def check_closed_qp_chain(cfg, args) -> bool:
                  + float(cfg.get("clear_hyst_m", 0.0)))
     delivers = q.get("obs_margin", 0.0) + q.get("w_veh", width_car) / 2.0
     head = delivers - idle_need
-    print(f"\nclosed_qp chain ({p.name} ReoptParams — a dataclass default, not a launch arg):")
+    print(f"\nclosed_qp chain ({yp.name}, with {p.name}'s ReoptParams as the fallback):")
+    for d in disagree:
+        print(f"  NOTE: {d} — the YAML wins at runtime")
     print(f"  delivers   obs_margin + w_veh/2 = {q.get('obs_margin', 0.0):.3f} + "
           f"{q.get('w_veh', width_car) / 2:.3f} = {delivers:.3f} m")
     print(f"  must beat  reactive IDLE entry = width_car/2 + clear_margin_m + clear_hyst_m = "
@@ -263,6 +287,89 @@ def check_closed_qp_chain(cfg, args) -> bool:
         return False
     print(f"  OK: a claimed box is published far enough out for the reactive layer to stay idle.")
     return True
+
+
+# node parameter -> the reopt_* launch arg it used to be declared as. The rules below were all
+# written against the arg names, and they are still the names people search for in a bag or a
+# runbook, so the names survive the move even though the source did not.
+REOPT_YAML_ALIASES = {
+    "safety_width": "reopt_safety_width", "obs_change_tol": "reopt_obs_change_tol",
+    "clearance_dirty_m": "reopt_clearance_dirty", "compute_sp": "reopt_compute_sp",
+    "reach_time": "reopt_reach_time", "reach_min": "reopt_reach_min",
+    "reach_max": "reopt_reach_max", "qp_veh_width": "reopt_qp_veh_width",
+    "wall_margin": "reopt_wall_margin", "obs_margin": "reopt_obs_margin",
+    "relax_floor": "reopt_relax_floor", "apex_merge_gap_m": "reopt_apex_merge_gap",
+    "swap_min_gain_m": "reopt_swap_min_gain", "wall_gate_kernel": "reopt_wall_gate_kernel",
+    "hold_max_gap_m": "reopt_hold_max_gap", "hold_kappa_max": "reopt_hold_kappa_max",
+    "fit_tol": "reopt_fit_tol", "reopt_grid_corridor": "reopt_grid_corridor",
+}
+STATIC_REOPT_NODE = "static_reopt_node"
+
+
+def load_static_reopt_yaml():
+    """(path, {param: value}) from config/static_reopt_params.yaml, under the node-name key.
+
+    THE SOURCE OF TRUTH for every re-opt tuning value since they left the launch files. If the
+    top-level key does not match the node name in base_system.launch.xml, ROS silently ignores
+    the whole file and the node runs on declare_parameter defaults -- which is exactly the failure
+    check_declare_yaml_symmetry() below exists to make loud.
+    """
+    p = STACK_MASTER / "config" / "static_reopt_params.yaml"
+    if not p.is_file():
+        return p, {}
+    d = yaml.safe_load(p.read_text()) or {}
+    return p, (d.get(STATIC_REOPT_NODE) or {}).get("ros__parameters", {}) or {}
+
+
+def load_reopt_declared_names():
+    """Every parameter name static_reopt_node declares, whatever the default LOOKS like.
+
+    load_reopt_node_defaults() only matches numeric literals -- it exists to compare VALUES. The
+    symmetry check needs names, and the ones most likely to be typo'd are exactly the ones that
+    regex misses: booleans, strings, and the closed_qp block whose defaults are expressions.
+    """
+    p = (STACK_MASTER.parent / "planner" / "gb_optimizer" / "gb_optimizer" / "static_reopt_node.py")
+    if not p.is_file():
+        return p, set()
+    return p, set(re.findall(r'self\.declare_parameter\(\s*"([A-Za-z_0-9]+)"', p.read_text()))
+
+
+def check_declare_yaml_symmetry() -> bool:
+    """Every reopt parameter the node declares is in the YAML, and every YAML key is declared.
+
+    This replaces the old race/base_system agreement check, whose subject no longer exists: with
+    one source there is nothing to disagree. The failure it was really guarding against does
+    survive the move, though -- a name that does not match falls back to a default in silence.
+    One character wrong in either file and the node runs on a number nobody chose.
+
+    Per-run values (map, racecar_version, reopt_method) are launch arguments by design and are
+    excluded.
+    """
+    p, y = load_static_reopt_yaml()
+    node_path, node_def = load_reopt_declared_names()
+    print(f"\n--- declare/YAML symmetry ({p.name} <-> {node_path.name}) ---")
+    if not y:
+        print(f"FAIL: {p.name} has no '{STATIC_REOPT_NODE}: ros__parameters:' block -- the node "
+              f"would silently run on its declare_parameter defaults.")
+        return False
+    launch_owned = {"map", "racecar_version", "reopt_method"}
+    declared = set(node_def) - launch_owned
+    in_yaml = set(y) - launch_owned
+    missing = sorted(k for k in in_yaml if k not in declared)
+    ok = True
+    if missing:
+        ok = False
+        print(f"FAIL: {len(missing)} YAML key(s) the node never declares -- silently ignored: "
+              f"{', '.join(missing)}")
+    # a declared parameter absent from the YAML is legal (it keeps its node default) but the
+    # tuning-relevant ones should be visible in one place, so name them rather than assert
+    absent = sorted(k for k in declared if k not in in_yaml)
+    if absent:
+        print(f"NOTE: {len(absent)} declared parameter(s) not in the YAML, running on the node's "
+              f"own default: {', '.join(absent)}")
+    if ok:
+        print(f"OK: all {len(in_yaml)} YAML key(s) are declared by the node.")
+    return ok
 
 
 def load_reopt_arg_bindings():
@@ -842,7 +949,7 @@ def main() -> int:
         ok = False
     if not check_dynamic_chain(sm_path, sm):
         ok = False
-    if not check_launch_agreement():
+    if not check_declare_yaml_symmetry():
         ok = False
 
     # WHICH CHAIN IS ACTUALLY ENFORCED. Everything above holds the HUMP path's floor; the closed
