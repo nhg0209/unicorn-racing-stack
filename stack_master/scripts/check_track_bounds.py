@@ -15,6 +15,14 @@ of the local tangent (the same left-positive convention the stack uses for d).
 
     python3 check_track_bounds.py f              # report only
     python3 check_track_bounds.py f --fix        # swap the labels back (writes .bak first)
+
+--fix IS NOT A FULL REPAIR. The exchanged widths do not just sit in the json: write_centerline
+feeds them to the trajectory optimizer, so the RACELINE ITSELF was optimized inside a mirrored
+corridor. Relabelling makes avoidance work again -- the corridor the planners read is finally the
+right way round -- but the line through it is still the product of the wrong one. A map that
+reports SWAPPED should be REGENERATED once the generator is fixed (global_planner_node now assigns
+sides from the centerline's own geometry, planner/gb_optimizer/gb_optimizer/track_bounds.py);
+--fix is the stopgap for a map you cannot regenerate right now.
     python3 check_track_bounds.py --all          # report on every map
 
 --fix swaps d_left<->d_right in every waypoint array of global_waypoints.json and the
@@ -34,72 +42,16 @@ import cv2
 import numpy as np
 import yaml
 
+# The SAME geometry global_planner_node labels the bounds with. Shared on purpose: while the
+# generator and this checker carried separate logic, the checker could be right and the generator
+# wrong -- which is exactly what shipped on maps f and ifac_0807.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                '..', 'planner', 'gb_optimizer'))
+from gb_optimizer.track_bounds import (load_contours, score,  # noqa: E402,F401
+                                       truth_left_right)
+
 MAPS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'maps')
 WPNT_KEYS = ('centerline_waypoints', 'global_traj_wpnts_iqp', 'global_traj_wpnts_sp')
-
-
-def load_contours(map_dir, name):
-    """The two track contours in metres: (outer, inner). Raises if the map is not a clean ring."""
-    info = yaml.safe_load(open(os.path.join(map_dir, f'{name}.yaml')))
-    img_path = os.path.join(map_dir, info['image'])
-    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        raise IOError(f'cannot read {img_path}')
-    res = float(info['resolution'])
-    ox, oy = float(info['origin'][0]), float(info['origin'][1])
-    height = img.shape[0]
-    cnts, _ = cv2.findContours((img > 250).astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-    cnts = sorted(cnts, key=len, reverse=True)
-    if len(cnts) < 2:
-        raise IOError(f'{name}: expected 2 free-space contours, found {len(cnts)}')
-
-    def to_m(c):
-        return np.stack([c[:, 0, 0] * res + ox, (height - 1 - c[:, 0, 1]) * res + oy], 1)
-    return to_m(cnts[0]), to_m(cnts[1])
-
-
-def truth_left_right(pts, i, outer, inner):
-    """(left_dist, right_dist) at pts[i], from the contours, via the left normal of the tangent."""
-    n = len(pts)
-    ax, ay = pts[(i + 3) % n]
-    bx, by = pts[(i - 3) % n]
-    tx, ty = ax - bx, ay - by
-    m = math.hypot(tx, ty)
-    if m < 1e-9:
-        return None
-    tx, ty = tx / m, ty / m
-    lx, ly = -ty, tx                       # left normal (left of travel)
-    px, py = pts[i]
-
-    def nearest(cont):
-        d = cont - np.array([px, py])
-        dist = np.hypot(d[:, 0], d[:, 1])
-        j = int(np.argmin(dist))
-        return float(d[j, 0] * lx + d[j, 1] * ly), float(dist[j])
-    s_out, d_out = nearest(outer)
-    s_in, d_in = nearest(inner)
-    return (d_out if s_out > 0 else d_in), (d_out if s_out < 0 else d_in)
-
-
-def score(pts, left_vals, right_vals, outer, inner, step_target=120):
-    """How many sampled points match the stored labelling vs the swapped one."""
-    n = len(pts)
-    step = max(1, n // step_target)
-    n_ok = n_swap = n_amb = 0
-    for i in range(0, n, step):
-        t = truth_left_right(pts, i, outer, inner)
-        if t is None:
-            continue
-        t_l, t_r = t
-        e_ok = abs(left_vals[i] - t_l) + abs(right_vals[i] - t_r)
-        e_sw = abs(left_vals[i] - t_r) + abs(right_vals[i] - t_l)
-        if abs(e_ok - e_sw) < 0.05:
-            n_amb += 1
-        elif e_ok < e_sw:
-            n_ok += 1
-        else:
-            n_swap += 1
-    return n_ok, n_swap, n_amb
 
 
 def read_centerline(path):

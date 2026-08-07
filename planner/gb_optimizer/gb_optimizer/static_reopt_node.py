@@ -66,6 +66,7 @@ from grid_filter.grid_filter import GridFilter
 from .readwrite_global_waypoints import read_global_waypoints
 from . import static_reopt_core as core
 from . import closed_reopt_bridge as cqb
+from . import track_bounds
 
 # [m] line-centre to obstacle EDGE: what the REACTIVE layer needs to see before it will go (and
 # stay) idle about a box -- width_car/2 + clear_margin_m + clear_hyst_m from
@@ -310,6 +311,7 @@ class StaticReoptNode(Node):
         if not self.map_name:
             raise RuntimeError("static_reopt_node requires the 'map' parameter")
         self.clean_bundle = self._load_clean_bundle(self.map_name)
+        self._warn_if_bounds_swapped()
         self.reftrack = core.load_reftrack(
             os.path.join(get_package_share_directory("stack_master"), "maps",
                          self.map_name, "centerline.csv"))
@@ -562,6 +564,36 @@ class StaticReoptNode(Node):
     # ----------------------------------------------------------------------------------
     # bundle construction
     # ----------------------------------------------------------------------------------
+    def _warn_if_bounds_swapped(self) -> None:
+        """Once, at startup: does this map's d_right/d_left match its own geometry?
+
+        A map whose labels are exchanged makes every corridor in this node mirror-imaged, so a
+        box on the straight comes back "neither side fits" and no re-optimization happens at all
+        -- which is how it was found. Maps f and ifac_0807 both shipped that way and nothing said
+        so at runtime, because the only checker was a manual script wired to no gate.
+
+        WARN, never block: refusing to start over a labelling defect is worse than driving with a
+        loud log, and the reactive layer still works. The same measurement is
+        stack_master/scripts/check_track_bounds.py.
+        """
+        try:
+            gw = self.clean_bundle.glb_wpnts.wpnts
+            v, n_ok, n_sw, _amb = track_bounds.verdict(
+                [[w.x_m, w.y_m] for w in gw], [w.d_right for w in gw], [w.d_left for w in gw],
+                os.path.join(get_package_share_directory("stack_master"), "maps", self.map_name),
+                self.map_name)
+        except Exception as e:                     # a diagnostic must never stop the node
+            self.get_logger().debug(f"[static_reopt] bounds check unavailable: {e}")
+            return
+        if v == "SWAPPED":
+            self.get_logger().error(
+                f"[static_reopt] MAP '{self.map_name}' SHIPS WITH d_right/d_left EXCHANGED "
+                f"({n_sw} sampled stations against {n_ok}). Every corridor this node derives is "
+                f"mirrored, so obstacles on one side read as unavoidable and no line is built for "
+                f"them. Relabel with stack_master/scripts/check_track_bounds.py --fix -- but the "
+                f"RACELINE itself was optimized through the mirrored corridor, so it needs "
+                f"regenerating to be correct.")
+
     def _load_clean_bundle(self, map_name: str) -> _Bundle:
         (map_info, est, cent_m, cent_w, glb_m, glb_w, sp_m, sp_w, bounds) = read_global_waypoints(map_name)
         return _Bundle(map_info, est, cent_w, cent_m, glb_w, glb_m, sp_w, sp_m, bounds)

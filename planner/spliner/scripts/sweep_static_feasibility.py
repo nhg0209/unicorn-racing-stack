@@ -225,13 +225,27 @@ def main():
 
     H = Harness(a.map)
     fails = []
-    # check_track_bounds.py --all exits 1 today: map f ships with d_left/d_right SWAPPED on 402
-    # stations against 0 correct, in all four of its waypoint sets. The corridor, the sampled
-    # terminal offsets and the obstacle keep-out sides in this sweep all come from those bounds,
-    # so a run on that map describes a mirrored track rather than this code. ifac is clean.
-    if a.map in ("f",):
-        print(f"  !! WARNING: map {a.map} ships with d_left/d_right SWAPPED "
-              f"(check_track_bounds.py --all). These numbers are not evidence about the planner.")
+    # MEASURED PER MAP, not looked up. This was `if a.map in ("f",)` -- a hardcoded literal, so
+    # ifac_0807 arrived with the same defect and the warning stayed silent for it. The corridor,
+    # the sampled terminal offsets and the obstacle keep-out sides all come from those bounds, so
+    # a run on such a map describes a mirrored track rather than this code.
+    try:
+        import json as _json
+        _sr = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "..", "..", ".."))
+        sys.path.insert(0, os.path.join(_sr, "planner", "gb_optimizer"))
+        from gb_optimizer import track_bounds as _tb
+        _d = os.path.join(_sr, "stack_master", "maps", a.map)
+        _wp = _json.load(open(os.path.join(_d, "global_waypoints.json")))[
+            "global_traj_wpnts_iqp"]["wpnts"]
+        _v, _ok, _sw, _ = _tb.verdict([[w["x_m"], w["y_m"]] for w in _wp],
+                                      [w["d_right"] for w in _wp], [w["d_left"] for w in _wp],
+                                      _d, a.map)
+        if _v == "SWAPPED":
+            print(f"  !! WARNING: map {a.map} ships with d_left/d_right SWAPPED ({_sw} stations "
+                  f"against {_ok}). These numbers are not evidence about the planner.")
+    except Exception:
+        pass
 
     # --- feasibility + superset ------------------------------------------------------------
     cells = {}

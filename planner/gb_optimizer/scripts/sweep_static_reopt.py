@@ -52,6 +52,7 @@ _STACK_ROOT = os.path.abspath(os.path.join(_THIS, "..", "..", ".."))
 sys.path.insert(0, os.path.abspath(os.path.join(_THIS, "..")))       # for `gb_optimizer`
 
 from gb_optimizer import static_reopt_core as core                   # noqa: E402
+from gb_optimizer import track_bounds                                # noqa: E402
 
 # The reactive apex this sweep simulates: an obstacle sitting ON the raceline forces the reactive
 # planner out by obstacle radius + keep-out (width_car/2 + safety_margin) + apex_bulge. With the
@@ -682,21 +683,31 @@ def check_multi(maps, cfg_dir, wall_margin, fit_tol, per_apex_s, enforce_laptime
     return ok
 
 
-SWAPPED_BOUNDS_MAPS = {"f"}   # see stack_master/scripts/check_track_bounds.py --all
-
-
 def _warn_if_bounds_swapped(name):
     """Say so, loudly, when a map's own d_left/d_right are the wrong way round.
 
-    check_track_bounds.py --all exits 1 today because map f ships SWAPPED on 402 stations against
-    0 correct, in all four of its waypoint sets. Every corridor in this sweep is derived from
-    those bounds, so a run on that map measures a mirrored track: it is not evidence about the
-    code under test. ifac and map_test are clean.
+    MEASURED PER MAP, not looked up. This was `SWAPPED_BOUNDS_MAPS = {"f"}` -- a hardcoded
+    literal, so map ifac_0807 arrived with the same defect (461 stations against 1) and this
+    warning stayed silent for it. Every corridor in this sweep is derived from those bounds, so a
+    run on such a map measures a mirrored track and is not evidence about the code under test.
     """
-    if name in SWAPPED_BOUNDS_MAPS:
+    try:
+        d = os.path.join(_STACK_ROOT, "stack_master", "maps", name)
+        wp = json.load(open(os.path.join(d, "global_waypoints.json")))["global_traj_wpnts_iqp"]["wpnts"]
+        pts = [[w["x_m"], w["y_m"]] for w in wp]
+        v, n_ok, n_sw, _amb = track_bounds.verdict(pts, [w["d_right"] for w in wp],
+                                                   [w["d_left"] for w in wp], d, name)
+    except Exception as exc:                       # a diagnostic must never stop the sweep
+        print(f"  (bounds check unavailable for {name}: {type(exc).__name__})")
+        return
+    if v == "SWAPPED":
         print(f"  !! WARNING: map {name} ships with d_left/d_right SWAPPED "
-              f"(check_track_bounds.py --all: 402 stations vs 0). Every corridor below is derived "
-              f"from those bounds, so these numbers describe a mirrored track, not this code.")
+              f"({n_sw} stations against {n_ok}). Every corridor below is derived from those "
+              f"bounds, so these numbers describe a mirrored track, not this code. "
+              f"stack_master/scripts/check_track_bounds.py --fix relabels it, but the RACELINE "
+              f"was optimized through the mirrored corridor and needs regenerating.")
+    elif v == "unknown":
+        print(f"  (bounds check could not read map {name} as a ring -- unverified)")
 
 
 def main() -> int:
