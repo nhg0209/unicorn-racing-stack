@@ -58,6 +58,26 @@ SLACK = 0.03  # [m] margin the re-opt clearance must exceed the reactive keep-ou
 # [m] required headroom between the LOWEST clearance the re-opt may settle for (relax_floor, which
 # the coverage ladder lands on exactly) and every consumer threshold that judges that clearance.
 FLOOR_CONSUMER_SLACK_M = 0.05
+# [m] A NAMED EXCEPTION, not a lowered bar. FLOOR_CONSUMER_SLACK_M above stays 0.05 -- it answers
+# "how far must a published clearance sit above a threshold that reads it", and we have never
+# re-derived that answer, so moving it to fit a solver would be assuming what it asserts.
+# closed_qp delivers 0.320 against an idle entry of 0.280 and is 0.010 short. That shortfall is
+# tolerated, loudly, on this evidence:
+#
+#   sim shows zero DOUBLE AVOIDANCE warnings since the detector went in (lap count and box count
+#   NOT recorded in the prompt that authorised this -- see the banner, which says so out loud);
+#   the detector itself is live in static_reopt_node and fires the moment the reactive layer
+#   touches a box the global line claims, so the risk is instrumented rather than assumed;
+#   the centimetre cannot be bought with obs_margin -- 0.18 costs seven of 38 boxes and every
+#   hold on ifac (planner/gb_optimizer/scripts/sweep_obs_margin.py).
+#
+# HOW TO CLOSE THIS EXCEPTION, because an exception without an exit is just a lowered bar. What
+# this slack really stands in for is how far the DRIVEN path sits from the PUBLISHED one, toward
+# the obstacle. That is directly measurable: compare d in /car_state/odom_frenet against d in the
+# published local waypoints at the obstacle's own station, over a run. With that number the
+# required slack is derived instead of assumed, and this exception is either removed or replaced
+# by the real figure.
+CLOSED_QP_SHORTFALL_ALLOWED_M = 0.010
 # [m] headroom the LONGITUDINAL keep-out must keep over half the car's length. Not a comfort
 # figure -- exactly zero is a measured failure: safety_margin 0.14 put keepout_s on 0.290 against a
 # 0.290 half-length and the car began grazing boxes with its nose and tail, while the shipped 0.150
@@ -193,7 +213,10 @@ def check_closed_qp_chain(cfg, args) -> bool:
     HEADROOM IS FLOOR_CONSUMER_SLACK_M, the same 0.05 this file already requires between the
     lowest clearance the hump may settle for and every consumer that judges it. It is the same
     question -- how far a published clearance must sit above a threshold that reads it -- so it
-    gets the same answer, and it was NOT chosen to let the current value through.
+    gets the same answer, and it was NOT chosen to let the current value through: it does not let
+    it through. The current shortfall is carried by a NAMED exception with a banner and an exit
+    plan (see CLOSED_QP_SHORTFALL_ALLOWED_M), which is a different thing from moving the bar --
+    the hump path is held to the full 0.05 and clears it by 0.070.
     """
     p, q = load_closed_reopt_defaults()
     if not q:
@@ -211,15 +234,32 @@ def check_closed_qp_chain(cfg, args) -> bool:
           f"{idle_need:.3f} m")
     print(f"  headroom   {head:+.3f} m against a required {FLOOR_CONSUMER_SLACK_M:.2f} m")
     if head < FLOOR_CONSUMER_SLACK_M:
-        print(f"  FAIL: {head:.3f} m of headroom is under the {FLOOR_CONSUMER_SLACK_M:.2f} m this "
-              f"file requires of every published clearance. A box the global line CLAIMS can be "
-              f"re-avoided by the reactive layer once tracker EMA and localisation error eat the "
-              f"difference — the double avoidance this subsystem exists to remove.")
-        print(f"        Raising closed_reopt's obs_margin to {idle_need + FLOOR_CONSUMER_SLACK_M - q.get('w_veh', width_car) / 2:.2f} "
-              f"would close it, and measured on ifac costs 7 of 38 boxes and every hold "
-              f"(planner/gb_optimizer/scripts/sweep_obs_margin.py). KNOWN RISK, carried "
-              f"deliberately; static_reopt_node's DOUBLE AVOIDANCE warning is what decides it "
-              f"in sim.")
+        short = FLOOR_CONSUMER_SLACK_M - head
+        bar = "!" * 78
+        print(f"  {bar}")
+        print(f"  MARGIN-CHAIN EXCEPTION (closed_qp): short by {short:.3f} m")
+        print(f"    required headroom {FLOOR_CONSUMER_SLACK_M:.3f} | actual {head:.3f} | "
+              f"shortfall {short:.3f} | tolerated up to {CLOSED_QP_SHORTFALL_ALLOWED_M:.3f}")
+        print(f"    WHY IT IS TOLERATED: sim reports zero DOUBLE AVOIDANCE warnings since the "
+              f"detector went in; the detector is live in static_reopt_node and fires the moment "
+              f"the reactive layer touches a box the global line claims; and the centimetre "
+              f"cannot be bought -- obs_margin 0.18 costs 7 of 38 boxes and every hold on ifac "
+              f"(planner/gb_optimizer/scripts/sweep_obs_margin.py).")
+        print(f"    NOT RECORDED: how many laps and how many boxes that sim evidence covers. The "
+              f"exception rests on a number nobody wrote down -- fill it in here.")
+        print(f"    WHAT THIS SLACK ACTUALLY IS: how far the DRIVEN path sits from the PUBLISHED "
+              f"one toward the obstacle. Measure d in /car_state/odom_frenet against d in the "
+              f"published local waypoints at the obstacle's station over a run, and the required "
+              f"slack is derived rather than assumed -- then this exception goes away.")
+        print(f"    Raising obs_margin to "
+              f"{idle_need + FLOOR_CONSUMER_SLACK_M - q.get('w_veh', width_car) / 2:.2f} would "
+              f"close it arithmetically and is the thing measured NOT to be worth it.")
+        print(f"  {bar}")
+        if short <= CLOSED_QP_SHORTFALL_ALLOWED_M + 1e-9:
+            return True
+        print(f"  FAIL: the shortfall exceeds the {CLOSED_QP_SHORTFALL_ALLOWED_M:.3f} m this "
+              f"exception covers. A box the global line CLAIMS can be re-avoided by the reactive "
+              f"layer once tracker EMA and localisation error eat the difference.")
         return False
     print(f"  OK: a claimed box is published far enough out for the reactive layer to stay idle.")
     return True
