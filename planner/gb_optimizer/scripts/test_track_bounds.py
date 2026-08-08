@@ -79,9 +79,16 @@ def test_reversing_the_centerline_swaps_the_sides(name):
     assert np.array_equal(l_fwd, r_rev)
 
 
-def test_the_two_known_bad_maps_are_still_detected():
-    """The shipped labels on f and ifac_0807 disagree with the geometry, and ifac's agree. If this
-    ever flips to 'ok' without the map being regenerated, the detector broke, not the map."""
+def test_the_known_bad_map_is_still_detected():
+    """f still ships with d_left/d_right disagreeing with its geometry; ifac and ifac_0807 agree.
+
+    ifac_0807 USED TO BE in the swapped list and is not any more -- it was regenerated (127
+    swapped stations against 0 at the commit this test was written, 0 against 124 now). That is
+    the map being fixed, not the detector breaking, so the expectation moves with it rather than
+    the test being deleted: f is what still exercises the positive case, and ifac_0807 has joined
+    ifac in exercising the negative one. If f ever reads 'ok' without being regenerated, THAT is
+    the detector breaking.
+    """
     seen = {}
     for name in ("ifac", "f", "ifac_0807"):
         d = os.path.join(MAPS, name)
@@ -91,10 +98,11 @@ def test_the_two_known_bad_maps_are_still_detected():
         a, b = load_contours(d, name)
         n_ok, n_sw, _amb = score(pts, wl, wr, a, b)
         seen[name] = "SWAPPED" if n_sw > n_ok else "ok"
-    assert seen.get("ifac") == "ok"
-    for bad in ("f", "ifac_0807"):
-        if bad in seen:
-            assert seen[bad] == "SWAPPED", f"{bad} reads {seen[bad]} -- regenerated, or detector broken"
+    for good in ("ifac", "ifac_0807"):
+        if good in seen:
+            assert seen[good] == "ok", f"{good} reads {seen[good]} -- regressed, or detector broken"
+    if "f" in seen:
+        assert seen["f"] == "SWAPPED", "f reads ok -- regenerated, or detector broken"
 
 
 def test_verdict_never_raises_on_a_bad_map_dir():
