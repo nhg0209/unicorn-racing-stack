@@ -374,6 +374,40 @@ static_avoidance_planner:
     # re-plan this trigger causes records the box as shaped and it cannot fire twice.
     commit_replan_gap_m: 7.0
 
+    # --- which shape carries the sampled terminal offset -----------------------------------
+    # sample      the quintic hump: raceline -> apex -> raceline, with the corridor consulted at the
+    #             obstacle's own station and along the two outer ramps. This is what ships.
+    # corridor_qp minimum bending inside the measured corridor, solved once per candidate over the
+    #             WHOLE span the maneuver owns -- entry ramp, every apex, the inter-apex weave and
+    #             the return -- with the keep-out of each shaped box and the terminal d = 0 folded
+    #             into the bounds. Knots, sides, apex offsets, lookahead and every gate afterwards
+    #             are the sampled path's, unchanged; only d(s) is re-decided.
+    #
+    # WHY THE OPTION EXISTS, in one line each (planner/spliner/RAMP_CEILING_NOTE.md):
+    #   67 % of the rejections that a corridor could fix sit in the inter-apex weave -- the one
+    #   segment nothing scans; the two ramps together are 11 %. The ceiling for re-deciding the
+    #   whole span, answering every gate the node runs, is 25.6 % / 35.1 % of ALL refusals.
+    # WHAT IT COSTS: the corridor-decided shape is more curved than a quintic through the same
+    #   apex, so its curvature-limited speed is lower. A slower real path where there was no path
+    #   is the trade; a refusal is a TRAILING standstill behind a stationary box.
+    # DEFAULT sample UNTIL SIM SAYS OTHERWISE. Every number for corridor_qp so far is offline.
+    static_plan_method: "sample"     # sample | corridor_qp
+    # corridor_qp: weight on ||d||^2 against ||d''||^2 in the objective. NOT a fraction -- the
+    # bending block carries 1/ds^4, which is 1e4 at the 0.1 m publishing grid, so this is only felt
+    # in the hundreds. 0 = pure minimum bending, which the terminal pins already keep bounded.
+    corridor_qp_w_dev: 0.0
+    # corridor_qp: hold the apex bands at the quintic's own values instead of letting the keep-out
+    # bounds decide them. Side selection and keep-out are ALREADY in the bounds, so the corridor
+    # forces the apex offset on its own and pinning the value as well over-constrains a run whose
+    # two ends are pinned already. Kept so the two formulations can be measured against each other
+    # (sweep_static_race.py --method corridor_qp --pin-apex).
+    corridor_qp_pin_apex: false
+    # corridor_qp: control points per solve. The BOUNDS are enforced at every published station
+    # whatever this is, so lowering it costs expressiveness and never costs feasibility. A three-box
+    # maneuver is 200+ stations at 0.1 m and the solve runs once per candidate inside a 20 Hz cycle;
+    # 60 keeps that at ~0.6 ms.
+    corridor_qp_max_vars: 60
+
     # --- cost weights  J = w_d*Σ|d| + w_k*Σκ² + w_c*|d_end-d_end_prev| + w_obs*Σexp(-dist/σ) ---
     w_d: 1.0                # raceline deviation
     w_k: 0.1                # curvature (smoothness)

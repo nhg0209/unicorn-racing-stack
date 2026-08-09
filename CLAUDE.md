@@ -47,6 +47,15 @@ system python3 has no trajectory_planning_helpers.
   `~/miniforge3/envs/unicorn/bin/python3 planner/gb_optimizer/scripts/test_static_reopt_node.py` (25 checks: the swap/publish/concurrency safety machinery, named per check in its docstring),
   `.../test_static_obstacle_layer.py`, `perception/scripts/test_static_classification.py`, `.../test_save_yaml_roundtrip.py`
 - Reopt geometry: `~/miniforge3/envs/unicorn/bin/python3 planner/gb_optimizer/scripts/gate_closed_reopt.py --check` (C1-C9 + the node contract; exit code). This replaced `sweep_static_reopt.py --check` as the reopt regression gate when the hump went — that script's five checks were all hump geometry. Margin sweep: `sweep_obs_margin.py`; raceline curvature sweep: `sweep_raceline_curvlim.py`.
-- Static-avoidance feasibility on the real map: `~/miniforge3/envs/unicorn/bin/python3 planner/spliner/scripts/sweep_static_feasibility.py --check` (~4 min)
+- Static-avoidance feasibility on the real map: `~/miniforge3/envs/unicorn/bin/python3 planner/spliner/scripts/sweep_static_feasibility.py --check` (~4 min).
+  Its CORNER-CELL count is WALL-CLOCK GATED (the ladder runs under ramp_search_max_ms), so it is not
+  reproducible to the cell: measured five times on unchanged code it reads 55-58 of 99 on ifac. Read
+  a difference of two as noise; the unbudgeted count (67 on ifac, 18 on ifac_0807) is the geometry's
+  own answer and does not move.
+- Which d(s) generator: `static_plan_method` in static_avoidance_params.yaml, `sample` (ships) or
+  `corridor_qp` (planner/spliner/spliner/corridor_path.py, pure numpy/scipy/quadprog, no ROS).
+  Compare them on the same cells: `sweep_static_race.py --method all` (R1-R4; take timings at
+  `--jobs 1`, they are wall clock). The QP module's own checks: `planner/spliner/test/test_corridor_path.py`.
+  See planner/spliner/CORRIDOR_QP_NOTE.md for what each number means and which of them is a trade.
 - NOT collected by pytest and not gates: `planner/lane_change_planner/scripts/probe_grid_corridor.py` is a diagnostic that prints tables. The pep257/flake8/copyright suites under state_estimation, TODO/ and race_utils/ error out on collection and are not part of any gate.
 - Sim: stack_master/STATIC_AVOIDANCE_TEST_RUNBOOK.md (S1–S5). Never claim "verified" without running the gate; paste actual output.

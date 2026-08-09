@@ -145,14 +145,26 @@ def _d_ends(cap_args, P, extra):
     return d
 
 
-def run(H, i, gap, cur_d, boxes, dense_d=False, dense_ramp=False):
+def run(H, i, gap, cur_d, boxes, dense_d=False, dense_ramp=False, ladder=True, max_ms=None):
     """One planning attempt. Returns a dict; `ok` is whether a path came out.
 
     dense_d / dense_ramp turn on the two oracle axes independently, which is what separates
-    "the node looked in too few places" from "the node had the wrong ramp lengths"."""
+    "the node looked in too few places" from "the node had the wrong ramp lengths".
+
+    `ladder`/`max_ms` are for the COST question only. Every feasibility number this campaign has
+    reported was taken with the ladder on and unbudgeted (see Harness.cell), and the defaults keep
+    it that way; asking what ONE pass costs means turning the retries off, which is a different
+    question and has to be a different call."""
     cap = _Cap()
-    n = H.make_node(i, gap, cur_d, ladder=True, boxes=boxes)
+    n = H.make_node(i, gap, cur_d, ladder=ladder, max_ms=max_ms, boxes=boxes)
     n.get_logger = lambda: cap
+    # s_entry0 of the SELECTED candidate, which is the one splice in the published profile (the
+    # pre-ramp decay joins the maneuver there). It is already an argument of _store_commit, so
+    # recording it needs no line in the planner. commit_enable gates nothing else on a one-shot
+    # cell: the reuse branch needs _committed, and this recorder deliberately stores nothing.
+    seam = {}
+    n.commit_enable = True
+    n._store_commit = lambda *a, **k: seam.update(s_entry0=k.get("s_entry0"))
     if dense_ramp:
         n.ramp_search_entry_m = list(DENSE_ENTRY)
         n.ramp_search_exit_m = list(DENSE_EXIT)
@@ -180,7 +192,13 @@ def run(H, i, gap, cur_d, boxes, dense_d=False, dense_ramp=False):
     ok = res is not None and res[0] is not None and len(res[0].wpnts) > 0
     out = {"ok": ok, "err": None, "ms": ms, "log": cap, "reject": cap.nofeas(),
            "squeeze": bool(ok and res[0].ot_line == "squeeze"), "ramp": cap.ladder(),
-           "d_grid": None, "d_sel": None, "n_sampled": None}
+           "d_grid": None, "d_sel": None, "n_sampled": None, "d_pub": None, "kappa_pub": None,
+           "s_entry0": seam.get("s_entry0")}
+    if ok:
+        # The PUBLISHED profile, not a candidate: what the seam-continuity and curvature-speed
+        # questions are actually about is the array the controller receives.
+        out["d_pub"] = np.array([w.d_m for w in res[0].wpnts])
+        out["kappa_pub"] = np.array([w.kappa_radpm for w in res[0].wpnts])
     if grabs["gate"]:
         first, extra0 = grabs["gate"][0]
         out["d_grid"] = _d_ends(first, H.P, extra0)

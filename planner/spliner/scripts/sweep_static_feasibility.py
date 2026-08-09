@@ -210,6 +210,11 @@ class Harness:
         self.last_exc = None     # cell() swallows exceptions to keep a sweep going; keep the last
         self.cur_vs = 3.0        # see _node: this is the squeeze gate as well as the lookahead
         self.force_relax = False  # emulate a live /planner/avoidance/relax request
+        # d(s) generator, or None for whatever the yaml ships. An OVERRIDE, not a second source:
+        # every other planner value still comes from the yaml, so a sweep that sets nothing here
+        # measures exactly the shipped configuration.
+        self.plan_method = None
+        self.pin_apex = None
 
     def _node(self, cur_d, ladder):
         san = self.san
@@ -262,6 +267,10 @@ class Harness:
         # has already reported stays reproducible, and made settable so the other side of that
         # threshold can be measured rather than assumed.
         n.cur_vs, n.cur_d = self.cur_vs, cur_d
+        if self.plan_method is not None:
+            n.static_plan_method = str(self.plan_method)
+        if self.pin_apex is not None:
+            n.corridor_qp_pin_apex = bool(self.pin_apex)
         return n
 
     OBS_HALF = 0.15                       # [m] box half-extent, in s and in d

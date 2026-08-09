@@ -27,6 +27,26 @@ from transforms3d.euler import quat2euler
 from grid_filter.grid_filter import GridFilter
 import trajectory_planning_helpers as tph
 
+# The corridor QP, loaded AS A SIBLING FILE rather than as `spliner.corridor_path`.
+# Every offline gate in this repo runs this node by exec'ing its source with no build (CLAUDE.md:
+# the user builds manually), and a package import there resolves against the INSTALL space -- so it
+# either fails outright, or, worse, succeeds and pairs source planner code with a stale solver. The
+# file beside this one is the matching one by construction, in the source tree and in the install
+# space alike. A plain `from spliner.corridor_path import ...` is what belongs here and is exactly
+# what cannot be trusted.
+def _load_corridor_path():
+    import importlib.util
+    import os
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "corridor_path.py")
+    spec = importlib.util.spec_from_file_location("spliner_corridor_path", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_corridor_path = _load_corridor_path()
+cut_keepout, solve_corridor_path = _corridor_path.cut_keepout, _corridor_path.solve_corridor_path
+
 # --- Evasion path kappa smoothing ---
 # [s] how old the last published path may be and still be blended onto. Not a tuning knob: the
 # loop runs at 20 Hz, so this is five cycles -- past that the "previous reference" is not what the
@@ -88,6 +108,18 @@ class ObstacleSpliner(Node):
         - ``/planner/avoidance/markers``    (MarkerArray)      grey=all, red=rejected, green=selected
         - ``/planner/avoidance/latency``    (Float32)          loop time (only if ``measure``)
     """
+
+    # CLASS-LEVEL, and only for the d(s) branch. Every other planning value reaches the node
+    # through dyn_param_cb and would be a second source of truth here. These four are the
+    # exception because the branch they select is the difference between the shape that ships and
+    # one that does not: an unset attribute would be an AttributeError inside do_spline, and the
+    # value to fall back on when the parameter machinery has not run is the shipped shape, not a
+    # crash. The yaml still overrides all four through the ordinary declare/branch/sync chain
+    # (planner/spliner/test/test_param_wiring.py enforces it).
+    static_plan_method = "sample"
+    corridor_qp_w_dev = 0.0
+    corridor_qp_pin_apex = False
+    corridor_qp_max_vars = 60
 
     def __init__(self):
         self.name = "static_avoidance_planner"
@@ -368,6 +400,8 @@ class ObstacleSpliner(Node):
             'commit_enable', 'commit_dev_max', 'commit_obs_ds', 'commit_obs_dd',
             'commit_drop_on_new_obstacle', 'commit_replan_gap_m',
             'commit_reanchor_len_m', 'commit_reanchor_max_m', 'preramp_len_m',
+            'static_plan_method', 'corridor_qp_w_dev', 'corridor_qp_pin_apex',
+            'corridor_qp_max_vars',
         ]))
         self.add_on_set_parameters_callback(self.dyn_param_cb)
 
@@ -523,6 +557,20 @@ class ObstacleSpliner(Node):
         self.declare_parameter('preramp_len_m', 3.0, dbl(0.0, 15.0, "decay the car's current d to the raceline within this much of the path before the hump [m]"))
         self.declare_parameter('commit_obs_ds', 0.75, dbl(0.05, 5.0, "drop the commit if the triggering obstacle s drifts this far [m]"))
         self.declare_parameter('commit_obs_dd', 0.40, dbl(0.05, 2.0, "drop the commit if the triggering obstacle d drifts this far [m]"))
+        # --- which shape carries the sampled terminal offset (see the branch in do_spline) ---
+        self.declare_parameter('static_plan_method', 'sample',
+                               ParameterDescriptor(type=ParameterType.PARAMETER_STRING,
+                                                   description="d(s) generator: 'sample' (the quintic hump) or 'corridor_qp' (minimum bending inside the measured corridor)"))
+        self.declare_parameter('corridor_qp_w_dev', 0.0,
+                               dbl(0.0, 1e5, "corridor_qp: weight on ||d||^2 against ||d''||^2. "
+                                             "The bending block carries 1/ds^4 (1e4 at 0.1 m "
+                                             "spacing), so this is only felt in the hundreds"))
+        self.declare_parameter('corridor_qp_pin_apex', False,
+                               ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
+                                                   description="corridor_qp: hold the apex bands at the quintic's own values instead of letting the keep-out bounds decide them"))
+        self.declare_parameter('corridor_qp_max_vars', 60,
+                               intd(8, 400, "corridor_qp: control points per solve. The BOUNDS are "
+                                            "still enforced at every published station"))
 
     def dyn_param_cb(self, params: List[Parameter]):
         for p in params:
@@ -675,6 +723,21 @@ class ObstacleSpliner(Node):
                 self.commit_obs_ds = float(p.value)
             elif n == 'commit_obs_dd':
                 self.commit_obs_dd = float(p.value)
+            elif n == 'static_plan_method':
+                v = str(p.value)
+                if v not in ("sample", "corridor_qp"):
+                    self.get_logger().error(
+                        f"[{self.name}] static_plan_method='{v}' is not a method; keeping "
+                        f"'{getattr(self, 'static_plan_method', 'sample')}'. A fallthrough branch "
+                        f"here would silently plan with something nobody asked for.")
+                else:
+                    self.static_plan_method = v
+            elif n == 'corridor_qp_w_dev':
+                self.corridor_qp_w_dev = float(p.value)
+            elif n == 'corridor_qp_pin_apex':
+                self.corridor_qp_pin_apex = bool(p.value)
+            elif n == 'corridor_qp_max_vars':
+                self.corridor_qp_max_vars = int(p.value)
         return SetParametersResult(successful=True)
 
     #############
@@ -1502,13 +1565,28 @@ class ObstacleSpliner(Node):
         # pinch for less. Floored at ramp_len_min_m; below that the curvature cost stops being
         # worth the feasibility.
         #
-        # Scanned ONCE per cycle at 0.5 m (about 20 grid-corridor calls, ~1.4 ms), not per
-        # candidate. The grid is built from the FULL ramp length, so a shortened ramp is a subset
-        # of it and no candidate needs its own grid.
+        # Scanned ONCE per cycle over the PUBLISHED grid, not per candidate. The grid is built from
+        # the FULL ramp length, so a shortened ramp is a subset of it and no candidate needs its own.
+        #
+        # AT wpnt_dist, NOT AT 0.5 m. The scan decides how much offset a ramp may carry, and it used
+        # to sample five times more coarsely than the path it is deciding for. Measured against the
+        # same corridor read at every published station, the 0.5 m scan was off by up to 1.10 m
+        # (ifac) and 1.80 m (ifac_0807) at stations it never visited -- a metre of corridor, on a
+        # track whose corridor is often not two metres wide. Restoring the scan's lateral WIDTH
+        # changes those numbers by ~0, so it was never the sweep; it was the station spacing.
+        #
+        # NOT SCANNED AT ALL ON A LADDER RUNG. `ramp_retry` hands _fit_ramp an explicit length that
+        # it takes as given -- the scan's answer is never consulted -- so every rung was paying for
+        # a corridor read whose result it discards, fifteen times over inside ramp_search_max_ms.
+        # At 0.5 m spacing that waste was 0.2 ms a rung and invisible; at the publishing grid it is
+        # 0.6 ms a rung, which is 5.7 ms of the ladder's 20 ms budget and cost 8 ifac corner cells.
+        # The SQUEEZE retry still scans: it re-enters with a different wall_margin, so its corridor
+        # is a different corridor.
         _RAMP_LADDER = (1.0, 0.85, 0.7, 0.6, 0.5)
         scan_lo_s = knots[0][0] - self.ramp_len
         scan_hi_s = knots[-1][0] + self.return_len
-        scan_s = np.arange(scan_lo_s, scan_hi_s + 1e-9, 0.5)
+        scan_s = (np.arange(scan_lo_s, scan_hi_s + 1e-9, wpnt_dist) if ramp_retry is None
+                  else np.empty(0))
         # ABSOLUTE stations for the corridor read. scan_s is path-local -- distance from the CAR,
         # like knots[i][0] -- and _grid_corridor_batch treats its argument as an absolute station
         # (`s_query % gb_max_s`). This is the same bug 6b8112e fixed for knot_cor, left behind in
@@ -1580,7 +1658,19 @@ class ObstacleSpliner(Node):
                     return R
             return limits[-1][0] if limits else full_len
 
+        # --- corridor over EVERY published station (corridor_qp only) --------------------------
+        # The sampled shape reads the corridor at the obstacle's station (the apex) and along the
+        # two ramps; nothing reads it between two apexes, and two thirds of the rejections are
+        # there. The QP is solved inside this array, so this is the one read that has to cover the
+        # whole maneuver. Same authority order and the same waypoint fallback as everything else.
+        qp_lo = qp_hi = None
+        qp_memo = {}                                          # see _corridor_profile: the sampled
+        if self.static_plan_method == "corridor_qp":          # offsets collapse onto a side choice
+            qp_lo, qp_hi = self._path_corridor(s_mod, idxs, gb_wpnts, wall_margin, sample_margin,
+                                               float(np.max(np.abs(d_ends))))
+
         dp0_full = cur_dp
+        n_qp_fallback = 0                                     # candidates the QP could not answer
         d_cands = np.zeros((N, n))
         cand_entry_i = np.zeros(N, dtype=int)                 # per-candidate prefix boundary
         for k, d_end in enumerate(d_ends):
@@ -1654,8 +1744,34 @@ class ObstacleSpliner(Node):
                 bp_s.append(max(s_exit_end, bp_s[-1] + 1e-3))
                 bp_d.append([0.0, 0.0, 0.0])
                 dv[m_span] = BPoly.from_derivatives(bp_s, bp_d)(s_local[m_span])
+                # --- THE BRANCH. Everything above built the sampled quintic; everything below --
+                # every gate, the cost, the commit, the publication -- is untouched and judges
+                # whichever profile comes out of here.
+                #
+                # corridor_qp re-decides d(s) over the SAME span, from the SAME knots, sides and
+                # apex offsets, as minimum bending inside the corridor those choices imply. The
+                # quintic is not thrown away: it is the start value the QP is pinned to, the apex
+                # values the pinned variant holds, and the answer whenever the QP has none.
+                if qp_lo is not None:
+                    dv_c = self._corridor_profile(
+                        dv, s_local, gap_wp, m_span, s_exit_end, knots, d_apex,
+                        qp_lo, qp_hi, wpnt_dist, obs_margin_s, obs_margin_d, cur_dp, qp_memo)
+                    if dv_c is None:
+                        n_qp_fallback += 1
+                    else:
+                        dv = dv_c
             dv[s_local > s_exit_end] = 0.0
             d_cands[k] = dv
+
+        if n_qp_fallback:
+            # Named, because it is the one way a corridor_qp run publishes a sampled shape. The
+            # corridor was unmeasurable, or the keep-outs of two boxes closed it entirely; there is
+            # nothing corridor-decided to offer and dropping the candidate outright would lose the
+            # planner a path for a reason that has nothing to do with the shape.
+            self.get_logger().warn(
+                f"[{self.name}] corridor_qp: {n_qp_fallback} of {N} candidate(s) fell back to the "
+                f"sampled quintic (corridor unmeasurable / closed by the keep-outs)",
+                throttle_duration_sec=2.0)
 
         # --- feasibility 1: track corridor (reject, don't clip) ---
         # Skipped when the grid is the corridor authority: _path_off_track then tests EVERY path
@@ -2494,26 +2610,164 @@ class ObstacleSpliner(Node):
             return None, None
         free = free.reshape(n_s, n_d)
         i0 = int(np.argmin(np.abs(d_scan)))
-        lo = np.full(n_s, np.nan)
-        hi = np.full(n_s, np.nan)
-        for r in range(n_s):
-            fr = free[r]
-            if not fr.any():
-                continue
-            j0 = i0
-            if not fr[j0]:                       # raceline blocked here -> nearest free sample
-                cand = np.flatnonzero(fr)
-                j0 = int(cand[np.argmin(np.abs(d_scan[cand]))])
-            a_i = b_i = j0
-            while a_i > 0 and fr[a_i - 1]:
-                a_i -= 1
-            while b_i < n_d - 1 and fr[b_i + 1]:
-                b_i += 1
-            l, h = float(d_scan[a_i]) + wm, float(d_scan[b_i]) - wm
-            if h < l:
-                l = h = 0.5 * (float(d_scan[a_i]) + float(d_scan[b_i]))
-            lo[r], hi[r] = l, h
+        # VECTORISED, and it has to be: the per-row while-loops cost ~0.06 ms a row, which was
+        # nothing at the ramp scan's old 19 rows and is 5.7 ms at the publishing grid's ~90. That
+        # cost came straight out of ramp_search_max_ms and took 8 ifac corner cells with it -- a
+        # feasibility regression whose entire cause was a Python loop.
+        #
+        # Same three steps as the loop, expressed on the whole block: a free cell's RUN is
+        # identified by how many blocked cells precede it in its row, so two free cells share a run
+        # exactly when that count matches; the seed column is the raceline's, or the nearest free
+        # column to it where the raceline itself reads blocked; and the run's extent is the first
+        # and last column carrying the seed's run id.
+        run = np.cumsum(~free, axis=1)
+        dist = np.where(free, np.abs(np.arange(n_d) - i0), n_d + 1)
+        j0 = dist.argmin(axis=1)
+        rows = np.arange(n_s)
+        same = free & (run == run[rows, j0][:, None])
+        a_i = same.argmax(axis=1)
+        b_i = n_d - 1 - same[:, ::-1].argmax(axis=1)
+        lo = d_scan[a_i] + wm
+        hi = d_scan[b_i] - wm
+        narrow = hi < lo                          # narrower than 2*wall_margin -> its middle
+        mid = 0.5 * (d_scan[a_i] + d_scan[b_i])
+        lo = np.where(narrow, mid, lo)
+        hi = np.where(narrow, mid, hi)
+        blocked = ~free.any(axis=1)               # nothing free at all -> unmeasurable
+        lo[blocked] = np.nan
+        hi[blocked] = np.nan
         return lo, hi
+
+    def _path_corridor(self, s_mod: np.ndarray, idxs: np.ndarray, gb_wpnts, wall_margin: float,
+                       sample_margin: float, d_reach: float):
+        """[lo, hi] at EVERY published station: the corridor `corridor_qp` is solved inside.
+
+        Same authority order as everywhere else on this path -- the measured grid first, the
+        waypoint bounds where the grid cannot answer -- and the same narrowed lateral sweep the
+        ramp scan uses, since a corridor wider than the path can reach constrains nothing. The
+        sweep is read at grid_scan_step, NOT at the ramp scan's coarser 0.10 m: this array is the
+        constraint itself, so 10 cm of quantisation on its edge is 10 cm taken off the maneuver.
+        """
+        n_s = len(s_mod)
+        lo = hi = None
+        if self.trust_grid_bounds:
+            lo, hi = self._grid_corridor_batch(
+                s_mod, d_max=max(d_reach + self.apex_bulge + 0.10, 0.5),
+                d_step=self.grid_scan_step, wall_margin=wall_margin)
+        if lo is None:
+            lo, hi = np.full(n_s, np.nan), np.full(n_s, np.nan)
+        miss = ~np.isfinite(lo)
+        if miss.any():
+            jj = np.asarray(idxs)[miss]
+            lo[miss] = np.array([-(gb_wpnts[j].d_right - sample_margin) for j in jj])
+            hi[miss] = np.array([gb_wpnts[j].d_left - sample_margin for j in jj])
+        return lo, hi
+
+    def _corridor_profile(self, dv, s_local, gap_wp, m_span, s_exit_end, knots, d_apex,
+                          qp_lo, qp_hi, wpnt_dist, obs_margin_s, obs_margin_d, cur_dp,
+                          memo=None):
+        """One candidate's d(s), re-decided by the corridor. None when there is no answer.
+
+        `dv` comes in carrying the sampled quintic (and, before s_entry0, the pre-ramp decay). What
+        is taken FROM it: the value and slope at the seam, and -- under corridor_qp_pin_apex -- the
+        apex bands. What is taken from the KNOTS: which side of each box this candidate passes.
+        Everything else is the QP's.
+
+        THE APEX IS NOT PINNED BY DEFAULT. Side selection and keep-out are already in the bounds,
+        so the corridor forces the apex offset on its own; pinning the value as well over-constrains
+        a run whose two ends are pinned already, and the ceiling's own seam numbers are where that
+        showed. corridor_qp_pin_apex restores the pinned formulation so the two can be measured
+        against each other rather than argued about.
+        """
+        m = np.flatnonzero(m_span)
+        if m.size < 3:
+            return None
+        j0, j1 = int(m[0]), int(m[-1])
+        a = max(j0 - 1, 0)                      # one prefix station comes in as the C1 pin
+        sel = np.arange(a, j1 + 1)
+        if sel.size < 5:                        # three pinned at the start, two at the end
+            return None
+
+        # THE CANDIDATES COLLAPSE. Everything the QP is given -- the span, the corridor, the
+        # keep-outs, the start pin -- is fixed by (a, j1) and by WHICH SIDE of each box the path
+        # takes. The sampled terminal offset itself never enters: two candidates that pass the same
+        # boxes on the same sides hand the solver identical arguments and get identical answers
+        # back. So ten candidates are two or three solves, and the sampling grid stops being a
+        # per-candidate cost. (Not under corridor_qp_pin_apex: there the apex bands are pinned to
+        # each candidate's OWN quintic, which is exactly the thing that differs.)
+        L = self.gb_max_s
+        boxes = []
+        for (_s_c, o, _c), da in zip(knots, d_apex):
+            o_span = (o.s_end - o.s_start) % L
+            gc = (o.s_center - self.cur_s) % L
+            if gc > L / 2.0:
+                gc -= L
+            box_lo = min(o.d_right, o.d_left) - obs_margin_d
+            box_hi = max(o.d_right, o.d_left) + obs_margin_d
+            boxes.append((gc - o_span / 2.0 - obs_margin_s, gc + o_span / 2.0 + obs_margin_s,
+                          box_lo, box_hi, bool(da >= 0.5 * (box_lo + box_hi))))
+        key = None
+        if memo is not None and not self.corridor_qp_pin_apex:
+            key = (a, j1, tuple(b[4] for b in boxes))
+            if key in memo:
+                span = memo[key]
+                if span is None:
+                    return None
+                out = np.asarray(dv).copy()
+                out[sel] = span
+                return out
+
+        def _miss(v):
+            if key is not None:
+                memo[key] = None
+            return v
+
+        lo = np.asarray(qp_lo)[sel].copy()
+        hi = np.asarray(qp_hi)[sel].copy()
+        if not (np.all(np.isfinite(lo)) and np.all(np.isfinite(hi))):
+            return _miss(None)
+
+        # Every box this path is SHAPED AROUND becomes corridor, on the side the candidate's own
+        # apex offset already chose. Boxes with no knot are deliberately left out: the node makes no
+        # side choice for them (obs_ok still enforces every one of them, knot or no knot), and
+        # inventing one here would be changing the side selection this round is not touching.
+        g_sel = np.asarray(gap_wp)[sel]
+        for (g0, g1, box_lo, box_hi, left) in boxes:
+            cut_keepout(lo, hi, (g_sel >= g0) & (g_sel <= g1), box_lo, box_hi,
+                        pass_left=left, bulge=self.apex_bulge)
+
+        if self.corridor_qp_pin_apex:
+            dv_sel = np.asarray(dv)[sel]
+            for (g0, g1, _bl, _bh, _left) in boxes:
+                band = (g_sel >= g0) & (g_sel <= g1)
+                lo[band] = hi[band] = dv_sel[band]
+
+        # The maneuver ends ON the raceline -- everything past s_exit_end is published as d = 0 --
+        # so the last two stations are held there. Two, not one: that is what makes d' = 0 at the
+        # seam in the same one-sided difference the seam is measured with.
+        lo[-1] = hi[-1] = 0.0
+        lo[-2] = hi[-2] = 0.0
+        if np.any(hi < lo - 1e-9):
+            return _miss(None)
+
+        # C2, not C1. Matching value and slope still leaves the solver free to start bending at the
+        # first station it owns, and it does: over the full race profile the |d'| step there came
+        # out at p90 0.0548 (ifac) / 0.0504 (ifac_0807) with the slope pin alone. The quintic has
+        # never had that freedom -- its first breakpoint is [d_start, dp0, 0.0] -- so the third pin
+        # is not a new demand, it is the same continuity the shape being replaced already provides.
+        d0 = float(dv[a])
+        dp0 = float((dv[a] - dv[a - 1]) / wpnt_dist) if a >= 1 else float(cur_dp)
+        dpp0 = (float(dv[a] - 2.0 * dv[a - 1] + dv[a - 2]) / (wpnt_dist ** 2) if a >= 2 else 0.0)
+        sol = solve_corridor_path(s_local[sel], lo, hi, d0, dp0,
+                                  w_dev=self.corridor_qp_w_dev,
+                                  max_vars=int(self.corridor_qp_max_vars), dpp0=dpp0)
+        if sol is None:
+            return _miss(None)
+        if key is not None:
+            memo[key] = sol
+        out = np.asarray(dv).copy()
+        out[sel] = sol
+        return out
 
     def _grid_is_authority(self) -> bool:
         """True when the occupancy grid both replaces the waypoint corridor AND is checked per path
