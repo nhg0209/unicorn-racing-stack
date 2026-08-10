@@ -1480,7 +1480,18 @@ class ObstacleSpliner(Node):
                 f"[{self.name}] all {len(obs_ahead)} obstacle(s) ahead are already cleared by the "
                 f"followed line (>= {obs_margin:.2f} m) -> no avoidance needed",
                 throttle_duration_sec=2.0)
-            self._committed = None
+            # NOT UNDER PROBE. This method's contract says a probe is "a plan NOBODY ACTS ON ... no
+            # commit", and dropping the live commit is acting: the next real cycle would find
+            # _committed None, re-plan from scratch, and lay fresh geometry under a moving car --
+            # a path swap caused by a diagnostic that is only on when someone is watching.
+            #
+            # The probe is the ONLY caller that can get here with a commit in hand. A probe runs
+            # with retry=True, which skips the committed-path reuse above (so it plans instead of
+            # returning early) AND skips the clear gate (so the branch that gate normally
+            # pre-empts becomes reachable). The squeeze and ramp retries also set retry=True, but
+            # they only ever run after the top-level pass already reached this point.
+            if not probe:
+                self._committed = None
             return None if retry else _empty()
         # Anchor the gap sampling on the first box we are actually shaping around, not on the
         # nearest one in the list -- that one may have been skipped as already cleared.
