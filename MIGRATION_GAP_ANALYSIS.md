@@ -71,7 +71,7 @@ OVERTAKE 중에는 궤적 갱신 동결(`opponent_trajectory.py:60-64`).
 
 | 위치 | 내용물 | 재활용 가치 |
 |---|---|---|
-| `planner/spliner/spliner/spliner_node.py` | 자체 장애물 전파 4모드(`_predict_obs_movement:525-598`): constant / **adaptive**(도달시간 리드 + d의 지수적 라인복귀 이완, `kd_obs_pred`) / adaptive_velheuristic / heuristic | **1순위** — GP 비의존·저비용·우아한 열화. 활성 lane_change에 이식 적합 |
+| `planner/lane_change_planner/lane_change_planner/obs_propagation.py` | 장애물 전파 4모드: constant / **adaptive**(도달시간 리드 + d의 지수적 라인복귀 이완, `kd_obs_pred`) / adaptive_velheuristic / heuristic | **추출 완료, 미배선.** 원본 `spliner/spliner_node.py:_predict_obs_movement`는 노드와 함께 삭제됨(추출 커밋 이전 이력 참조). 순수 함수로 이식했고 테스트 있음(`test_obs_propagation.py`). 배선 시 우선순위 3(동적 추월 ST 분해)의 GP-free 폴백 후보. **원본의 결함 3개는 이식하면서 고쳤고 모듈 상단에 기록**: heuristic의 `delta_s` 미할당(UnboundLocalError — 실행된 적 없다는 증거), adaptive_velheuristic의 0 나눗셈, `wpnts[int(cur_s*10)]`의 0.1 m 하드코딩(GlobalTracking이 같은 결함으로 로컬 윈도우를 최대 1 m 어긋나게 했던 것) |
 | `planner/sqp_planner/sqp_avoidance_node.py` | ① 예측 장애물 배열을 직접 회피 대상으로 사용(`obs_prediction_cb:202-206`) ② **GP d(s) 프로파일을 동적 장애물 회랑 중심**으로 사용(`sqp_solver:383-395`) ③ SLSQP d-프로파일 최적화 | ②는 이식 가치 높음 (버그 주의: `:392` s[m]를 waypoint 개수로 mod) |
 | `planner/spliner_planner/dynamic_avoidance_node.py` | 예측 기반 apex 배치 구조 | 🟡 예측 대입이 `len==20` 게이트(생산자는 200)로 도달 불가(`:309`) — 사실상 사장 |
 | `prediction/.../predictor_opponent_trajectory.py` | 상대가 라인 이탈 시 **라인 복귀 곡선 GP**(Matern, `vs_var=69` 센티널) | 런치 시 `/opponent_trajectory` 경합 주의(GP 노드와 동일 토픽) — 아이디어만 이식 권장 |

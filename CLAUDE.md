@@ -8,7 +8,7 @@
 - Plan-first: before editing, list files you will touch and why; keep diffs minimal. Line numbers given in prompts are evidence pointers — re-verify against the actual code before editing.
 
 ## Codebase boundaries
-- DORMANT — do not modify/launch/"fix": spliner_node, start_spline_node(v1), spliner_planner/*, sqp_planner/*, predictor_opponent_trajectory, dynamic_prediction_server, state_estimation/carstate_node.
+- DORMANT — do not modify/launch/"fix": spliner_planner/*, sqp_planner/*, predictor_opponent_trajectory, dynamic_prediction_server, state_estimation/carstate_node. (spliner_node and start_spline_node(v1) were DELETED — no launch exec'd them and nothing imported them. Their one migration item, the four obstacle-propagation modes, lives on as `planner/lane_change_planner/lane_change_planner/obs_propagation.py`, unwired.)
 - LIVE planners (race.launch.xml): change_avoidance_node (dynamic, OPEN/HOLD/CLOSE lane-hold) + update_waypoints from lane_change_planner, static_avoidance_node from spliner, static_reopt_node + static_obstacle_layer from gb_optimizer.
 - Single sources of truth: speed scaling = sector_tuner only; /global_waypoints ownership = global_republisher XOR static_reopt_node. Never add another publisher.
 - Params: there is no single convention in this subsystem, so check the node before assuming one.

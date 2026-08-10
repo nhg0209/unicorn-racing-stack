@@ -8,6 +8,12 @@ Subscribes to the running-sim topics (no rebuild needed; run with python3 after 
   /lap_data                     f110_msgs/LapData     -> lap time, lateral error
   <--latency-topic>             std_msgs/Float32      -> planner loop time (s) -> ms stats
       static  : /planner/avoidance/latency   (spliner/static_avoidance_node.py)
+                TWO LIVE NODES PUBLISH THIS ONE TOPIC. race.launch.xml starts both
+                static_avoidance_node (the static planner) and start_spline_node_v2
+                (the start planner), and each publishes /planner/avoidance/latency when
+                its own measure is true. With both measuring, the numbers below are an
+                interleaved mixture of two planners' loop times and belong to neither.
+                Run with only the one you are measuring set to measure:=true.
       dynamic : /planner/lane_change/latency (lane_change_planner, needs measure:=true)
   /state_machine                std_msgs/String       -> state transition count (chatter)
   /tracking/obstacles           f110_msgs/ObstacleArray
