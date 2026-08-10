@@ -1265,14 +1265,58 @@ class StaticDynamic(Node):
         obstaclearray_temp.obstacles = raw_opponent_array
         self.raw_opponent_pub.publish(obstaclearray_temp)
 
-    def publish_diag(self):
-        """Per-cycle state of every dynamic track, one JSON object per cycle on /tracking/diag.
+    def _diag_rec(self, o):
+        """One track's diagnostic record. `mean_s`/`mean_d` is the position a CONFIRMED STATIC
+        publishes (publishObstacles reads obs.mean for those), so it is the number that becomes the
+        static planner's keep-out; `s`/`d` is the KF state, which only a dynamic track has."""
+        dyn = o.dynamic_state
+        # A track can be dynamic with no filter: staticFlag False and isInitialised False is
+        # what ttl death and a rejected vs measurement leave behind. That KF still carries
+        # filterpy's (4, 1) zero state, which is not even scalar-indexable -- report nulls
+        # rather than a shape-dependent number.
+        kf = dyn.dynamic_kf if dyn.isInitialised else None
+        s = float(kf.x[0]) if kf is not None else None
+        last = self._diag_last_s.get(o.id)
+        rec = {
+            'id': int(o.id),
+            'dyn_id': None if dyn.id is None else int(dyn.id),
+            's': None if s is None else round(s, 4),
+            'ds': None if s is None or last is None else round(s - last, 5),
+            'vs': None if kf is None else round(float(kf.x[1]), 4),
+            'd': None if kf is None else round(float(kf.x[2]), 4),
+            'Pss': None if kf is None else round(float(kf.P[0][0]), 6),
+            'm': bool(o.matched) if self._diag_fresh else None,
+            'sf': o.staticFlag,
+            'nb': int(o.nb_meas),
+            'ttl': int(o.ttl),
+            'dttl': None if dyn.ttl is None else int(dyn.ttl),
+            'init': bool(dyn.isInitialised),
+            'avs': round(float(dyn.avg_vs), 4),
+            'mean_s': round(float(o.mean[0]), 4),
+            'mean_d': round(float(o.mean[1]), 4),
+            'size': round(float(o.size), 3),
+            'vis': bool(o.isVisible),
+        }
+        if s is None:
+            self._diag_last_s.pop(o.id, None)       # so ds is null, not a re-init jump
+        else:
+            self._diag_last_s[o.id] = s
+        return rec
 
-        Instrument for the "the blue marker laps the map at speed and comes back" report, which no
-        existing output can show: publish_Marker draws `x[0] % track_length` and
-        /tracking/obstacles publishes the same, so a state integrating far past the track length
-        looks exactly like laps and both hide the raw number. This prints RAW x[0] and its
-        per-cycle change beside everything that would explain it:
+    def publish_diag(self):
+        """Per-cycle state of every track, one JSON object per cycle on /tracking/diag.
+
+        Two arrays, because the two questions asked of this instrument are different. `dyn` carries
+        the tracks with a live KF; `stat` carries the confirmed-static and not-yet-classified ones,
+        which are the tracks the STATIC planner turns into keep-outs -- so a swerve can be traced
+        back to whichever track produced the box, with sf / nb / m / vis right there to say whether
+        it was a ghost. Match mean_d against the `obs keep-out d=[lo,hi]` in the planner's own
+        `avoid ...` log line at the same instant (that line is throttled to 2 s).
+
+        For the dynamic side, no existing output can show a diverging state: publish_Marker draws
+        `x[0] % track_length` and /tracking/obstacles publishes the same, so a state integrating far
+        past the track length looks exactly like laps and both hide the raw number. This prints RAW
+        x[0] and its per-cycle change beside everything that would explain it:
 
           m     matched to a measurement this cycle (null on a predict-only cycle, i.e. no new
                 detect array arrived -- a track that is never matched still advances on predict)
@@ -1291,38 +1335,13 @@ class StaticDynamic(Node):
         if not self.diag_dynamic:
             return
         self._diag_k += 1
-        recs = []
+        recs, stat = [], []
         for o in self.tracked_obstacles:
-            if not (o.dynamic_state.isInitialised or o.staticFlag is False):
-                continue
-            dyn = o.dynamic_state
-            # A track can be dynamic with no filter: staticFlag False and isInitialised False is
-            # what ttl death and a rejected vs measurement leave behind. That KF still carries
-            # filterpy's (4, 1) zero state, which is not even scalar-indexable -- report nulls
-            # rather than a shape-dependent number.
-            kf = dyn.dynamic_kf if dyn.isInitialised else None
-            s = float(kf.x[0]) if kf is not None else None
-            last = self._diag_last_s.get(o.id)
-            recs.append({
-                'id': int(o.id),
-                'dyn_id': None if dyn.id is None else int(dyn.id),
-                's': None if s is None else round(s, 4),
-                'ds': None if s is None or last is None else round(s - last, 5),
-                'vs': None if kf is None else round(float(kf.x[1]), 4),
-                'd': None if kf is None else round(float(kf.x[2]), 4),
-                'Pss': None if kf is None else round(float(kf.P[0][0]), 6),
-                'm': bool(o.matched) if self._diag_fresh else None,
-                'sf': o.staticFlag,
-                'nb': int(o.nb_meas),
-                'ttl': int(o.ttl),
-                'dttl': None if dyn.ttl is None else int(dyn.ttl),
-                'init': bool(dyn.isInitialised),
-                'avs': round(float(dyn.avg_vs), 4),
-            })
-            if s is None:
-                self._diag_last_s.pop(o.id, None)   # so ds is null, not a re-init jump
+            rec = self._diag_rec(o)
+            if o.dynamic_state.isInitialised or o.staticFlag is False:
+                recs.append(rec)
             else:
-                self._diag_last_s[o.id] = s
+                stat.append(rec)
         live = {o.id for o in self.tracked_obstacles}
         for gone in [k for k in self._diag_last_s if k not in live]:
             del self._diag_last_s[gone]
@@ -1335,6 +1354,7 @@ class StaticDynamic(Node):
             'nm': len(self.meas_obstacles),
             'ntrk': len(self.tracked_obstacles),
             'dyn': recs,
+            'stat': stat,
         }, separators=(',', ':'))
         self.diag_pub.publish(msg)
 

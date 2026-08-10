@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Does the dynamic-track diagnostic stay silent when off, and never throw when on?
+"""Does the track diagnostic stay silent when off, and never throw when on?
 
 publish_diag runs inside timer_callback, so an exception in it takes the tracker down with it --
 and it is reached on every cycle, including cycles where no new detect array arrived and where a
@@ -96,6 +96,28 @@ def test_a_off_by_default_publishes_nothing():
     assert y["tracking"]["ros__parameters"]["diag_dynamic"] is False, "shipped enabled"
 
 
+def test_b2_the_static_tracks_that_become_keep_outs_are_reported_too():
+    """The static planner turns CONFIRMED-STATIC tracks into keep-outs, so tracing a swerve back to
+    the track that produced the box needs those tracks -- with the position publishObstacles
+    actually publishes for them, which is obs.mean and not the KF."""
+    conf = track(2, 10.0, 0.0, True, False)
+    conf.mean = [10.25, -0.37]
+    unc = track(3, 12.0, 0.0, None, False)
+    n = node([track(1, 5.0, 3.0, False, True), conf, unc])
+    n.publish_diag()
+    rec = json.loads(n.diag_pub.sent[-1])
+    assert [r["id"] for r in rec["dyn"]] == [1]
+    assert [r["id"] for r in rec["stat"]] == [2, 3], f"static side missing: {rec['stat']}"
+    r = rec["stat"][0]
+    # mean_d is what the keep-out is built from; match it against the planner's own
+    # `obs keep-out d=[lo,hi]` log line at the same instant
+    assert r["mean_s"] == 10.25 and r["mean_d"] == -0.37, r
+    for k in ("sf", "nb", "m", "vis", "size"):
+        assert k in r, f"{k} missing -- it is what says ghost or real"
+    assert r["sf"] is True and rec["stat"][1]["sf"] is None
+    assert r["s"] is None and r["vs"] is None, "a static track has no KF state to report"
+
+
 def test_b_only_dynamic_tracks_and_the_raw_s_is_reported():
     # 42.5 is PAST the track length: publish_Marker and /tracking/obstacles both show 4.1 there,
     # which is the whole reason this instrument exists.
@@ -106,11 +128,12 @@ def test_b_only_dynamic_tracks_and_the_raw_s_is_reported():
     n.publish_diag()
     rec = json.loads(n.diag_pub.sent[-1])
     assert [r["id"] for r in rec["dyn"]] == [1], f"wrong tracks reported: {rec['dyn']}"
+    assert [r["id"] for r in rec["stat"]] == [2, 3], f"static side: {rec['stat']}"
     r = rec["dyn"][0]
     assert r["s"] == 42.5, f"s was wrapped to {r['s']}; the raw state is the point"
     assert r["s"] % rec["L"] != r["s"], "pick a test s that actually exceeds the track length"
     for k in ("id", "dyn_id", "s", "ds", "vs", "d", "Pss", "m", "sf", "nb", "ttl", "dttl",
-              "init", "avs"):
+              "init", "avs", "mean_s", "mean_d", "size", "vis"):
         assert k in r, f"{k} missing from the record"
     assert rec["k"] == 1 and rec["fresh"] is True and rec["nm"] == 2 and rec["ntrk"] == 3
 
