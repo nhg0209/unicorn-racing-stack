@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import math
 import os
 import time
@@ -12,7 +13,7 @@ from rclpy.parameter_event_handler import ParameterEventHandler
 from rclpy.qos import qos_profile_sensor_data
 from ament_index_python.packages import get_package_share_directory
 
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, String
 from f110_msgs.msg import WpntArray
 from sensor_msgs.msg import LaserScan
 from filterpy.common import Q_discrete_white_noise
@@ -41,12 +42,24 @@ def normalize_s(s, track_length):
         return s
 
 
+def wpnt_spacing(wpnts):
+    """Measured station spacing [m] of the published global line, or None.
+
+    The 0.1 m that used to be hardcoded as `s * 10` is a map-generation choice, not a constant --
+    the same defect GlobalTracking was fixed for and obs_propagation carries a note about."""
+    if wpnts is None or len(wpnts) < 2:
+        return None
+    d = float(wpnts[1].s_m - wpnts[0].s_m)
+    return d if d > 1e-9 else None
+
+
 class Opponent_state:
     """
     This class implements the opponent with a kalman filter
     """
     track_length = None
     waypoints = None
+    wpnt_dist = None  # m, measured off the published line (see wpnt_spacing)
     rate = None  # hz
     dt = None
     ttl = None
@@ -123,8 +136,24 @@ class Opponent_state:
                          Opponent_state.track_length), x[1], x[2], x[3]])
 
     def target_velocity(self):
-        idx_closest_waypoint = int((self.dynamic_kf.x[0]*10) % Opponent_state.track_length)
-        return Opponent_state.ratio_to_glob_path*Opponent_state.waypoints[idx_closest_waypoint].vx_mps
+        """Raceline speed at the track's current s, scaled.
+
+        The index used to be `int((x[0] * 10) % track_length)`: a STATION index taken modulo a
+        LENGTH IN METRES. On ifac (385 wpnts, 38.4 m) that reaches waypoints 0..38 only -- the
+        first 10 % of the track -- so a track anywhere else was handed the raceline speed of a
+        corner it is not in. The `* 10` is the same hardcoded 0.1 m spacing GlobalTracking was
+        fixed for. Round rather than truncate: the quantity wanted is the CLOSEST station, s/dist
+        is off by an ulp at exact multiples (38.4 // 0.1 is 383.0, not 384.0), and normalize_s
+        hands us s in (-L/2, L/2] where a small negative s belongs at the END of the array -- all
+        three of which `int(...)` gets wrong and `round(...) % len` gets right.
+
+        NOTE this is reached only through useTargetVel, which is hardcoded False (see __init__).
+        Fixing the arithmetic is not the same thing as enabling the term, and it is not enabled."""
+        wpnts, wpnt_dist = Opponent_state.waypoints, Opponent_state.wpnt_dist
+        if not wpnts or not wpnt_dist:
+            return float(self.dynamic_kf.x[1])   # no line yet -> zero the P term, don't invent one
+        idx = int(round(self.dynamic_kf.x[0] / wpnt_dist)) % len(wpnts)
+        return Opponent_state.ratio_to_glob_path*wpnts[idx].vx_mps
 
     # ---------------------------------------
     #     defining the predict and update
@@ -245,6 +274,10 @@ class ObstacleSD:
         self.size = size
         self.nb_detection = 0
         self.isVisible = isVisible
+        # set per cycle by the tracker: was this track associated with a measurement? A new track
+        # is, by construction. Read by the diagnostic publish, which needs to tell a track that is
+        # being corrected from one that is only being predicted.
+        self.matched = True
         # set per cycle by the tracker: measurement lies within the suppression radius of an
         # INITIALIZED dynamic track (= most likely a spare detection cluster of that car) ->
         # such a track may not VOTE static (confirmation suppressed, demotion unaffected)
@@ -432,6 +465,12 @@ class StaticDynamic(Node):
         self.timer = None
         self.from_bag = self._get_param("from_bag", False)
         self.measuring = self._get_param("measure", False)
+        # per-cycle dynamic-track dump on /tracking/diag (see publish_diag). Instrument only:
+        # nothing downstream reads it and it publishes nothing unless asked.
+        self.diag_dynamic = self._get_param("diag_dynamic", False)
+        self._diag_k = 0
+        self._diag_fresh = False
+        self._diag_last_s = {}
 
         # --- Subscribers ---
         self.create_subscription(ObstacleArray, '/detect/raw_obstacles', self.obstacleCallback, 10)
@@ -444,6 +483,7 @@ class StaticDynamic(Node):
         self.static_dynamic_marker_pub = self.create_publisher(MarkerArray, '/tracking/static_dynamic_marker_pub', 5)
         self.estimated_obstacles_pub = self.create_publisher(ObstacleArray, '/tracking/obstacles', 5)
         self.raw_opponent_pub = self.create_publisher(ObstacleArray, '/tracking/raw_obstacles', 5)
+        self.diag_pub = self.create_publisher(String, '/tracking/diag', 10)
         if self.measuring:
             self.latency_pub = self.create_publisher(Float32, '/tracking/latency', 10)
 
@@ -579,6 +619,11 @@ class StaticDynamic(Node):
         self.demote_speed_mps = self._get_param("demote_speed_mps", 0.6)
         self.near_dynamic_suppress_m = self._get_param("near_dynamic_suppress_m", 0.6)
         self.livox_max_view_dist = self._get_param("livox_max_view_dist", 7.0)
+        was_diag, self.diag_dynamic = self.diag_dynamic, self._get_param("diag_dynamic", False)
+        if self.diag_dynamic and not was_diag:
+            self.get_logger().info(
+                '[Tracking] per-cycle dynamic-track diagnostics ON. Capture with: '
+                'ros2 topic echo --field data /tracking/diag > /tmp/track_diag.jsonl')
 
         ObstacleSD.ttl = self.ttl_static
         ObstacleSD.min_nb_meas = self.min_nb_meas
@@ -672,6 +717,7 @@ class StaticDynamic(Node):
             self.track_length = data.wpnts[-1].s_m
             Opponent_state.track_length = self.track_length
             Opponent_state.waypoints = self.globalpath
+            Opponent_state.wpnt_dist = wpnt_spacing(self.globalpath)
         # The stack's frenet frame IS the global raceline, and static_reopt SWAPS that line at
         # runtime (obstacle-aware <-> clean). The ego frenet odom re-frames on every
         # /global_waypoints (frenet_odom_republisher), so if this node keeps the startup
@@ -693,6 +739,7 @@ class StaticDynamic(Node):
             self.track_length = new_length
             Opponent_state.track_length = new_length
             Opponent_state.waypoints = data.wpnts
+            Opponent_state.wpnt_dist = wpnt_spacing(data.wpnts)
             self.get_logger().info(
                 '[Tracking] global line changed -> rebuilt FrenetConverter and re-projected '
                 f'{len(self.tracked_obstacles)} tracked obstacle(s) into the new frame')
@@ -935,8 +982,10 @@ class StaticDynamic(Node):
         stamp_key = (self.current_stamp.sec, self.current_stamp.nanosec) \
             if self.current_stamp is not None else None
         if stamp_key is not None and stamp_key == getattr(self, "_last_meas_stamp", None):
+            self._diag_fresh = False      # predict-only cycle: `matched` is last cycle's answer
             return
         self._last_meas_stamp = stamp_key
+        self._diag_fresh = True
         now_t = self.get_clock().now().nanoseconds * 1e-9
 
         meas_obstacles_copy = self.meas_obstacles.copy()
@@ -957,6 +1006,7 @@ class StaticDynamic(Node):
         for tracked_obstacle in self.tracked_obstacles:
             # --- verify if the obstacle is tracked by position and update the associated obstacle ---
             isTracked, meas_obstacle = self.verify_position(tracked_obstacle, meas_obstacles_copy)
+            tracked_obstacle.matched = bool(isTracked)
 
             if isTracked:
                 tracked_obstacle.near_dynamic = any(
@@ -1215,6 +1265,79 @@ class StaticDynamic(Node):
         obstaclearray_temp.obstacles = raw_opponent_array
         self.raw_opponent_pub.publish(obstaclearray_temp)
 
+    def publish_diag(self):
+        """Per-cycle state of every dynamic track, one JSON object per cycle on /tracking/diag.
+
+        Instrument for the "the blue marker laps the map at speed and comes back" report, which no
+        existing output can show: publish_Marker draws `x[0] % track_length` and
+        /tracking/obstacles publishes the same, so a state integrating far past the track length
+        looks exactly like laps and both hide the raw number. This prints RAW x[0] and its
+        per-cycle change beside everything that would explain it:
+
+          m     matched to a measurement this cycle (null on a predict-only cycle, i.e. no new
+                detect array arrived -- a track that is never matched still advances on predict)
+          dttl  dynamic ttl, so a track that lost association can be watched decaying
+          Pss   P[0][0], which grows while a track is only predicted
+          vs    x[1]; the update gate only checks the MEASURED vs in (-1, 8), never the filtered
+                state, so this is where divergence past that band would show
+          id / dyn_id  dynamic_state.id is set once at initialisation and is what
+                /tracking/obstacles publishes; id != dyn_id means the KF history belongs to
+                another object than the track carrying it
+
+        Reproduce, then capture:
+          ros2 param set /tracking diag_dynamic true
+          ros2 topic echo --field data /tracking/diag > /tmp/track_diag.jsonl
+        """
+        if not self.diag_dynamic:
+            return
+        self._diag_k += 1
+        recs = []
+        for o in self.tracked_obstacles:
+            if not (o.dynamic_state.isInitialised or o.staticFlag is False):
+                continue
+            dyn = o.dynamic_state
+            # A track can be dynamic with no filter: staticFlag False and isInitialised False is
+            # what ttl death and a rejected vs measurement leave behind. That KF still carries
+            # filterpy's (4, 1) zero state, which is not even scalar-indexable -- report nulls
+            # rather than a shape-dependent number.
+            kf = dyn.dynamic_kf if dyn.isInitialised else None
+            s = float(kf.x[0]) if kf is not None else None
+            last = self._diag_last_s.get(o.id)
+            recs.append({
+                'id': int(o.id),
+                'dyn_id': None if dyn.id is None else int(dyn.id),
+                's': None if s is None else round(s, 4),
+                'ds': None if s is None or last is None else round(s - last, 5),
+                'vs': None if kf is None else round(float(kf.x[1]), 4),
+                'd': None if kf is None else round(float(kf.x[2]), 4),
+                'Pss': None if kf is None else round(float(kf.P[0][0]), 6),
+                'm': bool(o.matched) if self._diag_fresh else None,
+                'sf': o.staticFlag,
+                'nb': int(o.nb_meas),
+                'ttl': int(o.ttl),
+                'dttl': None if dyn.ttl is None else int(dyn.ttl),
+                'init': bool(dyn.isInitialised),
+                'avs': round(float(dyn.avg_vs), 4),
+            })
+            if s is None:
+                self._diag_last_s.pop(o.id, None)   # so ds is null, not a re-init jump
+            else:
+                self._diag_last_s[o.id] = s
+        live = {o.id for o in self.tracked_obstacles}
+        for gone in [k for k in self._diag_last_s if k not in live]:
+            del self._diag_last_s[gone]
+        msg = String()
+        msg.data = json.dumps({
+            'k': self._diag_k,
+            't': round(self.get_clock().now().nanoseconds * 1e-9, 4),
+            'fresh': self._diag_fresh,
+            'L': round(float(self.track_length), 3) if self.track_length else None,
+            'nm': len(self.meas_obstacles),
+            'ntrk': len(self.tracked_obstacles),
+            'dyn': recs,
+        }, separators=(',', ':'))
+        self.diag_pub.publish(msg)
+
     def opponents_predict(self):
         for obs in self.tracked_obstacles:
             if obs.dynamic_state.isInitialised:
@@ -1241,6 +1364,7 @@ class StaticDynamic(Node):
             self.latency_pub.publish(msg)
         self.publishObstacles()
         self.publish_Marker()
+        self.publish_diag()
 
 
 def main(args=None):

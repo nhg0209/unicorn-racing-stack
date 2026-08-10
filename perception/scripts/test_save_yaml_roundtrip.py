@@ -31,7 +31,8 @@ StaticDynamic = ns["StaticDynamic"]
 Opponent_state = ns["Opponent_state"]
 
 # every tracking key the shipped yaml carries but the save dict does not build
-SAVE_BLIND = ("static_net_floor_m", "livox_max_view_dist", "measure", "from_bag")
+# diag_dynamic is deliberately blind: a debug stream must not be persisted by the save button
+SAVE_BLIND = ("static_net_floor_m", "livox_max_view_dist", "measure", "from_bag", "diag_dynamic")
 
 
 class _Log:

@@ -86,5 +86,13 @@ tracking:
     # Livox path (no /scan): a spot counts as observable within this range (the MID-360 sees
     # 360 deg, so range is the limiter). Replaces the old unconditional "visible".
     livox_max_view_dist: 7.0
-    measure: false
+    measure: true
     from_bag: false
+    # Per-cycle dump of every dynamic track's raw KF state on /tracking/diag (see publish_diag):
+    # id / dyn_id / raw x[0] / ds / vs / d / P[0][0] / matched / staticFlag / nb_meas / ttls. The
+    # marker and /tracking/obstacles both publish x[0] % track_length, so a state integrating past
+    # the track length is invisible in them -- this is where to look instead. Instrument only:
+    # nothing downstream reads the topic. Live-togglable
+    # (ros2 param set /tracking diag_dynamic true), and deliberately NOT in save_yaml's key list,
+    # so the rqt save button can never leave a debug stream running on race day.
+    diag_dynamic: false
