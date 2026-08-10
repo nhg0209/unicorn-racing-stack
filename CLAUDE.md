@@ -16,7 +16,7 @@
   - static_reopt_node — stack_master/config/static_reopt_params.yaml (top-level key `static_reopt_node`), attached with a single `<param from=>`. `reopt` (enable) is the only launch arg left, because that is a per-run choice. There is STILL no reconfigure callback: every value is read once at construction, so a change needs a restart — a yaml here means one source, not live tuning. check_avoidance_margins.py reads that yaml and asserts declare/YAML symmetry, because a key the node never declares is silently ignored and a name that does not match falls back to a default in silence.
   - closed_reopt (the solver) — exposed as `closed_qp_*` in the same yaml. The ReoptParams dataclass KEEPS its defaults so the module still runs with no ROS at all (every offline gate depends on that); the yaml overrides them. w_veh is deliberately absent — it is the same quantity as qp_veh_width and is passed from there. check_avoidance_margins.py reads the yaml (dataclass as fallback) and enforces that chain; it is short of the required headroom by 0.010 m (0.320 delivered vs 0.280 needed + 0.05 required) and that shortfall is carried by a NAMED exception (CLOSED_QP_SHORTFALL_ALLOWED_M) which prints a banner on every run. FLOOR_CONSUMER_SLACK_M was NOT lowered; the exception names its own evidence and how to end it.
   - static_obstacle_layer — no yaml and no launch params at all; every value is the declare_parameter default in the node.
-  - multi_tracking — opponent_tracker_params.yaml + save_yaml (rqt save button). That save must update the block PER KEY; assigning a fresh dict deletes every key it does not list.
+  - multi_tracking — opponent_tracker_params.yaml + save_yaml (rqt save button). That save must update the block PER KEY; assigning a fresh dict deletes every key it does not list. `diag_dynamic` (per-cycle dynamic-track KF dump on /tracking/diag, live-togglable, off by default) is deliberately OUTSIDE the save list so the button cannot leave a debug stream running; test_save_yaml_roundtrip pins that.
 - Check race.launch.xml remaps before renaming topics (/planner/avoidance/otwpnts is remapped per-planner; /planner/avoidance/static_feasible deliberately NOT remapped). Planner gates are fail-closed — preserve that direction.
 
 ## Static re-optimization: one solver
@@ -42,18 +42,20 @@ system python3 has no trajectory_planning_helpers.
 - Margins/launch agreement: `python3 stack_master/scripts/check_avoidance_margins.py` (exit 0)
 - Speed continuity: `python3 stack_master/scripts/test_speed_continuity.py`
 - Track bounds: `python3 stack_master/scripts/check_track_bounds.py --all` — **exit 1 today**: map f (402 stations vs 0) ships with d_left/d_right SWAPPED. ifac, ifac_0807 and map_test are correct. **ifac_0807 was swapped and has been REGENERATED** (127 stations vs 0 at HEAD, 124 vs 0 in the working tree); measurements taken on it before that regeneration went through an inverted corridor and are not comparable to ones taken after. The GENERATOR is fixed (sides now come from the final centerline's geometry — planner/gb_optimizer/gb_optimizer/track_bounds.py, shared with this checker), so a map regenerated from now on is labelled correctly; f was written by the old code and is still on disk. `--fix` relabels it and makes avoidance work, but it is NOT a full repair: the widths went through write_centerline into the trajectory optimizer, so the raceline itself was optimized inside a mirrored corridor and the map needs REGENERATING — which is what ifac_0807 got. Treat any sweep taken on a SWAPPED map as measured through an inverted corridor — the sweeps now detect it per map and say so, instead of consulting a hardcoded list that a new map was never added to.
-- Unit tests: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest state_machine/test planner/spliner/test planner/lane_change_planner/test controller/test planner/gb_optimizer/scripts perception/scripts race_utils/unicorn_gym/f1tenth_gym_ros/test/test_ego_footprint.py -q`
+- Unit tests: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest state_machine/test planner/spliner/test planner/lane_change_planner/test controller/test planner/gb_optimizer/scripts perception/scripts race_utils/unicorn_gym/f1tenth_gym_ros/test/test_ego_footprint.py race_utils/unicorn_gym/virtual_perception/test -q`
   (the env var is REQUIRED: launch_testing_ros's pytest entrypoint aborts collection in this env)
-  **202 as of round 6** (192 before it). QUOTE THE TOTAL, and if it drops, account for the drop
-  before anything else. FROM A WORKTREE the last path is EMPTY: git does not populate submodules in
-  a worktree and `git submodule update --init race_utils/unicorn_gym` cannot fix it (the pinned
-  commit b41910d is local-only -- the remote answers `upload-pack: not our ref`). That silently
-  removes exactly 16 tests, which is a plausible-looking number and not a regression. Run it from a
-  worktree with the MAIN checkout's absolute path for that one file:
-  `.../unicorn-racing-stack/race_utils/unicorn_gym/f1tenth_gym_ros/test/test_ego_footprint.py`.
+  **235 as of round 7** (217 before it; the 202 recorded at round 6 was already stale by then).
+  QUOTE THE TOTAL, and if it drops, account for the drop before anything else. FROM A WORKTREE the
+  two race_utils paths are EMPTY: git does not populate submodules in a worktree and
+  `git submodule update --init race_utils/unicorn_gym` cannot fix it (the pinned commit is
+  local-only -- the remote answers `upload-pack: not our ref`). That silently removes exactly 23
+  tests (16 ego-footprint + 7 scan-occlusion), a plausible-looking number and not a regression. Run
+  it from a worktree with the MAIN checkout's absolute paths for those two:
+  `.../unicorn-racing-stack/race_utils/unicorn_gym/f1tenth_gym_ros/test/test_ego_footprint.py` and
+  `.../race_utils/unicorn_gym/virtual_perception/test`.
   The gb_optimizer and perception suites are ALSO runnable standalone, which is how they report their own measurements:
   `~/miniforge3/envs/unicorn/bin/python3 planner/gb_optimizer/scripts/test_static_reopt_node.py` (25 checks: the swap/publish/concurrency safety machinery, named per check in its docstring),
-  `.../test_static_obstacle_layer.py`, `perception/scripts/test_static_classification.py`, `.../test_save_yaml_roundtrip.py`
+  `.../test_static_obstacle_layer.py`, `perception/scripts/test_static_classification.py`, `.../test_save_yaml_roundtrip.py`, `.../test_target_velocity_index.py`, `.../test_diag_publish.py`, `race_utils/unicorn_gym/virtual_perception/test/test_scan_occlusion.py`
 - Reopt geometry: `~/miniforge3/envs/unicorn/bin/python3 planner/gb_optimizer/scripts/gate_closed_reopt.py --check` (C1-C9 + the node contract; exit code). This replaced `sweep_static_reopt.py --check` as the reopt regression gate when the hump went — that script's five checks were all hump geometry. Margin sweep: `sweep_obs_margin.py`; raceline curvature sweep: `sweep_raceline_curvlim.py`.
 - Static-avoidance feasibility on the real map: `~/miniforge3/envs/unicorn/bin/python3 planner/spliner/scripts/sweep_static_feasibility.py --check` (~4 min).
   Its CORNER-CELL count is WALL-CLOCK GATED (the ladder runs under ramp_search_max_ms), so it is not
