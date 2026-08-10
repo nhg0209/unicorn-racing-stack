@@ -467,3 +467,65 @@ of avoidance on that edge, so a leaking probe would make switching the log on ca
 `OPENED` is the line to grep for. A refusal rate is a sweep statistic and a car does not drive one;
 this is the only way to see, from a bag, what changing the shape actually changed. `LOST` is the
 reverse and has never been seen offline -- if a bag shows one, that is the finding.
+
+---
+
+## 9. How far off the raceline it goes, and what bounding it would cost
+
+Measured by `planner/spliner/scripts/sweep_deviation_cap.py` (ifac_0807, race profile, 3154 cells per
+row-and-`cur_d`, `--jobs 7`). Nothing here changed a value; this is what the numbers say.
+
+The shipped `corridor_qp_w_dev` is 0.0, so nothing in the objective prefers the raceline. Headline
+numbers at `cur_d = 0.0`, `>=0.4` being the fraction of published paths whose maneuver peak reaches
+`recovery_entry_d_m` — i.e. that trip RECOVERY the moment the car is on them:
+
+| row | refuse | closed | man p90 | man max | `>=0.4` | vcap med | seam p90 |
+|---|---|---|---|---|---|---|---|
+| `sample` | 41.1% | 37.6% | 0.600 | 1.075 | 43.2% | 2.76 | 0.0108 |
+| `w0` (ships) | 24.4% | 17.4% | 0.750 | 1.150 | **68.9%** | 2.63 | 0.0000 |
+| `w0.01` | 24.4% | 17.3% | 0.706 | 1.150 | 68.7% | 2.63 | 0.0000 |
+| `w0.05` | 24.4% | 17.6% | 0.654 | 1.150 | 68.3% | 2.63 | 0.0000 |
+| `w0.1` | 24.4% | 17.6% | 0.640 | 1.050 | 68.3% | 2.63 | 0.0000 |
+| `w0.5` | 24.4% | 17.3% | 0.633 | 1.028 | 67.8% | 2.62 | 0.0000 |
+| `cap0.5` | 43.5% | 27.4% | 0.500 | 0.500 | 59.7% | 2.64 | 0.0000 |
+| `cap0.4` | 58.0% | 38.2% | 0.400 | 0.400 | 52.7% | 2.72 | 0.0000 |
+| `cap0.3` | 78.3% | 57.6% | 0.300 | 0.300 | **0.0%** | 2.76 | 0.0000 |
+
+**`w_dev` is not the knob.** Fifty times the weight (0.01 → 0.5) moves p90 by 0.117 m, the peak by
+0.12 m, and the RECOVERY fraction by **1.1 pp** — while the refusal rate does not move at all
+(24.4% in every row). There is no trade to price here, because the excursion is set by the corridor
+and the keep-out, not by a weight: the QP must clear the box whatever `||d||^2` costs, and where the
+corridor is wide the penalty is cheap to pay. Raising it is close to free and close to useless.
+
+**A hard cap does bound it, and the bill is the refusal rate.** cap0.5 costs +19 pp of refusal,
+cap0.4 +34 pp, cap0.3 +54 pp — and only cap0.3 removes the RECOVERY contention outright (0.0%),
+because a cap AT 0.4 still trips `abs(cur_d) >= 0.4` with zero tracking error. Curvature-limited
+speed does not pay for it (`vcap` 2.63 → 2.72/2.76: a shorter excursion bends less) and the seam gate
+holds in every row (p90 <= 0.05, all nine).
+
+**The unmeasured cost that is also the reason nothing shipped:** refusal → TRAILING →
+`static_feasible=False` → more windows in which the only adoptable path is lane_change's. That
+planner engaged on stationary boxes and put the car in a wall (`ENGAGE_GATE_NOTE.md`). Bounding this
+planner before that one is fixed hands authority to the worse actor.
+
+### Two things the sweep found that are not about tuning
+
+1. **`corridor_qp` deviates far more than the shape it replaced.** 68.9% of its published paths reach
+   the RECOVERY threshold against `sample`'s 43.2%, and its p90 is 0.750 m against 0.600 m. That is
+   the cost of the refusal-rate win that made it the default (24.4% vs 41.1%), and it had not been
+   measured until now.
+2. **A clipped corridor is not a bound on the published path.** The sampled-quintic fallback was
+   *ruled out* — `fallback` is 0.0% in every row — and yet 59-297 cells per cap row publish a
+   maneuver peak over the cap (1182-1313 at `cur_d = 0.5`). What remains is the QP's own pinned start
+   (`d0/dp0/dpp0` are read off the unclipped quintic) and stations published outside the QP window.
+   So a hard cap needs a **gate** as well as bounds; `sweep_deviation_cap.ok()` is that gate, and
+   `capfail` counts what it catches.
+
+### Why the `cur_d` axis is in the table
+
+The QP pins `d(s0) = cur_d` as an **equality**, so a car already outside a cap has no feasible
+corridor. `sweep_static_race`'s race profile uses `|cur_d| <= 0.1`, which made that look academic.
+The crash run says otherwise: `recovery_spliner` reported raceline-lost at 0.82 / 0.47 / 0.43 /
+0.42 m, the controller's AEB saw 0.65, lane_change committed 0.58 and 0.68. At `cur_d = 0.5`,
+`cap0.4` refuses **70.5%** of cells and `cap0.5` 56.2% — against 24.4% uncapped. Any cap has to
+answer for that branch before it ships, and no sweep can answer it by averaging over it.
