@@ -215,6 +215,7 @@ class Harness:
         # measures exactly the shipped configuration.
         self.plan_method = None
         self.pin_apex = None
+        self.qp_ladder = None
 
     def _node(self, cur_d, ladder):
         san = self.san
@@ -236,6 +237,13 @@ class Harness:
         n.body_kernel_size = int(self.P["body_kernel_size"])
         # --- the only deliberate departures from the shipped configuration, each for a reason ---
         n.ramp_search_enable = bool(ladder)      # the superset check needs the ladder off as well
+        # corridor_qp skips the ladder BY ITS OWN RULE (it opens no cell there and costs the cycle
+        # 2.4x), so the switch above does not reach it. Deliberately NOT tied to that switch: the
+        # default sweep has to measure the SHIPPED configuration, and tying them made the default
+        # run measure a forced-on ladder instead -- a sweep that reports on a setting nobody runs.
+        # `qp_ladder` overrides it, which is how the claim stays re-testable.
+        if self.qp_ladder is not None:
+            n.corridor_qp_ramp_ladder = bool(self.qp_ladder)
         n.ramp_search_max_ms = 1e6               # offline: judge the ladder, not the machine
         n.commit_enable = False                  # one-shot cells: nothing to reuse, nothing to store
         n.obs_memory_sec = 0.5                   # node default; not a declared parameter

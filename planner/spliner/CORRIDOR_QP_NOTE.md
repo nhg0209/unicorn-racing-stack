@@ -52,8 +52,8 @@ exactly as the node clips its own peak). Pinning the VALUE as well over-constrai
 ends are already pinned.
 
 That was measured both ways -- `corridor_qp_pin_apex` keeps the pinned formulation -- and the
-comparison is in section 4b. Short version: pinning opens 1.6-3.6 pp more cells and is worse on
-every other axis, including one that is structural.
+comparison is in section 4b. Short version: pinning opens 1.1-2.7 pp more cells and is worse on
+every other axis, two of them structurally.
 
 The start pin is **C2**, not C1, and that is a measurement rather than a preference: with value and
 slope matched but curvature free, the |d'| step at the junction came out at p90 0.0548 / 0.0504
@@ -190,13 +190,13 @@ race-realistic cells.
 |---|---|---|
 | sample | **49.4 %** | 41.9 % |
 | corridor_qp | **32.0 %** | 21.0 % |
-| corridor_qp /pin-apex | **28.4 %** | 21.5 % |
+| corridor_qp /pin-apex | **29.3 %** | 21.5 % |
 
 | ifac_0807 | refuses | still closed |
 |---|---|---|
 | sample | **41.1 %** | 37.6 % |
 | corridor_qp | **24.4 %** | 17.4 % |
-| corridor_qp /pin-apex | **22.8 %** | 17.7 % |
+| corridor_qp /pin-apex | **23.3 %** | 18.1 % |
 
 The `sample` column reproduces the campaign's baseline to the decimal (49.4 / 41.1) with item (2)
 applied, which is the race-profile half of R5: changing which ramp length the scan authorises moved
@@ -243,7 +243,7 @@ choosing where to stand -- **max |d'| step over the WHOLE maneuver**:
 |---|---|---|
 | sample | 0.0196 / 0.0684 / 0.4049 | 0.0179 / 0.0472 / 0.3840 |
 | corridor_qp | 0.0381 / 0.2010 / 1.0026 | 0.0285 / 0.2055 / 1.0020 |
-| corridor_qp /pin-apex | 0.0590 / **0.4781** / 1.4613 | 0.0389 / **0.3874** / 1.1422 |
+| corridor_qp /pin-apex | 0.0584 / **0.4665** / 1.2429 | 0.0387 / **0.3846** / 1.1422 |
 
 The corridor-decided shape IS more curved than a quintic through the same apex -- p90 three times
 the quintic's -- and the seam is one of the smoother places on it. That is the honest reading, and
@@ -259,7 +259,7 @@ whose gap-PID fixed point is v = 0.
 |---|---|---|
 | sample | 2.52 / 2.02 | 2.76 / 2.27 |
 | corridor_qp | **2.43 / 1.93** | **2.63 / 2.12** |
-| corridor_qp /pin-apex | 2.35 / 1.91 | 2.58 / 2.08 |
+| corridor_qp /pin-apex | 2.36 / 1.91 | 2.59 / 2.08 |
 
 **Much better than the ceiling predicted.** Round 5 measured 1.96 / 2.02 m/s median for the same
 idea and framed the trade as "a real path where there was none, driven below what the existing
@@ -292,17 +292,22 @@ quadprog itself is **16-17 %** of a `corridor_qp` pass (43 % under `pin_apex`); 
 extra corridor read and the assembly around it. Two reductions already applied: the candidates are
 memoised onto (span, sides), which is 2.3x fewer solves, and `_grid_corridor_batch` is vectorised.
 
-**The honest verdict: `corridor_qp` does not fit the 20 Hz cycle as it stands.** A single pass fits
-the 20 ms rung budget at p50 (10.1 / 10.6 ms) and not at p95 (16.2 / 19.6 ms, so a second rung
-overruns), and a whole cell that spends the ladder and then the squeeze runs to p95 44.7 / 46.1 ms
-against a 50 ms period, with a max past it. `sample` fits with room (p95 28.8 / 29.0 ms). This is
-one of the two reasons the default does not move on this evidence; the other is that none of it ran
-in sim.
+**Superseded — see section 6. With the ramp ladder skipped (which it now is, because the ladder
+opens zero cells under this method), corridor_qp fits the cycle and is CHEAPER at p95 than the
+sampled path that ships.** The numbers above are what it cost while it was still paying for a
+retry mechanism it does not use.
 
 ### R5 -- the sample path's own regression
 
-Section 2. Zero cells lost, zero gained, four in five bit-identical; the rest is what (2) is for.
-The race-profile half is R1's `sample` row: 49.4 % / 41.1 %, the campaign baseline to the decimal.
+Section 2. Against the commit before this branch: zero cells lost, zero gained, four in five
+bit-identical; the rest is what (2) is for. The race-profile half is R1's `sample` row: 49.4 % /
+41.1 %, the campaign baseline to the decimal.
+
+Against **3800073** (the first commit of this branch), i.e. everything the ladder skip, the probe
+and the log added: **100.00 % bit identical**, 2739 / 3276 published paths, worst
+|d_after - d_before| = 0.0000 m, nothing lost or gained. The sampled path did not move a bit this
+round, and it should not have: every change is behind `static_plan_method == "corridor_qp"` or
+behind a flag that is off.
 
 ---
 
@@ -310,18 +315,20 @@ The race-profile half is R1's `sample` row: 49.4 % / 41.1 %, the campaign baseli
 
 The brief asked for the ceiling to be re-measured with the apex pinned and unpinned, and said to
 take the unpinned formulation if it opens as much or more. Read literally, **it does not**: pinning
-opens 3.6 pp (ifac) and 1.6 pp (ifac_0807) more cells.
+opens 2.7 pp (ifac) and 1.1 pp (ifac_0807) more cells.
 
-| | refuses (ifac / 0807) | whole-maneuver \|d'\| step p90 | speed cap median | one pass p50 | candidate collapse |
-|---|---|---|---|---|---|
-| corridor_qp | 32.0 / 24.4 % | 0.201 / 0.206 | 2.43 / 2.63 m/s | 10.1 / 10.6 ms | **2.3x** |
-| /pin-apex | **28.4 / 22.8 %** | **0.478 / 0.387** | 2.35 / 2.58 m/s | 15.9 / 17.7 ms | none possible |
+| | refuses (ifac / 0807) | whole-maneuver \|d'\| step p90 | speed cap median | one pass p50 | candidate collapse | needs the ramp ladder |
+|---|---|---|---|---|---|---|
+| corridor_qp | 32.0 / 24.4 % | 0.201 / 0.206 | 2.43 / 2.63 m/s | 9.9 / 10.5 ms | **2.3x** | no (section 6) |
+| /pin-apex | **29.3 / 23.3 %** | **0.467 / 0.385** | 2.36 / 2.59 m/s | 15.9 / 17.7 ms | none possible | yes, 0.9 / 0.5 pp |
 
-Every column except the first is worse, and the last one is structural: with the apex bands held at
-each candidate's own quintic, the solver's arguments differ per candidate and the collapse that
-makes this affordable cannot happen at all. The extra cells cost 2.4x the kink, 3-4 cm/s of speed,
-60 % more time per pass, and the one property that made the terminal-offset grid stop being a
-per-candidate cost.
+Every column except the first is worse, and two of them structurally. With the apex bands held at
+each candidate's own quintic the solver's arguments differ per candidate, so the collapse that makes
+this affordable cannot happen at all -- and pinning re-introduces a shape constraint that a shorter
+window can relieve, which is why the pinned variant is the only one the ramp ladder is still worth
+anything to (28.4 / 22.8 % with it against 29.3 / 23.3 % without). The extra cells cost 2.3x the
+kink, 3-4 cm/s of speed, 60 % more time per pass, the candidate collapse, and a retry mechanism the
+unpinned formulation has been shown not to need.
 
 So the default stays UNPINNED, and this is a departure from the brief's stated rule -- named here
 rather than buried, because the rule was written before these four columns existed. `pin_apex`
@@ -356,7 +363,107 @@ survive -- at the cost of a profile that has to bend to reach a number nothing n
 ## What would end the open questions
 
 1. Sim, S1-S5 in `stack_master/STATIC_AVOIDANCE_TEST_RUNBOOK.md`, with
-   `static_plan_method:=corridor_qp`. Nothing here is a driving claim.
-2. One corridor read shared between the ramp scan and the QP. That is where the pass time is.
-3. Whether a 2.4 m/s median cap through a three-box weave is drivable at all, which is a controller
+   `static_plan_method:=corridor_qp` and `static_plan_log:=true`. Nothing here is a driving claim.
+2. Whether a 2.4 m/s median cap through a three-box weave is drivable at all, which is a controller
    question this file cannot answer.
+
+---
+
+## 6. The ramp ladder is not this method's mechanism
+
+The ladder re-throws the whole candidate grid over a different ramp pair when everything was
+rejected. It is worth 5.5 pp (ifac) and 3.1 pp (ifac_0807) to the sampled path. Under `corridor_qp`
+it is worth **nothing**, and the measurement is not a rate that happens to match -- it is the same
+cells:
+
+| ladder | ifac refuses | ifac_0807 refuses | published paths (ifac / 0807) |
+|---|---|---|---|
+| sample, ON (ships) | 49.4 % | 41.1 % | 4931 / 5905 |
+| sample, OFF | **54.9 %** | **44.2 %** | 4692 / 5811 |
+| corridor_qp, ON | 32.0 % | 24.4 % | 6705 / 7818 |
+| corridor_qp, OFF | **32.0 %** | **24.4 %** | **6705 / 7818** |
+
+Cell by cell, over 1248 / 1398 cells: cells the ladder opens and the ladder-off run refuses --
+**0** for `corridor_qp`, **90 / 65** for `sample`.
+
+### Why, exactly
+
+A rung does NOT change the lookahead, the obstacle set, the knots, the sides, the sampled terminal
+offsets or the published grid length -- all of those are fixed before it runs. It changes one thing:
+`r_in`/`r_out`, and through them `s_entry0` and `s_exit_end`. And `s_entry0` is not just where the
+hump starts; it is `cand_entry_i`, **the station from which the grid and body gates hold a candidate
+responsible** (everything before it is the pre-ramp decay, which every candidate shares and none can
+change, so it is reported and never charged).
+
+That is what the ladder buys the quintic. On every one of the 90 / 65 cells it opens, the rung-0
+failure was `obs_box+grid+body`, and every winning rung has a SHORTER ENTRY (ifac 90 of 90;
+ifac_0807 65 of 65, with the exit staying at 4.5 m on 47 of them). The quintic's shape through a
+pinch is fixed once the apex offset is chosen, so its only way past an early one is to hand those
+stations back to the pre-ramp and the raceline tail.
+
+The QP has no such need: inside the LONG window it can already sit on the raceline over the early
+stations, because the corridor contains d = 0 there. So there is nothing for a shorter window to
+buy, and the rung is pure cost.
+
+### What skipping it is worth
+
+Single process, `--jobs 1`, one cell as the chain runs it with the shipped 20 ms rung budget:
+
+| corridor_qp | p50 | p95 | max |
+|---|---|---|---|
+| ifac, ladder ON, @3.0 m/s | 15.9 | 42.3 | 76.7 ms |
+| ifac, ladder OFF, @3.0 m/s | **9.9** | **16.7** | 65.0 ms |
+| ifac, ladder ON, @2.0 m/s (squeeze reachable) | 15.7 | 71.5 | 118.0 ms |
+| ifac, ladder OFF, @2.0 m/s | **11.7** | **31.0** | 62.3 ms |
+| ifac_0807, ladder OFF, @3.0 / @2.0 m/s | 10.5 / 11.4 | **18.7 / 38.4** | 33.1 / 72.6 ms |
+
+Wall clock on the sweep says the same thing from the other side: the full race profile takes
+5.3 / 5.4 min per map for `sample` and **3.2 / 3.4 min** for `corridor_qp`, on identical cells.
+
+against `sample` as it ships (ladder ON): p95 **28.7 / 40.8** ms (ifac, @3.0 / @2.0) and
+**28.9 / 43.7** ms (ifac_0807).
+
+**corridor_qp now fits the 20 Hz cycle, and at p95 it is cheaper than the path that ships.** Its
+tail is worse (max 65-73 ms against 51-54), and that is the remaining cost statement.
+
+`corridor_qp_ramp_ladder` puts the ladder back. It exists because this is two maps and one profile,
+and a claim that costs one flag to re-test should stay testable.
+
+---
+
+## 7. The squeeze is NOT made redundant
+
+The obvious guess is that a method which opens 17 pp more cells has already taken the ones a margin
+trade would have found, leaving the squeeze to spend time on nothing. Measured, the opposite:
+
+| recovered by the squeeze | of refusals | cells |
+|---|---|---|
+| ifac, sample | 15.2 % | 639 |
+| ifac, corridor_qp | **34.5 %** | **936** |
+| ifac_0807, sample | 8.5 % | 331 |
+| ifac_0807, corridor_qp | **28.9 %** | **669** |
+
+More in absolute count, not just in share: with the corridor deciding the shape, a centimetre of
+margin is worth more than it was, because the shape is already using the room the margin frees.
+Skipping the squeeze under `corridor_qp` would cost 936 / 669 cells. It stays.
+
+---
+
+## 8. The counterfactual, for sim
+
+`static_plan_log: true` (off by default; it costs a whole extra planning pass) emits one line per
+cycle:
+
+    PLAN method=corridor_qp ms=11.4 pts=151 obs=3 squeeze=0 vcap=2.44 vs_sample=OPENED
+
+`vs_sample` re-runs the REAL pipeline with the method swapped and `probe=True` -- same knots, same
+gates, same margins -- because a second copy of the gate stack would drift from the first one. A
+probe plans and records NOTHING: no feasibility verdict, no commit, no handover anchor, no
+anti-chatter memory, and a refusing probe returns None rather than the empty publication that
+carries `feasible=False` (that last one is the leak that would matter: the state machine drops out
+of avoidance on that edge, so a leaking probe would make switching the log on cause a TRAILING).
+`planner/spliner/test/test_plan_probe.py` asserts all five.
+
+`OPENED` is the line to grep for. A refusal rate is a sweep statistic and a car does not drive one;
+this is the only way to see, from a bag, what changing the shape actually changed. `LOST` is the
+reverse and has never been seen offline -- if a bag shows one, that is the finding.

@@ -407,6 +407,25 @@ static_avoidance_planner:
     # maneuver is 200+ stations at 0.1 m and the solve runs once per candidate inside a 20 Hz cycle;
     # 60 keeps that at ~0.6 ms.
     corridor_qp_max_vars: 60
+    # corridor_qp: run the ramp ladder as well. OFF, and measured rather than assumed.
+    # The ladder re-throws the candidate grid over a different ramp pair. What that buys the SAMPLE
+    # path is not a ramp length: on the 90 (ifac) / 65 (ifac_0807) cells it opens, every one died at
+    # rung 0 on obs_box+grid+body and every winning rung has a SHORTER ENTRY -- which moves
+    # s_entry0, and with it cand_entry_i, the station from which the grid and body gates hold a
+    # candidate responsible. The quintic's only way past an early pinch is to hand those stations
+    # back to the pre-ramp and the d = 0 tail. The QP can already sit on the raceline there inside
+    # the long window, so over 8484 / 9462 race cells the ladder opens exactly ZERO for it --
+    # identical refusal rate (32.0 % / 24.4 %) and identical published-path counts, at 2.4x the
+    # cell time. Set true to re-test the claim on a new map.
+    corridor_qp_ramp_ladder: false
+    # One PLAN line per cycle, for SIM runs. OFF: it costs a whole extra planning pass.
+    #   PLAN method=corridor_qp ms=11.4 pts=151 obs=3 squeeze=0 vcap=2.44 vs_sample=OPENED
+    # vs_sample re-runs the REAL pipeline with the other d(s) generator and probe=true, so it
+    # answers to the same knots, gates and margins. OPENED = this shape found a path the other one
+    # would not have; LOST = the reverse, never seen offline and worth investigating if a bag shows
+    # it. A refusal rate is a sweep statistic; this is the only way to see, from a bag, what
+    # changing the shape actually changed on a car.
+    static_plan_log: false
 
     # --- cost weights  J = w_d*Σ|d| + w_k*Σκ² + w_c*|d_end-d_end_prev| + w_obs*Σexp(-dist/σ) ---
     w_d: 1.0                # raceline deviation

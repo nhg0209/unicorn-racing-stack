@@ -120,6 +120,8 @@ class ObstacleSpliner(Node):
     corridor_qp_w_dev = 0.0
     corridor_qp_pin_apex = False
     corridor_qp_max_vars = 60
+    corridor_qp_ramp_ladder = False
+    static_plan_log = False
 
     def __init__(self):
         self.name = "static_avoidance_planner"
@@ -401,7 +403,7 @@ class ObstacleSpliner(Node):
             'commit_drop_on_new_obstacle', 'commit_replan_gap_m',
             'commit_reanchor_len_m', 'commit_reanchor_max_m', 'preramp_len_m',
             'static_plan_method', 'corridor_qp_w_dev', 'corridor_qp_pin_apex',
-            'corridor_qp_max_vars',
+            'corridor_qp_max_vars', 'corridor_qp_ramp_ladder', 'static_plan_log',
         ]))
         self.add_on_set_parameters_callback(self.dyn_param_cb)
 
@@ -571,6 +573,12 @@ class ObstacleSpliner(Node):
         self.declare_parameter('corridor_qp_max_vars', 60,
                                intd(8, 400, "corridor_qp: control points per solve. The BOUNDS are "
                                             "still enforced at every published station"))
+        self.declare_parameter('corridor_qp_ramp_ladder', False,
+                               ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
+                                                   description="corridor_qp: run the ramp ladder too. Measured to open ZERO cells on both maps and to cost the cycle 2.4x, so it is off"))
+        self.declare_parameter('static_plan_log', False,
+                               ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
+                                                   description="one PLAN line per cycle: method, cost, points, curvature-limited speed, and whether the OTHER d(s) generator would have found a path. Costs an extra planning pass; for sim runs"))
 
     def dyn_param_cb(self, params: List[Parameter]):
         for p in params:
@@ -738,6 +746,10 @@ class ObstacleSpliner(Node):
                 self.corridor_qp_pin_apex = bool(p.value)
             elif n == 'corridor_qp_max_vars':
                 self.corridor_qp_max_vars = int(p.value)
+            elif n == 'corridor_qp_ramp_ladder':
+                self.corridor_qp_ramp_ladder = bool(p.value)
+            elif n == 'static_plan_log':
+                self.static_plan_log = bool(p.value)
         return SetParametersResult(successful=True)
 
     #############
@@ -841,12 +853,60 @@ class ObstacleSpliner(Node):
         self._emit_markers = (self._marker_i % MARKER_DECIM == 0)
         if self.measuring:
             start = time.perf_counter()
+        t_plan = time.perf_counter()
         wpnts, mrks = self.do_spline(gb_wpnts=self.gb_scaled_wpnts.wpnts)
+        plan_ms = (time.perf_counter() - t_plan) * 1e3
         if self.measuring:
             self.latency_pub.publish(Float32(data=float(time.perf_counter() - start)))
         self.evasion_pub.publish(wpnts)
         if self._emit_markers:
             self.mrks_pub.publish(mrks)
+        if self.static_plan_log:
+            self._log_plan(wpnts, plan_ms)
+
+    def _log_plan(self, wpnts, plan_ms: float):
+        """One greppable line per cycle: what was planned, what it cost, and what the OTHER d(s)
+        generator would have done with the same cycle.
+
+            PLAN method=corridor_qp ms=11.4 pts=151 obs=3 squeeze=0 vcap=2.44 vs_sample=OPENED
+
+        `vs_sample` is the only way to see, from a bag, what changing the shape actually changed --
+        a refusal rate is a sweep statistic and a car does not drive one. It is computed by
+        RE-RUNNING THE REAL PIPELINE with the method swapped and `probe=True`, so it answers to the
+        same knots, the same gates and the same margins, and cannot drift from them the way a second
+        copy of the gate stack would.
+
+            OPENED   this cycle has a path and the sampled shape would have had none
+            LOST     the sampled shape would have had one and this cycle does not  (never seen
+                     offline; if a bag shows it, that is the finding)
+            same     both, or neither
+
+        OFF BY DEFAULT. The probe is a whole extra planning pass -- p50 ~5 ms for the quintic --
+        which is affordable inside a 50 ms period for a sim run and is not free. It is a diagnostic,
+        not telemetry.
+        """
+        n = len(wpnts.wpnts)
+        vcap = "-"
+        if n:
+            kap = max(abs(w.kappa_radpm) for w in wpnts.wpnts)
+            vcap = f"{math.sqrt(self.a_lat_max / max(kap, 1e-3)):.2f}"
+        alt = "-"
+        other = "sample" if self.static_plan_method == "corridor_qp" else "corridor_qp"
+        prev = self.static_plan_method
+        self.static_plan_method = other
+        try:
+            r = self.do_spline(gb_wpnts=self.gb_scaled_wpnts.wpnts, probe=True)
+            other_ok = bool(r is not None and r[0] is not None and len(r[0].wpnts))
+            alt = ("OPENED" if (n and not other_ok) else
+                   "LOST" if (not n and other_ok) else "same")
+        except Exception as e:                       # noqa: BLE001 -- a diagnostic never breaks a cycle
+            alt = f"probe-failed({type(e).__name__})"
+        finally:
+            self.static_plan_method = prev
+        self.get_logger().info(
+            f"[{self.name}] PLAN method={self.static_plan_method} ms={plan_ms:.1f} pts={n} "
+            f"obs={len(self.obstacles)} squeeze={int(wpnts.ot_line == 'squeeze')} vcap={vcap} "
+            f"vs_{other}={alt}")
 
     #########
     # UTILS #
@@ -1175,21 +1235,29 @@ class ObstacleSpliner(Node):
 
     def do_spline(self, gb_wpnts, safety_margin: float = None, wall_margin: float = None,
                   squeeze: bool = False,
-                  ramp_retry: Tuple[float, float] = None) -> Tuple[OTWpntArray, MarkerArray]:
+                  ramp_retry: Tuple[float, float] = None,
+                  probe: bool = False) -> Tuple[OTWpntArray, MarkerArray]:
         """Plan one static-avoidance path. `squeeze` marks a reduced-margin RETRY (see
         _squeeze_schedule); such a call returns None instead of an empty result so the caller can
         try the next step, and never publishes the feasibility verdict itself.
 
         `ramp_retry` is the same kind of retry one dimension over: (entry, exit) ramp lengths that
         OVERRIDE the adaptive fit, at the FULL margins. Both retries return None instead of an
-        empty result, and neither publishes a verdict -- only the top-level call does."""
+        empty result, and neither publishes a verdict -- only the top-level call does.
+
+        `probe` is a plan NOBODY ACTS ON: same margins, same everything, but no retries, no commit,
+        no feasibility verdict, no marker and no memory of the choice. It exists so the counterfactual
+        line in _log_plan ("would the other d(s) generator have found a path here?") can be answered
+        by the real pipeline instead of by a second copy of the gate stack that would drift from
+        it."""
         # The squeeze lowers `safety_margin`; both axes give up the SAME amount, so a squeeze after
         # the split behaves exactly as it did before it.
         safety_margin_d = self.safety_margin_d - (self.safety_margin - (
             self.safety_margin if safety_margin is None else safety_margin))
         safety_margin = self.safety_margin if safety_margin is None else safety_margin
         wall_margin = self.wall_margin if wall_margin is None else wall_margin
-        retry = squeeze or ramp_retry is not None      # a nested attempt: report nothing, return None
+        # a nested attempt, or one nobody acts on: report nothing, return None instead of empty
+        retry = squeeze or ramp_retry is not None or probe
         wpnts = OTWpntArray()
         wpnts.header.stamp = self.get_clock().now().to_msg()
         wpnts.header.frame_id = "map"
@@ -1910,7 +1978,25 @@ class ObstacleSpliner(Node):
             #
             # Rung 0 is today's adaptive geometry, which the pass above already tried, so the
             # ladder is a strict superset and cannot regress.
-            if self.ramp_search_enable and (self.ramp_search_entry_m or self.ramp_search_exit_m):
+            #
+            # NOT RUN UNDER corridor_qp, and this is measured rather than argued. What a rung buys
+            # the SAMPLE path is not really a ramp length: on the 90 (ifac) / 65 (ifac_0807) cells
+            # the ladder opens, EVERY one died at rung 0 on obs_box+grid+body and EVERY winning rung
+            # has a shorter ENTRY. A shorter entry moves s_entry0 -- and with it cand_entry_i, the
+            # station from which the grid and body gates hold a candidate responsible. The quintic
+            # cannot put its own early stations anywhere else, so its only way past a pinch there is
+            # to hand those stations back to the pre-ramp (which every candidate shares and none can
+            # change) and to the d = 0 tail. The QP can already put d(s) at the raceline over those
+            # stations inside the LONG window, so the rung has nothing left to offer it: over 8484
+            # (ifac) and 9462 (ifac_0807) race cells the ladder opens exactly ZERO -- refusal rate
+            # 32.0 % / 24.4 % with it and without it, published-path counts identical to the cell.
+            # It is not free: it costs the cell p95 111 -> 45 ms (ifac), which is the difference
+            # between fitting a 20 Hz cycle and not.
+            # corridor_qp_ramp_ladder puts it back, because the evidence is two maps and one
+            # profile, and a claim that costs nothing to re-test should stay testable.
+            ladder_ok = (self.ramp_search_enable and
+                         (self.static_plan_method != "corridor_qp" or self.corridor_qp_ramp_ladder))
+            if ladder_ok and (self.ramp_search_entry_m or self.ramp_search_exit_m):
                 t_ladder = time.perf_counter()
                 out_of_time = False
                 for r_in_try in (self.ramp_search_entry_m or [self.ramp_len]):
@@ -1975,7 +2061,8 @@ class ObstacleSpliner(Node):
             return wpnts, self._candidate_markers(xy_all, status, -1)
 
         status[best_k] = "selected"
-        self._d_end_prev = float(d_ends[best_k])
+        if not probe:
+            self._d_end_prev = float(d_ends[best_k])
         xy, psi_, kappa_ = best
 
         # --- HANDOVER BLEND ---------------------------------------------------------------
@@ -2074,7 +2161,7 @@ class ObstacleSpliner(Node):
                                   v=float(v_arr[i]), psi=psi_pub[i],
                                   kappa=kappa_[i], wpnts=wpnts))
 
-        if self.commit_enable:
+        if self.commit_enable and not probe:
             # obs_reach, NOT obs_enforce. The release condition compares this list against
             # everything inside the GATHER horizon, so it has to BE that set. obs_enforce is the
             # boxes the path was shaped around, and a box that found no free max_weave slot is in
@@ -2088,8 +2175,9 @@ class ObstacleSpliner(Node):
                                obs_margin=obs_margin_d, obs_margin_s=obs_margin_s, squeeze=squeeze,
                                s_entry0=float(s_local[cand_entry_i[best_k]]),
                                shaped=obs_enforce)
-        self._note_published(s_mod, d_sel)
-        self._publish_feasible(True)
+        if not probe:
+            self._note_published(s_mod, d_sel)
+            self._publish_feasible(True)
         return wpnts, self._candidate_markers(xy_all, status, best_k)
 
     ######################

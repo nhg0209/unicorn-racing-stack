@@ -92,9 +92,9 @@ def _shape_stats(H, r, o):
 
 
 def _shard(arg):
-    mapname, stations, profile, method, pin_apex = arg
+    mapname, stations, profile, method, pin_apex, ladder, qp_ladder = arg
     H = sw.Harness(mapname)
-    H.plan_method, H.pin_apex = method, pin_apex
+    H.plan_method, H.pin_apex, H.qp_ladder = method, pin_apex, qp_ladder
     C = sc.Corridor(H)
     layouts = so.RACE_LAYOUTS if profile == "race" else so.OBS_LAYOUTS
     cur_ds = so.RACE_CUR_D if profile == "race" else so.CUR_D
@@ -115,7 +115,7 @@ def _shard(arg):
         # budget the ladder spends it out of. The feasibility verdict still comes from the ladder-on
         # run, exactly as every earlier number in this campaign.
         o["ms1"].append(so.run(H, i, gap, cd, boxes, ladder=False)["ms"])
-        r0 = so.run(H, i, gap, cd, boxes)
+        r0 = so.run(H, i, gap, cd, boxes, ladder=ladder)
         o["ms"].append(r0["ms"])
         if r0["ok"]:
             o["node_ok"] += 1
@@ -123,10 +123,10 @@ def _shard(arg):
             continue
         # --- the two retries the chain actually has -------------------------------------------
         H.cur_vs = SQUEEZE_SPEED                       # squeeze reachable: the car has slowed
-        r_sq = so.run(H, i, gap, cd, boxes)
+        r_sq = so.run(H, i, gap, cd, boxes, ladder=ladder)
         sq = r_sq["ok"]
         H.cur_vs, H.force_relax = RACE_SPEED, True     # relax: the SM certified a deadlock
-        r_rx = so.run(H, i, gap, cd, boxes)
+        r_rx = so.run(H, i, gap, cd, boxes, ladder=ladder)
         rx = r_rx["ok"]
         H.force_relax = False
         if sq:
@@ -141,7 +141,7 @@ def _shard(arg):
         o["closed"] += 1
         o["closed_by_layout"][lname] += 1
         H.cur_vs = RACE_SPEED
-        r = so.run(H, i, gap, cd, boxes)
+        r = so.run(H, i, gap, cd, boxes, ladder=ladder)
         if r["reject"]:
             sig = "+".join(nm for nm, v in zip(("bounds", "obs_box", "grid", "body", "curv"),
                                                r["reject"][1:]) if v) or "none"
@@ -162,23 +162,27 @@ def _shard(arg):
     return o
 
 
-def sweep(mapname, jobs, profile, stride=None, limit=None, method=None, pin_apex=None):
+def sweep(mapname, jobs, profile, stride=None, limit=None, method=None, pin_apex=None,
+          ladder=True, qp_ladder=None):
     H = sw.Harness(mapname)
     st = list(range(0, len(H.wp) - 1, stride or sw.STATION_STRIDE))
     if limit:
         st = st[:limit]
     del H
     t0 = time.time()
-    args = (mapname, st, profile, method, pin_apex)
+    args = (mapname, st, profile, method, pin_apex, ladder, qp_ladder)
     if jobs <= 1:
         parts = [_shard(args)]
     else:
         import multiprocessing as mp
         shards = [s for s in (st[k::jobs] for k in range(jobs)) if s]
         with mp.get_context("fork").Pool(len(shards)) as pool:
-            parts = pool.map(_shard, [(mapname, s, profile, method, pin_apex) for s in shards])
+            parts = pool.map(_shard,
+                             [(mapname, s, profile, method, pin_apex, ladder, qp_ladder)
+                              for s in shards])
     R = {"map": mapname, "profile": profile, "secs": time.time() - t0, "jobs": jobs,
-         "method": method or "yaml", "pin_apex": bool(pin_apex),
+         "method": method or "yaml", "pin_apex": bool(pin_apex), "ladder": bool(ladder),
+         "qp_ladder": qp_ladder,
          "dprime": list(sc.Corridor.DPRIME)}
     for k in ("n_raw", "n", "unplaceable", "node_ok", "sq_ok", "relax_ok", "closed",
               "n_empty", "n_split", "delta_none"):
@@ -201,7 +205,8 @@ def _q(a, p):
 def shape_report(R):
     """R2 / R3 / R4: what the published shape costs, per method. Nothing here is a refusal rate --
     it is the price of the paths the refusal rate counts."""
-    tag = f"{R['map']} | {R['method']}{' /pin-apex' if R['pin_apex'] else ''}"
+    tag = (f"{R['map']} | {R['method']}{' /pin-apex' if R['pin_apex'] else ''}"
+           f"{'' if R.get('ladder', True) else ' | ladder OFF'}")
     n_pub = len(R["vcap"])
     print(f"\n--- {tag} | shape of the {n_pub} published path(s) ---")
     print(f"  R2 seam |d'| step at s_entry0   median {_q(R['seam'],50):.4f}  p90 {_q(R['seam'],90):.4f}"
@@ -224,7 +229,9 @@ def shape_report(R):
 def report(R):
     n = max(R["n"], 1)
     print(f"\n=== {R['map']} | profile {R['profile']} | method {R['method']}"
-          f"{' /pin-apex' if R['pin_apex'] else ''} | {R['secs']/60:.1f} min ===")
+          f"{' /pin-apex' if R['pin_apex'] else ''}"
+          f"{'' if R.get('ladder', True) else ' | ramp ladder OFF'}"
+          f" | {R['secs']/60:.1f} min ===")
     if R["unplaceable"]:
         print(f"  {R['n_raw']} cells generated; {R['unplaceable']} dropped because a box would "
               f"not physically fit there ({100.0*R['unplaceable']/R['n_raw']:.1f} %) -> {R['n']} "
@@ -279,7 +286,10 @@ def r1_table(allR):
         if R["profile"] != "race":
             continue
         n = max(R["n"], 1)
-        tag = R["method"] + ("/pin-apex" if R["pin_apex"] else "")
+        tag = (R["method"] + ("/pin-apex" if R["pin_apex"] else "")
+               + ("" if R.get("ladder", True) else " NO-LADDER")
+               + ("" if R.get("qp_ladder") is None else
+                  " QP-LADDER-" + ("ON" if R["qp_ladder"] else "OFF")))
         base.setdefault(R["map"], {})[tag] = (100.0 * (n - R["node_ok"]) / n,
                                               100.0 * R["closed"] / n, R["n"])
     for m, rows in base.items():
@@ -303,6 +313,14 @@ def main():
     # gates, the same retries, one branch of the planner different.
     ap.add_argument("--method", default="both",
                     choices=("sample", "corridor_qp", "corridor_qp_pin", "both", "all"))
+    # The RAMP LADDER axis. The ladder exists because a sampled quintic that is rejected at one ramp
+    # geometry may pass at another -- it re-throws the same candidate grid over a different span.
+    # Whether corridor_qp needs it is a question about the SPAN, not about the shape: for a given
+    # window the QP's answer is unique, so a rung can only help by changing the window.
+    ap.add_argument("--ladder", default="on", choices=("on", "off"))
+    # ...and the corridor_qp side of it, which the node decides for itself. `default` measures
+    # what SHIPS; `on` forces the ladder back for the re-test.
+    ap.add_argument("--qp-ladder", default="default", choices=("default", "on", "off"))
     a = ap.parse_args()
     runs = {"both": [("sample", False), ("corridor_qp", False)],
             "all": [("sample", False), ("corridor_qp", False), ("corridor_qp", True)],
@@ -310,7 +328,9 @@ def main():
     allR = []
     for m in a.map:
         for meth, pin in runs:
-            R = sweep(m, a.jobs, a.profile, a.stride, a.limit, method=meth, pin_apex=pin)
+            R = sweep(m, a.jobs, a.profile, a.stride, a.limit, method=meth, pin_apex=pin,
+                      ladder=(a.ladder == "on"),
+                      qp_ladder=None if a.qp_ladder == "default" else (a.qp_ladder == "on"))
             report(R)
             allR.append(R)
     r1_table(allR)

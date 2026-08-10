@@ -29,6 +29,16 @@ Two things this module deliberately does NOT do.
     BOUNDS are still enforced at every published station (`lo <= B c <= hi`), so the reduction
     costs expressiveness and never costs feasibility -- which is the direction that matters, since
     a station the constraint skips is exactly the failure this whole round is about.
+
+A TRAP WORTH CARRYING OUT OF THIS FILE, because it will recur anywhere a reduced basis meets a
+tight constraint. If a station whose box is DEGENERATE -- pinned to one value within a micrometre --
+does not coincide with a control point, a cubic can only satisfy it between its knots by accident,
+and quadprog reports `constraints are inconsistent, no solution`. That message names the CORRIDOR,
+and the corridor is fine; what is too coarse is the basis. Measured here: 13.2 % of solves, every
+one of them recovered at full resolution. The diagnosis is cheap once you know to make it -- re-solve
+with one unknown per station, where boxes on the unknowns themselves are feasible by construction
+whenever lo <= hi -- and the fix is `_ctrl_indices`, which forces every pinned station to be a
+control point. Read an infeasibility report from a reduced-basis QP as a question, not a verdict.
 """
 from typing import Optional, Tuple
 

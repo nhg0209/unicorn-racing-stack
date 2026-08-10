@@ -43,6 +43,13 @@ system python3 has no trajectory_planning_helpers.
 - Track bounds: `python3 stack_master/scripts/check_track_bounds.py --all` — **exit 1 today**: map f (402 stations vs 0) ships with d_left/d_right SWAPPED. ifac, ifac_0807 and map_test are correct. **ifac_0807 was swapped and has been REGENERATED** (127 stations vs 0 at HEAD, 124 vs 0 in the working tree); measurements taken on it before that regeneration went through an inverted corridor and are not comparable to ones taken after. The GENERATOR is fixed (sides now come from the final centerline's geometry — planner/gb_optimizer/gb_optimizer/track_bounds.py, shared with this checker), so a map regenerated from now on is labelled correctly; f was written by the old code and is still on disk. `--fix` relabels it and makes avoidance work, but it is NOT a full repair: the widths went through write_centerline into the trajectory optimizer, so the raceline itself was optimized inside a mirrored corridor and the map needs REGENERATING — which is what ifac_0807 got. Treat any sweep taken on a SWAPPED map as measured through an inverted corridor — the sweeps now detect it per map and say so, instead of consulting a hardcoded list that a new map was never added to.
 - Unit tests: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest state_machine/test planner/spliner/test planner/lane_change_planner/test controller/test planner/gb_optimizer/scripts perception/scripts race_utils/unicorn_gym/f1tenth_gym_ros/test/test_ego_footprint.py -q`
   (the env var is REQUIRED: launch_testing_ros's pytest entrypoint aborts collection in this env)
+  **202 as of round 6** (192 before it). QUOTE THE TOTAL, and if it drops, account for the drop
+  before anything else. FROM A WORKTREE the last path is EMPTY: git does not populate submodules in
+  a worktree and `git submodule update --init race_utils/unicorn_gym` cannot fix it (the pinned
+  commit b41910d is local-only -- the remote answers `upload-pack: not our ref`). That silently
+  removes exactly 16 tests, which is a plausible-looking number and not a regression. Run it from a
+  worktree with the MAIN checkout's absolute path for that one file:
+  `.../unicorn-racing-stack/race_utils/unicorn_gym/f1tenth_gym_ros/test/test_ego_footprint.py`.
   The gb_optimizer and perception suites are ALSO runnable standalone, which is how they report their own measurements:
   `~/miniforge3/envs/unicorn/bin/python3 planner/gb_optimizer/scripts/test_static_reopt_node.py` (25 checks: the swap/publish/concurrency safety machinery, named per check in its docstring),
   `.../test_static_obstacle_layer.py`, `perception/scripts/test_static_classification.py`, `.../test_save_yaml_roundtrip.py`
