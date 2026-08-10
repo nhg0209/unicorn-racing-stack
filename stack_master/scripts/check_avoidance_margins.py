@@ -567,6 +567,28 @@ def check_dynamic_chain(sm_path, sm) -> bool:
     print(f"\n--- dynamic chain ({lc_path.name} <-> {dyn_path.name}) ---")
     ok = True
 
+    # 0. THE TWO PLANNERS MAY NOT BOTH CLAIM ONE OBSTACLE.
+    # static_avoidance treats a dynamic-flagged obstacle as STATIC once it reads below
+    # static_near_zero_mps for static_promote_sec; lane_change may ENGAGE one once it reads above
+    # engage_min_vs_mps for engage_moving_s. If the engage floor drops below the static band the two
+    # windows overlap, and an obstacle inside the overlap gets a static avoidance to one side and a
+    # lane change to the other at the same time. That is not a tuning wobble: the reference stepped
+    # 1.58 m, the steering saturated and the car hit the wall (run_0810_2102).
+    # A GAP is fine and is deliberate -- it resolves to TRAILING.
+    sa_path, sa = load_reactive_params()
+    near_zero = float(sa["static_near_zero_mps"])
+    engage_v = float(lc["engage_min_vs_mps"])
+    if engage_v >= near_zero:
+        print(f"  OK   engage_min_vs_mps {engage_v:.2f} >= static_near_zero_mps {near_zero:.2f} "
+              f"-- no obstacle can be claimed by both planners"
+              + (f" (gap {near_zero:.2f}-{engage_v:.2f} m/s trails)" if engage_v > near_zero else ""))
+    else:
+        print(f"  FAIL engage_min_vs_mps {engage_v:.2f} < static_near_zero_mps {near_zero:.2f} "
+              f"({lc_path.name} vs {sa_path.name}): an obstacle reading between them is BOTH a "
+              f"static keep-out and an overtake target, and the two planners will pull it opposite "
+              f"ways. Raise engage_min_vs_mps or lower static_near_zero_mps.")
+        ok = False
+
     # 1. mirrors must equal the real values
     mirrors = [
         ("sm_gb_ego_width_m", float(lc["sm_gb_ego_width_m"]), float(sm["gb_ego_width_m"]), sm_path.name),
