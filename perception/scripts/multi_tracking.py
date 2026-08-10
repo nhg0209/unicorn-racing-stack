@@ -25,6 +25,14 @@ from transforms3d.euler import quat2euler
 
 from f110_msgs.msg import ObstacleArray, Obstacle
 
+# OPTIONAL BY DESIGN. rate_check only ever prints a warning, so a workspace where it has not been
+# built yet loses the warning and nothing else -- which is exactly the state every node was in
+# before it existed. Hard-failing a live node on a missing diagnostic would be a worse trade.
+try:
+    from rate_check.rate_check import RateCheck
+except ImportError:                          # pragma: no cover - deployment shape, not logic
+    RateCheck = None
+
 
 def normalize_s(s, track_length):
         s = s % (track_length)
@@ -697,6 +705,12 @@ class StaticDynamic(Node):
         if self.timer is None and self.converter is not None:
             self.get_logger().info('[Opponent Tracking]: Ready!')
             self.timer = self.create_timer(1.0 / self.rate, self.timer_callback)
+            self._rate_check = (RateCheck(
+                self, nominal_hz=self.rate, name="multi_tracking",
+                consequence="the speed estimate (vs = ds * rate), the Kalman "
+                            "filter's process-noise dt, the classification window "
+                            "win_t = (n-1)/rate and the demotion count")
+                if RateCheck else None)
 
     def reproject_tracks(self, old_converter, new_converter, old_length, new_length):
         """Carry every tracked obstacle across a raceline swap: old (s,d) -> map (x,y) via the
@@ -1207,6 +1221,8 @@ class StaticDynamic(Node):
                 obs.dynamic_state.predict()
 
     def timer_callback(self):
+        if getattr(self, '_rate_check', None) is not None:
+            self._rate_check.tick()
         # Gate the loop on the inputs the ROS1 main() waited for before starting.
         # current_stamp stays None until the first /detect/raw_obstacles arrives;
         # publishing with a None stamp throws, so wait for it too.

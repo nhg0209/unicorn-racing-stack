@@ -25,6 +25,14 @@ from f110_msgs.msg import Obstacle, ObstacleArray, OTWpntArray, Wpnt, WpntArray,
 from frenet_conversion.frenet_converter import FrenetConverter
 from transforms3d.euler import quat2euler
 from grid_filter.grid_filter import GridFilter
+
+# OPTIONAL BY DESIGN. rate_check only ever prints a warning, so a workspace where it has not been
+# built yet loses the warning and nothing else -- which is exactly the state every node was in
+# before it existed. Hard-failing three live nodes on a missing diagnostic would be a worse trade.
+try:
+    from rate_check.rate_check import RateCheck
+except ImportError:                          # pragma: no cover - deployment shape, not logic
+    RateCheck = None
 import trajectory_planning_helpers as tph
 
 # The corridor QP, loaded AS A SIBLING FILE rather than as `spliner.corridor_path`.
@@ -433,6 +441,10 @@ class ObstacleSpliner(Node):
         self.wait_for_messages()
         self.converter = self.initialize_converter()
         self.create_timer(1.0 / 20.0, self.loop)   # 20 Hz
+        self._rate_check = (RateCheck(
+            self, nominal_hz=20.0, name=self.name,
+            consequence="the planner's own 50 ms period, which the state machine's "
+                        "staleness gate is set against") if RateCheck else None)
 
     #####################
     # DYNAMIC PARAMETERS #
@@ -848,6 +860,8 @@ class ObstacleSpliner(Node):
     # MAIN LOOP #
     #############
     def loop(self):
+        if self._rate_check is not None:
+            self._rate_check.tick()
         # decimate the (heavy) candidate markers to ~5 Hz so viz load never starves the 20 Hz plan
         self._marker_i += 1
         self._emit_markers = (self._marker_i % MARKER_DECIM == 0)
