@@ -39,6 +39,14 @@ static_avoidance_planner:
     # but a genuinely parked obstacle keeps reading 0.00 for as long as you look at it.
     # Raise if the car still twitches out of corners; lower if a real static box is picked up
     # too late. 0.0 restores the old behaviour (promote immediately).
+    # Throttle [s] on the per-cycle `avoid ... | corridor d=[..] obs keep-out d=[..]` line -- the
+    # only record of which side this planner chose and why. At 2.0 s / 20 Hz that is 1 line per 40
+    # cycles, and the sequence it has to order (a lane-change engage, an SM planner swap, 15
+    # saturated steering cycles, a wall) fits inside 1 s, so 2.0 loses exactly the ordering. Left at
+    # 2.0 so race-day log volume is unchanged; set 0.0 for a reproduction run:
+    #   ros2 param set /static_avoidance_planner avoid_log_throttle_s 0.0
+    # There is no save_params in this node, so nothing can persist a debug value by accident.
+    avoid_log_throttle_s: 2.0
     static_near_zero_mps: 0.15
     static_promote_sec: 0.5
     # Hysteresis: once promoted it stays static until it reads clearly moving (above

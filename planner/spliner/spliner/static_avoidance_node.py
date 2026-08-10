@@ -130,6 +130,10 @@ class ObstacleSpliner(Node):
     corridor_qp_max_vars = 60
     corridor_qp_ramp_ladder = False
     static_plan_log = False
+    # Same reason as the five above: every offline harness builds this node with __new__ and a
+    # hand-set attribute list, so a NEW attribute the hot path reads is an AttributeError in 31
+    # tests before it is ever a feature. A diagnostic throttle must not be able to break planning.
+    avoid_log_throttle_s = 2.0
 
     def __init__(self):
         self.name = "static_avoidance_planner"
@@ -209,6 +213,15 @@ class ObstacleSpliner(Node):
         # tracker's position error. Equal to safety_margin here, which makes the split a pure
         # refactor -- every published path is bit-identical to before it.
         self.safety_margin_d = 0.16
+        # How often the per-cycle `avoid ...` selection line may print. It is the ONE record of
+        # which side this planner chose, at what d_end, inside which corridor and against which
+        # keep-out -- i.e. the only way to line this planner up against the other one after a
+        # crash. At 2.0 s and a 20 Hz loop that is one line per 40 cycles, and the events it has to
+        # order (an engage, a planner swap, 15 saturated steering cycles, a wall) happen inside
+        # 1 s: the ordering is exactly what gets lost. Kept at 2.0 as the DEFAULT so race-day log
+        # volume does not change, and made settable so a reproduction run can turn it down:
+        #   ros2 param set /static_avoidance_planner avoid_log_throttle_s 0.0
+        self.avoid_log_throttle_s = 2.0
         self.static_near_zero_mps = 0.15  # speed band for the near-stationary fallback
         self.static_promote_sec = 0.5     # how long it must hold before the fallback is believed
         self.static_demote_mps = 0.35     # clearly-moving band that ends the belief
@@ -396,7 +409,8 @@ class ObstacleSpliner(Node):
             'kernel_size', 'body_kernel_size',
             'lookahead_min', 'lookahead_k', 'n_d_samples', 'sample_gaps', 'kappa_max',
             'kappa_add_max', 'kappa_abs_max', 'a_lat_max', 'a_long_max', 'a_long_accel',
-            'safety_margin', 'safety_margin_d', 'static_near_zero_mps', 'static_promote_sec',
+            'safety_margin', 'safety_margin_d', 'avoid_log_throttle_s',
+            'static_near_zero_mps', 'static_promote_sec',
             'static_demote_mps', 'static_demote_sec',
             'wall_margin', 'knot_merge_s_m', 'shift_min', 'shift_buffer', 'ramp_len', 'hold_after',
             'return_len', 'ramp_len_min_m',
@@ -479,6 +493,10 @@ class ObstacleSpliner(Node):
         self.declare_parameter('a_long_accel', 3.0, dbl(0.5, 20.0, "longitudinal accel for forward pass (gentle exit) [m/s^2]"))
         self.declare_parameter('safety_margin', 0.16, dbl(0.0, 1.0, "clearance around obstacle box [m]"))
         self.declare_parameter('safety_margin_d', 0.16, dbl(0.0, 1.0, "LATERAL clearance around the obstacle box [m]"))
+        self.declare_parameter('avoid_log_throttle_s', 2.0,
+                               ParameterDescriptor(
+                                   description="throttle [s] on the `avoid ...` selection line; "
+                                               "0 = every cycle (reproduction runs)"))
         self.declare_parameter('static_near_zero_mps', 0.15,
                                dbl(0.0, 1.0, "speed band for the near-stationary fallback [m/s]"))
         self.declare_parameter('static_promote_sec', 0.5,
@@ -633,6 +651,8 @@ class ObstacleSpliner(Node):
                 self.safety_margin = float(p.value)
             elif n == 'safety_margin_d':
                 self.safety_margin_d = float(p.value)
+            elif n == 'avoid_log_throttle_s':
+                self.avoid_log_throttle_s = max(0.0, float(p.value))
             elif n == 'static_near_zero_mps':
                 self.static_near_zero_mps = float(p.value)
             elif n == 'static_promote_sec':
@@ -2156,7 +2176,7 @@ class ObstacleSpliner(Node):
             f"sampled {n_left}L+{n_right}R of {N} | reject bounds={n_bounds} obs={n_obs} "
             f"grid={n_grid} body={n_body} curv={n_curv} | "
             f"corridor d=[{d_lo:.2f},{d_hi:.2f}] ({cor_src}) obs keep-out d=[{obox_lo:.2f},{obox_hi:.2f}]",
-            throttle_duration_sec=2.0)
+            throttle_duration_sec=self.avoid_log_throttle_s)
 
         if SMOOTH_OTWPNTS:
             kappa_ = _savgol_safe(kappa_, SMOOTH_OTWPNTS_WINDOW)
