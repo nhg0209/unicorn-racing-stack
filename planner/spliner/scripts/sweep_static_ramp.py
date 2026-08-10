@@ -1062,10 +1062,11 @@ def report(R):
                   f"on the SAME candidate median {np.median(bk):.3f} "
                   f"p90 {np.percentile(bk, 90):.3f}")
             # THE PRICE. Passing the curvature gate is not the same as being worth driving: the
-            # maneuver's speed cap is sqrt(a_lat_max / peak|kappa|), the same quantity
-            # sweep_static_feasibility gates at MIN_SPEED_CAP = 2.50 m/s over the cells the node
-            # already publishes. A ceiling bought at 1 m/s is a ceiling on paper.
-            cap = np.sqrt(sw.A_LAT_MAX / np.maximum(ka, 1e-3))
+            # maneuver's speed cap is sqrt(a_lat_max / peak|kappa|). sweep_static_feasibility
+            # gates the GEOMETRIC half of it (mean sqrt(1/|kappa|) >= MIN_BEND) so the gate does
+            # not move with the vehicle file; the speed is reported there and here, at the
+            # planner's own a_lat_max. A ceiling bought at 1 m/s is a ceiling on paper.
+            cap = np.sqrt(float(sw.load_params()["a_lat_max"]) / np.maximum(ka, 1e-3))
             print(f"      curvature-limited speed cap sqrt(a_lat/kappa): median {np.median(cap):.2f}"
                   f" m/s, p10 {np.percentile(cap, 10):.2f}, min {np.min(cap):.2f}  "
                   f"(the feasibility sweep gates the node's own published cells at "

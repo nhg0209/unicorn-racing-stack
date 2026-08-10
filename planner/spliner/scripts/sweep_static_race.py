@@ -60,7 +60,6 @@ import sweep_static_corridor as sc             # noqa: E402
 SQUEEZE_SPEED = 2.0      # below squeeze_max_speed_mps (3.0): the schedule is non-empty
 RACE_SPEED = 3.0         # the harness default, and exactly ON the gate
 
-A_LAT_MAX = 6.0          # sweep_static_feasibility's own, for the curvature-limited speed cap
 SEAM_DPRIME_MAX = 0.05   # R2: |d'| step the splice at s_entry0 may carry
 LADDER_BUDGET_MS = 20.0  # static_avoidance_params.yaml: ramp_search_max_ms -- one rung must fit
 CYCLE_MS = 50.0          # 20 Hz
@@ -83,7 +82,9 @@ def _shape_stats(H, r, o):
     if d is None or kap is None or len(d) < 5:
         return
     ds = H.wp[1]["s_m"] - H.wp[0]["s_m"]
-    o["vcap"].append(float(np.sqrt(A_LAT_MAX / max(np.max(np.abs(kap)), 1e-3))))
+    # a_lat from the node, not a local constant: this used to carry its own 6.0, which
+    # matched neither vehicle config (CAR ay_max 4.5, SIM 8.0).
+    o["vcap"].append(float(np.sqrt(float(H.P["a_lat_max"]) / max(np.max(np.abs(kap)), 1e-3))))
     o["kpeak"].append(float(np.max(np.abs(kap))))
     j0 = 1 if s0 is None else int(np.clip(round(float(s0) / ds), 1, len(d) - 2))
     dpp = np.abs(np.diff(d, 2)) / ds

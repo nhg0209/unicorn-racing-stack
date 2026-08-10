@@ -11,6 +11,10 @@
 #
 # Raising it is also not free downstream: ay_max is the lateral budget the reactive planner's
 # curvature-limited cap divides by, so it changes avoidance speeds as well as raceline speeds.
+#
+# THE TWO VEHICLE CONFIGS DIVERGE HERE ON PURPOSE. CAR and SIM are different surfaces, so their
+# ay_max is not the same number and sim tuning of anything that divides by it does NOT transfer to
+# the car. Check which config you are reading before quoting a value from this file.
 0.0, 5.0,4.5
 4.0, 5.0,4.5
 8.0, 5.0,4.5

@@ -100,8 +100,25 @@ CORNER_HEADROOM_MAX_M = 0.130      # ifac today: 0.108
 CORNER_GAPS = (12.0, 8.0, 4.0)     # 33 stations x 3 = 99 cells on ifac
 SHIPPED_LADDER_MS = 20.0           # static_avoidance_params.yaml: ramp_search_max_ms
 MAX_LOOP_P95_MS = 40.0
-MIN_SPEED_CAP = 2.50               # [m/s] mean over the feasible cells
-A_LAT_MAX = 6.0
+# WHAT THE LADDER COSTS, AS GEOMETRY. This gate exists to catch a ramp search that buys
+# feasibility by bending the path harder than it should -- a shape question. It used to be
+# expressed as a SPEED, mean sqrt(a_lat_max / |kappa|) >= 2.50 m/s, which folds the vehicle's
+# lateral budget into a threshold about geometry: the same paths score 2.630 m/s at a_lat 6.0,
+# 2.278 at 4.5 and 3.037 at 8.0 while not one waypoint moves. The repo's two vehicle configs
+# disagree by 78 % on that number (CAR ay_max 4.5, SIM 8.0), so the gate moved with the config
+# and reported it as a planner change. Same disease as G2 measuring SPATIAL and REPLAN as one
+# number (see sweep_avoidance_stability).
+#
+# So the gate is now the geometric half alone, mean sqrt(1 / |kappa|), and the threshold is the
+# old one with the vehicle divided back out -- an EXACT re-expression, not a re-tune:
+#
+#     MIN_BEND = MIN_SPEED_CAP / sqrt(A_LAT_MAX) = 2.50 / sqrt(6.0) = 1.02062
+#
+# so today's verdict is bit-for-bit the verdict it replaces (measured 1.0737 against 1.0206, the
+# same margin as 2.630 against 2.50) and it stops moving when the vehicle file does. The speed is
+# still PRINTED, with the a_lat_max it was computed at, because what the driver feels is a speed.
+# Units are sqrt(m): sqrt(1/kappa) is the square root of a radius. Ugly, and honest.
+MIN_BEND = 2.50 / math.sqrt(6.0)   # [sqrt(m)] mean sqrt(1/|kappa|) over the feasible cells
 CORNER_KAPPA = 0.8
 EARLY_GAPS = [round(0.5 * k, 2) for k in range(1, 41)]     # 0.5 .. 20.0 m
 
@@ -346,11 +363,9 @@ def main():
 
     H = Harness(a.map)
     fails = []
-    # The speed gate divides by the SAME a_lat the planner used; a yaml edit that moved one and
-    # not the other would print a cap belonging to neither.
-    if abs(float(H.P["a_lat_max"]) - A_LAT_MAX) > 1e-9:
-        fails.append(f"A_LAT_MAX here is {A_LAT_MAX} but the planner runs at "
-                     f"{H.P['a_lat_max']}; the speed cap below is not the planner's")
+    # The A_LAT_MAX-vs-planner consistency check that used to be here is GONE because the
+    # constant it compared is gone: the reported speed now reads H.P["a_lat_max"] directly, so the
+    # two cannot disagree. A guard that exists to catch a copy is worth less than not copying.
     # MEASURED PER MAP, not looked up. This was `if a.map in ("f",)` -- a hardcoded literal, so
     # ifac_0807 arrived with the same defect and the warning stayed silent for it. The corridor,
     # the sampled terminal offsets and the obstacle keep-out sides all come from those bounds, so
@@ -402,13 +417,20 @@ def main():
     # --- speed -----------------------------------------------------------------------------
     # over the WHOLE grid, every gap: a ladder that shortens a ramp does it wherever the
     # geometry is tight, and the tight cells are the near ones
-    caps = [math.sqrt(A_LAT_MAX / max(v[1], 1e-3)) for k, v in cells.items() if k[0] and v]
     kap = [v[1] for k, v in cells.items() if k[0] and v]
-    mean_cap = float(np.mean(caps)) if caps else 0.0
-    print(f"=== speed | mean peak|kappa| {np.mean(kap):.3f} -> mean cap "
-          f"sqrt(a_lat/kappa) = {mean_cap:.3f} m/s over {len(caps)} feasible cells ===")
-    if mean_cap < MIN_SPEED_CAP:
-        fails.append(f"mean speed cap {mean_cap:.3f} m/s < {MIN_SPEED_CAP} "
+    bend = [math.sqrt(1.0 / max(v[1], 1e-3)) for k, v in cells.items() if k[0] and v]
+    mean_bend = float(np.mean(bend)) if bend else 0.0
+    # The speed is the same number times sqrt(a_lat_max) -- reported, never gated, and printed
+    # with the a_lat it came from so it can never again be read as if it were vehicle-independent.
+    # Taken from the node's own parameter rather than a constant here: that constant was a NINTH
+    # copy of the vehicle's lateral budget, and it disagreed with both configs.
+    a_lat = float(H.P["a_lat_max"])
+    print(f"=== bend | mean peak|kappa| {np.mean(kap):.3f} -> mean sqrt(1/|kappa|) = "
+          f"{mean_bend:.4f} sqrt(m) over {len(bend)} feasible cells (gate {MIN_BEND:.4f}) ===")
+    print(f"    at the planner's a_lat_max = {a_lat:.2f} that is a mean speed cap of "
+          f"{mean_bend * math.sqrt(a_lat):.3f} m/s   [reported, NOT gated]")
+    if mean_bend < MIN_BEND:
+        fails.append(f"mean sqrt(1/|kappa|) {mean_bend:.4f} < {MIN_BEND:.4f} sqrt(m) "
                      f"(the ladder is escaping into ramps that are too short)")
 
     # --- corners, and what the ladder costs to get them --------------------------------------
