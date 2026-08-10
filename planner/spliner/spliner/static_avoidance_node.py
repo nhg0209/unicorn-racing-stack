@@ -124,7 +124,7 @@ class ObstacleSpliner(Node):
     # value to fall back on when the parameter machinery has not run is the shipped shape, not a
     # crash. The yaml still overrides all four through the ordinary declare/branch/sync chain
     # (planner/spliner/test/test_param_wiring.py enforces it).
-    static_plan_method = "sample"
+    static_plan_method = "corridor_qp"
     corridor_qp_w_dev = 0.0
     corridor_qp_pin_apex = False
     corridor_qp_max_vars = 60
@@ -572,7 +572,7 @@ class ObstacleSpliner(Node):
         self.declare_parameter('commit_obs_ds', 0.75, dbl(0.05, 5.0, "drop the commit if the triggering obstacle s drifts this far [m]"))
         self.declare_parameter('commit_obs_dd', 0.40, dbl(0.05, 2.0, "drop the commit if the triggering obstacle d drifts this far [m]"))
         # --- which shape carries the sampled terminal offset (see the branch in do_spline) ---
-        self.declare_parameter('static_plan_method', 'sample',
+        self.declare_parameter('static_plan_method', 'corridor_qp',
                                ParameterDescriptor(type=ParameterType.PARAMETER_STRING,
                                                    description="d(s) generator: 'sample' (the quintic hump) or 'corridor_qp' (minimum bending inside the measured corridor)"))
         self.declare_parameter('corridor_qp_w_dev', 0.0,
@@ -748,7 +748,7 @@ class ObstacleSpliner(Node):
                 if v not in ("sample", "corridor_qp"):
                     self.get_logger().error(
                         f"[{self.name}] static_plan_method='{v}' is not a method; keeping "
-                        f"'{getattr(self, 'static_plan_method', 'sample')}'. A fallthrough branch "
+                        f"'{getattr(self, 'static_plan_method', 'corridor_qp')}'. A fallthrough branch "
                         f"here would silently plan with something nobody asked for.")
                 else:
                     self.static_plan_method = v
