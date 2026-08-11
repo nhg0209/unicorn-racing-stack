@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<!--
+  raceline_tuner.launch.xml — interactive RViz waypoint editor for an EXISTING raceline.
+
+  Starts ONLY the gb_optimizer `global_trajectory_tuner` node (no RViz, no map server,
+  no car). It loads stack_master/maps/<map>/global_waypoints.json, publishes
+  InteractiveMarkers + MarkerArrays, and lets you drag waypoints / edit speeds from a
+  right-click menu, then Save back to the json (follows the maps symlink to the SOURCE
+  tree, so edits persist across rebuilds).
+
+  Headless / remote use (SSH into the NUC, view on a laptop):
+    - Run this on the NUC:   ros2 launch stack_master raceline_tuner.launch.xml map:=ifac
+    - On the laptop, open RViz2 (same ROS_DOMAIN_ID + same LAN as the NUC) and add:
+        * InteractiveMarkers display   -> namespace  track_info_interactive
+        * MarkerArray display          -> the tuner's waypoint markers
+      Drag the markers / right-click for the menu (Pos_Straighten, Vel_Set, Update, Save...).
+
+  BACK UP FIRST (Save overwrites global_waypoints.json):
+    cp stack_master/maps/<map>/global_waypoints.json stack_master/maps/<map>/global_waypoints.json.bak
+-->
+<launch>
+  <arg name="map" description="Map name (folder in stack_master/maps/) whose global_waypoints.json to edit"/>
+  <let name="maps_dir" value="$(find-pkg-share stack_master)/maps"/>
+
+  <node pkg="gb_optimizer" exec="global_trajectory_tuner" name="global_trajectory_tuner"
+        output="screen" emulate_tty="true">
+    <param name="map"     value="$(var map)"/>
+    <param name="map_dir" value="$(var maps_dir)/$(var map)/"/>
+  </node>
+</launch>

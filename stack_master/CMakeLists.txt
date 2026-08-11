@@ -41,6 +41,7 @@ install(PROGRAMS
   scripts/global_velocity_planner.py
   scripts/static_tf_publisher.py
   scripts/vesc_calibration_node.py
+  scripts/opponent_bridge_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -34,15 +34,9 @@ L1_PARAMS = [
     'trailing_d_gain', 'blind_trailing_speed', 'curvature_factor',
     'speed_factor_for_lat_err', 'speed_factor_for_curvature', 'KP', 'KI', 'KD',
     'heading_error_thres', 'steer_gain_for_speed', 'future_constant', 'AEB_thres',
+    'AEB_thres_overtake', 'AEB_offline_d_thres', 'AEB_release_hyst_m', 'AEB_min_hold_s',
     'speed_diff_thres', 'start_speed', 'start_curvature_factor',
-]
-
-# FTG params live-tunable via rqt (controller.yaml). Mapped onto the FTG instance
-# in dyn_param_cb. Disparity-extender tunables are in metres/degrees.
-FTG_PARAMS = [
-    'ftg_debug', 'ftg_max_lidar_dist', 'ftg_max_speed', 'ftg_track_width',
-    'ftg_front_fov_deg', 'ftg_smooth_deg', 'ftg_disp_thresh', 'ftg_bubble_m',
-    'ftg_steer_ema', 'ftg_max_steer',
+    'l1_lat_err_cap', 'max_accel_mps2', 'max_decel_mps2',
 ]
 
 
@@ -126,15 +120,11 @@ class ControllerManager(Node):
             node=self,
             mapping=False,
             debug=self._get_param('ftg_debug', False),
+            safety_radius=int(self._get_param('ftg_safety_radius', 10)),
             max_lidar_dist=self._get_param('ftg_max_lidar_dist', 10.0),
             max_speed=self._get_param('ftg_max_speed', 1.5),
+            range_offset=int(self._get_param('ftg_range_offset', 0)),
             track_width=self._get_param('ftg_track_width', 2.0),
-            front_fov_deg=self._get_param('ftg_front_fov_deg', 90.0),
-            smooth_deg=self._get_param('ftg_smooth_deg', 1.0),
-            disp_thresh=self._get_param('ftg_disp_thresh', 0.5),
-            bubble_m=self._get_param('ftg_bubble_m', 0.30),
-            steer_ema=self._get_param('ftg_steer_ema', 0.0),
-            max_steer=self._get_param('ftg_max_steer', 0.4),
         )
 
         # Subscribers
@@ -172,11 +162,25 @@ class ControllerManager(Node):
 
     ############################################ LAZY INIT ############################################
     def global_wpnts_cb(self, data: WpntArray):
-        if self.controller is not None:
-            return
         if len(data.wpnts) < 2:
             return
-        self.waypoints = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in data.wpnts])
+        new_wpnts = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in data.wpnts])
+        if self.controller is not None:
+            # The global line can CHANGE at runtime (static re-optimization swaps in an
+            # obstacle-aware line). Rebuild the FrenetConverter so the lateral-error / L1
+            # lookahead logic references the CURRENT line, not the one seen at startup —
+            # otherwise the car's lateral error is measured against the stale clean line and
+            # the `lower_bound = sqrt(2)*lat_err` clamp inflates the lookahead. Only rebuild on
+            # an ACTUAL change (the line is published rarely), so there is no per-message churn.
+            if (self.waypoints is None or new_wpnts.shape != self.waypoints.shape
+                    or not np.allclose(new_wpnts, self.waypoints)):
+                self.waypoints = new_wpnts
+                self.track_length = data.wpnts[-1].s_m
+                self.converter = FrenetConverter(new_wpnts[:, 0], new_wpnts[:, 1])
+                self.controller.converter = self.converter
+                self.get_logger().info(f"[{self.name}] global line changed -> rebuilt FrenetConverter")
+            return
+        self.waypoints = new_wpnts
         # ROS1 read /global_republisher/track_length; derive from the waypoints' s_m
         self.track_length = data.wpnts[-1].s_m
         self.converter = FrenetConverter(self.waypoints[:, 0], self.waypoints[:, 1])
@@ -201,6 +205,14 @@ class ControllerManager(Node):
         )
         self.controller.speed_now = self.speed_now
         self.controller.yaw_rate = self.yaw_rate
+        # not part of the positional Controller signature; delivered like the live-tuned params
+        self.controller.AEB_thres_overtake = self.AEB_thres_overtake
+        self.controller.AEB_offline_d_thres = self.AEB_offline_d_thres
+        self.controller.AEB_release_hyst_m = self.AEB_release_hyst_m
+        self.controller.AEB_min_hold_s = self.AEB_min_hold_s
+        self.controller.l1_lat_err_cap = self.l1_lat_err_cap
+        self.controller.max_accel_mps2 = self.max_accel_mps2
+        self.controller.max_decel_mps2 = self.max_decel_mps2
         self.get_logger().info(f"[{self.name}] initialized FrenetConverter + Controller. Ready!")
 
     ############################################ CALLBACKS ############################################
@@ -223,38 +235,9 @@ class ControllerManager(Node):
                 setattr(self, name, param.value)
                 if self.controller is not None:
                     setattr(self.controller, name, param.value)
-            elif name in FTG_PARAMS:
-                self._apply_ftg_param(name, param.value)
             elif name == 'save_params' and param.value:
                 self._save_requested = True
         return SetParametersResult(successful=True)
-
-    def _apply_ftg_param(self, name, value):
-        """Live-update an ftg_* param on the FTG instance (rqt tuning)."""
-        if self.ftg_controller is None:
-            return
-        f = self.ftg_controller
-        if name == 'ftg_debug':
-            f.DEBUG = bool(value)
-        elif name == 'ftg_max_lidar_dist':
-            f.MAX_LIDAR_DIST = float(value)
-        elif name == 'ftg_track_width':
-            f.track_width = float(value)
-        elif name == 'ftg_front_fov_deg':
-            f.FRONT_FOV = np.radians(float(value) / 2.0)   # param = TOTAL front FOV
-        elif name == 'ftg_smooth_deg':
-            f.SMOOTH_RAD = np.radians(float(value))
-        elif name == 'ftg_disp_thresh':
-            f.DISP_THRESH = float(value)
-        elif name == 'ftg_bubble_m':
-            f.BUBBLE_M = float(value)
-        elif name == 'ftg_steer_ema':
-            f.STEER_EMA = float(value)
-        elif name == 'ftg_max_steer':
-            f.MAX_STEER = float(value)
-        elif name == 'ftg_max_speed':
-            f.MAX_SPEED = float(value)
-            f.recompute_speeds()
 
     def save_yaml(self):
         if not self.save_yaml_path:
@@ -266,12 +249,8 @@ class ControllerManager(Node):
                 with open(self.save_yaml_path, "r") as f:
                     data = yaml.safe_load(f) or {}
             params = {p: float(getattr(self, p)) for p in L1_PARAMS}
-            for p in FTG_PARAMS:                      # keep FTG tuning + current values
-                if self.has_parameter(p):
-                    params[p] = self.get_parameter(p).value
             params['save_params'] = False
-            block = data.setdefault('controller_manager', {}).setdefault('ros__parameters', {})
-            block.update(params)                      # merge: don't drop other keys
+            data.setdefault('controller_manager', {})['ros__parameters'] = params
             with open(self.save_yaml_path, "w") as f:
                 yaml.dump(data, f, default_flow_style=False, sort_keys=False)
             self.get_logger().info(f"controller params saved to: {self.save_yaml_path}")
@@ -367,6 +346,10 @@ class ControllerManager(Node):
         if self.state != "FTGONLY":
             speed, acceleration, jerk, steering_angle = self.controller_cycle()
         else:
+            # FTG owns the command while it runs, so the L1 slew limiter's memory of the last
+            # published speed is stale the moment we come back. Drop it: the first cycle after
+            # FTG adopts its command as-is instead of ramping from a value that is seconds old.
+            self.controller._speed_cmd_prev = None
             speed, steering_angle = self.ftg_cycle()
 
         ack_msg = self.create_ack_msg(speed, acceleration, jerk, steering_angle)
@@ -381,8 +364,7 @@ class ControllerManager(Node):
         if self.scan is None:
             return
         speed, acceleration, jerk, steering_angle = 0, 0, 0, 0
-        speed, steering_angle = self.ftg_controller.process_lidar(
-            self.scan.ranges, self.scan.angle_min, self.scan.angle_increment)
+        speed, steering_angle = self.ftg_controller.process_lidar(self.scan.ranges)
         ack_msg = self.create_ack_msg(speed, acceleration, jerk, steering_angle)
         self.drive_pub.publish(ack_msg)
 
@@ -409,13 +391,15 @@ class ControllerManager(Node):
         if self.waypoint_safety_counter >= self.loop_rate/self.state_machine_rate * 10:
             self.get_logger().error(f"[{self.name}] Received no local wpnts. STOPPING!!", throttle_duration_sec=0.5)
             speed = 0
-            steering_angle = 0
+            # brake, but HOLD the last steering: zeroing it mid-corner straightened the car into
+            # the wall whenever the SM hiccuped for a few cycles (e.g. digesting a line swap) —
+            # braking along the current arc is strictly safer than braking straight.
+            steering_angle = float(getattr(self.controller, "curr_steering_angle", 0.0))
 
         return speed, acceleration, jerk, steering_angle
 
     def ftg_cycle(self):
-        speed, steer = self.ftg_controller.process_lidar(
-            self.scan.ranges, self.scan.angle_min, self.scan.angle_increment)
+        speed, steer = self.ftg_controller.process_lidar(self.scan.ranges)
         self.get_logger().warning(f"[{self.name}] FTGONLY!!!")
         return speed, steer
 

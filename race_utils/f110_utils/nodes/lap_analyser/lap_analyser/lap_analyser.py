@@ -8,8 +8,8 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Pose, Point
 from visualization_msgs.msg import Marker
 
+from ament_index_python.packages import get_package_share_directory
 from collections import deque
-from copy import deepcopy
 import numpy as np
 
 from datetime import datetime
@@ -24,14 +24,17 @@ class LapAnalyser(Node):
 
         self.get_logger().info("Lap_analyser node started")
 
-        # Where to place the lap-stats text marker. ROS1 blocked here with
-        # wait_for_message("/state_marker") to grab the state machine's marker pose;
-        # rclpy can't block in __init__, so we latch it lazily on the first
-        # /state_marker (marker_cb) instead. Until then vis_pos stays unset so the
-        # text isn't pinned to the origin.
-        self.vis_pos = None
+        # Wait for state machine to start to figure out where to place the visualization message
+        self.vis_pos = Pose()
         self.state_marker = None
         self.marker_sub = self.create_subscription(Marker, '/state_marker', self.marker_cb, 10)
+
+        if self.state_marker is not None:
+            self.vis_pos = self.state_marker.pose
+
+        self.vis_pos.position.z += 1.5  # appear on top of the state marker
+        self.get_logger().info(
+            f"LapAnalyser will be centered at {self.vis_pos.position.x}, {self.vis_pos.position.y}, {self.vis_pos.position.z}")
 
         # stuff for min distance to track boundary
         self.wp_flag = False
@@ -74,10 +77,11 @@ class LapAnalyser(Node):
         # New publisher for odom trajectory and other markers (unicorn-specific)
         self.lap_marker_pub = self.create_publisher(Marker, 'lap_marker', 5)
 
-        # Open up logfile (in the source package's data/ dir, matching ROS1)
-        pkg_root = os.path.realpath(os.path.join(os.path.dirname(__file__), '..'))
-        data_path = os.path.join(pkg_root, 'data')
-        self.get_logger().info(f"lap_analyser data dir: {data_path}")
+        # Open up logfile
+        package_path = get_package_share_directory('lap_analyser')
+        ws_path = os.path.abspath(os.path.join(package_path, '..', '..', '..', '..'))
+        data_path = os.path.join(ws_path, 'data/lap_analyser')
+        self.get_logger().warn(data_path)
         if not os.path.exists(data_path):
             os.makedirs(data_path)
 
@@ -95,14 +99,6 @@ class LapAnalyser(Node):
 
     def marker_cb(self, data: Marker):
         self.state_marker = data
-        # Latch the text-marker position once, from the first state marker (ROS1
-        # did this via wait_for_message in __init__).
-        if self.vis_pos is None:
-            self.vis_pos = deepcopy(data.pose)
-            self.vis_pos.position.z += 1.5  # appear on top of the state marker
-            self.get_logger().info(
-                f"LapAnalyser will be centered at {self.vis_pos.position.x}, "
-                f"{self.vis_pos.position.y}, {self.vis_pos.position.z}")
 
     def waypoints_cb(self, data: WpntArray):
         """
@@ -138,6 +134,10 @@ class LapAnalyser(Node):
                 self.lap_start_time = self.get_clock().now()
                 self.get_logger().info("LapAnalyser: started first lap")
                 self.lap_count = 0
+            elif (self.get_clock().now() - self.lap_start_time).nanoseconds / 1e9 < 3.0:
+                # 0810 debounce: 210Hz kiss odom 의 s 지터가 결승선 근처에서 랩을
+                # 이중 트리거 (ms 간격 → 0.007s 랩 표기). 3초 미만 랩은 무시.
+                pass
             else:
                 self.lap_count += 1
                 self.publish_lap_info()
@@ -235,12 +235,6 @@ class LapAnalyser(Node):
         mark.ns = 'lap_info'
         mark.type = Marker.TEXT_VIEW_FACING
         mark.action = Marker.ADD
-        if self.vis_pos is None:
-            # /state_marker not seen yet -> skip this lap's text marker rather than
-            # pinning it to the origin (it latches on the first /state_marker).
-            self.get_logger().warn("vis_pos not set (no /state_marker yet); skipping lap text marker",
-                                    throttle_duration_sec=5.0)
-            return
         mark.pose = self.vis_pos
         mark.scale.x = 0.0
         mark.scale.y = 0.0

@@ -1,0 +1,60 @@
+<launch>
+  <!--
+    mpcc_unicorn.launch.xml - MPCC time-trial bring-up for unicorn-racing-stack.
+    ===========================================================================
+    접근 A (selectable): 기존 L1 controller_manager 대신 MPCC만 띄운다.
+    둘을 동시에 띄우지 말 것 (출력 토픽 /vesc/high_level/ackermann_cmd 충돌).
+
+    전제 (먼저 떠 있어야 함):
+      - localization.launch.xml  -> /car_state/odom + low_level(simple_mux -> VESC)
+        예: ros2 launch stack_master localization.launch.xml localization:=kiss map:=ifac keyboard_teleop:=false
+
+    이 launch가 직접 띄우는 것:
+      - gb_optimizer global_trajectory_publisher -> /global_waypoints + /centerline_waypoints
+        (maps/<map>/global_waypoints.json 을 읽음.  publish_global:=false 로 끌 수 있음)
+      - mpc_node (MPCC 컨트롤러)
+
+    실행:
+      unicorn
+      ros2 launch nonlinear_mpc_acados mpcc_unicorn.launch.xml map:=ifac
+
+    주의:
+      - GP off (use_gp_casadi=false in yaml; use_gp_residual=false).
+      - acados codegen 첫 launch ~30s (이후 캐시).
+      - 즉시 수동 복귀(조이패드 등) 가능하게 둘 것.
+  -->
+
+  <arg name="map"           default="ifac"                              description="맵/트랙 이름 (tracks/track{map} CSV 폴백 + maps/{map} json)"/>
+  <arg name="publish_global" default="true"                            description="gb_optimizer 로 /global_waypoints 발행. false면 mpc_node가 CSV 트랙(tracks/track{map})을 직접 로드 (gb_optimizer/f110_msgs 우회)"/>
+  <arg name="config"        default="$(find-pkg-share nonlinear_mpc_acados)/config/ddrx_unified_params.yaml"/>
+  <arg name="odom_topic"    default="/car_state/odom"                  description="localization odom"/>
+  <arg name="cmd_topic"     default="/vesc/high_level/ackermann_cmd"   description="unicorn simple_mux input"/>
+  <arg name="track_source"  default="raceline"                            description="raceline -> /global_waypoints"/>
+  <arg name="obstacle_topic" default="/kiss_loc/obstacle_poses"        description="회피 입력: kiss LiDAR 클러스터 PoseArray (MPCC /external_obstacles 로 remap)"/>
+
+  <!-- acados 런타임 libs: unicorn.sh 가 DYLD 를 필터링하므로 launch 에서 직접 주입.
+       => run_mpcc.sh 없이 'ros2 launch' 만으로 동작 (IFAC2026 방식). -->
+  <set_env name="DYLD_LIBRARY_PATH" value="$(env HOME)/acados/lib:$(env DYLD_LIBRARY_PATH '')"/>
+  <set_env name="LD_LIBRARY_PATH" value="$(env HOME)/acados/lib:$(env LD_LIBRARY_PATH '')"/>
+
+  <!-- 글로벌 레이싱 라인 발행: maps/<map>/global_waypoints.json -> /global_waypoints, /centerline_waypoints, ... -->
+  <node pkg="gb_optimizer" exec="global_trajectory_publisher" name="global_republisher" output="screen"
+        if="$(var publish_global)">
+    <param name="map" value="$(var map)"/>
+  </node>
+
+  <!-- MPCC 컨트롤러 -->
+  <node pkg="nonlinear_mpc_acados" exec="mpc_node" name="mpc_node" output="screen">
+    <param from="$(var config)"/>
+    <param name="odom_topic_name"   value="$(var odom_topic)"/>
+    <param name="cmd_vel_topic_name" value="$(var cmd_topic)"/>
+    <param name="track_source"      value="$(var track_source)"/>
+    <param name="track_name"        value="$(var map)"/>   <!-- CSV 폴백: tracks/track{map}/track{map}_*.csv -->
+    <param name="use_gp_residual"   value="false"/>
+    <param name="enable_sim_reset"  value="false"/>   <!-- 실차 안전: stuck 시 /sim/initialpose 발행 안 함 -->
+    <!-- VESC /vesc/odom(wheel-only, drifts) -> EKF /car_state/odom (real-car 검증 배선 미러) -->
+    <remap from="/vesc/odom" to="/car_state/odom"/>
+    <remap from="/external_obstacles" to="$(var obstacle_topic)"/>
+  </node>
+
+</launch>

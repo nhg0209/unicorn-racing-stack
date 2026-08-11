@@ -13,6 +13,7 @@
   <depend>nav_msgs</depend>
   <depend>visualization_msgs</depend>
   <depend>f110_msgs</depend>
+  <depend>frenet_conversion</depend>
   <depend>stack_master</depend>
   <depend>vel_planner</depend>
 

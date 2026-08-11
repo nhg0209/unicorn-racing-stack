@@ -1,0 +1,2195 @@
+"""
+static_reopt_node.py — obstacle-aware global-waypoint republisher (IFAC static obstacles).
+
+Runtime replacement for gb_optimizer's global_trajectory_publisher during obstacle races.
+It holds the CLEAN raceline bundle (read once from global_waypoints.json) and, when static
+obstacles are present, a re-optimized OBSTACLE-AWARE bundle (main mincurv_iqp + shortest_path
+SP, both from the width-modulated reftrack), and republishes whichever is active on the exact
+same topics the rest of the stack already consumes. gb_optimizer itself is untouched — only
+its library functions are imported (see static_reopt_core, memory: project-ifac-static-reopt).
+
+HARD GUARANTEE — it must NEVER stop publishing a valid raceline:
+  * ANY re-opt failure (infeasible QP, exception) is swallowed — the node keeps the last
+    valid bundle (obstacle-aware if one was ever built for the current obstacles, else clean);
+  * `active` is only ever rebound to a fully-built bundle.
+So even a track-blocking obstacle degrades to "publish the previous good line" (the reactive
+planner then handles what the global line cannot) — it never emits nothing or a broken line.
+
+THREADING — the solve runs on a ONE-WORKER ThreadPoolExecutor and its result is collected in
+republish_cb. It used to be synchronous inside frenet_cb, on the claim that the solve is ~10 ms;
+measured, it is 200-850 ms (ifac 1/2/3 obstacles: 211/464/630 ms, map f: 389/731/844), so a
+40 Hz callback was stalling for the better part of a second and BLOCKING THE VERY GATES THE SWAP
+WAITS ON -- ego-s freshness and reactive idleness are both judged from callbacks that could not
+run. No lock is needed: the solve is a pure function of a snapshot (clean line, reftrack, apex
+pairs, obstacles), and every mutation of node state stays on the executor thread. The legacy
+`reopt_method: "global"` path (minutes per solve) must still never be used online -- off the
+executor it no longer freezes the node, but a line that arrives minutes late is not a plan.
+
+Obstacle input (phase 1, before the perception static-layer exists): a MarkerArray on
+`/static_reopt/obstacles`; each marker -> Obstacle(x, y, r=max(scale.x,scale.y)/2 or the
+`default_obs_radius` param). An empty array clears obstacles. This is trivial to drive from a
+test script or RViz and will later be fed by the static-obstacle layer.
+
+Line swap happens at start/finish (frenet s wrap) so the two closed lines coincide -> C2
+continuity; a timeout forces the swap if no frenet odom is seen (bench testing).
+"""
+
+import copy
+import os
+import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+
+# Pin BLAS/OpenMP to ONE thread BEFORE numpy loads. OpenBLAS otherwise spawns a large pool
+# that, on the tiny windowed-QP matrices, pegs every core for ~1s per solve and starves the
+# sim + control loop (whole-system stutter whenever an obstacle triggers a re-opt). setdefault
+# so an explicit launch <env> still wins; this covers `ros2 run` / missing-env launches too.
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
+import numpy as np
+from contextlib import redirect_stdout
+from typing import List, Optional
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
+
+from ament_index_python.packages import get_package_share_directory
+from std_msgs.msg import String, Float32, Bool, Empty, Float32MultiArray
+from nav_msgs.msg import Odometry
+from visualization_msgs.msg import Marker, MarkerArray
+from f110_msgs.msg import WpntArray, OTWpntArray
+
+from grid_filter.grid_filter import GridFilter
+
+from .readwrite_global_waypoints import read_global_waypoints
+from . import static_reopt_core as core
+from . import closed_reopt_bridge as cqb
+from . import track_bounds
+
+# [m] line-centre to obstacle EDGE: what the REACTIVE layer needs to see before it will go (and
+# stay) idle about a box -- width_car/2 + clear_margin_m + clear_hyst_m from
+# static_avoidance_params.yaml, currently 0.15 + 0.10 + 0.03. Mirrored here for one purpose: to
+# say, at publish time, how much headroom the line being published actually has over it. If a
+# claimed box is published nearer than this, the reactive layer will avoid it AGAIN on top of the
+# global line -- the double avoidance this whole subsystem exists to remove. The chain itself is
+# enforced by stack_master/scripts/check_avoidance_margins.py, not here; this is a diagnostic.
+_REACTIVE_IDLE_CLEARANCE_M = 0.28
+
+
+class _Bundle:
+    """The full set of messages the republisher emits (mirrors global_trajectory_publisher)."""
+
+    __slots__ = (
+        "map_info", "est_lap_time",
+        "cent_wpnts", "cent_markers",
+        "glb_wpnts", "glb_markers",
+        "sp_wpnts", "sp_markers",
+        "trackbounds", "n_apex", "clearance_ok", "clearance_by_key", "floor_by_key",
+        "coverage",
+    )
+
+    def __init__(self, map_info, est_lap_time, cent_wpnts, cent_markers,
+                 glb_wpnts, glb_markers, sp_wpnts, sp_markers, trackbounds, n_apex=0,
+                 clearance_ok=True, clearance_by_key=None, floor_by_key=None,
+                 coverage=None):
+        # n_apex = humps ACTUALLY laid into this line. 0 means the geometry is the clean raceline
+        # even if obstacles were passed in (no apex recorded, or the corridor could not hold it).
+        self.n_apex = n_apex
+        # clearance_ok = every obstacle this line claims to have reshaped is really cleared by
+        # obs_margin, measured on the built geometry. False = do NOT publish it (see
+        # _check_line_clearance); the previous good line is kept instead.
+        self.clearance_ok = clearance_ok
+        # clearance_by_key = per-obstacle edge clearance of THIS line at the positions it was
+        # built from. The baseline the drift trigger compares live positions against, so it must
+        # travel with the line rather than with the node (see _clearance_drifted).
+        self.clearance_by_key = clearance_by_key or {}
+        # floor_by_key = the clearance each LAID hump was accepted at (the coverage
+        # ladder may settle below obs_margin). What the line promised for that box.
+        self.floor_by_key = floor_by_key or {}
+        # coverage = one record per confirmed obstacle: what this line does about it and
+        # why. Published on /static_reopt/coverage and used to compare candidate lines.
+        self.coverage = coverage or []
+        self.map_info = map_info
+        self.est_lap_time = est_lap_time
+        self.cent_wpnts = cent_wpnts
+        self.cent_markers = cent_markers
+        self.glb_wpnts = glb_wpnts
+        self.glb_markers = glb_markers
+        self.sp_wpnts = sp_wpnts
+        self.sp_markers = sp_markers
+        self.trackbounds = trackbounds
+
+
+class StaticReoptNode(Node):
+    def __init__(self):
+        super().__init__("static_reopt_node")
+
+        self.declare_parameter("map", "")
+        self.declare_parameter("racecar_version", "SIM")
+        self.declare_parameter("safety_width", 0.5)
+        self.declare_parameter("safety_width_sp", 0.5)
+        # obs_margin: extra clearance for the re-optimized line. Also prevents DOUBLE
+        # AVOIDANCE (design A) — must be >= the reactive keep-out (width_car/2 + safety_margin
+        # in static_avoidance_params.yaml, currently 0.15+0.15=0.30) or the re-opt line sits
+        # inside the reactive planner's own keep-out and gets re-avoided every lap. Verify with
+        # stack_master/scripts/check_avoidance_margins.py after tuning either side.
+        self.declare_parameter("obs_margin", 0.35)
+        # [m] lowest clearance a hump may be ACCEPTED at when obs_margin is unreachable on either
+        # side (see the coverage ladder in static_reopt_core.build_offset_profile). Set at the
+        # REACTIVE keep-out (width_car/2 + safety_margin): below obs_margin the global line stops
+        # relieving the reactive layer of that box, but down to here it still clears it by what the
+        # reactive planner would itself have driven -- strictly better than not covering it. Set
+        # equal to obs_margin to disable the ladder.
+        # See the reopt_relax_floor description in base_system.launch.xml: at least the reactive
+        # keep-out (0.30), AND at least 5 cm above every consumer of the clearance it produces --
+        # the reactive clear-gate entry (0.28) binds. The ladder lands exactly on this floor.
+        self.declare_parameter("relax_floor", 0.33)
+        # FINAL wall gate: every published point is checked against the eroded occupancy map before
+        # the line is allowed to swap in. The corridor the fit works in is derived from the
+        # waypoints' d_left/d_right, which are an estimate; the map is the only wall source that
+        # cannot be mislabelled or smoothed. Same erosion kernel as the reactive planner so the two
+        # agree on where a wall is. 0 disables the gate.
+        # 3 -> 7. cv2.erode eats floor(k/2) cells, so 3 reserved ONE cell (0.05 m) around a point
+        # that is a CAR CENTRE: the global line the car follows for every lap after the swap was
+        # checked against a third of the clearance the reactive planner's own body gate demands
+        # (body_kernel_size 7 = 0.15 m = half a car). 7 makes the two agree, which is the whole
+        # premise of the comment below about "the same erosion kernel as the reactive planner".
+        self.declare_parameter("wall_gate_kernel", 7)
+        # [m] apex spacing below which two obstacles are treated as ONE cluster: same side ->
+        # merged into a single hump, opposite sides -> dropped as a pair when no reach can swing
+        # between them inside the curvature budget. 0 disables the pre-pass.
+        # [m] how much more room one side must have, measured in the ERODED MAP beside the box,
+        # before it overrules the side a recorded reactive apex proved. Within this band the apex
+        # wins: it knows something a corridor width does not, namely that the car actually got
+        # through there. 0 makes the map always decide.
+        # [s] how long a confirmed obstacle is carried after it stops being reported. The tracker
+        # recreates its tracks around every lap and a recreated track is published by nobody for a
+        # few frames; without this, that gap reads as a removal and costs a re-solve and a swap
+        # each way. Actual removal is still handled -- by the layer's unlatch and lap accounting,
+        # which have evidence this node does not.
+        self.declare_parameter("obs_forget_s", 1.5)
+        self.declare_parameter("side_hint_margin_m", 0.15)
+        self.declare_parameter("default_obs_radius", 0.15)
+        self.declare_parameter("republish_period", 1.0)     # [s] keep-alive republish
+        # `update_map` re-notify period. MUST stay below sector_tuner's 0.5 s scale timer so a
+        # consumer that consumed the flag before it had the new line re-takes it within one of
+        # its own ticks (otherwise it publishes the OLD geometry until the next notify).
+        self.declare_parameter("notify_period", 0.2)        # [s] update_map re-notify
+        self.declare_parameter("notify_ticks", 10)          # re-notify count after a swap (~2 s)
+        self.declare_parameter("swap_at_startfinish", True)
+        self.declare_parameter("swap_timeout_s", 4.0)        # force swap if no s-wrap seen
+        self.declare_parameter("obs_change_tol", 0.10)       # [m] min move to count as a change
+        # [m] CONSEQUENCE trigger, complementing obs_change_tol's cause trigger. obs_change_tol
+        # fires on how far a box moved, which says nothing about whether the move mattered; this
+        # fires when the ACTIVE line has stopped clearing a box it used to clear. Set at the SM's
+        # static GB requirement (gb_ego_width_m/2 + lateral_width_static_gb_m = 0.25) plus slack,
+        # i.e. rebuild BEFORE the free-check would call the line blocked and drop to TRAILING.
+        # Must stay between that requirement and obs_margin — check_avoidance_margins.py verifies.
+        self.declare_parameter("clearance_dirty_m", 0.30)
+        self.declare_parameter("compute_sp", True)
+        # closed_qp's own tuning. These reach closed_reopt.ReoptParams, which keeps its own
+        # dataclass defaults so the module still runs with no ROS at all (every offline gate
+        # depends on that) -- these are declared with the SAME values, and the YAML overrides
+        # them. The one field deliberately absent is w_veh: it is the same physical quantity as
+        # qp_veh_width and is passed from there, because two keys for one width is how they drift.
+        # Rationale for each number lives in stack_master/config/static_reopt_params.yaml.
+        _cq = cqb.cq.ReoptParams()
+        self.declare_parameter("closed_qp_grid_step_m", _cq.grid_step_m)
+        self.declare_parameter("closed_qp_dev_weight", _cq.dev_weight)
+        self.declare_parameter("closed_qp_obs_margin", _cq.obs_margin)
+        self.declare_parameter("closed_qp_disc_allow_m", _cq.disc_allow_m)
+        self.declare_parameter("closed_qp_infl_len_m", _cq.infl_len_m)
+        self.declare_parameter("closed_qp_kappa_budget", _cq.kappa_budget)
+        self.declare_parameter("closed_qp_budget_exp", cqb.cq._BUDGET_EXP)
+        self.declare_parameter("qp_veh_width", 0.30)         # [m] vehicle width for the corridor/
+                                                             # clearance floor (obstacle clearance
+                                                             # is obs_margin, separate)
+        self.declare_parameter("wall_margin", 0.05)          # [m] keep the arc this far off the
+                                                             # track walls. Aligned with the reactive
+                                                             # spliner's wall reserve: the recorded
+                                                             # apex was DRIVEN at that reserve, and a
+                                                             # bigger one here shrank the hump below
+                                                             # the proven clearance (all-or-nothing
+                                                             # fit then rejects it).
+        # [m] corridor-fit TOLERANCE. The corridor is a smoothed estimate that ripples ~2 mm between
+        # adjacent stations while the amplitude cap parks the hump peak exactly on it, so a
+        # zero-tolerance fit rejects every wide reach over a sub-millimetre violation and collapses
+        # the hump. Measured on ifac: 0 -> 5 mm took the fitted reach from 1.24 m to 5.00 m, the
+        # laid curvature from 1.98 to 1.46 (curvlim 1.5) and +1.62 s of lap time back to +0.05 s.
+        # Raise only if the walls are being shaved; it is spent out of wall_margin.
+        self.declare_parameter("fit_tol", 0.005)
+        # Intersect the corridor the re-opt fits its humps into with the one MEASURED in the eroded
+        # occupancy map (see _grid_corridor_lap). Off reproduces the waypoint-only corridor, which
+        # is optimistic by 5-44 mm exactly where a corner hump's exit ramp runs -- and that is what
+        # the final wall gate was rejecting whole bundles over.
+        self.declare_parameter("reopt_grid_corridor", True)
+
+        self.map_name = self.get_parameter("map").value
+        self.racecar_version = self.get_parameter("racecar_version").value
+        self.safety_width = float(self.get_parameter("safety_width").value)
+        self.safety_width_sp = float(self.get_parameter("safety_width_sp").value)
+        self.obs_margin = float(self.get_parameter("obs_margin").value)
+        self.relax_floor = float(self.get_parameter("relax_floor").value)
+        self.wall_gate_kernel = int(self.get_parameter("wall_gate_kernel").value)
+        self.obs_forget_s = float(self.get_parameter("obs_forget_s").value)
+        self.side_hint_margin_m = float(self.get_parameter("side_hint_margin_m").value)
+        self.default_obs_radius = float(self.get_parameter("default_obs_radius").value)
+        self.republish_period = float(self.get_parameter("republish_period").value)
+        self.notify_period = float(self.get_parameter("notify_period").value)
+        self.notify_ticks = int(self.get_parameter("notify_ticks").value)
+        self.swap_at_sf = bool(self.get_parameter("swap_at_startfinish").value)
+        self.swap_timeout_s = float(self.get_parameter("swap_timeout_s").value)
+        self.obs_change_tol = float(self.get_parameter("obs_change_tol").value)
+        self.clearance_dirty_m = float(self.get_parameter("clearance_dirty_m").value)
+        self.compute_sp = bool(self.get_parameter("compute_sp").value)
+        # _BUDGET_EXP is a module constant by design (it shapes the same trade-off infl_len_m
+        # does, and two knobs for one trade-off is how the hump pipeline ended up with sixteen).
+        # It is settable here only so the value lives with the others in one file; changing it is
+        # a modelling decision, not tuning.
+        cqb.cq._BUDGET_EXP = float(self.get_parameter("closed_qp_budget_exp").value)
+        self.closed_qp_params = cqb.cq.ReoptParams(
+            grid_step_m=float(self.get_parameter("closed_qp_grid_step_m").value),
+            dev_weight=float(self.get_parameter("closed_qp_dev_weight").value),
+            obs_margin=float(self.get_parameter("closed_qp_obs_margin").value),
+            disc_allow_m=float(self.get_parameter("closed_qp_disc_allow_m").value),
+            infl_len_m=float(self.get_parameter("closed_qp_infl_len_m").value),
+            kappa_budget=float(self.get_parameter("closed_qp_kappa_budget").value),
+            w_veh=float(self.get_parameter("qp_veh_width").value))
+        self.qp_veh_width = float(self.get_parameter("qp_veh_width").value)
+        self.wall_margin = float(self.get_parameter("wall_margin").value)
+        self.fit_tol = float(self.get_parameter("fit_tol").value)
+        self.reopt_grid_corridor = bool(self.get_parameter("reopt_grid_corridor").value)
+        self._grid_corr_cache = None            # (eroded_image, (lo, hi)) -- computed once per map
+        self._live_xy = {}                      # marker id -> the layer's UNHELD (x, y) estimate
+
+        self.input_path = os.path.join(
+            get_package_share_directory("stack_master"), "config", self.racecar_version)
+
+        # --- load the clean bundle (guaranteed-valid fallback + no-obstacle output) --------
+        if not self.map_name:
+            raise RuntimeError("static_reopt_node requires the 'map' parameter")
+        self.clean_bundle = self._load_clean_bundle(self.map_name)
+        self._warn_if_bounds_swapped()
+        self.reftrack = core.load_reftrack(
+            os.path.join(get_package_share_directory("stack_master"), "maps",
+                         self.map_name, "centerline.csv"))
+        # clean raceline as arrays for the windowed QP (x,y + dist-to-bounds + speed)
+        gw = self.clean_bundle.glb_wpnts.wpnts
+        self._clean_xy = np.array([[w.x_m, w.y_m] for w in gw], dtype=float)
+        self._clean_dr = np.array([w.d_right for w in gw], dtype=float)
+        self._clean_dl = np.array([w.d_left for w in gw], dtype=float)
+        self._clean_vx = np.array([w.vx_mps for w in gw], dtype=float)
+        self._clean_kappa = np.array([w.kappa_radpm for w in gw], dtype=float)
+        self.get_logger().info(
+            f"[static_reopt] loaded clean bundle ({len(gw)} raceline pts) + reftrack "
+            f"({self.reftrack.shape[0]} pts) for '{self.map_name}'")
+
+        # --- state ------------------------------------------------------------------------
+        # BATCH workflow: obstacles are just COLLECTED during a lap; the re-opt is solved ONCE and
+        # swapped at the start/finish crossing (over ALL confirmed obstacles). No incremental solve.
+        # single-threaded rclpy executor: obstacles_cb / frenet_cb / republish_cb never run
+        # concurrently, and the batch re-opt is synchronous, so no lock is needed.
+        self.active = self.clean_bundle         # what is published (always a valid line)
+        self._obstacles: List[core.Obstacle] = []      # currently confirmed obstacle set
+        self._obstacles_dirty = False           # set changed since the last build -> rebuild at s/f
+        # RECORDED reactive-spline apexes (design B): on the exploration lap the reactive spliner
+        # publishes the avoidance path it actually drives; per confirmed obstacle we keep the
+        # map-frame apex point (the spline point beside it, max |d| over the lap). The re-opt then
+        # RESHAPES that apex into the global line (keep apex, grow gentle ramps). key = quantized
+        # obstacle (x,y); value = (x_apex, y_apex, |d_apex|).
+        self._apex_by_obs = {}
+        self._apex_assoc_tol = 2.0              # [m] max obstacle->spline-point dist to associate
+        self._apex_min_d = 0.05                 # [m] ignore near-raceline paths (not avoiding)
+        # Apex records are keyed by the UPSTREAM track id (static_obstacle_layer publishes a stable
+        # marker_id per track, assigned once at creation and kept across its EMA position updates).
+        # The old key quantized (x,y) on a 0.2 m grid, which is SMALLER than obs_change_tol (0.25 m):
+        # every position update that passed the change gate necessarily landed in a different bin
+        # and so DELETED that obstacle's apex. Combined with detection flicker (one empty frame
+        # wiped every record) that is why the line reverted to clean after a lap.
+        self._obs_ids: List[int] = []           # marker ids, index-aligned with _obstacles
+        self._apex_miss = {}                    # key -> consecutive frames the obstacle was absent
+        # Apex movement at or above this counts as a MAJOR change: worth discarding a queued
+        # (pending) line over. Below it the queued line and the rebuilt one differ by centimetres,
+        # and the queued one is allowed to commit first — see _mark_dirty.
+        self.declare_parameter("apex_major_change_m", 0.10)
+        # [m] how far past the obstacle's abeam station a reactive path must extend on BOTH sides
+        # before its apex is believed. Rejects the exit ramp of an already-passed committed slice.
+        self.declare_parameter("apex_span_margin_m", 0.5)
+        # [m] max |d| the recorded apex may fall SHORT of what the obstacle geometrically requires.
+        # Symmetric with the long-standing overshoot clamp; without it a decaying tail reads as a
+        # legitimately tighter apex.
+        self.declare_parameter("apex_undershoot_m", 0.12)
+        # [m] max along-track distance from the obstacle to the recorded point. 1.0 admitted the
+        # polluted records (0.4-1.0 m) as readily as the healthy ones (all <= 0.1 m).
+        self.declare_parameter("apex_abeam_gap_m", 0.5)
+        self.apex_major_change_m = float(self.get_parameter("apex_major_change_m").value)
+        self.apex_span_margin_m = float(self.get_parameter("apex_span_margin_m").value)
+        self.apex_undershoot_m = float(self.get_parameter("apex_undershoot_m").value)
+        self.apex_abeam_gap_m = float(self.get_parameter("apex_abeam_gap_m").value)
+        self._apex_change_major = False
+        self._last_seen = {}               # marker id -> (wall time, Obstacle); see obs_forget_s
+        self._apex_dirty_pending = False   # an apex changed; arm the rebuild at idle
+        # WHICH GATE held the swap this lap. The commit path is a chain of fail-closed gates, and
+        # from outside they are indistinguishable: the line simply never swaps. One counted line per
+        # lap turns "why is it still on the clean line?" from a bisect into a read.
+        self._swap_block = {}
+        self._swap_lap_t = 0.0
+        # Obstacle keys whose clearance drift has already re-armed the solve against the CURRENTLY
+        # active line. Without this latch the trigger re-fires every frame until the new line is
+        # committed — and _mark_dirty discards the pending, so the very swap that would restore
+        # the clearance could never land. Cleared when the active line changes.
+        self._clearance_dirty_keys = set()
+        self.declare_parameter("apex_miss_frames", 20)   # tolerate this many missing frames
+        self.apex_miss_frames = int(self.get_parameter("apex_miss_frames").value)
+        # publish the bundle only when the active line CHANGES (+ a slow keep-alive), NOT on every
+        # timer tick. Topics are latched (TRANSIENT_LOCAL) so late subscribers still get the last
+        # line; a fast periodic republish makes frenet_conversion / sector_tuner re-process the
+        # raceline constantly, glitching the frenet odom (wobble). This keeps churn below 2 s.
+        self._last_published: Optional[_Bundle] = None
+        self._last_publish_t = 0.0
+        # after a swap, re-publish `update_map` for a few ticks so sector_tuner / ot_interpolator
+        # (which cache the FIRST /global_waypoints, then only rescale velocity) re-take the NEW
+        # geometry -> /global_waypoints_scaled actually follows the swapped line.
+        # The notification runs on its OWN fast timer (notify_period), NOT the 1 s keep-alive:
+        # sector_tuner re-takes the geometry only when its 0.5 s scale timer happens to see the
+        # flag set, so a 1 s re-notify is SLOWER than the consumer it is trying to reach and can
+        # leave it publishing the OLD geometry for a whole second after the swap.
+        self._notify_scaler_ticks = 0
+
+        self._last_s = None
+        self._last_frenet_t = None              # wall time of the last frenet msg (stale fallback)
+        self._dirty_since = 0.0                 # wall time the set went dirty (stale-frenet fallback)
+        # LAP GATING (S2). `s < last_s - 1.0` alone fires on ANY backward jump of s, not only a real
+        # wrap: a localization correction, or the frenet projection flipping to another nearest
+        # segment near the seam, both trigger it — and because the seam is the MAP's s=0, not where
+        # the car started, a car launched at s=20 m "completed" the exploration lap after 15 m.
+        # Require BOTH a genuine seam crossing AND a full lap of forward progress.
+        self._track_len = float(self.clean_bundle.glb_wpnts.wpnts[-1].s_m)
+        self._s_progressed = 0.0
+        # A swap is only jump-free where the two lines COINCIDE. The offset seam sits in the largest
+        # apex-free gap, not at s=0, so swapping blindly at s=0 can step the reference laterally.
+        # Solve at the lap boundary, then commit at the first station where they agree.
+        self._pending: Optional[_Bundle] = None
+        self._pending_dev = None                # per-station |pending - active| [m]
+        # REACTIVE-SPLINE state. The swap must NOT land while the car is inside (or about to enter)
+        # a reactive avoidance: waiting for s=0 meant the line could switch right next to the NEXT
+        # obstacle, and the car then failed to avoid it. The reactive planner publishes a non-empty
+        # path exactly while an obstacle is inside its planning horizon, so "reactive idle" is a
+        # direct read of "no obstacle near, safe to change the line under the planner".
+        self._reactive_active = False
+        self._reactive_idle_t = 0.0             # wall time the reactive path went idle
+        self.declare_parameter("swap_idle_s", 0.3)     # [s] reactive must stay idle this long
+        self.swap_idle_s = float(self.get_parameter("swap_idle_s").value)
+        # SWAP HORIZON: the lines must agree not only where the car IS but over the stretch the
+        # controller is about to look at — committing right at a hump entrance changed the line
+        # inside the lookahead and jerked the car. Horizon = max(min_m, time_s * current speed).
+        self.declare_parameter("swap_horizon_min_m", 3.0)
+        self.declare_parameter("swap_horizon_time_s", 1.0)
+        self.swap_horizon_min_m = float(self.get_parameter("swap_horizon_min_m").value)
+        self.swap_horizon_time_s = float(self.get_parameter("swap_horizon_time_s").value)
+        self._last_vs = 0.0                     # frenet forward speed (horizon scaling)
+        # SWAP DEADLOCK BREAKER: a car stuck TRAILING behind the obstacle sits INSIDE the pending
+        # hump — the horizon gate can then never pass and the reactive flicker blocks the idle
+        # gate, so the very swap that would free the car (the new line drives around the
+        # obstacle) never lands. Once the pending has waited this long with the car slow, commit
+        # anyway: at low speed the controller preview is short, so the mid-hump line change is
+        # benign — and it un-sticks the car.
+        self.declare_parameter("swap_deadlock_s", 5.0)       # [s] pending age before forcing
+        self.declare_parameter("swap_deadlock_max_vs", 2.0)  # [m/s] only force while this slow
+        # never force-commit a line the car is further off than this: a sane hump keeps the
+        # car within ~apex distance of the new line; anything bigger means the pending geometry
+        # is poisoned (observed: a ratcheted 1.41 m hump) and committing it strands the car.
+        self.declare_parameter("swap_deadlock_max_dev", 0.6)
+        # [m] how far the car may be from the PENDING line and still have the deadlock breaker
+        # force the swap. Above it the breaker holds instead: a queued line is kept, the current
+        # one keeps being followed, and the swap waits for the car to be near the new geometry.
+        # swap_deadlock_max_dev (0.6) is a different question -- above THAT the pending is judged
+        # poisoned and thrown away. Between the two the line is fine and the moment is not.
+        self.declare_parameter("swap_deadlock_max_dev_commit_m", 0.25)
+        self.swap_deadlock_s = float(self.get_parameter("swap_deadlock_s").value)
+        self.swap_deadlock_max_vs = float(self.get_parameter("swap_deadlock_max_vs").value)
+        self.swap_deadlock_max_dev = float(self.get_parameter("swap_deadlock_max_dev").value)
+        self.swap_deadlock_max_dev_commit_m = float(
+            self.get_parameter("swap_deadlock_max_dev_commit_m").value)
+        self._pending_since = 0.0               # wall time the current pending was installed
+        # RETRO-APEX buffer: recent reactive paths. A near-start obstacle is often CONFIRMED only
+        # after the car already passed it (layer confirm latency) — the avoidance that was just
+        # driven is gone from /planner/avoidance/static_otwpnts by then, so its apex was lost and
+        # the obstacle-aware line slipped a whole lap. Replaying the buffer when the confirmed set
+        # changes recovers that apex within the same lap.
+        self.declare_parameter("apex_buffer_sec", 3.0)
+        self.apex_buffer_sec = float(self.get_parameter("apex_buffer_sec").value)
+        self._path_buffer = deque()             # (t, wx, wy, wd) of recent non-idle reactive paths
+        # SOLVE RETRY BACKOFF: a failed/0-hump build keeps the dirty flag armed so the rebuild is
+        # retried — but the retry tick is frenet_cb (40 Hz); without a backoff a persistently
+        # infeasible corridor would re-solve every frame (~10 ms each) and starve the executor.
+        self.declare_parameter("solve_retry_backoff_s", 1.0)
+        self.solve_retry_backoff_s = float(self.get_parameter("solve_retry_backoff_s").value)
+        # Minimum wall time between two SUCCESSFUL solves. The set-change and apex triggers can fire
+        # a few times a second while a track flaps or an apex settles, and each solve replaces the
+        # queued bundle -- so the line kept being rebuilt and the swap kept being pushed back. One
+        # second is short against the swap cadence (a lap) and long against the flap.
+        self.declare_parameter("solve_min_interval_s", 1.0)
+        self.solve_min_interval_s = float(self.get_parameter("solve_min_interval_s").value)
+        # SWAP SAFETY GATE. Changing the reference under a car that is already braking for an
+        # obstacle close ahead is the worst possible moment: the controller's look-ahead lands on
+        # geometry it has never tracked, and the reactive planner's own commit is anchored to the
+        # OLD line. On the real run the collision was 28 ms after a swap taken in exactly that
+        # state. Hold the commit while the state machine reports TRAILING and the nearest obstacle
+        # ahead is inside swap_min_obs_gap_m -- the pending is not discarded, only held.
+        self.declare_parameter("swap_block_trailing", True)
+        # [m] a rebuild whose geometry differs from the active line by less than this, and which
+        # covers no more, is not queued at all -- see _finish_rebuild. Same scale as the horizon
+        # agreement tolerance the commit gate already uses, because it is the same question: below
+        # it the two lines are the same line as far as the controller is concerned.
+        self.declare_parameter("swap_min_gain_m", 0.05)
+        self.declare_parameter("swap_min_obs_gap_m", 3.0)
+        self.declare_parameter("swap_state_stale_s", 1.0)
+        self.swap_block_trailing = bool(self.get_parameter("swap_block_trailing").value)
+        self.swap_min_gain_m = float(self.get_parameter("swap_min_gain_m").value)
+        self.swap_min_obs_gap_m = float(self.get_parameter("swap_min_obs_gap_m").value)
+        self.swap_state_stale_s = float(self.get_parameter("swap_state_stale_s").value)
+        self._sm_state = ""
+        self._sm_state_t = -1e9
+        self._solve_backoff_until = 0.0
+        # ONE worker: the solves are serial by nature (each supersedes the last) and a second
+        # thread would only contend for the BLAS core the core pins itself to.
+        self._solve_pool = ThreadPoolExecutor(max_workers=1,
+                                              thread_name_prefix="static_reopt_solve")
+        self._solve_future = None
+        self._solve_ctx = None
+        # EPOCH of the confirmed obstacle set. Bumped by every change of what is being solved FOR
+        # (see _mark_dirty / clear_cb / the empty-set path). A solve carries the epoch it was
+        # submitted under, and a result whose epoch no longer matches is thrown away instead of
+        # installed -- otherwise a 0.95 s solve submitted while three boxes were still confirmed
+        # lands AFTER the set has emptied and the line has correctly swapped to CLEAN, and puts the
+        # obstacle-aware line back. With the set now empty and unchanging there is nothing left to
+        # re-arm the trigger, so that stale line is terminal: the observed run drove its last 37 s
+        # on it and pressing clear again did nothing.
+        self._solve_epoch = 0
+        self._last_solve_t = -1e9               # solve debounce, see solve_min_interval_s
+
+        # --- pub/sub ----------------------------------------------------------------------
+        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                             history=HistoryPolicy.KEEP_LAST)
+        self.pub_glb = self.create_publisher(WpntArray, "/global_waypoints", latched)
+        self.pub_glb_m = self.create_publisher(MarkerArray, "/global_waypoints/markers", latched)
+        self.pub_sp = self.create_publisher(WpntArray, "/global_waypoints/shortest_path", latched)
+        self.pub_sp_m = self.create_publisher(MarkerArray, "/global_waypoints/shortest_path/markers", latched)
+        self.pub_cent = self.create_publisher(WpntArray, "/centerline_waypoints", latched)
+        self.pub_cent_m = self.create_publisher(MarkerArray, "/centerline_waypoints/markers", latched)
+        self.pub_bounds = self.create_publisher(MarkerArray, "/trackbounds/markers", latched)
+        self.pub_info = self.create_publisher(String, "/map_infos", latched)
+        self.pub_lap = self.create_publisher(Float32, "/estimated_lap_time", latched)
+        # tells sector_tuner (and any consumer that caches the first global line) to re-take
+        # the new geometry after a swap. Relative topic "update_map" == sector_tuner's sub.
+        self.pub_update_map = self.create_publisher(Bool, "update_map", 10)
+        # Per-obstacle coverage of the line that is ACTUALLY driving. Latched: what this answers --
+        # "is that box covered by the global line, and if not why" -- is exactly the question asked
+        # after the fact, from a bag or a late subscriber.
+        self.pub_coverage = self.create_publisher(MarkerArray, "/static_reopt/coverage", latched)
+        # THE clearance definition, published for everyone who needs one. See _publish_clearance.
+        self.pub_clearance = self.create_publisher(Float32MultiArray, "/static_reopt/clearance",
+                                                   latched)
+
+        # Eroded occupancy map for the final wall gate (see _wall_gate_ok).
+        self.map_filter = None
+        if self.wall_gate_kernel > 0:
+            self.map_filter = GridFilter(node=self, map_topic="/map", debug=False)
+            self.map_filter.set_erosion_kernel_size(self.wall_gate_kernel)
+
+        self.create_subscription(MarkerArray, "/static_reopt/obstacles", self.obstacles_cb, 10)
+        self.create_subscription(Odometry, "/car_state/odom_frenet", self.frenet_cb, 10)
+        # reactive STATIC avoidance path (exploration lap) — records each obstacle's apex for the
+        # reshape. The static_avoidance_planner is remapped to /planner/avoidance/static_otwpnts
+        # (race.launch.xml); /planner/avoidance/otwpnts is the DYNAMIC (opponent) planner, wrong here.
+        self.create_subscription(OTWpntArray, "/planner/avoidance/static_otwpnts", self.otwpnts_cb, 10)
+        # Same pit/bench reset the layer listens to: drop the apex records right away instead of
+        # letting them age out over apex_miss_frames publishes (the layer's empty set follows).
+        self.create_subscription(Empty, "/static_reopt/clear_obstacles", self.clear_cb, 1)
+        # state machine state — read-only, for the swap safety gate (see _swap_blocked_by_state)
+        self.create_subscription(String, "/state_machine", self.state_cb, 1)
+
+        self.create_timer(self.republish_period, self.republish_cb)
+        self.create_timer(self.notify_period, self.notify_cb)
+        self.get_logger().info("[static_reopt] up — publishing CLEAN line; awaiting obstacles")
+        # Bag-record the coupled margins: double-avoidance prevention depends on obs_margin
+        # covering the reactive keep-out (see check_avoidance_margins.py).
+        self.get_logger().info(
+            f"[static_reopt] margins: obs_margin={self.obs_margin:.2f} wall_margin={self.wall_margin:.2f} "
+            f"qp_veh_width={self.qp_veh_width:.2f} safety_width={self.safety_width:.2f}")
+
+    # ----------------------------------------------------------------------------------
+    # bundle construction
+    # ----------------------------------------------------------------------------------
+    def _warn_if_bounds_swapped(self) -> None:
+        """Once, at startup: does this map's d_right/d_left match its own geometry?
+
+        A map whose labels are exchanged makes every corridor in this node mirror-imaged, so a
+        box on the straight comes back "neither side fits" and no re-optimization happens at all
+        -- which is how it was found. Maps f and ifac_0807 both shipped that way and nothing said
+        so at runtime, because the only checker was a manual script wired to no gate.
+
+        WARN, never block: refusing to start over a labelling defect is worse than driving with a
+        loud log, and the reactive layer still works. The same measurement is
+        stack_master/scripts/check_track_bounds.py.
+        """
+        try:
+            gw = self.clean_bundle.glb_wpnts.wpnts
+            v, n_ok, n_sw, _amb = track_bounds.verdict(
+                [[w.x_m, w.y_m] for w in gw], [w.d_right for w in gw], [w.d_left for w in gw],
+                os.path.join(get_package_share_directory("stack_master"), "maps", self.map_name),
+                self.map_name)
+        except Exception as e:                     # a diagnostic must never stop the node
+            self.get_logger().debug(f"[static_reopt] bounds check unavailable: {e}")
+            return
+        if v == "SWAPPED":
+            self.get_logger().error(
+                f"[static_reopt] MAP '{self.map_name}' SHIPS WITH d_right/d_left EXCHANGED "
+                f"({n_sw} sampled stations against {n_ok}). Every corridor this node derives is "
+                f"mirrored, so obstacles on one side read as unavoidable and no line is built for "
+                f"them. Relabel with stack_master/scripts/check_track_bounds.py --fix -- but the "
+                f"RACELINE itself was optimized through the mirrored corridor, so it needs "
+                f"regenerating to be correct.")
+
+    def _load_clean_bundle(self, map_name: str) -> _Bundle:
+        (map_info, est, cent_m, cent_w, glb_m, glb_w, sp_m, sp_w, bounds) = read_global_waypoints(map_name)
+        return _Bundle(map_info, est, cent_w, cent_m, glb_w, glb_m, sp_w, sp_m, bounds)
+
+    # ORDER OF PREFERENCE for what a line does about one obstacle. Used to compare two candidate
+    # lines obstacle-by-obstacle so a rebuild can never quietly cover LESS than what is already
+    # driving -- see _coverage_regresses. "already_clear" ranks with "laid": the line needs no hump
+    # there and is not failing to provide one.
+    _COVER_RANK = {"laid": 2, "already_clear": 2, "no_apex": 1, "dropped": 0}
+
+    def _coverage(self, obstacles, pairs, res, gaps_by_id=None, traj=None) -> List[dict]:
+        """One record per confirmed obstacle: what this line does about it, and why.
+
+        Everything here already existed inside the build, scattered across `apex_laid`,
+        `apex_dropped` and a subtraction; what was missing was a single attributed answer per
+        obstacle. Without it "2/3 reshaped" is the only thing anyone downstream (or reading a bag)
+        can see, and it does not say WHICH obstacle is uncovered or why -- so a line that silently
+        stopped covering one is indistinguishable from one that never could.
+        """
+        apex_of = {id(o): i for i, (_xy, o, _src) in enumerate(pairs)}
+        from_apex = {id(o): bool(src) for _xy, o, src in pairs}
+        laid_by_i = {a["obs_i"]: a for a in res.get("apex_laid", []) if a.get("obs_i") is not None}
+        drop_by_i = {d["obs_i"]: d for d in res.get("apex_dropped", []) if d.get("obs_i") is not None}
+        gaps = (gaps_by_id if gaps_by_id is not None
+                else dict(zip((id(o) for o in obstacles), self._line_clearances(traj, obstacles)))
+                if traj is not None else {})
+        out = []
+        for o in obstacles:
+            i_a = apex_of.get(id(o))
+            clr = float(gaps.get(id(o), float("nan")))
+            if i_a is None:
+                # No recorded reactive apex. Distinguish "needs nothing" from "needs something we
+                # cannot place": the core skips an obstacle the line already clears BEFORE any apex
+                # is involved, and calling that a missing apex is what the old arithmetic did.
+                status = "already_clear" if clr >= self.obs_margin else "no_apex"
+            elif i_a in laid_by_i:
+                # a hump exists either way; say whether it needed a reactive pass to be placed
+                status = "laid" if from_apex.get(id(o), True) else "laid:obstacle_derived"
+            elif i_a in drop_by_i:
+                status = "dropped:" + str(drop_by_i[i_a].get("reason", "?"))
+            else:
+                status = "already_clear" if clr >= self.obs_margin else "no_apex"
+            out.append({"id": int(getattr(o, "id", -1)) if hasattr(o, "id") else -1,
+                        "x": float(o.x), "y": float(o.y), "r": float(o.r),
+                        "status": status, "clearance_m": clr})
+        return out
+
+    def _coverage_regresses(self, new_cov, old_cov) -> Optional[str]:
+        """Does `new_cov` do WORSE than `old_cov` for any obstacle? Returns a reason, or None.
+
+        The policy this enforces is not "all or nothing". A line that covers two of three
+        obstacles is worth publishing -- the third is the reactive layer's, and it says so. What
+        must never happen is a REGRESSION, because the fallback is not the clean line, it is
+        whatever older line is still active: refusing to publish a line that covers less would
+        leave the car on a better one, and publishing it would take coverage away silently.
+        """
+        if not old_cov:
+            return None
+        old_rank = {}
+        for c in old_cov:
+            old_rank[(round(c["x"], 2), round(c["y"], 2))] = self._COVER_RANK.get(
+                c["status"].split(":")[0], 0)
+        for c in new_cov:
+            k = (round(c["x"], 2), round(c["y"], 2))
+            if k not in old_rank:
+                continue                     # a newly confirmed obstacle cannot be a regression
+            new_r = self._COVER_RANK.get(c["status"].split(":")[0], 0)
+            if new_r < old_rank[k]:
+                return (f"obstacle @({c['x']:.2f},{c['y']:.2f}) would go from covered to "
+                        f"'{c['status']}'")
+        return None
+
+    def _log_publish_margins(self, bundle) -> None:
+        """At publish time, what the line that is about to drive clears each box by, and by how
+        much it beats the reactive layer's idle requirement. One line per claimed box, one line
+        for everything handed over.
+
+        Printed here rather than at solve time on purpose: a bundle can be built and never
+        commit, and the number that matters is the one on the wire.
+        """
+        cov = getattr(bundle, "coverage", None) or []
+        if not cov:
+            return
+        claimed = [c for c in cov if not c["status"].startswith("dropped")
+                   and c["status"] != "no_apex"]
+        handed = [c for c in cov if c not in claimed]
+        for c in claimed:
+            gap = float(c.get("clearance_m", float("nan")))
+            head = gap - _REACTIVE_IDLE_CLEARANCE_M
+            msg = (f"[static_reopt] PUBLISH @({c['x']:.2f},{c['y']:.2f}) clears {gap:+.3f} m, "
+                   f"headroom {head:+.3f} m over the reactive idle requirement "
+                   f"{_REACTIVE_IDLE_CLEARANCE_M:.2f}")
+            if head < 0.0:
+                self.get_logger().warning(
+                    msg + " <- NEGATIVE: the reactive layer will avoid this box again on top of "
+                    "the global line")
+            elif head < 0.05:
+                self.get_logger().warning(
+                    msg + " <- THIN: less than 5 cm against tracker EMA and localisation error")
+            else:
+                self.get_logger().info(msg)
+        if handed:
+            self.get_logger().info(
+                f"[static_reopt] PUBLISH hands {len(handed)} obstacle(s) to the reactive layer: "
+                + "; ".join(f"@({c['x']:.2f},{c['y']:.2f}) {c['status']}" for c in handed))
+
+    def _publish_coverage(self, bundle) -> None:
+        """/static_reopt/coverage — one marker per confirmed obstacle, coloured by status, with the
+        status and measured clearance in its text. Latched, so a late subscriber (or a bag opened
+        afterwards) sees what the line that is actually driving does about every obstacle."""
+        arr = MarkerArray()
+        clear_m = Marker()
+        clear_m.action = Marker.DELETEALL
+        arr.markers.append(clear_m)
+        for i, c in enumerate(getattr(bundle, "coverage", []) or []):
+            head = c["status"].split(":")[0]
+            m = Marker()
+            m.header.frame_id = "map"
+            m.header.stamp = self.get_clock().now().to_msg()
+            m.ns = "static_reopt_coverage"
+            m.id = i
+            m.type = Marker.TEXT_VIEW_FACING
+            m.action = Marker.ADD
+            m.pose.position.x, m.pose.position.y = c["x"], c["y"]
+            m.pose.position.z = 0.6
+            m.pose.orientation.w = 1.0
+            m.scale.z = 0.25
+            m.color.a = 1.0
+            # green = the line handles it, amber = waiting on an apex, red = the reactive layer's
+            m.color.r = 0.0 if head in ("laid", "already_clear") else 1.0
+            m.color.g = 1.0 if head in ("laid", "already_clear", "no_apex") else 0.0
+            m.text = f"id={c['id']} {c['status']} {c['clearance_m']:+.2f}m"
+            arr.markers.append(m)
+        self.pub_coverage.publish(arr)
+
+    def _publish_clearance(self) -> None:
+        """/static_reopt/clearance — how far the line the car is ACTUALLY FOLLOWING passes each
+        confirmed obstacle, as [x, y, r, clearance] per obstacle.
+
+        THE definition of "clear", in one place. It used to be three: this node measured the 2-D
+        distance from the line to the obstacle EDGE, while the reactive clear gate and the state
+        machine's static free-check each re-derived a LATERAL distance in their own frenet frame.
+        Those agree on a straight and diverge on a curve -- and they were being compared against
+        thresholds only 2 cm apart, so a curve was enough to make one layer believe the line clears
+        an obstacle while another believed it does not. That disagreement is what a fail-closed
+        chain turns into a permanent TRAILING.
+
+        Keyed by MAP POSITION, not by id: this node's obstacles carry the static layer's marker
+        ids while the reactive planner and the state machine carry tracker ids, and the two id
+        spaces are unrelated. Position is the one handle all three already share.
+
+        Published latched, on every swap and on the republish tick. A consumer that has no fresh
+        entry for an obstacle falls back to its own computation -- the feed may only ever REPLACE a
+        measurement, never remove one.
+        """
+        try:
+            obstacles = list(self._obstacles)
+            msg = Float32MultiArray()
+            if obstacles:
+                _sb, xb, yb = self._bundle_xy(self.active)
+                for o in obstacles:
+                    clr = float(np.min(np.hypot(xb - o.x, yb - o.y))) - float(o.r)
+                    msg.data.extend([float(o.x), float(o.y), float(o.r), clr])
+            self.pub_clearance.publish(msg)
+        except Exception as e:                      # a diagnostic must never break the node
+            self.get_logger().debug(f"[static_reopt] clearance publish failed: {e}")
+
+    def _map_free(self, xy) -> Optional[np.ndarray]:
+        """Vectorised eroded-map lookup: True where the point is in free space, None with no map.
+
+        Same pixel convention as GridFilter.is_point_inside (row = y, no vertical flip) and the
+        same eroded image the wall gate uses, so "free" means one thing in this node."""
+        f = self.map_filter
+        img = getattr(f, "eroded_image", None) if f is not None else None
+        if img is None or f.resolution is None or f.origin is None:
+            return None
+        xy = np.asarray(xy, float).reshape(-1, 2)
+        px = ((xy[:, 0] - f.origin[0]) / f.resolution).astype(int)
+        py = ((xy[:, 1] - f.origin[1]) / f.resolution).astype(int)
+        h, w = img.shape
+        inside = (px >= 0) & (py >= 0) & (px < w) & (py < h)
+        free = np.zeros(len(xy), dtype=bool)
+        free[inside] = img[py[inside], px[inside]] == 255
+        return free
+
+    def _grid_corridor_lap(self):
+        """Car-centre lateral limits (lo[N], hi[N]) at EVERY station of the clean line, measured in
+        the eroded occupancy map. NaN where the map cannot answer. None when no map has arrived.
+
+        The waypoint bounds d_left/d_right are what the re-opt fits its humps into, and they are
+        optimistic where it matters: measured on ifac, at the stations a corner hump's EXIT ramp
+        runs through, the laid offset sat 5-44 mm outside the map's own car-centre limit. The
+        bundle then died at the final wall gate -- which judges the WHOLE bundle, so one corner
+        took every other obstacle's hump with it (14 of 15 live refusals, all this violation).
+
+        Measuring it here instead of clipping afterwards is what makes the fit see the real wall:
+        the amplitude cap, the reach search and the corridor-fit tolerance all read these bounds.
+        Same convention as the rest of the file: the erosion (wall_gate_kernel = 7 cells = 0.15 m)
+        already reserves half a car, so what is measured IS a car-centre limit and only
+        wall_margin comes off on top -- the same total reserve as the waypoint side's
+        0.5*w_veh + wall_margin.
+
+        Computed ONCE per map (~5 ms for 368 stations x 121 samples in one vectorised lookup) and
+        cached against the eroded image itself, so a solve pays nothing.
+        """
+        f = self.map_filter
+        img = getattr(f, "eroded_image", None) if f is not None else None
+        if img is None:
+            return None
+        if self._grid_corr_cache is not None and self._grid_corr_cache[0] is img:
+            return self._grid_corr_cache[1]
+        t0 = time.perf_counter()
+        nvec = core._wrap_normals(self._clean_xy)      # the basis the offset is laid on
+        reach, step = 3.0, 0.05
+        d_scan = np.arange(-reach, reach + 1e-9, step)
+        i0 = int(np.argmin(np.abs(d_scan)))
+        pts = self._clean_xy[:, None, :] + d_scan[None, :, None] * nvec[:, None, :]
+        free = self._map_free(pts.reshape(-1, 2))
+        if free is None:
+            return None
+        free = free.reshape(len(self._clean_xy), len(d_scan))
+        n = len(self._clean_xy)
+        hi = np.full(n, np.nan)
+        lo = np.full(n, np.nan)
+        # Only the CONTIGUOUS free run containing the raceline counts: free space belonging to
+        # another part of the track further out must not widen the corridor.
+        blocked_hi = ~free[:, i0:]
+        blocked_lo = ~free[:, :i0 + 1][:, ::-1]
+        any_hi, any_lo = blocked_hi.any(axis=1), blocked_lo.any(axis=1)
+        k_hi = np.where(any_hi, np.argmax(blocked_hi, axis=1), blocked_hi.shape[1])
+        k_lo = np.where(any_lo, np.argmax(blocked_lo, axis=1), blocked_lo.shape[1])
+        ok = free[:, i0]                               # the raceline itself must read free
+        hi[ok] = (k_hi[ok] - 1) * step - self.wall_margin
+        lo[ok] = -((k_lo[ok] - 1) * step - self.wall_margin)
+        # A station whose free run is narrower than 2*wall_margin has no room for the reserve;
+        # collapse it to the middle rather than invert it.
+        bad = ok & (hi < lo)
+        mid = 0.5 * (hi + lo)
+        hi[bad] = mid[bad]
+        lo[bad] = mid[bad]
+        n_meas = int(np.count_nonzero(np.isfinite(hi)))
+        self.get_logger().info(
+            f"[static_reopt] grid corridor measured at {n_meas}/{n} stations in "
+            f"{(time.perf_counter() - t0) * 1e3:.1f} ms (kernel {self.wall_gate_kernel}, "
+            f"wall_margin {self.wall_margin:.2f}); the rest keep the waypoint bounds")
+        self._grid_corr_cache = (img, (lo, hi))
+        return lo, hi
+
+    def _grid_room(self, i: int, left: np.ndarray, d_obs: float, r: float):
+        """Free room beside the obstacle on each side, measured in the ERODED MAP: (left, right).
+
+        Walks outward from each box edge until the map stops being free. The map is used rather
+        than the waypoints' d_left/d_right deliberately: those are labelled by one global decision
+        in gb_optimizer and ship EXCHANGED on some maps (measured on map f: 125 of 128 sampled
+        waypoints), and a side chosen from exchanged bounds puts the hump into the wall. Returns
+        (None, None) when no map has arrived, so the caller can fall back.
+        """
+        free_all = self._map_free(self._clean_xy[i])
+        if free_all is None:
+            return None, None
+        step, reach = 0.05, 3.0
+        ds = np.arange(0.0, reach + 1e-9, step)
+        room = []
+        for sgn in (1.0, -1.0):
+            d0 = d_obs + sgn * float(r)                   # start at the box EDGE
+            pts = self._clean_xy[i] + np.outer(d0 + sgn * ds, left)
+            free = self._map_free(pts)
+            if free is None or not free[0]:
+                room.append(0.0)
+                continue
+            blocked = np.flatnonzero(~free)
+            room.append(float(ds[blocked[0] - 1]) if blocked.size else float(reach))
+        return room[0], room[1]
+
+    def _wall_gate_ok(self, traj) -> bool:
+        """Is every PUBLISHED point inside the eroded free space of the occupancy map?
+
+        The last gate before a swap, and the only one that consults the map rather than a model of
+        it. Everything upstream reasons about the corridor derived from the waypoints' d_left /
+        d_right, which is an estimate: it is smoothed, it is offset by a wall_margin someone can
+        lower, and on some maps the two sides ship exchanged. The map cannot be any of those.
+
+        Vectorised `GridFilter.is_point_inside` -- same pixel convention (row = y, no vertical
+        flip) and the same erosion kernel as the reactive planner, so the two agree on where a wall
+        is. Returns True when no map has arrived (bench/bag runs): a missing map must not silently
+        block every swap, and the corridor checks upstream still apply.
+        """
+        f = self.map_filter
+        img = getattr(f, "eroded_image", None) if f is not None else None
+        if img is None or f.resolution is None or f.origin is None:
+            return True
+        try:
+            xy = np.asarray(traj)[:, 1:3]
+            px = ((xy[:, 0] - f.origin[0]) / f.resolution).astype(int)
+            py = ((xy[:, 1] - f.origin[1]) / f.resolution).astype(int)
+            h, w = img.shape
+            inside = (px >= 0) & (py >= 0) & (px < w) & (py < h)
+            free = np.zeros(len(xy), dtype=bool)
+            free[inside] = img[py[inside], px[inside]] == 255
+            if free.all():
+                return True
+            bad = np.flatnonzero(~free)
+            # Name the OBSTACLES whose humps are implicated, not just the coordinate: a refusal
+            # here means a hump the corridor accepted puts the car body into a wall, and the first
+            # question is always which box asked for it. The corridor comes from d_left/d_right,
+            # which some maps ship exchanged -- exactly the case where this gate is the only thing
+            # standing between the car and the wall, so it is never the thing to lower.
+            near = []
+            for o in self._obstacles:
+                d = float(np.min(np.hypot(xy[bad, 0] - o.x, xy[bad, 1] - o.y)))
+                if d < 6.0:
+                    near.append(f"@({o.x:.2f},{o.y:.2f}) r={o.r:.2f} [{d:.2f} m away]")
+            k_eff = (int(self.wall_gate_kernel) // 2) * float(f.resolution or 0.05)
+            self.get_logger().error(
+                f"[static_reopt] REFUSING to publish: {bad.size} of {len(xy)} published points are "
+                f"outside the free space eroded by {k_eff:.2f} m "
+                f"(kernel {self.wall_gate_kernel}); first @"
+                f"({xy[bad[0], 0]:.2f},{xy[bad[0], 1]:.2f}), s={float(np.asarray(traj)[bad[0], 0]):.2f} m. "
+                + (f"Implicated obstacle(s): {'; '.join(near)}. " if near else "No obstacle within 6 m "
+                   "of the violation — this is the clean line's own geometry or a corridor error. ")
+                + f"The line would put the car BODY into a wall — this gate reserves half a car and "
+                f"is not the thing to lower; check reopt_wall_margin / reopt_qp_veh_width and the "
+                f"map's d_left/d_right (some maps ship them exchanged)")
+            return False
+        except Exception as e:                       # a gate must never crash the build
+            self.get_logger().debug(f"[static_reopt] wall gate skipped: {e}")
+            return True
+
+    def _line_clearances(self, traj, obstacles: List[core.Obstacle]) -> List[float]:
+        """Distance from the line to each obstacle's EDGE [m], index-aligned with `obstacles`.
+
+        One hypot scan per obstacle over every published station — the same measurement the core's
+        acceptance floor enforces per hump, so the two cannot disagree about what "cleared" means.
+        """
+        xy = np.asarray(traj)[:, 1:3]
+        return [float(np.min(np.hypot(xy[:, 0] - o.x, xy[:, 1] - o.y))) - float(o.r)
+                for o in obstacles]
+
+    def _check_line_clearance(self, traj, obstacles: List[core.Obstacle], laid: List[dict],
+                              apex_obs: List[core.Obstacle] = None, floors: dict = None) -> bool:
+        """Measure what the line ACTUALLY clears, in the map frame, and VETO it if it does not.
+
+        Everything upstream reports intent -- "2/2 obstacle apex(es) reshaped" is printed whether
+        the resulting line passes 0.6 m from the box or through it. It was true for six laps
+        straight on the real car (bag verify_0731_2114) while the published line stayed ~0.2 m from
+        an obstacle that needs radius + obs_margin, so the reactive layer re-avoided it every single
+        lap and the log never said why.
+
+        It used to be a pure report, on the argument that refusing the swap leaves the clean line,
+        which clears even less. That argument only holds for the FIRST build: the fallback is not
+        the clean line, it is whatever is currently active — and once an obstacle-aware line is
+        active, publishing a worse one is a strict regression the stack cannot detect. The core now
+        drops a hump it cannot lay to obs_margin (reason "clearance") and reports it, so a line
+        arriving here short is a genuine escape: the woven/resampled geometry is not what the
+        per-hump gate accepted. Keep the previous good line and say exactly which obstacle failed.
+
+        Obstacles with NO hump at all (never reactively avoided, or honestly dropped) are expected
+        to read short — they are the reactive layer's job and must not veto the line that was built
+        for the others. Only apexes the core claims it LAID are held to the floor, and which those
+        are is decided by IDENTITY (`apex_obs`, index-aligned with the apexes the core was given),
+        not by proximity.
+
+        Returns True when the line may be published.
+        """
+        try:
+            if traj is None or len(traj) == 0 or not obstacles:
+                return True
+            gaps = self._line_clearances(traj, obstacles)
+            floors = floors or {}
+            # TOLERANCE. The floor is what the core's per-hump gate accepted, measured on the FITTED
+            # profile; what arrives here is that profile after weaving, resampling to uniform
+            # spacing and the corridor clip -- each of which may move a station by up to fit_tol,
+            # the slack the fit is explicitly permitted to spend. Comparing the two with a bare `<`
+            # therefore vetoes on sub-millimetre representation noise: a hump accepted at exactly
+            # its floor (the relax ladder lands on the floor by construction) measures a few tenths
+            # of a millimetre short here and the whole line is refused, leaving the car on a line
+            # that clears LESS. Allow exactly the slack the fit was allowed, and no more.
+            tol = self.fit_tol + 1e-6
+            bad = [(o, d) for o, d in zip(obstacles, gaps)
+                   if d < floors.get(id(o), self.obs_margin) - tol]
+            apex_obs = apex_obs or []
+            laid_obs = [apex_obs[a["obs_i"]] for a in (laid or [])
+                        if a.get("obs_i") is not None and a["obs_i"] < len(apex_obs)]
+            if not bad:
+                self.get_logger().info(
+                    f"[static_reopt] line clearance OK: all {len(obstacles)} obstacle(s) cleared by "
+                    f">= {self.obs_margin:.2f} m")
+                return True
+            # Which of the short ones did the core promise to have reshaped? By IDENTITY: the core
+            # reports the index of the obstacle each hump belongs to, and `laid_obs` resolves those
+            # back to the obstacle objects.
+            #
+            # This used to match by position -- "some laid apex within 1.5 m of this box" -- which
+            # is not the same question. Two obstacles a metre apart are inside each other's radius,
+            # so a hump laid for one made its DROPPED neighbour count as broken, and the neighbour's
+            # (expected, by-design) short clearance then vetoed a line that was correct for
+            # everything it actually claimed. On a cluster that is every publish.
+            broken = [(o, d) for o, d in bad if any(o is lo for lo in laid_obs)]
+            det = "; ".join(f"@({o.x:.2f},{o.y:.2f}) r={o.r:.2f} -> {d:+.2f} m" for o, d in bad)
+            if not broken:
+                self.get_logger().info(
+                    f"[static_reopt] {len(bad)}/{len(obstacles)} obstacle(s) are NOT cleared by the "
+                    f"line (need >= {self.obs_margin:.2f} m): {det}. No hump was laid for them — "
+                    f"the reactive layer keeps handling those, as designed")
+                return True
+            det_b = "; ".join(f"@({o.x:.2f},{o.y:.2f}) r={o.r:.3f} -> {d:+.3f} m "
+                              f"(promised {floors.get(id(o), self.obs_margin):.3f}, "
+                              f"veto below {floors.get(id(o), self.obs_margin) - tol:.3f})"
+                              for o, d in broken)
+            self.get_logger().error(
+                f"[static_reopt] REFUSING to publish: {len(broken)} obstacle(s) the re-opt claims "
+                f"to have reshaped are cleared by less than the floor they were accepted at: "
+                f"{det_b}. Keeping the previous line — check the recorded apex and "
+                f"reopt_wall_margin / reopt_fit_tol")
+            return False
+        except Exception as e:                      # a diagnostic must never break the build
+            self.get_logger().debug(f"[static_reopt] clearance check failed: {e}")
+            return True
+
+    def _build_obstacle_bundle(self, obstacles: List[core.Obstacle], pairs=None) -> _Bundle:
+        """Run the width-modulated re-optimization and assemble a full bundle. May raise;
+        the caller runs this inside a try/except so a failure never reaches the timer.
+
+        RUNS ON A WORKER THREAD (see _rebuild_and_swap). Everything it reads must therefore be
+        either immutable after startup -- the clean line, the reftrack, the tuning -- or passed in
+        as a snapshot. `pairs` is the one mutable input: the apex records are rewritten by
+        otwpnts_cb at 20 Hz, so they are resolved on the caller's thread and handed over."""
+        if pairs is None:
+            pairs = self._apex_pairs(obstacles)
+        # ONE convex QP over the lateral offset, whole lap, no apex required. There is no branch
+        # here any more: reopt_method used to choose between this, the hump pipeline and -- by
+        # FALLTHROUGH, not by name -- a whole-track mincurv_iqp its own comment called an offline
+        # tool taking minutes, so any typo in the method string selected something that starves
+        # the control loop.
+        corr = self._grid_corridor_lap() if self.reopt_grid_corridor else None
+        corr_lo, corr_hi = corr if corr is not None else (None, None)
+        res = cqb.reoptimize_closed_window(
+            self._clean_xy, self._clean_dr, self._clean_dl, self.reftrack,
+            obstacles, self.input_path,
+            params=self.closed_qp_params,
+            w_veh=self.qp_veh_width, clean_vx=self._clean_vx,
+            clean_kappa=self._clean_kappa, corridor_lo=corr_lo, corridor_hi=corr_hi)
+        traj, br, bl, est = res["main"]
+        if "d_right" in res:                    # the bridge returns exact widths
+            d_r, d_l = res["d_right"], res["d_left"]
+        else:
+            d_r, d_l = core.dist_to_bounds(traj[:, 1:3], br, bl)  # traj is [s,x,y,...]
+        glb_w, glb_m = core.build_wpnts(traj, d_r, d_l, second_traj=False)
+
+        if self.compute_sp and "sp" in res:
+            sp_traj, sbr, sbl, sp_est = res["sp"]
+            sd_r, sd_l = core.dist_to_bounds(sp_traj[:, 1:3], sbr, sbl)
+            sp_w, sp_m = core.build_wpnts(sp_traj, sd_r, sd_l, second_traj=True)
+        else:
+            sp_w, sp_m = copy.deepcopy(self.clean_bundle.sp_wpnts), copy.deepcopy(self.clean_bundle.sp_markers)
+
+        rep = res["report"]
+        info = String()
+        clearance_ok = True                 # `global` method: no per-apex geometry to check
+        clearance_by_key = {}
+        floor_by_key = {}
+        coverage = []
+        n_obs = len(obstacles)
+        gaps = self._line_clearances(traj, obstacles)
+        coverage = cqb.coverage_records(obstacles, res, gaps)
+        floor = float(res.get("clearance_floor", self.obs_margin))
+        dropped = res.get("apex_dropped", [])
+        crep = res.get("closed_report")
+        info.data = (f"[static_reopt] obstacle-aware (closed QP) est {est:.3f}s; "
+                     f"{res.get('n_windows', 0)}/{n_obs} obstacle(s) covered by the global "
+                     f"line, {len(dropped)} handed to the reactive layer")
+        # SAME LINE SHAPE AS THE HUMP PATH so the two can be diffed straight out of a bag:
+        # solve time, coverage, peak curvature, worst clearance.
+        self.get_logger().info(
+            f"[static_reopt] closed_qp solved in "
+            f"{getattr(crep, 'solve_ms', float('nan')):.1f} ms; covered "
+            f"{res.get('n_windows', 0)}/{n_obs}; max|kappa| "
+            f"{getattr(crep, 'peak_kappa', float('nan')):.3f} (clean "
+            f"{getattr(crep, 'clean_peak_kappa', float('nan')):.3f}); worst clearance "
+            f"{min(gaps) if gaps else float('nan'):+.3f} m against a floor of {floor:.2f}")
+        if dropped:
+            # THE HANDOVER, said out loud as well as published on /static_reopt/coverage. A
+            # box the global line will not claim is the reactive layer's for every lap, and
+            # the reason carries the station, the side and the metres it fell short by.
+            self.get_logger().warning(
+                f"[static_reopt] {len(dropped)} obstacle(s) NOT covered by the global line "
+                f"(the reactive layer keeps handling them): "
+                + "; ".join(str(d.get("detail", d.get("reason", "?"))) for d in dropped))
+        keys = self._keys_for(obstacles, self._obs_ids)
+        clearance_by_key = dict(zip(keys, gaps))
+        floor_by_key = {k: floor for k, c in zip(keys, coverage) if c["status"] == "laid"}
+        floors_by_id = {id(o): floor for o, c in zip(obstacles, coverage)
+                        if c["status"] == "laid"}
+        # the SAME three vetoes the hump path answers to, in the same order
+        clearance_ok = self._check_line_clearance(traj, obstacles, res.get("apex_laid", []),
+                                                  apex_obs=list(obstacles),
+                                                  floors=floors_by_id)
+        clearance_ok = self._wall_gate_ok(traj) and clearance_ok
+        if not res.get("kappa_published_ok", True):
+            self.get_logger().warning(
+                f"[static_reopt] REFUSED: published max|kappa| "
+                f"{res.get('kappa_published_max', float('nan')):.3f} exceeds what the car can "
+                f"steer there ({res.get('kappa_published_allow', float('nan')):.3f} = "
+                f"max(curvlim, the clean line's own curvature))")
+            clearance_ok = False
+        lap = Float32(); lap.data = float(est)
+
+        # centerline + trackbounds are map-fixed -> reuse the clean ones
+        return _Bundle(info, lap,
+                       self.clean_bundle.cent_wpnts, self.clean_bundle.cent_markers,
+                       glb_w, glb_m, sp_w, sp_m, self.clean_bundle.trackbounds,
+                       n_apex=int(res.get("n_windows", 0)), clearance_ok=clearance_ok,
+                       clearance_by_key=clearance_by_key, floor_by_key=floor_by_key,
+                       coverage=coverage)
+
+    # ----------------------------------------------------------------------------------
+    # obstacle input: COLLECT only (batch re-opt happens at the start/finish crossing)
+    # ----------------------------------------------------------------------------------
+    def obstacles_cb(self, msg: MarkerArray):
+        from visualization_msgs.msg import Marker
+        obs: List[core.Obstacle] = []
+        ids: List[int] = []
+        for m in msg.markers:
+            # only ADD markers are obstacles; skip DELETE / DELETEALL housekeeping markers
+            if getattr(m, "action", Marker.ADD) != Marker.ADD:
+                continue
+            r = max(m.scale.x, m.scale.y) / 2.0
+            if r <= 1e-3:
+                r = self.default_obs_radius
+            obs.append(core.Obstacle(m.pose.position.x, m.pose.position.y, r))
+            ids.append(int(getattr(m, "id", 0)))
+            # The layer HOLDS the published pose inside a dead-band and carries the live estimate
+            # in points[0]. The set-change logic keeps reading the held pose -- that hold is what
+            # stops estimate noise re-arming a rebuild every frame -- but the drift check must not:
+            # measuring a drift with the same frozen coordinate that caused it can never fire.
+            pts = getattr(m, "points", None)
+            if pts:
+                self._live_xy[int(getattr(m, "id", 0))] = (float(pts[0].x), float(pts[0].y))
+
+        # A BRIEF DISAPPEARANCE IS NOT A REMOVAL. The tracker deletes and recreates tracks around
+        # every lap (ids 22 -> 36 -> 43 -> 54 for three physical boxes), and each recreation costs
+        # a few frames during which the box is classified by nobody and published by nobody. Taking
+        # that at face value shrinks the set, re-solves, swaps, and then does it all again in
+        # reverse a fraction of a second later. An obstacle seen within obs_forget_s is carried.
+        # Position and radius come from the LAST sighting -- this only keeps it in the set.
+        now_t = self.get_clock().now().nanoseconds * 1e-9
+        for o, i in zip(obs, ids):
+            self._last_seen[i] = (now_t, o)
+        for i in list(self._last_seen):
+            t_seen, o = self._last_seen[i]
+            if (now_t - t_seen) > self.obs_forget_s:
+                del self._last_seen[i]
+            elif i not in ids:
+                obs.append(o)
+                ids.append(i)
+                self.get_logger().info(
+                    f"[static_reopt] obstacle id={i} @({o.x:.2f},{o.y:.2f}) not reported this "
+                    f"frame; carried for up to {self.obs_forget_s:.1f} s rather than treated as "
+                    f"removed", throttle_duration_sec=2.0)
+
+        # Age out apex records on EVERY frame (not only on a "changed" frame): a track that is
+        # missing for a single frame must not lose its apex, but one gone for good must.
+        live = set(self._keys_for(obs, ids))
+        for k in list(self._apex_by_obs):
+            if k in live:
+                self._apex_miss[k] = 0
+            else:
+                self._apex_miss[k] = self._apex_miss.get(k, 0) + 1
+                if self._apex_miss[k] >= self.apex_miss_frames:
+                    del self._apex_by_obs[k]
+                    self._apex_miss.pop(k, None)
+
+        if not self._clearance_drifted(obs, ids) and not self._obstacles_changed(obs, ids):
+            self._obs_ids = ids           # ids can be re-issued without the position changing
+            self._adopt_orphan_apexes()   # re-issued ids must not orphan the apex records
+            return
+        # Just RECORD the confirmed set; do NOT solve here. The batch re-opt runs once at the next
+        # start/finish crossing (frenet_cb) with ALL obstacles -> one consistent line, no mid-lap churn.
+        # A SHRINKING set keeps the queued bundle. The queued line was built for MORE obstacles
+        # than are now confirmed, so every hump it carries is still drivable and every obstacle it
+        # still knows about is still avoided -- it is conservative, not stale, and the fresh solve
+        # that removes the surplus hump lands right behind it. Discarding it is what turned each
+        # unlatch flap into a lost swap: the layer demotes a track for half a second, the pending is
+        # thrown away, the re-confirm arms another rebuild, and the commit gates -- hardest to
+        # satisfy exactly where the obstacles are -- have to be re-earned from scratch. A set that
+        # GREW or MOVED still discards it: those humps are genuinely missing or in the wrong place.
+        shrank = len(obs) < len(self._obstacles) and not self._obstacles_moved_or_grew(obs)
+        self._obstacles = obs
+        self._obs_ids = ids
+        self._adopt_orphan_apexes()
+        self._mark_dirty(keep_pending=shrank)
+        self.get_logger().info(
+            f"[static_reopt] obstacle set -> {len(obs)} obstacle(s); will batch re-opt at "
+            f"start/finish" + ("; queued line kept (set only shrank)" if shrank else ""))
+        self._publish_clearance()      # a changed set means changed clearances, now not in 1 s
+        # RETRO association: an obstacle confirmed only AFTER the car passed it (layer confirm
+        # latency, typical for obstacles right past the start line) missed its live apex — the
+        # avoidance path that produced it is already empty. Replay the recent-path buffer so the
+        # just-driven maneuver still contributes its apex, and the solve can run THIS lap.
+        if obs and self._path_buffer:
+            replayed = self._record_apexes_best_of(list(self._path_buffer))
+            if replayed:
+                self.get_logger().info(
+                    f"[static_reopt] retro-associated apex(es) from {len(self._path_buffer)} "
+                    f"buffered reactive path(s)")
+
+    def clear_cb(self, _msg: Empty):
+        self._apex_by_obs.clear()
+        self._apex_miss.clear()
+        self._path_buffer.clear()   # no retro-resurrection of just-cleared apexes
+        self._clearance_dirty_keys.clear()
+        if self._obstacles:
+            self._obstacles = []
+            self._obs_ids = []
+            self._mark_dirty()
+        self._solve_epoch += 1                   # discard anything in flight for the old set
+        self.get_logger().info("[static_reopt] obstacle set + apex records CLEARED by external request")
+
+    def _mark_dirty(self, keep_pending: bool = False):
+        """Arm the rebuild trigger, and by default discard any pending bundle.
+
+        A pending built from the PREVIOUS obstacle/apex state is normally stale — it both blocked
+        the fresh rebuild (the solve gate requires _pending is None) and, once committed, installed
+        an outdated line. Observed: a spurious unlatch->re-confirm flap (set 1->0->1) left a pending
+        CLEAN revert queued while the obstacle was confirmed again — the re-opt then never ran.
+
+        `keep_pending` is for the case where that reasoning does not apply: a MINOR apex refinement,
+        where the queued line and the line the rebuild would produce differ by centimetres. Throwing
+        the pending away there costs a whole swap opportunity, because the commit gates (reactive
+        idle + the lines agreeing over the controller's look-ahead) are hardest to satisfy exactly
+        where the obstacles are — so the lap-2 swap slips to lap 3 for a 5 cm improvement nobody
+        asked for. Keeping it lets the good-enough line commit now; the flag stays armed and the
+        refinement lands on the next solve, which runs as soon as the pending clears.
+        """
+        self._obstacles_dirty = True
+        self._dirty_since = self.get_clock().now().nanoseconds * 1e-9
+        if not keep_pending:
+            # THE EPOCH AND THE PENDING BUNDLE ARE INVALIDATED BY THE SAME EVENTS, and that is the
+            # invariant. keep_pending means "this change is small enough that the queued line is
+            # still the line I want" -- a minor apex refinement, or a set that only shrank. An
+            # in-flight SOLVE for that same state is good for exactly the same reason, and it is
+            # the more expensive thing to throw away: it takes 200-850 ms, while the apex path
+            # arms this every time the reactive layer goes idle. Bumping the epoch here
+            # unconditionally meant a refinement landing during a solve discarded it, the discard
+            # re-armed the trigger, the next solve met the next refinement, and no obstacle-aware
+            # line was ever installed.
+            self._solve_epoch += 1               # anything in flight was solved for the old set
+            self._pending = None
+            self._pending_dev = None
+
+    def _clearance_drifted(self, obs: List[core.Obstacle], ids: List[int]) -> bool:
+        """Has an obstacle drifted into the clearance of the line the car is FOLLOWING?
+
+        `obs_change_tol` is a cause trigger: it fires on how far a box moved, and says nothing
+        about whether the move mattered. Between the tolerance and the margin chain there is a
+        band where a sub-tolerance drift is still enough to take the active line under the SM's
+        static requirement — the line then reads BLOCKED, the car drops to TRAILING, and nothing
+        ever re-solves because the obstacle "did not move". This is the consequence trigger for
+        exactly that band: it fires on the quantity the downstream gates actually test.
+
+        Only obstacles this line CLEARED when it was built can fire it. One that was already
+        short (its hump was honestly dropped; the reactive layer owns it) would otherwise re-arm a
+        deterministic rebuild that changes nothing, every frame, forever.
+
+        Latched per key against the active line, because _mark_dirty discards the pending bundle:
+        an unlatched trigger would re-fire until the new line commits and so prevent it from ever
+        committing.
+        """
+        base = getattr(self.active, "clearance_by_key", None)
+        if not base or not obs:
+            return False
+        try:
+            _s, xa, ya = self._bundle_xy(self.active)
+        except Exception:                       # a trigger must never break the callback
+            return False
+        thr = self.clearance_dirty_m
+        drifted = False
+        for o, i, key in zip(obs, ids, self._keys_for(obs, ids)):
+            was = base.get(key)
+            if was is None or was < thr or key in self._clearance_dirty_keys:
+                continue                        # never cleared by this line, or already reported
+            # the LIVE estimate, not the held one the layer publishes as the pose. The hold is a
+            # dead-band on the SET (it stops estimate noise re-arming a rebuild), and reading it
+            # here made the cause and the measurement of a drift the same stale number -- the
+            # check documented as the safety net for sub-tolerance drift could not fire at all.
+            ox, oy = self._live_xy.get(i, (o.x, o.y))
+            now = float(np.min(np.hypot(xa - ox, ya - oy))) - float(o.r)
+            if now >= thr:
+                continue
+            self._clearance_dirty_keys.add(key)
+            drifted = True
+            self.get_logger().warning(
+                f"[static_reopt] obstacle @({ox:.2f},{oy:.2f}) drifted into the active line: "
+                f"clearance {was:+.2f} -> {now:+.2f} m, under {thr:.2f} — re-optimizing before "
+                f"the state machine reads the line as blocked")
+        return drifted
+
+    def _obstacles_moved_or_grew(self, new: List[core.Obstacle]) -> bool:
+        """Does `new` contain anything the current set does not already cover?
+
+        "Shrank" has to mean the new set is a SUBSET of the old one, not merely shorter: one
+        obstacle disappearing while another appears elsewhere leaves the count lower and the queued
+        line wrong about the new one.
+        """
+        tol = max(self.obs_change_tol, 1e-6)
+        for a in new:
+            if not any(abs(a.x - b.x) <= tol and abs(a.y - b.y) <= tol and a.r <= b.r + tol
+                       for b in self._obstacles):
+                return True
+        return False
+
+    def _obstacles_changed(self, new: List[core.Obstacle], new_ids=None) -> bool:
+        """Has the confirmed set materially changed?
+
+        Compared BY ID, not by position in the list. The old zip() paired the n-th new obstacle
+        with the n-th old one, so a MarkerArray that merely arrived in a different order read as
+        every obstacle having jumped -- a full set change, a re-solve and a swap, for nothing.
+        """
+        old_ids = list(self._obs_ids or [])
+        new_ids = list(new_ids if new_ids is not None else [])
+        tol = self.obs_change_tol
+        if len(old_ids) == len(self._obstacles) and len(new_ids) == len(new):
+            old_by = {i: o for i, o in zip(old_ids, self._obstacles)}
+            if len(old_by) == len(self._obstacles):          # ids unambiguous on the old side
+                if set(new_ids) != set(old_by):
+                    return True
+                for i, o in zip(new_ids, new):
+                    b = old_by[i]
+                    if (abs(o.x - b.x) > tol or abs(o.y - b.y) > tol or abs(o.r - b.r) > tol):
+                        return True
+                return False
+        if len(new) != len(self._obstacles):
+            return True
+        for a, b in zip(new, self._obstacles):
+            if abs(a.x - b.x) > tol or abs(a.y - b.y) > tol or abs(a.r - b.r) > tol:
+                return True
+        return False
+
+    # ----------------------------------------------------------------------------------
+    # reactive-spline apex recording (design B) — exploration lap learns each obstacle's apex
+    # ----------------------------------------------------------------------------------
+    @staticmethod
+    def _quant_key(o: core.Obstacle):
+        """Fallback key when the publisher supplies no usable marker ids."""
+        return ("q", round(o.x / 0.2), round(o.y / 0.2))
+
+    def _keys_for(self, obs: List[core.Obstacle], ids: List[int]):
+        """One stable key per obstacle. Prefers the upstream track id (static_obstacle_layer assigns
+        marker_id once per track and keeps it across EMA position updates) so an apex survives the
+        obstacle drifting; falls back to position quantization only if the ids are absent or
+        ambiguous (all zero / duplicated), which would otherwise alias two obstacles onto one key."""
+        # NOT `any(i != 0)`. marker_id 0 is a perfectly good id -- the layer hands it out first --
+        # so that clause meant the key scheme FLIPPED to position quantization the moment the only
+        # confirmed obstacle left was the one holding id 0. Every lookup keyed on ("id", 0) then
+        # missed at once: floor_by_key, clearance_by_key, _apex_by_obs, and with them the apex
+        # freeze. Duplicated ids are still a real ambiguity and still fall back.
+        if ids and len(ids) == len(obs) and len(set(ids)) == len(ids):
+            return [("id", i) for i in ids]
+        return [self._quant_key(o) for o in obs]
+
+    def _warn_double_avoidance(self, wps) -> None:
+        """The reactive layer has just started avoiding. Is it avoiding a box the ACTIVE global
+        line says it already covers?
+
+        That is the failure this subsystem exists to remove, and until now it was only visible by
+        reading two logs side by side: the re-opt says "3/3 covered" while the reactive planner
+        avoids one of them on every lap. It is a WARNING and nothing else -- no gate, no rebuild,
+        no state change -- because the reactive layer is always allowed to act; what is wrong is
+        the global line's claim, and that is what this names.
+        """
+        try:
+            cov = getattr(self.active, "coverage", None) or []
+            claimed = [c for c in cov if c["status"].startswith("laid")
+                       or c["status"] == "already_clear"]
+            if not claimed or not wps:
+                return
+            j = int(np.argmax([abs(w.d_m) for w in wps]))       # the apex of this maneuver
+            ax, ay = float(wps[j].x_m), float(wps[j].y_m)
+            near = min(claimed, key=lambda c: (c["x"] - ax) ** 2 + (c["y"] - ay) ** 2)
+            d = float(np.hypot(near["x"] - ax, near["y"] - ay))
+            if d > 1.5:                                          # not about one of our boxes
+                return
+            self.get_logger().warning(
+                f"[static_reopt] DOUBLE AVOIDANCE: the reactive layer is avoiding "
+                f"@({near['x']:.2f},{near['y']:.2f}) — a box the ACTIVE global line claims to "
+                f"cover ({near['status']}, published clearance "
+                f"{float(near.get('clearance_m', float('nan'))):+.3f} m against the reactive idle "
+                f"requirement {_REACTIVE_IDLE_CLEARANCE_M:.2f}). The global line's margin is not "
+                f"reaching the reactive layer's threshold; see /static_reopt/coverage",
+                throttle_duration_sec=5.0)
+        except Exception:
+            pass                     # a diagnostic must never break the 20 Hz callback
+
+    def otwpnts_cb(self, msg: OTWpntArray):
+        """Record each confirmed obstacle's apex from the reactive avoidance path. For each
+        obstacle we take the spline point NEAREST it (the point beside it = its apex) and keep the
+        one with the largest |d| seen over the lap (the widest clearance the reactive layer
+        committed to). The map-frame (x,y) is stored so the core re-projects it convention-free."""
+        wps = msg.wpnts
+        # A SQUEEZE path passed the box at reduced margins (the planner had no candidate at its
+        # design ones). Judging its apex by the design requirement rejects it -- see _apex_candidate.
+        squeeze = str(getattr(msg, "ot_line", "")) == "squeeze"
+        # Track whether the reactive layer is currently commanding an avoidance. An empty path, or
+        # one that never leaves the raceline, means idle.
+        now = self.get_clock().now().nanoseconds * 1e-9
+        active = bool(wps) and max((abs(w.d_m) for w in wps), default=0.0) >= self._apex_min_d
+        went_idle = self._reactive_active and not active
+        if went_idle:
+            self._reactive_idle_t = now
+        if active and not self._reactive_active:
+            self._warn_double_avoidance(wps)
+        self._reactive_active = active
+        # ARM THE REBUILD ONLY WHEN THE MANEUVER IS OVER. A new/better apex is a reason to
+        # rebuild -- without it an obstacle set collected BEFORE its apex existed leaves the solve
+        # gate permanently closed -- but arming it MID-MANEUVER is what made the trigger harmful.
+        # The reactive planner republishes at 20 Hz while the car is driving the avoidance, so a
+        # record that keeps refining armed _mark_dirty on nearly every message, and each call with
+        # a major change discarded the pending bundle: the very swap the records were being
+        # collected for could not land. Wait for the reactive layer to go idle, which is exactly
+        # "the maneuver this apex describes has finished", and rebuild once with the settled
+        # record. A MINOR refinement still keeps any pending bundle alive (see _mark_dirty).
+        # BEFORE the empty-message return below: an empty publish is the most common way the
+        # reactive layer goes idle, and returning first would swallow the trigger entirely.
+        if went_idle and self._apex_dirty_pending:
+            self._apex_dirty_pending = False
+            self.get_logger().info(
+                "[static_reopt] reactive layer went idle with a new/updated apex -> rebuilding",
+                throttle_duration_sec=2.0)
+            self._mark_dirty(keep_pending=not self._apex_change_major)
+        if not wps:
+            return
+        wx = np.fromiter((w.x_m for w in wps), float, len(wps))
+        wy = np.fromiter((w.y_m for w in wps), float, len(wps))
+        wd = np.fromiter((w.d_m for w in wps), float, len(wps))
+        if active:
+            # keep recent avoidance paths for RETRO association (obstacle confirmed after the pass)
+            self._path_buffer.append((now, wx, wy, wd, squeeze))
+            while self._path_buffer and (now - self._path_buffer[0][0]) > self.apex_buffer_sec:
+                self._path_buffer.popleft()
+        if not self._obstacles:
+            return
+        if self._record_apexes(wx, wy, wd, squeeze=squeeze):
+            self._apex_dirty_pending = True
+
+    def _adopt_orphan_apexes(self):
+        """Re-key apex records whose track id vanished (the layer re-issues marker ids on an
+        unlatch->re-confirm flap or track replacement): an orphaned record lying beside a CURRENT
+        obstacle is the same physical avoidance. Losing it silently dropped that obstacle's hump
+        from the next rebuild — the line 'forgot' obstacle 1 the moment obstacle 2 triggered a
+        re-solve, and the swap yanked the car off the vanished hump."""
+        keys = self._keys_for(self._obstacles, self._obs_ids)
+        live = set(keys)
+        orphans = [k for k in self._apex_by_obs if k not in live]
+        for o, key in zip(self._obstacles, keys):
+            if key in self._apex_by_obs or not orphans:
+                continue
+            best, best_d = None, 1.5              # apex sits within ~clearance of its obstacle
+            for k in orphans:
+                rec = self._apex_by_obs[k]
+                d = float(np.hypot(rec[0] - o.x, rec[1] - o.y))
+                if d < best_d:
+                    best, best_d = k, d
+            if best is not None:
+                self._apex_by_obs[key] = self._apex_by_obs.pop(best)
+                self._apex_miss.pop(best, None)
+                orphans.remove(best)
+                self.get_logger().info(
+                    f"[static_reopt] adopted orphaned apex record for obstacle "
+                    f"@({o.x:.2f},{o.y:.2f}) (track id re-issued)")
+
+    def _clean_offset(self, x: float, y: float):
+        """Signed lateral offset of a map point from the CLEAN raceline (+d = d_left side).
+        Returns (d, station_index, left_normal)."""
+        i = int(np.argmin(np.hypot(self._clean_xy[:, 0] - x, self._clean_xy[:, 1] - y)))
+        j = (i + 1) % len(self._clean_xy)
+        t = self._clean_xy[j] - self._clean_xy[i]
+        norm = float(np.hypot(t[0], t[1]))
+        if norm < 1e-9:                                   # duplicated closing point
+            j = (i + 2) % len(self._clean_xy)
+            t = self._clean_xy[j] - self._clean_xy[i]
+            norm = float(np.hypot(t[0], t[1])) or 1.0
+        left = np.array([-t[1], t[0]]) / norm             # +d side (d_left convention)
+        d = float((np.array([x, y]) - self._clean_xy[i]) @ left)
+        return d, i, left
+
+    def _apex_plausible(self, x: float, y: float) -> bool:
+        """Corridor sanity for a CANDIDATE apex: its signed offset from the clean raceline must
+        fit inside the drivable band at that station (minus roughly half a car). Reactive paths
+        produced while the car/frames were displaced (stuck phases, mid-swap transients) can
+        carry outlier d values; recording one poisons the hump the re-opt lays."""
+        d, i, _ = self._clean_offset(x, y)
+        return -(self._clean_dr[i] - 0.12) <= d <= (self._clean_dl[i] - 0.12)
+    def _apex_candidate(self, wx, wy, wd, owner, idx, o, squeeze=False):
+        """The apex ONE reactive path offers for ONE obstacle, or None.
+
+        Every rejection here exists because a bad record is unrecoverable: the apex sets where the
+        hump is centred, and a hump centred in the wrong place misses its box by a few centimetres
+        with no downstream check able to put it back. Forensics on the failing run: records drifted
+        up to 1.0 m DOWNSTREAM of the obstacle, and the resulting humps were 3-12 cm short.
+
+        The predicates, in the order they fire:
+
+          SPAN. The path must extend past the obstacle's abeam station in BOTH directions. The
+          committed-path reuse in the reactive planner republishes the slice still AHEAD of the
+          car, so once the car is beside a box the republished slice is that box's exit RAMP --
+          a decaying tail whose widest point sits downstream of the obstacle. Under newest-wins
+          those tails overwrote good records every cycle. A path that genuinely passed the box
+          starts before it and ends after it.
+
+          UNDERSHOOT. The overshoot clamp below has always bounded how much WIDER than necessary a
+          record may be. Nothing bounded how much narrower, so a decaying tail that survived the
+          other gates was recorded as a legitimately tighter apex. Symmetric bound.
+
+          ABEAM. The recorded point must sit beside the obstacle along the track: 0.5 m, down from
+          1.0. Measured on the run, healthy records were all within 0.1 m and the polluted ones sat
+          at 0.4-1.0 m, so the old gate admitted exactly the bad half.
+        """
+        mine = np.where(owner == idx)[0]
+        if mine.size == 0:
+            return None
+        dist = np.hypot(wx[mine] - o.x, wy[mine] - o.y)
+        j = int(mine[int(np.argmax(np.abs(wd[mine])))])
+        if float(dist.min()) > self._apex_assoc_tol or abs(wd[j]) < self._apex_min_d:
+            return None
+        if float(np.hypot(wx[j] - o.x, wy[j] - o.y)) > self._apex_assoc_tol:
+            return None
+        d_rec, i_rec, _left = self._clean_offset(float(wx[j]), float(wy[j]))
+        d_obs, i_obs, left_obs = self._clean_offset(float(o.x), float(o.y))
+        n_cl = len(self._clean_xy)
+        st_m = self._track_len / max(n_cl - 1, 1)          # metres per station
+        # --- SPAN -------------------------------------------------------------------------
+        _d0, i_first, _l0 = self._clean_offset(float(wx[0]), float(wy[0]))
+        _d1, i_last, _l1 = self._clean_offset(float(wx[-1]), float(wy[-1]))
+        margin = max(1, int(self.apex_span_margin_m / max(st_m, 1e-6)))
+        fwd_len = (i_last - i_first) % n_cl
+        fwd_obs = (i_obs - i_first) % n_cl
+        if not (margin <= fwd_obs <= fwd_len - margin):
+            return None
+        # --- ABEAM ------------------------------------------------------------------------
+        gap_st = abs(i_rec - i_obs)
+        gap_st = min(gap_st, n_cl - gap_st) * st_m
+        if gap_st > self.apex_abeam_gap_m:
+            return None
+        if not self._apex_plausible(float(wx[j]), float(wy[j])):
+            self.get_logger().warning(
+                f"[static_reopt] REJECTED implausible apex xy=({wx[j]:.2f},{wy[j]:.2f}) "
+                f"d={wd[j]:+.2f}m for obstacle @({o.x:.2f},{o.y:.2f}) — outside the track "
+                f"corridor (displaced-frame outlier)", throttle_duration_sec=2.0)
+            return None
+        # --- OVERSHOOT clamp / UNDERSHOOT reject ------------------------------------------
+        # `need` is what the obstacle REQUIRES: its own offset + radius + keep-out + bulge + slack.
+        side = 1.0 if d_rec >= d_obs else -1.0
+        need = d_obs + side * (float(o.r) + 0.45)
+        # A SQUEEZE path is held to a different bar, because it answered a different question. The
+        # planner reached for it precisely when it had NO candidate at the design margins, so its
+        # apex is short of `need` by construction -- on the shipped numbers |d| = 0.45 against a
+        # need of 0.60, a 0.15 m shortfall against an undershoot bound of 0.12, so it was rejected
+        # and about a fifth of squeezed obstacles never got a global hump at all. That is backwards:
+        # the squeeze is the evidence that this box CAN be passed, in the one place where a global
+        # hump would relieve the reactive layer the most.
+        #
+        # The honest bar is the floor the core is willing to lay a hump at -- relax_floor, the
+        # reactive keep-out, the bottom rung of the coverage ladder. An apex that proves a pass at
+        # that clearance is usable; below it the core could not use the apex anyway. The OVERSHOOT
+        # clamp is unchanged: a squeeze apex is still clamped to `need`, never beyond it.
+        floor_lo = float(o.r) + self.relax_floor
+        if (d_rec - need) * side > 0.0:                    # wider than required -> clamp onto it
+            d_rec = need
+        elif squeeze:
+            if abs(d_rec - d_obs) < floor_lo - 1e-9:
+                return None                                 # not even the reactive keep-out
+        elif (need - d_rec) * side > self.apex_undershoot_m:
+            return None                                     # narrower than required -> a tail
+        # --- ANCHOR AT THE OBSTACLE -------------------------------------------------------
+        # Store the point beside the OBSTACLE, not the point the path happened to be widest at.
+        # d_rec survives as amplitude/side evidence; i_rec does not, because it is the thing that
+        # drifts. This is what makes a stale record cost nothing: it can only be wrong about how
+        # far out to go, never about where.
+        ax_x = float(self._clean_xy[i_obs][0] + d_rec * left_obs[0])
+        ax_y = float(self._clean_xy[i_obs][1] + d_rec * left_obs[1])
+        return ax_x, ax_y, abs(float(d_rec)), float(need)
+
+    def _commit_apex(self, key, o, cand) -> bool:
+        """Store one accepted apex. Returns True when it is a rebuild-worthy change."""
+        ax_x, ax_y, amp, _need = cand
+        prev = self._apex_by_obs.get(key)
+        self._apex_by_obs[key] = (ax_x, ax_y, amp)
+        if prev is None:
+            self._apex_change_major = True                 # a hump that did not exist before
+            self.get_logger().info(
+                f"[static_reopt] recorded reactive apex for obstacle @({o.x:.2f},{o.y:.2f}) "
+                f"-> apex xy=({ax_x:.2f},{ax_y:.2f}) |d|={amp:.2f}m (anchored abeam)")
+            return True
+        d_amp = abs(amp - prev[2])
+        d_pos = float(np.hypot(prev[0] - ax_x, prev[1] - ax_y))
+        if d_amp > 0.05 or d_pos > 0.10:
+            if d_amp >= self.apex_major_change_m or d_pos >= self.apex_major_change_m:
+                self._apex_change_major = True
+            return True
+        return False
+
+    def _apex_frozen(self, key, o) -> bool:
+        """Is this obstacle's apex settled, so further reactive paths must not touch it?
+
+        Once the ACTIVE line carries a hump for an obstacle and that hump still clears it by the
+        floor it was accepted at, the record has done its job. Re-recording from every subsequent
+        reactive publish can only move it -- and the reactive planner is still publishing while the
+        car drives the very hump the line already provides, so those publishes are the least
+        trustworthy ones there are. Released by the two triggers that mean the world changed: the
+        obstacle moving more than obs_change_tol, or the clearance-drift check.
+        """
+        floor = getattr(self.active, "floor_by_key", {}).get(key)
+        if floor is None:
+            return False
+        try:
+            _s, xa, ya = self._bundle_xy(self.active)
+            now = float(np.min(np.hypot(xa - o.x, ya - o.y))) - float(o.r)
+        except Exception:
+            return False
+        return now >= floor - 1e-9
+
+    def _record_apexes(self, wx, wy, wd, squeeze=False) -> bool:
+        """Associate one reactive path with the confirmed obstacles and update the apex records.
+        Returns True when any apex was newly recorded or MOVED by more than 5 cm in amplitude
+        (or 10 cm in position) — a rebuild-worthy change. Also sets `_apex_change_major`, which
+        separates "a new obstacle to lay a hump for" from "the same hump, a few centimetres
+        different": only the former is worth discarding a pending bundle over (see _mark_dirty).
+
+        NEWEST-WINS among paths that pass _apex_candidate: the historical max RATCHETED (one
+        outlier permanently inflated the hump), and the acceptance predicates are what keep
+        "newest" from meaning "whatever the exit ramp said last".
+
+        OWNERSHIP first: give every spline point to its NEAREST obstacle, then let each obstacle
+        pick its apex only from the points it owns — a second obstacle sitting inside the FIRST
+        one's avoidance hump must not record that hump as its own apex."""
+        self._apex_change_major = False
+        keys = self._keys_for(self._obstacles, self._obs_ids)
+        if not self._obstacles:
+            return False
+        ox = np.fromiter((o.x for o in self._obstacles), float, len(self._obstacles))
+        oy = np.fromiter((o.y for o in self._obstacles), float, len(self._obstacles))
+        owner = np.argmin(np.hypot(wx[:, None] - ox[None, :], wy[:, None] - oy[None, :]), axis=1)
+        changed = False
+        for idx, (o, key) in enumerate(zip(self._obstacles, keys)):
+            if self._apex_frozen(key, o):
+                continue
+            cand = self._apex_candidate(wx, wy, wd, owner, idx, o, squeeze=squeeze)
+            if cand is None:
+                continue
+            changed = self._commit_apex(key, o, cand) or changed
+        return changed
+
+    def _record_apexes_best_of(self, paths) -> bool:
+        """Retro association over the buffered paths: take the BEST candidate per obstacle, not
+        the last one.
+
+        Replaying the buffer newest-last meant the most recent path won even when an earlier one
+        had passed the obstacle properly and the latest was its decaying tail. With the acceptance
+        predicates in place the tails are rejected outright, but among survivors "newest" is still
+        arbitrary -- so pick the one whose amplitude is closest to what the obstacle geometrically
+        requires."""
+        keys = self._keys_for(self._obstacles, self._obs_ids)
+        if not self._obstacles:
+            return False
+        ox = np.fromiter((o.x for o in self._obstacles), float, len(self._obstacles))
+        oy = np.fromiter((o.y for o in self._obstacles), float, len(self._obstacles))
+        best = {}
+        for _t, wx, wy, wd, sq in paths:
+            owner = np.argmin(np.hypot(wx[:, None] - ox[None, :], wy[:, None] - oy[None, :]), axis=1)
+            for idx, (o, key) in enumerate(zip(self._obstacles, keys)):
+                if self._apex_frozen(key, o):
+                    continue
+                cand = self._apex_candidate(wx, wy, wd, owner, idx, o, squeeze=sq)
+                if cand is None:
+                    continue
+                err = abs(cand[2] - abs(cand[3]))
+                if key not in best or err < best[key][0]:
+                    best[key] = (err, o, cand)
+        changed = False
+        for key, (_err, o, cand) in best.items():
+            changed = self._commit_apex(key, o, cand) or changed
+        return changed
+
+    def _apex_pairs(self, obstacles: List[core.Obstacle]) -> List[tuple]:
+        """(knot (x, y), obstacle, came_from_a_recorded_apex) for EVERY confirmed obstacle.
+
+        The knot is what the core interpolates the hump through, and the obstacle beside it is what
+        the laid hump has to measurably miss. Both are now derived from the OBSTACLE:
+
+          station    abeam the box (the clean-line point nearest it)
+          amplitude  d_obs + side * (r + obs_margin)   -- computed in the core, from the box
+          side       the roomier side, MEASURED IN THE ERODED MAP
+
+        Only the SIDE ever needed evidence, and this used to take it exclusively from a recorded
+        reactive apex -- so an obstacle the reactive layer had never successfully avoided got no
+        knot at all, stayed reactive-only forever, and did so quietly: every lap the car swerved
+        around it by hand while the global line pretended the obstacle was not there. Nothing in
+        the pipeline could escalate, because the thing that would have fixed it was gated on the
+        thing that was failing.
+
+        The recorded apex keeps the two jobs it is good at, and loses the veto:
+          (i)  a SIDE HINT, decisive when the map says the two sides are within hint_margin of each
+               other -- there the apex knows something the corridor width does not (which side the
+               car could actually drive), and
+          (ii) standing evidence that a pass on that side is drivable.
+
+        Choosing the side wrong is recoverable, which is why a measured preference is enough: the
+        core's coverage ladder tries the MIRRORED side before giving up on an obstacle.
+        """
+        out = []
+        for o, key in zip(obstacles, self._keys_for(obstacles, self._obs_ids)):
+            rec = self._apex_by_obs.get(key)
+            try:
+                d_obs, i_obs, left = self._clean_offset(float(o.x), float(o.y))
+            except Exception:
+                if rec is not None:
+                    out.append(((rec[0], rec[1]), o, True))
+                continue
+            room_l, room_r = self._grid_room(i_obs, left, d_obs, float(o.r))
+            side = None
+            if rec is not None:
+                d_rec = float((np.array([rec[0], rec[1]]) - self._clean_xy[i_obs]) @ left)
+                side = 1.0 if d_rec >= d_obs else -1.0
+            if room_l is not None:
+                need = float(o.r) + self.obs_margin
+                # the apex's side stands unless the map says it has materially less room
+                if side is None or abs(room_l - room_r) > self.side_hint_margin_m:
+                    side = 1.0 if room_l >= room_r else -1.0
+                elif (room_l if side > 0 else room_r) + 1e-9 < need - float(o.r):
+                    side = 1.0 if room_l >= room_r else -1.0
+            if side is None:
+                # no map and no apex: either side is a guess, and the ladder will try the other
+                side = 1.0 if self._clean_dl[i_obs] >= self._clean_dr[i_obs] else -1.0
+            if rec is not None:
+                out.append(((rec[0], rec[1]), o, True))
+                continue
+            d_t = d_obs + side * (float(o.r) + self.obs_margin)
+            xy = self._clean_xy[i_obs] + d_t * left
+            out.append(((float(xy[0]), float(xy[1])), o, False))
+        return out
+
+    def _apex_list(self, obstacles: List[core.Obstacle]) -> List[tuple]:
+        """Map-frame (x,y) knot points only — the trigger gates just need to know one exists."""
+        return [xy for xy, _o, _src in self._apex_pairs(obstacles)]
+
+    def _rebuild_and_swap(self, reason: str):
+        """Solve ONE re-opt over the whole confirmed obstacle set. Called once a full exploration
+        lap is done; the swap itself is DEFERRED to a station where the old and new lines coincide
+        (see _commit_pending) — the offset seam sits in the largest apex-free gap, not at s=0, so
+        swapping at s=0 can step the reference laterally. The solve is ~10 ms (BLAS-pinned)."""
+        obstacles = list(self._obstacles)
+        # There is no longer a "0 recorded apexes -> nothing to build" case: every confirmed
+        # obstacle gets a knot derived from its own geometry (see _apex_pairs), so a solve is
+        # always worth running once an obstacle exists. What used to stand here was a guard against
+        # building a bit-for-bit CLEAN line and burning the dirty flag on it -- that outcome is now
+        # only reachable when the CORRIDOR rejects every hump, which the n_apex == 0 guard in
+        # _finish_rebuild catches with the honest reason attached.
+        now = self.get_clock().now().nanoseconds * 1e-9
+        # AN EMPTY SET IS ANSWERED IMMEDIATELY, AHEAD OF EVERYTHING. The clean bundle is
+        # precomputed, so this needs no worker -- and it must not be made to wait behind an
+        # in-flight solve, because that solve was computed FOR OBSTACLES and cannot describe an
+        # empty set. Reverting to the clean line is also the safe direction, so it is the one
+        # thing that should never be queued behind anything.
+        if not obstacles:
+            self._obstacles_dirty = False
+            self._last_solve_t = now
+            self._invalidate_solve("the obstacle set emptied")
+            self._finish_rebuild(self.clean_bundle, [], reason, now)
+            return
+        if self._solve_future is not None:
+            # NOT just "still running". A FINISHED but uncollected result was being overwritten by
+            # the next submit and silently lost -- the trigger had already been burned for it, so
+            # its work was thrown away and nothing re-armed. Collect it first; if it is still
+            # running, leave the trigger armed and come back.
+            if not self._solve_future.done():
+                return
+            self._collect_solve()
+        self._obstacles_dirty = False
+        self._last_solve_t = now                 # debounce clock: stamped for EVERY solve attempt,
+                                                 # including the fallback paths that skip the gate
+        # OFF THE EXECUTOR. The solve is 200-850 ms of pure function over a snapshot; running it
+        # inline stalled the 40 Hz frenet_cb for that long, and the swap gates it feeds -- ego-s
+        # freshness, reactive idleness -- are judged from callbacks that then could not run, so the
+        # solve was blocking the very conditions it was waiting for. The apex pairs are resolved
+        # HERE, on this thread, because otwpnts_cb rewrites them at 20 Hz.
+        pairs = self._apex_pairs(obstacles)
+
+        def _work():
+            with open(os.devnull, "w") as devnull, redirect_stdout(devnull):
+                return self._build_obstacle_bundle(obstacles, pairs=pairs)
+
+        self._solve_future = self._solve_pool.submit(_work)
+        self._solve_ctx = (obstacles, reason, now, self._solve_epoch)
+        self.get_logger().info(
+            f"[static_reopt] solving ({reason}) for {len(obstacles)} obstacle(s) off the "
+            f"executor; the result is collected on the republish tick",
+            throttle_duration_sec=2.0)
+
+    def _invalidate_solve(self, why: str) -> None:
+        """Drop an in-flight or uncollected solve whose premise no longer holds."""
+        if self._solve_future is None:
+            return
+        self._solve_future.cancel()
+        self._solve_future = None
+        self._solve_ctx = None
+        self.get_logger().info(
+            f"[static_reopt] discarding the in-flight solve: {why}", throttle_duration_sec=2.0)
+
+    def _collect_solve(self):
+        """Take a finished off-executor solve and run the install path on the executor thread."""
+        fut = self._solve_future
+        if fut is None or not fut.done():
+            return
+        self._solve_future = None
+        obstacles, reason, now, epoch = self._solve_ctx
+        self._solve_ctx = None
+        if epoch != self._solve_epoch:
+            # The set changed while this was solving. Installing it would describe a world that no
+            # longer exists -- and if the set has since EMPTIED, would undo a correct clean swap
+            # with nothing left to re-arm the trigger. Re-arm and let the next solve answer the
+            # question that is actually being asked.
+            self.get_logger().info(
+                f"[static_reopt] discarding a stale solve ({reason}, epoch {epoch} != "
+                f"{self._solve_epoch}); the obstacle set changed while it ran")
+            self._obstacles_dirty = True
+            return
+        try:
+            bundle = fut.result()
+        except Exception as e:  # noqa: BLE001 — must never propagate to the timer
+            self.get_logger().warn(
+                f"[static_reopt] batch re-opt FAILED ({type(e).__name__}: {str(e)[:80]}); "
+                f"keeping the current line — will retry (reactive planner handles the gap)")
+            self._obstacles_dirty = True         # re-arm; a transient failure must not eat the trigger
+            self._solve_backoff_until = (self.get_clock().now().nanoseconds * 1e-9
+                                         + self.solve_retry_backoff_s)
+            return
+        self._finish_rebuild(bundle, obstacles, reason, now)
+
+    def _finish_rebuild(self, bundle, obstacles, reason: str, now: float):
+        """Everything after the solve: the acceptance gates and the queueing of the swap. Runs on
+        the executor thread in both paths, so node state is still touched from one thread only."""
+        # INVARIANT: with no confirmed obstacles, the only line that may be installed is the clean
+        # one. Everything below reasons about obstacles -- the coverage comparison returns None
+        # when the active line has none, and the no-change check is guarded on self._obstacles --
+        # so an obstacle-aware bundle arriving here after the set emptied passes every gate by
+        # default. This is the backstop for that, independent of the epoch check upstream.
+        if not self._obstacles and bundle is not self.clean_bundle:
+            self.get_logger().warn(
+                f"[static_reopt] refusing an obstacle-aware line ({reason}) with an EMPTY "
+                f"obstacle set — the clean line is the only correct answer here",
+                throttle_duration_sec=5.0)
+            return
+        if bundle is self.active:
+            return
+        # Same guard, now on the BUILT result: every apex was corridor-rejected (all-or-nothing
+        # fit), so the bundle is geometrically clean. Never install it: from an obstacle-aware
+        # active it would silently revert the avoidance; from the CLEAN active it is a no-op swap.
+        # Corridor rejection is DETERMINISTIC (same apexes + same track -> same answer), so the
+        # trigger stays burned — no retry loop; a new/better apex re-arms it via otwpnts_cb, and
+        # transient solve failures take the exception path above instead.
+        # The built line measurably fails to clear an obstacle it claims to have reshaped. Never
+        # install it: from an obstacle-aware active it is a strict regression nothing downstream
+        # can detect, and from the clean active it buys a detour that still needs the reactive
+        # layer. Deterministic (same apexes + track -> same answer), so the trigger stays burned;
+        # a new/better apex re-arms it via otwpnts_cb.
+        if obstacles and not getattr(bundle, "clearance_ok", True):
+            return
+        n_ap = getattr(bundle, "n_apex", 0)
+        if obstacles and n_ap == 0:
+            self.get_logger().warning(
+                f"[static_reopt] re-opt laid 0 humps for {len(obstacles)} obstacle(s) — every "
+                f"apex rejected (track too tight, or the hump would exceed curvlim; see the "
+                f"REJECTED log for the per-apex reason). "
+                f"Keeping the current line; those obstacles stay reactive-only")
+            return
+        # COVERAGE POLICY. Publish the best coverage available, never a regression. A line that
+        # covers two of three obstacles is worth swapping to -- the third stays the reactive
+        # layer's and the coverage topic says so -- but a line that covers LESS than what is
+        # already driving must not be installed, because the fallback here is not the clean line,
+        # it is the older, better-covered line the car is on.
+        regress = self._coverage_regresses(getattr(bundle, "coverage", []),
+                                           getattr(self.active, "coverage", []))
+        if regress:
+            self.get_logger().warning(
+                f"[static_reopt] rebuild REFUSED: it would reduce coverage — {regress}. Keeping "
+                f"the active line; see /static_reopt/coverage", throttle_duration_sec=5.0)
+            return
+        # A SWAP WITH NOTHING IN IT. Of 16 swaps in one run, 6 moved the line by at most 0.054 m
+        # anywhere -- rebuilds triggered by re-measurement noise, producing a line the car cannot
+        # tell from the one it is on. Each still costs a /global_waypoints publish and a
+        # FrenetConverter rebuild in the controller, the state machine and the planner.
+        #
+        # Skipped only when BOTH hold: the geometry is within swap_min_gain_m everywhere, AND the
+        # ACTIVE line still clears every current obstacle by the floor its own humps were accepted
+        # at. The first alone is not enough -- a line identical to a stale one is still stale --
+        # and the second is what makes coverage-equality an argument rather than an assumption:
+        # with max deviation < eps the two lines' clearances differ by at most eps, and no new hump
+        # of amplitude >= the floor can exist inside it.
+        dev = self._line_dev(bundle, self.active)
+        if self._obstacles and float(np.max(dev)) < self.swap_min_gain_m:
+            floors = getattr(self.active, "floor_by_key", {}) or {}
+            keys = self._keys_for(self._obstacles, self._obs_ids)
+            _sa, xa, ya = self._bundle_xy(self.active)
+            gaps = [float(np.min(np.hypot(xa - o.x, ya - o.y))) - float(o.r)
+                    for o in self._obstacles]
+            still_ok = all(g >= floors.get(k, self.relax_floor) - self.fit_tol - 1e-6
+                           for g, k in zip(gaps, keys))
+            if still_ok:
+                self.get_logger().info(
+                    f"[static_reopt] rebuild ({reason}) differs from the active line by at most "
+                    f"{float(np.max(dev)) * 1e3:.0f} mm and the active line still clears every "
+                    f"obstacle -- not queueing a swap for it",
+                    throttle_duration_sec=5.0)
+                # deliberately NOT refreshing active.clearance_by_key here: _clearance_drifted
+                # fires once per active line off that baseline, and rewriting it with today's
+                # numbers would disarm the drift trigger for these obstacles for good.
+                return
+        self._pending = bundle
+        self._pending_dev = dev
+        self._pending_since = now
+        kind = "CLEAN" if (bundle is self.clean_bundle or n_ap == 0) else f"OBSTACLE-AWARE ({n_ap} apex)"
+        self.get_logger().info(
+            f"[static_reopt] batch re-opt -> {kind} ready ({reason}); committing where the lines "
+            f"meet (max dev {float(np.max(self._pending_dev)):.3f} m)")
+
+    @staticmethod
+    def _bundle_xy(b: "_Bundle"):
+        wp = b.glb_wpnts.wpnts
+        return (np.array([w.s_m for w in wp]),
+                np.array([w.x_m for w in wp]), np.array([w.y_m for w in wp]))
+
+    def _line_dev(self, a: "_Bundle", b: "_Bundle") -> np.ndarray:
+        """Per-station GEOMETRIC distance from each of `a`'s points to the polyline `b`.
+
+        NOT s-matched: the hump changes the total arc length (a 0.6 m apex measured +0.95 m of
+        lap), so comparing points at equal s reads ~0.95 m of PHANTOM deviation at stations 10 m
+        away from the hump whose geometry is identical (measured: 4% of the lap "agreeing" at
+        5 cm vs the true 82%). That blocked the commit gates everywhere but the seam and made
+        the deadlock breaker refuse geometrically-perfect lines."""
+        _, xa, ya = self._bundle_xy(a)
+        _, xb, yb = self._bundle_xy(b)
+        ax, ay = xb, yb
+        bx, by = np.roll(xb, -1), np.roll(yb, -1)
+        dx, dy = bx - ax, by - ay
+        seg2 = np.maximum(dx * dx + dy * dy, 1e-12)
+        t = ((xa[:, None] - ax[None, :]) * dx[None, :]
+             + (ya[:, None] - ay[None, :]) * dy[None, :]) / seg2[None, :]
+        t = np.clip(t, 0.0, 1.0)
+        cx = ax[None, :] + t * dx[None, :]
+        cy = ay[None, :] + t * dy[None, :]
+        return np.sqrt(((xa[:, None] - cx) ** 2 + (ya[:, None] - cy) ** 2).min(axis=1))
+
+    def state_cb(self, msg: String):
+        self._sm_state = str(msg.data)
+        self._sm_state_t = self.get_clock().now().nanoseconds * 1e-9
+
+    def _swap_blocked_by_state(self, car_x: float, car_y: float, s: float, now: float):
+        """Is this a moment where swapping the reference could hurt? Returns the gap [m] that
+        blocks it, or None.
+
+        TRAILING means the state machine has already decided something is in the way and is braking
+        for it. Swapping the global line there hands the controller a reference it has never
+        tracked, at the one station where the reactive layer's own commit is still anchored to the
+        OLD geometry. Only the combination blocks: TRAILING far from any obstacle is the opponent's
+        doing and no reason to hold a static re-opt.
+
+        Silent when the state machine is not publishing (bag / headless): a gate that cannot see
+        the state must not disable the feature outright -- the reactive-idle and line-agreement
+        gates still stand on their own.
+        """
+        if not self.swap_block_trailing or self._sm_state != "TRAILING":
+            return None
+        if (now - self._sm_state_t) > self.swap_state_stale_s:
+            return None
+        if not self._obstacles:
+            return None
+        try:
+            sb, xb, yb = self._bundle_xy(self.active)
+            L = float(sb[-1]) if len(sb) and sb[-1] > 0 else self._track_len
+            s_car = float(s) % L
+            gaps = []
+            for o in self._obstacles:
+                j = int(np.argmin(np.hypot(xb - o.x, yb - o.y)))
+                gaps.append((float(sb[j]) - s_car) % L)
+            gap = min(gaps)
+        except Exception:
+            return None
+        return gap if gap < self.swap_min_obs_gap_m else None
+
+    def _note_swap_block(self, reason: str):
+        """Count one cycle in which this gate held the swap (see _swap_block)."""
+        self._swap_block[reason] = self._swap_block.get(reason, 0) + 1
+
+    def _report_swap_blocks(self, lap_hint: str = ""):
+        """One line per lap naming the gate that held the swap, then reset.
+
+        Printed even when nothing blocked, because "the swap was never attempted" and "the swap was
+        blocked 800 times by the reactive layer" are different problems with the same symptom."""
+        blocks = self._swap_block
+        self._swap_block = {}
+        if self._pending is None and not blocks:
+            return
+        if not blocks:
+            self.get_logger().info(
+                f"[static_reopt] swap gates{lap_hint}: nothing blocked a queued line this lap")
+            return
+        top = sorted(blocks.items(), key=lambda kv: -kv[1])
+        self.get_logger().info(
+            f"[static_reopt] swap gates{lap_hint}: held by "
+            + ", ".join(f"{k} x{v}" for k, v in top)
+            + (f" (a line is still queued)" if self._pending is not None else ""))
+
+    def _commit_pending(self, s: float, force: bool = False):
+        """Swap once BOTH hold: the reactive layer is idle (no obstacle in its horizon, so changing
+        the global line cannot pull the rug from under an avoidance in progress), and the lines
+        agree (< 5 cm) over the WHOLE stretch the controller is about to consume — from the car to
+        swap_horizon ahead. Agreement at the current station alone let the swap land right at a
+        hump entrance: the line then changed inside the controller's lookahead and jerked the car.
+
+        This replaces waiting for the start/finish crossing: s=0 is an arbitrary point that can fall
+        right beside the NEXT obstacle, and swapping there made the car miss it.
+
+        force=True (stale-frenet bench fallback only): no odometry means no meaningful station or
+        reactive state — commit unconditionally so headless/bag runs still get the line."""
+        if self._pending is None:
+            return
+        if not force:
+            now = self.get_clock().now().nanoseconds * 1e-9
+            # Map the car onto the PENDING line GEOMETRICALLY: the car's s lives on the ACTIVE
+            # line and the hump changes total arc length (~1 m for a 0.6 m apex), so matching by
+            # s picked a pending station up to ΔL (~10 stations) away from where the car really is.
+            sb, xb, yb = self._bundle_xy(self.active)
+            Lb = float(sb[-1]) if len(sb) and sb[-1] > 0 else self._track_len
+            car_x = float(np.interp(s % Lb, sb, xb))
+            car_y = float(np.interp(s % Lb, sb, yb))
+            sa, xa, ya = self._bundle_xy(self._pending)
+            j0 = int(np.argmin(np.hypot(xa - car_x, ya - car_y)))
+            # DEADLOCK BREAKER (see the parameter block): stuck trailing = the car sits inside
+            # the pending hump at low speed; the normal gates can then never pass. Commit anyway.
+            blocked = self._swap_blocked_by_state(car_x, car_y, s, now)
+            if blocked is not None:
+                self._note_swap_block("trailing_near_obstacle")
+                # Ahead of the deadlock breaker on purpose: "stuck, slow, waiting" IS what trailing
+                # a close obstacle looks like, so letting the breaker through here would leave the
+                # gate doing nothing in the one case it exists for. It cannot deadlock: the car
+                # either clears the obstacle (the gap opens) or the state leaves TRAILING, and
+                # holding the current line while nose-to-nose with a box costs nothing.
+                self.get_logger().info(
+                    f"[static_reopt] holding the swap: TRAILING with an obstacle {blocked:.2f} m "
+                    f"ahead (< {self.swap_min_obs_gap_m:.2f}) — the pending line stays queued",
+                    throttle_duration_sec=2.0)
+                return
+            stuck = ((now - self._pending_since) > self.swap_deadlock_s
+                     and abs(self._last_vs) < self.swap_deadlock_max_vs)
+            if stuck:
+                dev_car = float(self._pending_dev[j0])
+                if dev_car > self.swap_deadlock_max_dev:
+                    # A sane hump never puts the new line this far from a car that was following
+                    # the active line — the pending geometry is poisoned. Committing it strands
+                    # the car >1 m off its own raceline (AEB clamps, lookahead lands on the far
+                    # line). Discard; the next (sanity-checked) apex update rebuilds a sane one.
+                    self.get_logger().error(
+                        f"[static_reopt] deadlock breaker REFUSED: pending line is {dev_car:.2f} m "
+                        f"from the car (> {self.swap_deadlock_max_dev:.2f}) — discarding the "
+                        f"pending; waiting for a sane apex/rebuild")
+                    self._pending = None
+                    self._pending_dev = None
+                    return
+                if dev_car > self.swap_deadlock_max_dev_commit_m:
+                    # NOT sane enough to force. The breaker exists to un-stick a car that has been
+                    # waiting behind an obstacle, and its old cap only DISCARDED a pending beyond
+                    # 0.6 m -- so anything under that was committed however far the car was from
+                    # it. Observed: 0.59 m, forced mid-hump after a 5.3 s wait. The reference
+                    # stepped half a metre sideways under a car already in an avoidance, the
+                    # obstacle's d jumped 0.58 m in one cycle as the frame changed, and the two
+                    # replans that followed were at g_near 0.81 and 0.56 m -- inside the 0.9-2.0 m
+                    # a fresh plan needs, so arithmetically unsolvable.
+                    #
+                    # The pending is KEPT, not discarded: it is a good line, just not one to hand
+                    # over from here. The car goes on following the line it is already tracking,
+                    # and the swap lands when the car is near the new line -- which is what the
+                    # normal gates were always waiting for.
+                    self.get_logger().warn(
+                        f"[static_reopt] deadlock breaker HELD: the car is {dev_car:.2f} m from "
+                        f"the pending line (> {self.swap_deadlock_max_dev_commit_m:.2f}); forcing "
+                        f"the swap here would step the reference sideways under a car that is "
+                        f"mid-avoidance. Keeping the queued line and the current one",
+                        throttle_duration_sec=2.0)
+                    self._note_swap_block("deadlock_dev_too_large")
+                    return
+                self.get_logger().warn(
+                    f"[static_reopt] swap deadlock breaker: pending waited "
+                    f"{now - self._pending_since:.1f}s with the car at {self._last_vs:.1f} m/s "
+                    f"— committing mid-hump to un-stick (car {dev_car:.2f} m off the new line)")
+            else:
+                if self._reactive_active or (now - self._reactive_idle_t) < self.swap_idle_s:
+                    self._note_swap_block("reactive_not_idle")
+                    return
+                horizon = max(self.swap_horizon_min_m, self.swap_horizon_time_s * abs(self._last_vs))
+                La = float(sa[-1]) if len(sa) and sa[-1] > 0 else self._track_len
+                ahead = ((sa - sa[j0]) % La) <= horizon
+                if not ahead.any():
+                    self._note_swap_block("no_horizon")
+                    return
+                if float(np.max(self._pending_dev[ahead])) > 0.05:
+                    self._note_swap_block("lines_disagree_in_horizon")
+                    return
+        bundle = self._pending
+        self._pending = None
+        self._pending_dev = None
+        self.active = bundle
+        self._clearance_dirty_keys.clear()       # new line -> new clearance baseline to drift from
+        # tell caching consumers to re-take the new geometry, repeatedly and FAST (notify_cb)
+        self._notify_scaler_ticks = self.notify_ticks
+        kind = "CLEAN" if bundle is self.clean_bundle else "OBSTACLE-AWARE"
+        self.get_logger().info(f"[static_reopt] swapped to {kind} at s={s:.2f} m")
+        self._publish_active(bundle)             # publish now, don't wait for the republish tick
+        self._publish_coverage(bundle)
+        self._log_publish_margins(bundle)
+        self._publish_clearance()                # the new line clears the boxes by new amounts
+        self.pub_update_map.publish(Bool(data=True))   # /global_waypoints already latched above
+
+    def _publish_active(self, active: "_Bundle"):
+        now = self.get_clock().now().nanoseconds * 1e-9
+        self._last_published = active
+        self._last_publish_t = now
+        self.pub_glb.publish(active.glb_wpnts)
+        self.pub_glb_m.publish(active.glb_markers)
+        self.pub_sp.publish(active.sp_wpnts)
+        self.pub_sp_m.publish(active.sp_markers)
+        self.pub_cent.publish(active.cent_wpnts)
+        self.pub_cent_m.publish(active.cent_markers)
+        self.pub_bounds.publish(active.trackbounds)
+        self.pub_info.publish(active.map_info)
+        self.pub_lap.publish(active.est_lap_time)
+
+    # ----------------------------------------------------------------------------------
+    # start/finish crossing -> batch re-opt + swap
+    # ----------------------------------------------------------------------------------
+    def frenet_cb(self, msg: Odometry):
+        s = msg.pose.pose.position.x  # frenet s
+        self._last_vs = float(msg.twist.twist.linear.x)   # swap-horizon scaling
+        self._last_frenet_t = self.get_clock().now().nanoseconds * 1e-9
+        L = self._track_len
+        if self._last_s is not None:
+            ds = s - self._last_s
+            if ds < -1.0:
+                ds += L                       # a genuine wrap is one lap of forward travel
+            if 0.0 <= ds < 1.0:               # ignore backward/teleport frames in the odometer
+                self._s_progressed += ds
+        # A real seam crossing needs the PREVIOUS sample to be near the end of the lap; requiring a
+        # full lap of travel on top makes the trigger independent of WHERE the car started (the
+        # map's s=0 is not the start of the exploration lap) and immune to a parked car's s
+        # flickering across the seam (its odometer never advances).
+        # ...and the lap boundary is where the swap-gate tally is reported (see _report_swap_blocks)
+        crossed_sf = (self._last_s is not None
+                      and s < self._last_s - 1.0
+                      and self._last_s > 0.85 * L
+                      and self._s_progressed > 0.9 * L)
+        self._last_s = s
+        if crossed_sf:
+            self._report_swap_blocks()
+        # SOLVE as soon as the set is dirty AND at least one apex has been captured — no need to
+        # wait for the lap boundary, the solve is the cheap part and the swap is gated separately.
+        # The lap crossing stays as a retry tick for the case where no apex existed yet.
+        # DEBOUNCE. An empty set is exempt: reverting to the clean line is the safe direction and
+        # its bundle is precomputed, so making it wait would be pure cost.
+        debounced = (self._obstacles
+                     and (self._last_frenet_t - self._last_solve_t) < self.solve_min_interval_s)
+        if (self._obstacles_dirty and self._pending is None and not debounced
+                and self._last_frenet_t >= self._solve_backoff_until):
+            # An EMPTY set must rebuild immediately: _apex_list([]) is falsy, so without the extra
+            # clause the clean revert would wait for the next seam crossing — up to a full lap on
+            # an obsolete detour after the obstacles were physically removed. The clean bundle is
+            # precomputed, the "solve" is free.
+            if self._apex_list(self._obstacles) or crossed_sf or not self._obstacles:
+                if crossed_sf:
+                    self._s_progressed = 0.0
+                self._rebuild_and_swap(
+                    "obstacles cleared" if not self._obstacles
+                    else ("apex captured" if not crossed_sf else "start/finish"))
+        self._commit_pending(s)
+
+    def republish_cb(self):
+        now = self.get_clock().now().nanoseconds * 1e-9
+        self._collect_solve()          # install an off-executor solve, if one finished
+        self._publish_clearance()      # keep-alive for the consumers of THE clearance definition
+        # STALE-FRENET fallback: no odom -> we never see the s-wrap. Solve once so a headless /
+        # bag run still gets the obstacle line. Never fires while the car is actually driving.
+        frenet_stale = (self._last_frenet_t is None
+                        or (now - self._last_frenet_t) > self.swap_timeout_s)
+        # Only when there is NO odometry at all (bag / headless). With odometry the lap gate in
+        # frenet_cb owns the trigger — this path would otherwise swap at an arbitrary s.
+        if self._obstacles_dirty and frenet_stale and (now - self._dirty_since) > self.swap_timeout_s:
+            self._rebuild_and_swap("frenet stale fallback")
+        # ...and force it in on a LATER tick, because the solve is no longer synchronous: with no
+        # odometry there is no station or horizon gate to satisfy, so whenever a line is queued and
+        # frenet is stale it should simply go in. Checked outside the trigger above, since by the
+        # time the result exists the dirty flag has been consumed.
+        if frenet_stale and self._pending is not None:
+            self._commit_pending(self._last_s if self._last_s is not None else 0.0, force=True)
+
+        active = self.active
+        # publish ONLY when the line changed, or as a slow keep-alive (>= 5 s). No churn.
+        if (active is not self._last_published) or (now - self._last_publish_t) >= 5.0:
+            self._publish_active(active)
+
+    def notify_cb(self):
+        """Fast `update_map` re-notify after a swap (own timer, notify_period << sector_tuner's
+        0.5 s scale timer). sector_tuner re-takes the geometry only when its scale timer sees the
+        flag set; a single notify can be consumed BEFORE the new /global_waypoints arrives (the
+        1-byte Bool can beat the ~36 kB WpntArray), leaving it re-scaling the OLD line. Repeating
+        the notify closes that window within one consumer tick."""
+        if self._notify_scaler_ticks > 0:
+            self._notify_scaler_ticks -= 1
+            self.pub_update_map.publish(Bool(data=True))
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = StaticReoptNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # stop the solve worker before tearing the node down, or a solve in flight outlives the
+        # node it would write into
+        try:
+            node._solve_pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

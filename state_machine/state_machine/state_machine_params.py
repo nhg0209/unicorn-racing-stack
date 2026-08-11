@@ -27,15 +27,30 @@ class StateMachineParams:
     # dynamic params that the node also mirrors as a same-named attribute
     _NODE_MIRRORED_PARAMS = {
         "lateral_width_gb_m",
+        "lateral_width_static_gb_m",
         "lateral_width_ot_m",
         "splini_hyst_timer_sec",
         "emergency_break_horizon",
         "ftg_speed_mps",
         "ftg_timer_sec",
         "gb_ego_width_m",
+        "recovery_exit_d_m",
+        "recovery_entry_d_m",
         "gb_horizon_m",
         "interest_horizon_m",
+        "reframe_warn_m",
+        "squeeze_speed_cap_mps",
+        "avoidance_ay_max",
+        "static_invisible_grace_sec",
         "overtaking_horizon_m",
+        "getting_closer_rel_vel_mps",
+        "local_window_accel_limit_enable",
+        "local_window_a_long_mps2",
+        "min_dwell_sec",
+        "ot_free_lost_sec",
+        "free_check_predict_dynamic",
+        "free_check_pass_speed",
+        "free_check_dynamic_ot_slow",
     }
 
     def __init__(self, node: "StateMachine") -> None:
@@ -105,6 +120,69 @@ class StateMachineParams:
         )
         self.gb_ego_width_m: float = node.get_parameter("gb_ego_width_m").value
 
+        # The assembled local window is where the two speed seams meet -- the avoidance-to-global
+        # padding join and the global raceline's own s = 0 discontinuity -- and nothing downstream
+        # bounds d(vx)/ds. The state machine does it once, on the copy it publishes.
+        self._declare(
+            "local_window_accel_limit_enable", True,
+            ParameterDescriptor(
+                description=(
+                    "Bound d(vx)/ds over the ASSEMBLED local window (one backward + one forward "
+                    "pass) before publishing. Measured with it off: required |a_long| p50/p95/max "
+                    "4.88/35.6/56.8 m/s^2 against a ggv ax_max of 5.0, and 104 of the 137 "
+                    "stations over 6 m/s^2 come from the raceline's s = 0 seam alone. False "
+                    "publishes the seams as assembled."),
+                type=ParameterType.PARAMETER_BOOL,
+            ),
+        )
+        self.local_window_accel_limit_enable: bool = node.get_parameter(
+            "local_window_accel_limit_enable").value
+
+        self._declare(
+            "local_window_a_long_mps2", 5.0,
+            ParameterDescriptor(
+                description=(
+                    "[m/s^2] the longitudinal bound the pass above enforces. 5.0 is the ggv / "
+                    "ax_max_machines limit the velocity profile is itself solved to, so this only "
+                    "removes what the ASSEMBLY introduced and never re-shapes a feasible "
+                    "profile."),
+                type=ParameterType.PARAMETER_DOUBLE,
+            ),
+        )
+        self.local_window_a_long_mps2: float = node.get_parameter(
+            "local_window_a_long_mps2").value
+
+        self._declare(
+            "recovery_exit_d_m", 0.2,
+            ParameterDescriptor(
+                description=(
+                    "|d| below which the car counts as back on the raceline when LEAVING a "
+                    "non-GB_TRACK state (RECOVERY/TRAILING/OVERTAKE/START/FTGONLY). Entry into "
+                    "RECOVERY uses gb_ego_width_m, so this is the lower half of the hysteresis "
+                    "band and must stay below it. Was hardcoded at 0.05 m -- tighter than normal "
+                    "tracking error, so RECOVERY never exited [m]"
+                ),
+                type=ParameterType.PARAMETER_DOUBLE,
+            ),
+        )
+        self.recovery_exit_d_m: float = node.get_parameter("recovery_exit_d_m").value
+
+        self._declare(
+            "recovery_entry_d_m", 0.4,
+            ParameterDescriptor(
+                description=(
+                    "|d| at or above which the car counts as having lost the raceline, i.e. the "
+                    "RECOVERY ENTRY threshold (_check_line_lost). Upper half of the hysteresis "
+                    "band and must stay above recovery_exit_d_m. Entry used to be driven by the "
+                    "per-state close_to_raceline flag instead, which made the bar tighter while "
+                    "TRAILING than while GB_TRACKing and latched the car onto the recovery "
+                    "spline whenever it trailed an opponent [m]"
+                ),
+                type=ParameterType.PARAMETER_DOUBLE,
+            ),
+        )
+        self.recovery_entry_d_m: float = node.get_parameter("recovery_entry_d_m").value
+
         self._declare(
             "gb_horizon_m", 15.0,
             ParameterDescriptor(
@@ -122,6 +200,62 @@ class StateMachineParams:
             ),
         )
         self.interest_horizon_m: float = node.get_parameter("interest_horizon_m").value
+
+        self._declare(
+            "reframe_warn_m", 0.05,
+            ParameterDescriptor(
+                description="Warn when an incoming obstacle's (s,d) has to be re-anchored into "
+                            "this node's frenet frame by more than this [m]. A large value means "
+                            "upstream tracking is not re-projecting on a static_reopt line swap.",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=1.0, step=0.01)],
+            ),
+        )
+        self.reframe_warn_m: float = node.get_parameter("reframe_warn_m").value
+
+        self._declare(
+            "squeeze_speed_cap_mps", 2.5,
+            ParameterDescriptor(
+                description="Speed ceiling [m/s] applied to a static-avoidance path the planner "
+                            "marked ot_line='squeeze' -- one it could only solve by reducing its "
+                            "clearance margins. The geometry is legal but the error budget is "
+                            "spent, so it must not be driven at raceline pace.",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=0.5, to_value=10.0, step=0.1)],
+            ),
+        )
+        self.squeeze_speed_cap_mps: float = node.get_parameter("squeeze_speed_cap_mps").value
+
+        self._declare(
+            "avoidance_ay_max", 5.0,
+            ParameterDescriptor(
+                description="Lateral-accel limit [m/s^2] used when THIS node re-profiles an "
+                            "avoidance path, replacing the global ggv's ay column for that path "
+                            "only. The ggv is tuned for the raceline; an avoidance is a brief "
+                            "deliberate excursion the planner itself already sizes at a higher "
+                            "a_lat_max, so re-profiling it at the raceline limit is what made the "
+                            "avoidance spline crawl. Does not affect the global line.",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=1.0, to_value=12.0, step=0.1)],
+            ),
+        )
+        self.avoidance_ay_max: float = node.get_parameter("avoidance_ay_max").value
+
+        self._declare(
+            "static_invisible_grace_sec", 1.5,
+            ParameterDescriptor(
+                description="How long [s] a STATIC obstacle stays in the interest list after it "
+                            "was last reported is_visible. The flag is a per-frame lidar verdict "
+                            "that drops out on occlusion / FOV edge / sparse returns at range, "
+                            "while a static obstacle cannot actually leave -- so acting on each "
+                            "drop flipped the state and the trailing target for that cycle. 0 "
+                            "restores the undebounced behaviour.",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=10.0, step=0.1)],
+            ),
+        )
+        self.static_invisible_grace_sec: float = \
+            node.get_parameter("static_invisible_grace_sec").value
 
         self._declare(
             "overtaking_horizon_m", 6.9,
@@ -144,6 +278,23 @@ class StateMachineParams:
             ),
         )
         self.lateral_width_gb_m: float = node.get_parameter("lateral_width_gb_m").value
+
+        self._declare(
+            "lateral_width_static_gb_m", 0.05,
+            ParameterDescriptor(
+                description="GB_FREE margin vs STATIC obstacles, distance-independent [m]. The "
+                            "requirement gb_ego_width_m/2 + this must stay at or below the "
+                            "reactive planner's clear-gate STAY threshold (width_car/2 + "
+                            "clear_margin_m), which in turn stays below the enforced re-opt "
+                            "clearance floor (reopt_obs_margin) minus slack. Anything above the "
+                            "clear-gate threshold opens a dead band where the SM reads the "
+                            "swapped line as blocked while the planner idles -> TRAILING behind "
+                            "a cleared line. Checked by check_avoidance_margins.py.",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=1.0, step=0.01)],
+            ),
+        )
+        self.lateral_width_static_gb_m: float = node.get_parameter("lateral_width_static_gb_m").value
 
         self._declare(
             "lateral_width_ot_m", 0.3,
@@ -220,6 +371,94 @@ class StateMachineParams:
 
         self._declare("use_force_trailing", False)
         self.use_force_trailing: bool = node.get_parameter("use_force_trailing").value
+
+        # static_ot_speed_mps REMOVED: the live config had it at 10.0 (= disabled), and a speed
+        # guard on the commit is conceptually wrong for a STATIC obstacle — trailing one means
+        # stopping behind it; the avoidance path's own slow-in velocity profile handles entry
+        # speed. The commit gate is: fresh on-spline static path AND (fresh) feasible signal.
+
+        self._declare(
+            "getting_closer_rel_vel_mps", -0.5,
+            ParameterDescriptor(
+                description="Min (ego - obstacle) s-velocity to count as 'getting closer' [mps]",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=-5.0, to_value=5.0, step=0.1)],
+            ),
+        )
+        self.getting_closer_rel_vel_mps: float = node.get_parameter("getting_closer_rel_vel_mps").value
+
+        self._declare(
+            "min_dwell_sec", 0.2,
+            ParameterDescriptor(
+                description="Minimum time [s] a state must be held before switching to a non-safe "
+                            "state (transition hysteresis / anti-chatter). Switches TOWARD the safe "
+                            "states (TRAILING, FTGONLY) bypass this and are allowed immediately.",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=2.0, step=0.05)],
+            ),
+        )
+        self.min_dwell_sec: float = node.get_parameter("min_dwell_sec").value
+
+        self._declare(
+            "ot_free_lost_sec", 0.4,
+            ParameterDescriptor(
+                description="How long the dynamic avoidance path may read NOT-free before "
+                            "OVERTAKE is dropped [s]. The free-check is a single-point test "
+                            "against a tracked opponent, so one noisy cycle fails it; without "
+                            "this debounce the car flaps between the overtake spline and the "
+                            "raceline. Mirrors static_feasible_lost_sec on the static path. "
+                            "ENTRY still requires the path to be free right now.",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=3.0, step=0.05)],
+            ),
+        )
+        self.ot_free_lost_sec: float = node.get_parameter("ot_free_lost_sec").value
+
+        self._declare(
+            "free_check_predict_dynamic", True,
+            ParameterDescriptor(
+                description="Free-check: for a DYNAMIC obstacle with no usable prediction, "
+                            "propagate it over the ttc..tt0 window (when the ego is alongside) "
+                            "instead of testing the path at its current s. Matches what the "
+                            "prediction branch already does. Near-stationary obstacles are "
+                            "unaffected -- they take the static branch and are never "
+                            "propagated. False restores the current-s test.",
+                type=ParameterType.PARAMETER_BOOL,
+            ),
+        )
+        self.free_check_predict_dynamic: bool = node.get_parameter("free_check_predict_dynamic").value
+
+        self._declare(
+            "free_check_pass_speed", True,
+            ParameterDescriptor(
+                description="Free-check: time the alongside window (ttc/tt0) from the speed the "
+                            "ego will run once the overtake is committed (local raceline pace), "
+                            "not from the TRAILING closing speed. The trailing value collapses "
+                            "to the 0.5 m/s floor and places the window metres too far ahead, "
+                            "which forces the planner to hold its offset across track the pass "
+                            "never reaches. False restores the old timing.",
+                type=ParameterType.PARAMETER_BOOL,
+            ),
+        )
+        self.free_check_pass_speed: bool = node.get_parameter("free_check_pass_speed").value
+
+        self._declare(
+            "free_check_dynamic_ot_slow", True,
+            ParameterDescriptor(
+                description="Free-check: keep a SLOW-but-moving opponent on the dynamic branch "
+                            "when testing a dynamic OVERTAKE path, instead of reclassifying it "
+                            "as static. The near-stationary reclassification exists to protect "
+                            "the STATIC avoidance spline from bogus predicted trajectories; on "
+                            "the dynamic path it is actively harmful, because the static branch "
+                            "evaluates the lane at the obstacle's CURRENT s -- where an "
+                            "overtaking lane sits on the raceline by design -- so the path reads "
+                            "NOT-free forever and OVERTAKE can never commit. For a genuinely "
+                            "stationary obstacle the ttc..tt0 propagation is a no-op, so nothing "
+                            "regresses. False restores the old routing.",
+                type=ParameterType.PARAMETER_BOOL,
+            ),
+        )
+        self.free_check_dynamic_ot_slow: bool = node.get_parameter("free_check_dynamic_ot_slow").value
 
         # Momentary rqt buttons (ROS1: served by dynamic_statemachine_server). When set
         # true they trigger an action and reset to false (done in the node timer, not

@@ -64,4 +64,10 @@ install(PROGRAMS
   RENAME tracking_node
 )
 
+# KISS BEV-detection -> /detect/raw_obstacles adapter (no 2D scan; car2).
+install(PROGRAMS
+  scripts/kiss_obstacle_adapter.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()

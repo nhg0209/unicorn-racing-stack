@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import os
+from copy import deepcopy
+
 import yaml
 import rclpy
 from rcl_interfaces.msg import ParameterType, ParameterDescriptor, FloatingPointRange
@@ -228,9 +230,16 @@ class SectorTuner(Node):
 
     def scale_points(self):
         """Scales the global waypoints' velocities."""
-        if self.glb_wpnts_scaled is None or self.update_map:
-            self.glb_wpnts_scaled = self.glb_wpnts_og
-            self.glb_wpnts_sp_scaled = self.glb_wpnts_sp_og
+        # re-take also on a point-count change: indexing the old copy would IndexError-kill the
+        # node if the published line ever breaks the pinned-count invariant
+        if (self.glb_wpnts_scaled is None or self.update_map
+                or len(self.glb_wpnts_scaled.wpnts) != len(self.glb_wpnts_og.wpnts)):
+            # DEEP copy, not an alias: writing vx into an alias mutates the cached original
+            # message, so every 0.5 s tick re-multiplies the already-scaled velocity — with
+            # scaling != 1.0 the published speeds decay geometrically between the publisher's
+            # ~5 s keep-alives (unnoticed so far only because the ifac map scales at 1.0).
+            self.glb_wpnts_scaled = deepcopy(self.glb_wpnts_og)
+            self.glb_wpnts_sp_scaled = deepcopy(self.glb_wpnts_sp_og)
             self.update_map = False
 
         for i, wpnt in enumerate(self.glb_wpnts_og.wpnts):

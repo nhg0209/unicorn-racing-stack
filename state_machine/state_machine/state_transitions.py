@@ -24,8 +24,8 @@ NOTE 2: notice that, when implementing new states, if an attribute/condition in 
 
 NOTE 3: transitions must not have side effects on the state machine!
     i.e. any attribute of the state machine should not be modified in the transitions.
-    (The UNICORN implementation does mutate overtaking_ttl_count / cur_start_wpnts here;
-     behaviour preserved as-is from the ROS1 stack.)
+    (overtaking_ttl_count is now updated by the node in _update_overtake_ttl, not here.
+     StartTransition still flips cur_start_wpnts.is_init - a remaining ROS1 carry-over.)
 """
 
 
@@ -45,7 +45,10 @@ def RecoveryTransition(state_machine: "StateMachine") -> Tuple[StateType, StateT
     recovery_sustainability = state_machine._check_sustainability(
         state_machine.recovery_wpnts, state_machine.cur_recovery_wpnts
     )
-    close_to_raceline = state_machine._check_close_to_raceline(0.05) * state_machine._check_close_to_raceline_heading(20)
+    close_to_raceline = (
+        state_machine._check_close_to_raceline(state_machine.recovery_exit_d_m)
+        * state_machine._check_close_to_raceline_heading(20)
+    )
 
     if recovery_sustainability and not close_to_raceline:
         return StateType.RECOVERY, StateType.RECOVERY
@@ -55,7 +58,10 @@ def RecoveryTransition(state_machine: "StateMachine") -> Tuple[StateType, StateT
 
 def TrailingTransition(state_machine: "StateMachine") -> Tuple[StateType, StateType]:
     """Transitions for being in `StateType.TRAILING`"""
-    close_to_raceline = state_machine._check_close_to_raceline(0.05) * state_machine._check_close_to_raceline_heading(20)
+    close_to_raceline = (
+        state_machine._check_close_to_raceline(state_machine.recovery_exit_d_m)
+        * state_machine._check_close_to_raceline_heading(20)
+    )
     if len(state_machine.cur_obstacles_in_interest) == 0:
         return NonObstacleTransition(state_machine, close_to_raceline)
     else:
@@ -65,17 +71,20 @@ def TrailingTransition(state_machine: "StateMachine") -> Tuple[StateType, StateT
 
 
 def OvertakingTransition(state_machine: "StateMachine") -> Tuple[StateType, StateType]:
-    """Transitions for being in `StateType.OVERTAKE`"""
+    """Transitions for being in `StateType.OVERTAKE` (pure: the ttl counter is updated by the node
+    in `_update_overtake_ttl`, not here)."""
     ot_sustainability = state_machine._check_overtaking_mode_sustainability()
     enemy_in_front = state_machine._check_enemy_in_front()
-    if ot_sustainability and enemy_in_front:
-        state_machine.overtaking_ttl_count = 0
+    # Stay in OVERTAKE while the path is still sustainable AND either an enemy is directly ahead or
+    # the ttl latch still has budget (keeps overtaking briefly after the enemy clears -> anti-chatter).
+    if ot_sustainability and (
+        enemy_in_front or state_machine.overtaking_ttl_count < state_machine.overtaking_ttl_count_threshold
+    ):
         return StateType.OVERTAKE, StateType.OVERTAKE
-    if ot_sustainability and state_machine.overtaking_ttl_count < state_machine.overtaking_ttl_count_threshold:
-        state_machine.overtaking_ttl_count += 1
-        return StateType.OVERTAKE, StateType.OVERTAKE
-    state_machine.overtaking_ttl_count = 0
-    close_to_raceline = state_machine._check_close_to_raceline(0.05) * state_machine._check_close_to_raceline_heading(20)
+    close_to_raceline = (
+        state_machine._check_close_to_raceline(state_machine.recovery_exit_d_m)
+        * state_machine._check_close_to_raceline_heading(20)
+    )
     return GlobalTrackingTransition(state_machine, close_to_raceline)
 
 
@@ -88,7 +97,8 @@ def StartTransition(state_machine: "StateMachine") -> Tuple[StateType, StateType
         return StateType.START, StateType.START
     else:
         close_to_raceline = (
-            state_machine._check_close_to_raceline(0.05) * state_machine._check_close_to_raceline_heading(20)
+            state_machine._check_close_to_raceline(state_machine.recovery_exit_d_m)
+            * state_machine._check_close_to_raceline_heading(20)
         )
         state_machine.cur_start_wpnts.is_init = False
         return GlobalTrackingTransition(state_machine, close_to_raceline)
@@ -96,18 +106,24 @@ def StartTransition(state_machine: "StateMachine") -> Tuple[StateType, StateType
 
 def FTGOnlyTransition(state_machine: "StateMachine") -> Tuple[StateType, StateType]:
     """Transitions for being in `StateType.FTGONLY`"""
-    close_to_raceline = state_machine._check_close_to_raceline(0.05) * state_machine._check_close_to_raceline_heading(20)
+    close_to_raceline = (
+        state_machine._check_close_to_raceline(state_machine.recovery_exit_d_m)
+        * state_machine._check_close_to_raceline_heading(20)
+    )
     if len(state_machine.cur_obstacles_in_interest) == 0:
         return NonObstacleTransition(state_machine, close_to_raceline)
     else:
         if close_to_raceline and state_machine._check_free_frenet(state_machine.cur_gb_wpnts):
             return StateType.GB_TRACK, StateType.GB_TRACK
 
-        recovery_availability = state_machine._check_latest_wpnts(
-            state_machine.recovery_wpnts, state_machine.cur_recovery_wpnts
-        )
-        if recovery_availability and state_machine._check_free_frenet(state_machine.cur_recovery_wpnts):
-            return StateType.RECOVERY, StateType.RECOVERY
+        # Same RECOVERY entry gate as the other transitions (this one had no lateral gate at all,
+        # so FTGONLY handed over to the recovery spline whenever a path happened to be available).
+        if state_machine._check_line_lost():
+            recovery_availability = state_machine._check_latest_wpnts(
+                state_machine.recovery_wpnts, state_machine.cur_recovery_wpnts
+            )
+            if recovery_availability and state_machine._check_free_frenet(state_machine.cur_recovery_wpnts):
+                return StateType.RECOVERY, StateType.RECOVERY
 
         if state_machine._check_overtaking_mode() or state_machine._check_static_overtaking_mode():
             return StateType.OVERTAKE, StateType.OVERTAKE
@@ -123,19 +139,26 @@ def NonObstacleTransition(state_machine: "StateMachine", close_to_raceline) -> T
     if close_to_raceline:
         return StateType.GB_TRACK, StateType.GB_TRACK
 
-    if state_machine._check_latest_wpnts(state_machine.recovery_wpnts, state_machine.cur_recovery_wpnts):
-        if state_machine._check_on_spline(state_machine.cur_recovery_wpnts):
-            return StateType.RECOVERY, StateType.RECOVERY
+    # Same entry gate as ObstacleTransition: only reach for the recovery spline once the raceline
+    # is actually lost, not merely because the caller's exit threshold was missed. LOSTLINE below
+    # is resolved back to GB_TRACK by the node in the same cycle, so the in-between band
+    # (recovery_exit_d_m <= |d| < recovery_entry_d_m) keeps global-tracking.
+    if state_machine._check_line_lost():
+        if state_machine._check_latest_wpnts(state_machine.recovery_wpnts, state_machine.cur_recovery_wpnts):
+            if state_machine._check_on_spline(state_machine.cur_recovery_wpnts):
+                return StateType.RECOVERY, StateType.RECOVERY
 
     return StateType.LOSTLINE, StateType.GB_TRACK
 
 
 def ObstacleTransition(state_machine: "StateMachine", close_to_raceline) -> Tuple[StateType, StateType]:
-    recovery_availability = False
     if close_to_raceline and state_machine._check_free_frenet(state_machine.cur_gb_wpnts):
         return StateType.GB_TRACK, StateType.GB_TRACK
 
-    if not close_to_raceline:
+    # RECOVERY entry is judged on _check_line_lost() (recovery_entry_d_m), NOT on the inverse of
+    # close_to_raceline: that flag carries the tight per-state exit hysteresis, so keying entry off
+    # it made the bar tighter while trailing than while global-tracking. See _check_line_lost.
+    if state_machine._check_line_lost():
         recovery_availability = state_machine._check_latest_wpnts(
             state_machine.recovery_wpnts, state_machine.cur_recovery_wpnts
         )
@@ -144,12 +167,21 @@ def ObstacleTransition(state_machine: "StateMachine", close_to_raceline) -> Tupl
 
     if state_machine._check_overtaking_mode() or state_machine._check_static_overtaking_mode():
         return StateType.OVERTAKE, StateType.OVERTAKE
-    else:
-        if close_to_raceline:
-            return StateType.TRAILING, StateType.GB_TRACK
-        elif recovery_availability:
-            return StateType.TRAILING, StateType.RECOVERY
-        elif state_machine._check_free_frenet(state_machine.cur_gb_wpnts):
-            return StateType.TRAILING, StateType.GB_TRACK
-        else:
-            return StateType.TRAILING, StateType.GB_TRACK
+
+    # Dropping a static OVERTAKE while the car is still OUT on the avoidance hump used to snap the
+    # reference straight back to the raw raceline — which, for a static obstacle, is the line that
+    # runs INTO it. The controller steered toward the obstacle while the gap PID braked for it.
+    # Hold the avoidance geometry until the car is genuinely back near the line, so the drop is a
+    # deceleration and not a swerve toward the thing being avoided. The predicate is conservative
+    # (off the line AND still on the cached path) and side-effect free.
+    if state_machine._hold_static_avoidance_reference():
+        return StateType.TRAILING, StateType.OVERTAKE
+
+    # Otherwise TRAILING follows the global raceline. The recovery spline is for rejoining the line
+    # when we are off it AND the path is free (the RECOVERY return above) — it is not a trailing
+    # reference. The old `elif recovery_availability -> TRAILING, RECOVERY` branch was the common
+    # case, not the exception: the callers gate close_to_raceline at recovery_exit_d_m, and while
+    # that was hardcoded at 0.05 m -- below normal tracking error -- trailing latched onto the
+    # recovery line and followed it away from the raceline, keeping cur_d large and the branch
+    # self-sustaining.
+    return StateType.TRAILING, StateType.GB_TRACK

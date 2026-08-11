@@ -117,3 +117,6 @@ cbuild() {
 }
 
 echo "[unicorn] env ready  |  RMW=$RMW_IMPLEMENTATION  ROS_DOMAIN_ID=$ROS_DOMAIN_ID  |  helpers: cbuild, ros2kill"
+
+# Per-machine overrides (gitignored), sourced last so it overrides anything above.
+[ -f "$_URS_REPO/unicorn.local.sh" ] && source "$_URS_REPO/unicorn.local.sh"

@@ -7,17 +7,20 @@
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/CAR" unless="$(var sim)"/>
   <arg name="vehicle_config" default="$(var config_dir)/vehicle_config.yaml"/>
   <arg name="use_estop"      default="false"               description="Use emergency stop (true) or not (false)"/>
-  <!-- Livox MID-360 3D LiDAR: primary LiDAR on the real car. Publishes /livox/lidar
-       (PointCloud2) + /livox/imu in frame_id 'livox_frame'. Needs the livox network
-       (host 192.168.1.2, see livox_ros_driver2/config/MID360_config.json). -->
-  <arg name="livox"                default="true"  description="Start the Livox MID-360 driver on the real car"/>
-  <arg name="use_system_timestamp" default="true"  description="Livox stamp source: true=ROS now() (mapping), false=device HW clock (LIO-only)"/>
-  <!-- Hokuyo 2D LiDAR (urg_node -> /scan). Disabled by default; set hokuyo:=true to
-       start it. The Livox MID-360 is the primary LiDAR. -->
-  <arg name="hokuyo"               default="false" description="Start the Hokuyo (urg_node) 2D LiDAR driver on the real car"/>
+  <!-- 2026-07-30: 이 차(nuc14)는 Hokuyo 2D 라이다가 없다. 설정은 192.168.0.10 을
+       보는데 NUC 이더넷은 192.168.1.102/24 (Livox MID360 192.168.1.197 전용) 라
+       urg_node 가 2.5초마다 'could not open ethernet port' 를 무한 반복했다.
+       주행에는 영향 없지만(localization=Livox, MPCC detector=false 라 /scan 미사용)
+       로그가 묻혀 진짜 에러를 놓친다. Hokuyo 달린 차에서는 use_2d_lidar:=true. -->
+  <arg name="use_2d_lidar"   default="false"              description="Hokuyo 2D LiDAR(urg_node) 사용. 이 차엔 없어서 기본 false"/>
+  <!-- Livox MID-360: now started from low_level (was launched separately). So
+       localization.launch alone brings it up, matching car1. Set livox:=false to
+       launch livox_lidar.launch.py by hand instead. -->
+  <arg name="livox"                default="true"  description="Start the Livox MID-360 driver (/livox/lidar, /livox/imu)"/>
+  <arg name="use_system_timestamp" default="true"  description="passed to livox_lidar.launch.py (informational on this car; see kiss.yaml stamp_at_scan_end)"/>
   <!-- Keyboard teleop: start keyboard_joy (pynput -> /joy_keyboard) and route the
        mux to it. The pitwall panel's Joy/Keyboard buttons can still switch at runtime. -->
-  <arg name="keyboard_teleop" default="false"             description="Drive the ego with the keyboard instead of a joystick"/>
+  <arg name="keyboard_teleop" default="false"              description="Drive the ego with the keyboard instead of a joystick"/>
   <!-- virtual_perception (scan_overlay + virtual opponent + static obstacles).
        Defaults ON in sim (preserves prior behavior), OFF on the real car; toggle
        with virtual:=true (e.g. to overlay a virtual opponent onto the real LiDAR). -->
@@ -48,28 +51,31 @@
          identity remap leaves it on /scan. -->
     <let name="lidar_scan_out" value="/scan_raw" if="$(var virtual)"/>
     <let name="lidar_scan_out" value="/scan"     unless="$(var virtual)"/>
-    <group if="$(var hokuyo)">
+    <group if="$(var use_2d_lidar)">
       <node pkg="urg_node" exec="urg_node_driver" name="urg_node" output="screen">
         <param from="$(var vehicle_config)"/>
         <remap from="/scan" to="$(var lidar_scan_out)"/>
       </node>
     </group>
 
-    <!-- Livox MID-360 3D LiDAR (primary). Wrapper includes livox_ros_driver2's
-         msg_MID360 driver; publishes /livox/lidar + /livox/imu. -->
+    <!-- Livox MID-360 3D LiDAR -> /livox/lidar (PointCloud2) + /livox/imu.
+         Uses this car's own livox_lidar.launch.py (direct Node, xfer_format=0).
+         Do NOT also run livox_lidar.launch.py by hand (double-launch). -->
     <group if="$(var livox)">
       <include file="$(find-pkg-share stack_master)/launch/livox_lidar.launch.py">
         <arg name="use_system_timestamp" value="$(var use_system_timestamp)"/>
       </include>
     </group>
 
-    <!-- Static TFs (base_link->laser, IMU frames) now come from per-vehicle config
-         so they can differ by SIM/CAR — edit config/CAR/static_transforms.yaml,
-         no launch change needed. config_dir is CAR here (this is the unless-sim
-         group); in sim base_link->laser comes from the gym URDF and there is no IMU. -->
-    <node pkg="stack_master" exec="static_tf_publisher.py" name="static_tf_publisher" output="screen">
-      <param from="$(var config_dir)/static_transforms.yaml"/>
-    </node>
+    <!-- Static TF: base_link → laser -->
+    <node pkg="tf2_ros" exec="static_transform_publisher" name="base_to_laser_broadcaster"
+          args="--x 0.27 --y 0 --z 0.11 --qx 0 --qy 0 --qz 0 --qw 1 --frame-id base_link --child-frame-id laser"/>
+    <!-- Static TF: base_link -> vesc_imu (yaw +90 deg, Z axis same as base_link) -->
+    <node pkg="tf2_ros" exec="static_transform_publisher" name="base_to_vesc_imu_broadcaster"
+          args="--x 0 --y 0 --z 0.0 --roll 0 --pitch 0 --yaw 1.5707963 --frame-id base_link --child-frame-id vesc_imu"/>
+    <!-- Static TF: vesc_imu -> vesc_imu_rot (reverse yaw=-90 deg: same orientation as base_link) -->
+    <node pkg="tf2_ros" exec="static_transform_publisher" name="vesc_imu_to_rot_broadcaster"
+          args="--x 0 --y 0 --z 0 --roll 0 --pitch 0 --yaw -1.5707963 --frame-id vesc_imu --child-frame-id vesc_imu_rot"/>
 
   </group>
 
@@ -91,11 +97,17 @@
        tracking_merger run. Gated by `virtual`; when off, the sensor owns /scan
        directly and none of these nodes start. -->
   <group if="$(var virtual)">
+    <!-- The kinematic opponent_vehicle IS the opponent in BOTH sim and real:
+         gym_bridge_launch.py hardcodes use_external_opponent=true, so the gym runs
+         EGO-ONLY (no /goal_pose sub, no opp pubs/TF) and the virtual opponent owns the
+         whole /goal_pose -> /opp_* -> overlay chain. Do NOT disable it in sim, or a
+         2D Goal Pose spawns nothing. -->
     <include file="$(find-pkg-share virtual_perception)/launch/virtual_perception.launch.xml">
       <arg name="map_path"       value="$(var map_path).yaml"/>
       <arg name="ego_odom_topic" value="/car_state/odom"/>
       <arg name="scan_in"        value="/scan_raw"/>
       <arg name="scan_out"       value="/scan"/>
+      <arg name="virtual_opponent" value="true"/>
     </include>
   </group>
 

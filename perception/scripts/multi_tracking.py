@@ -658,6 +658,12 @@ class StaticDynamic(Node):
         """
         dist_to_obs = np.linalg.norm(vec_car_to_obs)
 
+        # No 2D LiDAR on this car (e.g. KISS-detection-only setup): we can't do a
+        # scan-based visibility check, so treat the obstacle as visible and let the
+        # normal ttl aging handle stale tracks instead of crashing on len(None).
+        if self.scans is None:
+            return True
+
         angle = self.angle_to_obs(vec_car_to_obs, car_orientation_copy)
 
         max_angle = len(self.scans) - 1

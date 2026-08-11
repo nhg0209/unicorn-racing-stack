@@ -1,0 +1,91 @@
+# kiss_icp_localization — 3D voxel-ICP localization on the real car (Livox MID-360).
+# Aligned to car1 (mac) config. Per-car deviations kept (see inline CAR2 notes):
+#   - odom_twist_topic "" (car1 uses /vesc/odom; car2 vesc under calibration)
+#   - adaptive_range 60   (car1 uses 15; CLAUDE.md warns 15 tightens threshold and
+#                          can collapse lock — car2 lock is already failing)
+#   - map_z_offset 0.158  (car1 mount height; VERIFY on car2 via tf2_echo map base_link)
+# Publishes localized pose on /car_state/odom (no EKF) + TF map->base_link.
+# Map assets injected by localization.launch.xml from the active map folder.
+kiss_icp_localization:
+  ros__parameters:
+    # ---- input front-end (Livox 3D PointCloud2) ----
+    input_mode: "3d"                 # full-cloud voxel point-to-plane ICP against <map>.pcd
+    lidar_topic: "/livox/lidar"      # sensor_msgs/PointCloud2 (livox_ros_driver2)
+    scan_topic: "/scan"              # (unused in 3D)
+    # ---- prediction: rotation from gyro, translation from ICP CV (odom twist off) ----
+    odom_twist_topic: "/vesc/odom"   # CAR2: enabled per request (wheel twist -> translation prediction)
+    imu_topic: "/livox/imu"          # Livox internal IMU (gyro deskew + high-rate prediction)
+    imu_en: true
+    deskew_en: true                  # gyro deskew within each 100 ms frame
+    deskew_accel: true               # time-varying-v deskew: correct floor doubling under hard accel/brake
+    imu_rate_odom: true              # high-rate pose between lidar frames
+    imu_init_samples: 100            # static gyro-bias init samples
+    stamp_at_scan_end: false         # EXPERIMENT: isolate yaw-in-turns timing (revert to true if no improvement)
+    extrinsic_R_il: [1.0, 0.0, 0.0,
+                     0.0, 1.0, 0.0,
+                     0.0, 0.0, 1.0]
+
+    # ---- output (direct to the stack's fused-odom topic, EKF bypassed) ----
+    odom_topic: "/car_state/odom"
+    map_frame: "map"
+    base_frame: "base_link"
+    publish_tf: true                 # map->base_link
+
+    # ---- map / scan preprocessing ----
+    map_voxel_size: 0.5              # voxel hash cell [m] (= code default)
+    map_max_points_per_voxel: 30
+    use_normals: true                # point-to-plane ICP
+    scan_voxel_size: 0.35            # registration downsample [m]
+    min_range: 0.3                   # drop ego-body reflections
+    max_range: 60.0
+    point_filter_num: 1
+    # CAR2: 0.158 is car1's measured |base_link z|. VERIFY on car2 (tf2_echo map base_link);
+    # affects published z only, not xy convergence. 0 = off.
+    map_z_offset: 0.158
+
+    # ---- registration + safety ----
+    loc_2d_corr_gain: 0.3            # 2d-mode only; ignored in 3d
+    max_iterations: 50
+    convergence_eps: 2.0e-3
+    initial_threshold: 1.0
+    min_threshold: 0.1
+    min_motion: 0.05
+    adaptive_range: 60.0             # CAR2: kept 60 (car1=15; 15 tightens threshold, risks lock loss)
+    vel_smoothing: 0.3
+    reject_trans: 2.0
+    reject_rot_deg: 30.0
+    reject_recover_count: 3
+    max_velocity: 15.0
+    max_accel: 10.0
+
+    # ---- initial pose ----
+    initial_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    use_initial_pose_topic: true     # /initialpose (RViz 2D Pose Estimate)
+
+    # ---- BEV detection (opponents / unmapped obstacles) ----
+    detect_en: true
+    detect_deskew: true              # deskew_accel on -> use deskewed scan for detection
+    detect_track_filter: true        # reject returns off the track mask (=walls/exterior)
+    detect_track_dist_min: 0.2       # min distance from black/wall [m] to count as a candidate
+    detect_z_max: 0.50               # hard cap on map-frame z [m]; drop returns above (RANSAC-independent)
+    # RANSAC ground-plane removal on the track-filter survivors, refit every frame.
+    detect_ransac_dist_thresh: 0.05  # inlier distance to the fitted plane [m]
+    detect_ransac_iters: 100         # RANSAC iterations
+    detect_ransac_vertical_min: 0.85 # min |n.z()| to accept a candidate plane
+    detect_ransac_min_points: 8      # minimum survivors to even attempt a fit
+    detect_ransac_passes: 2          # two-pass ground removal: catch floor split into two sheets by pitch/deskew residual
+    detect_ransac_second_gap: 0.3    # max height gap [m] for 2nd sheet to count as floor
+    detect_res: 0.05                 # BEV cell size [m]
+    detect_eps: 0.3                  # DBSCAN neighborhood radius [m]
+    detect_min_samples: 2            # sparse scan -> low core threshold
+    detect_min_cluster_cells: 2
+    detect_track_gate: 1.0           # max cluster-center step to associate [m]
+    detect_moving_speed: 0.5         # |v| above this => moving (opponent) [m/s]
+    detect_max_misses: 5
+    detect_pose_topic: "/kiss_loc/obstacle_poses"
+
+    # ---- map_server owns /map ----
+    publish_2d_map: false
+    publish_2d_scan: true
+    publish_aligned_scan: true       # /kiss_loc/scan_aligned for RViz debug
+    print_stats: true                # STAT lines for runtime tuning/debug

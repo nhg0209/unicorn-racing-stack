@@ -1,0 +1,85 @@
+<launch>
+  <!--
+    mpcc.launch.xml
+    ====================
+    Nonlinear MPCC controller + global waypoints publisher (ppc.launch.xml mirror).
+
+    Run AFTER:
+      sim  : ros2 launch stack_master low_level.launch.xml sim:=true map:=<name>
+      real : ros2 launch stack_master middle_level.launch.xml map:=<name>
+
+    Usage:
+      sim  : ros2 launch nonlinear_mpc_acados mpcc.launch.xml map:=<name> sim:=true
+      real : ros2 launch nonlinear_mpc_acados mpcc.launch.xml map:=<name>
+
+    Notes:
+      - Default speed cap = 4 m/s (yaml). 첫 lap 은 더 낮춰서 검증 권장.
+      - acados codegen 첫 launch 약 30s. 이후 cache 사용.
+      - LB joypad 버튼으로 즉시 수동 복귀 (그들 safety convention).
+  -->
+
+  <arg name="map"    description="Map name (folder in stack_master/maps/)"/>
+  <arg name="sim"    default="false" description="true: sim (/vesc/odom from gym_bridge); false: real (remap /vesc/odom → /car_state/odom)"/>
+  <!-- 2026-07-30: track_source 를 launch 가 yaml 뒤에 다시 써서 덮던 것을 제거.
+       (ROS2 launch 는 뒤에 오는 <param> 이 <param from=yaml> 을 이긴다 →
+       "yaml 을 고쳤는데 안 먹는" 함정.) 이제 track_source 는 yaml 이 단일 출처.
+       track_name/odom_topic_name/cmd_vel_topic_name 은 map:= 인자와 sim/real
+       배선이 이겨야 하므로 의도적으로 남겨둔다. -->
+  <arg name="config" default="$(find-pkg-share nonlinear_mpc_acados)/config/ddrx_unified_params.yaml"/>
+  <arg name="use_gp_residual" default="false" description="Phase D GP residual wrap (requires PYTHONPATH=$HOME/l4acados/src)"/>
+  <arg name="enable_sim_reset" default="$(var sim)" description="/sim/initialpose publish on stuck (true for sim, false for real car safety)"/>
+  <arg name="detector" default="true" description="LiDAR scan → /external_obstacles 장애물 감지 노드 (2D /scan 기반)"/>
+  <arg name="scan_topic" default="/scan" description="detector 입력 LaserScan 토픽"/>
+  <arg name="odom_topic" default="/car_state/odom" description="Localization odom topic (sim: gym /car_state/odom; real+KISS: /kiss_loc/odometry)"/>
+  <arg name="cmd_topic" default="/vesc/high_level/ackermann_cmd" description="mpc drive output topic (sim mux input; real-mac mux input: /vesc/high_level/ackermann_cmd_mux/input/nav_1)"/>
+  <arg name="obstacle_topic" default="/external_obstacles" description="obstacle PoseArray source (real+KISS detection: /kiss_loc/obstacle_poses)"/>
+  <arg name="lap_analyser" default="true" description="per-lap lap_time+lateral error(d)+boundary dist (needs /car_state/odom_frenet + /global_waypoints)"/>
+
+  <!-- Global waypoints publisher (loads stack_master/maps/<map>/centerline.csv + global_waypoints.csv) -->
+  <node pkg="global_planner" exec="waypoint_publisher" name="waypoint_publisher" output="screen">
+    <param name="map_name" value="$(var map)"/>
+  </node>
+
+  <!-- Lap analyser: 매 랩 lap_time + 횡오차(d from raceline) + 벽 최소거리. 2026-07-08 추가. -->
+  <group if="$(var lap_analyser)">
+    <node pkg="lap_analyser" exec="lap_analyser" name="lap_analyser" output="screen"/>
+  </group>
+
+  <!-- Nonlinear MPCC controller.
+       sim : gym_bridge publishes /vesc/odom directly (GT), no remap needed.
+       real: VESC /vesc/odom wheel-only (drifts) → use EKF /car_state/odom via remap. -->
+  <group if="$(var sim)">
+    <node pkg="nonlinear_mpc_acados" exec="mpc_node" name="mpc_node" output="screen">
+      <param from="$(var config)"/>
+      <param name="odom_topic_name" value="$(var odom_topic)"/>
+      <param name="cmd_vel_topic_name" value="$(var cmd_topic)"/>
+      <remap from="/external_obstacles" to="$(var obstacle_topic)"/>
+      <param name="track_name" value="$(var map)"/>
+      <param name="use_gp_residual" value="$(var use_gp_residual)"/>
+      <param name="enable_sim_reset" value="$(var enable_sim_reset)"/>
+    </node>
+  </group>
+  <group unless="$(var sim)">
+    <node pkg="nonlinear_mpc_acados" exec="mpc_node" name="mpc_node" output="screen">
+      <param from="$(var config)"/>
+      <param name="odom_topic_name" value="$(var odom_topic)"/>
+      <param name="cmd_vel_topic_name" value="$(var cmd_topic)"/>
+      <remap from="/external_obstacles" to="$(var obstacle_topic)"/>
+      <param name="track_name" value="$(var map)"/>
+      <param name="use_gp_residual" value="$(var use_gp_residual)"/>
+      <param name="enable_sim_reset" value="$(var enable_sim_reset)"/>
+      <remap from="/vesc/odom" to="/car_state/odom"/>
+    </node>
+  </group>
+
+  <!-- LiDAR 장애물 감지 → /external_obstacles (mpc_node 회피 입력).
+       /map(occupancy) 기반 벽 erosion으로 벽 리턴 제외 → 클러스터링 → persist.
+       끄려면 detector:=false -->
+  <group if="$(var detector)">
+    <node pkg="nonlinear_mpc_acados" exec="scan_obstacle_detector" name="scan_obstacle_detector" output="screen">
+      <param name="scan_topic" value="$(var scan_topic)"/>
+      <param name="odom_topic" value="$(var odom_topic)"/>
+    </node>
+  </group>
+
+</launch>

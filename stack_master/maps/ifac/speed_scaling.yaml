@@ -1,34 +1,18 @@
-sector_tuner:
+speed_sector_tuner:
   ros__parameters:
     global_limit: 1.0
-    n_sectors: 5
-    Sector0:
-      start: 0
-      end: 39
-      scaling: 1.0
+    n_sectors: 2
+    # 0810: MPCC가 이 파일을 읽도록 개조됨 (mpc_node [sector_refv]).
+    # 인덱스 = global_waypoints IQP wpnt id. 코너 초과분은 κ/a_lat 캡이 잘라줌.
+    Sector0:    # 상단 중간직선 (6,3)→(3,5)
+      start: 135
+      end: 175
+      scaling: 1.1
       only_FTG: false
       no_FTG: false
-    Sector1:
-      start: 40
-      end: 66
-      scaling: 1.0
-      only_FTG: false
-      no_FTG: false
-    Sector2:
-      start: 67
-      end: 92
-      scaling: 1.0
-      only_FTG: false
-      no_FTG: false
-    Sector3:
-      start: 93
-      end: 121
-      scaling: 1.0
-      only_FTG: false
-      no_FTG: false
-    Sector4:
-      start: 122
-      end: 179
-      scaling: 1.0
+    Sector1:    # 하단 메인직선 (2,0)→(11,0)
+      start: 276
+      end: 345   # 0810b: 365→345, 제동 2m 전 부스트 종료 (헤어핀 진입 산포 0.14→ 회복 목표)
+      scaling: 1.15   # 0810 첫 실험: 메인직선만 강하게 (상단 1.1과 효과 비교)
       only_FTG: false
       no_FTG: false

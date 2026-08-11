@@ -2,6 +2,10 @@ controller_manager:
   ros__parameters:
     t_clip_min: 0.7
     t_clip_max: 8.0
+    # cap on the sqrt(2)*lat_err lookahead LOWER-bound inflation. Post-swap the car can sit
+    # ~1 m off the new global line (deadlock-breaker commit); uncapped, the anti-swerve bound
+    # stretched the L1 through 0.7 m corner zones -> corner-cut into the wall on the 1.4 m track.
+    l1_lat_err_cap: 1.0
     m_l1: 0.47
     q_l1: -0.2
     speed_lookahead: 0.25
@@ -12,7 +16,7 @@ controller_manager:
     end_scale_speed: 10.0
     downscale_factor: 0.5
     speed_lookahead_for_steer: 0.0
-    trailing_gap: 1.55
+    trailing_gap: 1.5
     trailing_vel_gain: 0.25
     trailing_p_gain: 1.35
     trailing_i_gain: 0.0
@@ -28,19 +32,29 @@ controller_manager:
     steer_gain_for_speed: 1.0
     future_constant: 0.05
     AEB_thres: 0.5
+    # Used whenever the LOCAL WINDOW is an offset line (max|d_m| > AEB_offline_d_thres), not when
+    # the state happens to be named OVERTAKE: an offset line is legitimately far from the car, and
+    # the tight garbage-path threshold clamps to 2 m/s against it. Keying on the state name missed
+    # the cases where the SM hands the same avoidance geometry to the controller under TRAILING
+    # (holding the avoidance reference through a drop, and on the trailing approach) -- there the
+    # 0.5 m bar fired and released repeatedly, i.e. a sawtooth in the speed command.
+    AEB_thres_overtake: 0.9
+    AEB_offline_d_thres: 0.1
+    # The bar is LATCHED. Without hysteresis every wobble of the measured distance around it is a
+    # fresh engage and release, i.e. a 2 m/s clamp toggling at the loop rate -- measured on the
+    # real car as 2.87 -> 2.00 -> 3.24 in two cycles and 86.8 m/s^2 of published acceleration.
+    # Release needs the distance to fall this far BELOW the bar, and the clamp to have been held
+    # at least AEB_min_hold_s.
+    AEB_release_hyst_m: 0.25
+    AEB_min_hold_s: 0.2
     speed_diff_thres: 0.1
     start_speed: 10.0
     start_curvature_factor: 1.5
-    # FTG (FTGONLY state) - disparity-extender; all tunables in metres/degrees,
-    # live-tunable via rqt. Beam/FOV independent (no beam-count params).
-    ftg_debug: true
-    ftg_max_lidar_dist: 4.0      # NaN / no-return beams clipped to this [m]
-    ftg_max_speed: 2.0           # top speed; speed schedule scales off this [m/s]
-    ftg_track_width: 2.0         # returns closer than half this are ignored [m]
-    ftg_front_fov_deg: 80.0      # TOTAL front field of view considered [deg] (+-45)
-    ftg_smooth_deg: 1.0          # scan smoothing window width [deg]
-    ftg_disp_thresh: 0.5         # range jump that counts as a discontinuity [m]
-    ftg_bubble_m: 0.3            # safety bubble blown at each disparity [m]
-    ftg_steer_ema: 0.0           # steering low-pass 0..1 (0=off, higher=smoother)
-    ftg_max_steer: 0.4           # steering command clip [rad]
+    # Longitudinal slew limit on the PUBLISHED speed command. Mirrors veh_dyn_info/ggv.csv
+    # (ax_max = 5.0) and ax_max_machines.csv (5.0) — the same limits the global trajectory is
+    # planned against, so this never clips a feasible plan, only steps. Measured before it
+    # existed: the command moved at up to 86.8 m/s^2 (p99 12.2) on a real run. Raise only if the
+    # ggv is raised too; lowering it makes the car sluggish out of TRAILING.
+    max_accel_mps2: 7.0
+    max_decel_mps2: 7.0
     save_params: false

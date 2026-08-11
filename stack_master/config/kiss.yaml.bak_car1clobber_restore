@@ -1,0 +1,110 @@
+# kiss_icp_localization — 2D scan-to-SDF localization on the real car.
+# Drop-in replacement for the particle_filter: consumes the 2D LiDAR /scan and
+# publishes the localized pose DIRECTLY on /car_state/odom (no EKF) + TF map->base_link.
+#
+# Topic names are matched here (no remapping). The 2D-input front-end skips the
+# 3D PointCloud band-crop and feeds /scan straight into scan-to-SDF matching.
+#
+# TWO separate maps, managed/generated independently (both injected by
+# localization.launch.xml from the active map folder, NOT hard-set here):
+#   - loc_2d_map_yaml : the 2D map for localization (scan-to-SDF) = <map>.yaml
+#                       (the existing cartographer occupancy grid).
+#   - track_map_yaml  : the track mask for BEV detection = <map>_track.yaml
+#                       (flood-filled drivable region; generated separately,
+#                       later). Only read when detect_en:true.
+kiss_icp_localization:
+  ros__parameters:
+    # ---- input front-end (3D Livox PointCloud2) ----
+    input_mode: "3d"                 # PointCloud2 voxel point-to-plane ICP (localization_2d=false)
+    lidar_topic: "/livox/lidar"      # Livox MID360 PointCloud2
+    scan_topic: "/scan"              # (unused in 3D) urg_node LaserScan
+    # ---- prediction: translation from wheel odom, rotation from gyro ----
+    odom_twist_topic: "/vesc/odom"   # twist.vx drives translation prediction
+    imu_topic: "/livox/imu"          # Livox internal IMU (gyro deskew + high-rate prediction)
+    imu_en: true
+    deskew_en: true                  # gyro deskew
+    deskew_accel: true               # time-varying-v deskew: correct floor doubling under hard accel/brake
+    imu_rate_odom: true              # high-rate pose between scans (gyro rot + odom vx)
+    imu_init_samples: 100            # static gyro-bias init samples
+    # PER-CAR (do not unify): car1's livox_lidar.launch.py includes the stock
+    # msg_MID360_launch.py which HONORS use_system_timestamp -> header = scan END
+    # -> true is correct. car2 launches the driver as a direct Node that IGNORES
+    # use_system_timestamp -> header ~ scan BEGIN -> car2 needs false. The right
+    # value follows the livox launch's stamping, not the car.
+    stamp_at_scan_end: true          # car1 (stock msg_MID360 launch, use_system_timestamp honored)
+    # Livox MID360 internal IMU -> LiDAR rotation is identity (datasheet).
+    extrinsic_R_il: [1.0, 0.0, 0.0,
+                     0.0, 1.0, 0.0,
+                     0.0, 0.0, 1.0]
+
+    # ---- output (direct to the stack's fused-odom topic, EKF bypassed) ----
+    odom_topic: "/car_state/odom"
+    map_frame: "map"
+    base_frame: "base_link"          # static base_link->laser completes map->laser
+    publish_tf: true                 # map->base_link (perception looks up map->laser)
+
+    # ---- scan preprocessing / range gate ----
+    scan_voxel_size: 0.35            # 3D Livox cloud is dense; 0.35 keeps ICP real-time (bag-tuned)
+    min_range: 0.3                   # drop near-body returns
+    max_range: 60.0                  # Livox MID360 range
+    # Lift the map ground to z=0 so base_link/odom lands on the 2D /map grid (which
+    # is drawn at z=0) instead of sinking below it. Set to |base_link z| you read
+    # from `tf2_echo map base_link` (GLIM refs map z=0 to sensor height). 0 = off.
+    map_z_offset: 0.158             # measured |base_link z| (tf2_echo) -> ground to z=0
+
+    # ---- 2D scan-to-SDF registration + safety ----
+    loc_2d_corr_gain: 0.3            # complementary low-pass (cuts per-scan yaw jitter)
+    max_iterations: 50
+    convergence_eps: 2.0e-3
+    initial_threshold: 1.0
+    min_threshold: 0.1
+    min_motion: 0.05
+    adaptive_range: 15.0             # indoor track scale (km-scale margin not needed)
+    vel_smoothing: 0.3
+    reject_trans: 2.0
+    reject_rot_deg: 30.0
+    reject_recover_count: 3
+    max_velocity: 15.0
+    max_accel: 10.0
+
+    # ---- initial pose ----
+    initial_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    use_initial_pose_topic: true     # /initialpose (RViz 2D Pose Estimate)
+
+    # ---- BEV detection (opponents / unmapped obstacles) ----
+    # Two-map setup: detection uses its OWN track mask (track_map_yaml, injected
+    # by launch as <map>_track.yaml), kept separate from the localization 2D map
+    # (loc_2d_map_yaml = <map>.yaml). detect_en stays false until that track map
+    # is generated AND the 2D-scan detection code path lands (z-band bypass);
+    # flip to true then. Params below are pre-set so enabling is a one-line change.
+    detect_en: true
+    detect_deskew: true              # deskew now trustworthy (stamp/accel fix) -> deskewed scan for detection
+    detect_track_filter: true        # reject returns off the track mask (=walls/exterior)
+    detect_track_dist_min: 0.2       # min distance from black/wall [m] to count as a candidate
+    # Ground/ceiling removal = fixed map-frame z band (RANSAC removed): keep
+    # z_min <= z <= z_max. Below z_min = floor, above z_max = ceiling/overhang.
+    detect_z_min: 0.10               # map-frame floor cut [m]; TUNE from detect_debug (ground=intensity 3)
+    detect_z_max: 0.50               # map-frame ceiling cut [m]
+    # Ego self-return box (SENSOR frame; x forward -> -x is behind the car). Drops
+    # the car's own chassis the LiDAR sees behind itself before it clusters as a
+    # phantom obstacle at the ego pose. ~0.2x0.2 box just behind base_link; all
+    # keys are live-tunable via rqt/ros2 param set (drag onto the self-hit in RViz).
+    detect_self_filter: true
+    detect_self_x_min: -0.45         # behind: box far edge [m]
+    detect_self_x_max: -0.25         # behind: box near edge [m]  (0.2 deep)
+    detect_self_y_min: -0.10         # right edge [m]
+    detect_self_y_max: 0.10          # left edge  [m]  (0.2 wide)
+    detect_res: 0.05                 # BEV cell size [m]
+    detect_eps: 0.3                  # DBSCAN neighborhood radius [m]
+    detect_min_samples: 2            # 2D scan is sparse -> low core threshold
+    detect_min_cluster_cells: 2
+    detect_track_gate: 1.0           # max cluster-center step to associate [m]
+    detect_moving_speed: 0.5         # |v| above this => moving (opponent) [m/s]
+    detect_max_misses: 5
+    detect_pose_topic: "/kiss_loc/obstacle_poses"   # cluster centers (PoseArray, map)
+
+    # ---- map_server owns /map; node publishes neither grid nor band scan ----
+    publish_2d_map: false
+    publish_2d_scan: true
+    publish_aligned_scan: true       # /kiss_loc/scan_aligned for RViz debug
+    print_stats: true

@@ -1,0 +1,43 @@
+/**:
+  ros__parameters:
+    camera:
+      i_enable_imu: true
+      i_enable_ir: true
+      i_laser_dot_brightness: 800
+      i_floodlight_brightness: 0
+      i_nn_type: none
+      i_pipeline_type: RGBD
+      i_enable_sync: true
+
+    rgb:
+      i_publish_topic: true
+      i_resolution: "1080P"
+      i_fps: 30.0
+      i_set_isp_scale: true
+      i_isp_num: 2
+      i_isp_den: 3
+      i_enable_lazy_publisher: false
+      i_publish_compressed: false
+
+    left:
+      i_publish_topic: false
+
+    right:
+      i_publish_topic: false
+
+    stereo:
+      i_publish_topic: true
+      i_align_depth: true
+      i_subpixel: true
+      i_lr_check: true
+      i_depth_preset: "HIGH_ACCURACY"
+      i_left_rect_publish_topic: false
+      i_right_rect_publish_topic: false
+      i_enable_lazy_publisher: false
+      i_publish_compressed: false
+
+    imu:
+      i_acc_freq: 400
+      i_gyro_freq: 400
+      i_sync_method: "LINEAR_INTERPOLATE_ACCEL"
+      i_enable_rotation: false
