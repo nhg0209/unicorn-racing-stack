@@ -88,10 +88,17 @@ tracking:
     livox_max_view_dist: 7.0
     measure: true
     from_bag: false
-    # Per-cycle dump of every dynamic track's raw KF state on /tracking/diag (see publish_diag):
-    # id / dyn_id / raw x[0] / ds / vs / d / P[0][0] / matched / staticFlag / nb_meas / ttls. The
-    # marker and /tracking/obstacles both publish x[0] % track_length, so a state integrating past
-    # the track length is invisible in them -- this is where to look instead. Instrument only:
+    # Per-cycle dump of every track on /tracking/diag (see publish_diag), in two arrays:
+    #   dyn   tracks with a live KF: id / dyn_id / raw x[0] / ds / vs / d / P[0][0] / matched /
+    #         staticFlag / nb_meas / ttls. The marker and /tracking/obstacles both publish
+    #         x[0] % track_length, so a state integrating past the track length is invisible in
+    #         them -- this is where to look instead.
+    #   stat  confirmed-static and not-yet-classified tracks, i.e. the ones the STATIC planner
+    #         turns into keep-outs: mean_s / mean_d (the position publishObstacles actually
+    #         publishes for them) / size / vis, so a swerve can be traced to the track that made
+    #         the box and sf+nb+m say whether it was a ghost. Cross-reference mean_d against the
+    #         `obs keep-out d=[lo,hi]` in static_avoidance's own `avoid ...` line (throttled 2 s).
+    # Instrument only:
     # nothing downstream reads the topic. Live-togglable
     # (ros2 param set /tracking diag_dynamic true), and deliberately NOT in save_yaml's key list,
     # so the rqt save button can never leave a debug stream running on race day.
