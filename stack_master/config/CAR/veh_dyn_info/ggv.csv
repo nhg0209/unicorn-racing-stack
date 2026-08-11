@@ -1,35 +1,19 @@
 # v_mps,ax_max_mps2,ay_max_mps2
-#
-# CHANGING ay_max OR ax_max HERE DOES NOT RAISE THE CAR'S SPEED ON ITS OWN. THE RACELINE MUST BE
-# REGENERATED. The velocity profile the car actually follows is vx_mps inside
-# stack_master/maps/<map>/global_waypoints.json, and that is an OFFLINE product of the global
-# optimizer: closed_reopt_bridge publishes those values through unchanged (:126 seeds vx from
-# clean_vx, :159 restores it wherever the geometry has rejoined the raceline), and this table is
-# consulted only to cap it FURTHER (_cap_speed_to_published_curvature). So the online path can
-# lower vx and can never raise it, and a bigger number here buys nothing until the raceline is
-# rebuilt from it. Restarting the stack is not enough.
-#
-# Raising it is also not free downstream: ay_max is the lateral budget the reactive planner's
-# curvature-limited cap divides by, so it changes avoidance speeds as well as raceline speeds.
-#
-# THE TWO VEHICLE CONFIGS DIVERGE HERE ON PURPOSE. CAR and SIM are different surfaces, so their
-# ay_max is not the same number and sim tuning of anything that divides by it does NOT transfer to
-# the car. Check which config you are reading before quoting a value from this file.
-0.0, 5.0,4.5
-4.0, 5.0,4.5
-8.0, 5.0,4.5
-12.0,5.0,4.5
-16.0,5.0,4.5
-20.0,5.0,4.5
-24.0,5.0,4.5
-28.0,5.0,4.5
-32.0,5.0,4.5
-36.0,5.0,4.5
-40.0,5.0,4.5
-44.0,5.0,4.5
-48.0,5.0,4.5
-52.0,5.0,4.5
-56.0,5.0,4.5
-60.0,5.0,4.5
-66.0,5.0,4.5
-72.0,5.0,4.5
+0.0, 7.0,5.7
+4.0, 7.0,5.7
+8.0, 7.0,5.7
+12.0,7.0,5.7
+16.0,7.0,5.7
+20.0,7.0,5.7
+24.0,7.0,5.7
+28.0,7.0,5.7
+32.0,7.0,5.7
+36.0,7.0,5.7
+40.0,7.0,5.7
+44.0,7.0,5.7
+48.0,7.0,5.7
+52.0,7.0,5.7
+56.0,7.0,5.7
+60.0,7.0,5.7
+66.0,7.0,5.7
+72.0,7.0,5.7
