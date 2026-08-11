@@ -34,3 +34,14 @@ COLCON_IGNORE
 # rosbag recordings (local debugging only; keep the folder, ignore contents)
 /bags/*
 !/bags/.gitkeep
+
+# Point-cloud maps: the 3D localization voxel map (localization.launch.xml passes
+# map_pcd_3d = <map>.pcd, REQUIRED when kiss.yaml input_mode is "3d"). ifac_0807.pcd is 117 MB,
+# past GitHub's hard 100 MB blob limit, so it cannot live in this repo as a plain object -- the
+# push is rejected by a pre-receive hook, not merely discouraged. It was carried in history from
+# cf01400 until 2026-08-11 and has been stripped from those 28 commits (backup tag:
+# backup/pre-pcd-strip-0811). The file stays on disk and on the car; a fresh clone that needs the
+# Livox 3D path has to obtain it out of band, or regenerate it from a mapping run. If it should be
+# versioned instead, that is Git LFS and a deliberate decision -- it costs 12 % of the free quota
+# and makes git-lfs a clone requirement for everyone.
+*.pcd
