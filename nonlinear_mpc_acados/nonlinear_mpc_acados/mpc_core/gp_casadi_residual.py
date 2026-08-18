@@ -129,14 +129,55 @@ def load_gp_casadi_params(ckpt_path: str | Path,
     posterior mean (and hence alpha) is correct.
 
     Requires torch + gpytorch + l4acados on PYTHONPATH (offline / build time).
+
+    2026-08-03: torch/gpytorch import 를 캐시 확인 **뒤**로 이동. 캐시 히트
+    경로는 numpy 만 쓰는데 임포트가 먼저 죽어서, launch 환경(unicorn.sh 의
+    PYTHONPATH 필터로 torch 미가시)에서는 캐시가 있어도 매번 "No module named
+    'torch'" 폴백 → Phase D 가 로그 전 이력에서 단 한 번도 활성화된 적이
+    없었다. 이제 캐시(.casadi_cache.npz)만 있으면 torch 없는 환경(실차 포함)
+    에서도 GP 가 산다. 캐시 미스(재학습 직후 등)에만 torch 가 필요하다.
     """
+    ckpt_path = os.path.expanduser(str(ckpt_path))
+    # ── 2026-07-16 결과 캐시: gp(Z) 사후평균 평가가 train blob 전체(수만 샘플)에
+    # 조건화된 채 돌아 시작마다 수 분(torch/openblas 300%+ CPU) 소모 — 추출 결과
+    # (GpCasadiParams 전체)를 npz 로 캐시. 수치 동일.
+    # 2026-08-03: 키를 mtime → **내용 sha1** 로 교체. rsync/scp 로 노트북↔실차
+    # 를 오가면 mtime 이 바뀌어 캐시가 영구 미스였다 (실측: 저장키
+    # 1784192964_* vs 복사후 mtime 1784531762_*). 내용 해시는 복사에 불변이라
+    # 어느 머신에서든 같은 ckpt 면 캐시가 산다. 파일이 18KB/280KB 라 해시
+    # 비용은 ms 단위. 구키(mtime 형식) 캐시는 자연 미스 → 1회 재계산 후 신키.
+    _td_for_key = train_data_path if train_data_path is not None else _default_train_data_path(ckpt_path)
+    _cache_path = ckpt_path + ".casadi_cache.npz"
+    _key = None
+    try:
+        if _td_for_key and os.path.isfile(os.path.expanduser(str(_td_for_key))):
+            import hashlib
+            def _sha1(p):
+                h = hashlib.sha1()
+                with open(p, 'rb') as f:
+                    h.update(f.read())
+                return h.hexdigest()[:16]
+            _key = "%s_%s" % (_sha1(ckpt_path),
+                              _sha1(os.path.expanduser(str(_td_for_key))))
+    except OSError:
+        pass
+    if _key is not None and os.path.isfile(_cache_path):
+        try:
+            _c = np.load(_cache_path, allow_pickle=True)
+            if str(_c["key"]) == _key:
+                return GpCasadiParams(
+                    Z=_c["Z"], alpha=_c["alpha"], lengthscale=_c["lengthscale"],
+                    outputscale=_c["outputscale"], X_mean=_c["X_mean"], X_std=_c["X_std"],
+                    Y_mean=_c["Y_mean"], Y_std=_c["Y_std"],
+                    input_keys=list(_c["input_keys"]), output_keys=list(_c["output_keys"]))
+        except Exception:
+            pass  # 캐시 손상 → 재계산
+    # ── 여기부터는 캐시 미스 — torch 필수 (학습 blob 재조건화) ──
     import torch
     import gpytorch
 
-    ckpt_path = os.path.expanduser(str(ckpt_path))
     ckpt = torch.load(ckpt_path, weights_only=False)
 
-    in_dim = len(ckpt["input_keys"])
     out_dim = len(ckpt["output_keys"])
     inducing = ckpt["inducing"]
 
@@ -218,6 +259,18 @@ def load_gp_casadi_params(ckpt_path: str | Path,
         b_d = mu_Z[:, d]
         alpha[d] = np.linalg.solve(Kuu, b_d)
 
+    if _key is not None:
+        try:
+            np.savez(_cache_path, key=_key, Z=Z, alpha=alpha, lengthscale=lengthscale,
+                     outputscale=outputscale,
+                     X_mean=X_mean.cpu().numpy().astype(np.float64),
+                     X_std=X_std.cpu().numpy().astype(np.float64),
+                     Y_mean=Y_mean.cpu().numpy().astype(np.float64),
+                     Y_std=Y_std.cpu().numpy().astype(np.float64),
+                     input_keys=np.array(list(ckpt["input_keys"])),
+                     output_keys=np.array(list(ckpt["output_keys"])))
+        except Exception:
+            pass
     return GpCasadiParams(
         Z=Z,
         alpha=alpha,
@@ -240,22 +293,6 @@ def _rbf_gram_np(A: np.ndarray, B: np.ndarray, ell: np.ndarray,
     B = np.atleast_2d(B) / ell[None, :]
     sq = (A**2).sum(1)[:, None] + (B**2).sum(1)[None, :] - 2.0 * A @ B.T
     return outputscale * np.exp(-0.5 * np.clip(sq, 0.0, None))
-
-
-# ────────────────────────────────────────────────────────────────
-# Reference numpy evaluation of the closed form (for validation / debug)
-# ────────────────────────────────────────────────────────────────
-def eval_numpy(z_raw: np.ndarray, p: GpCasadiParams) -> np.ndarray:
-    """Evaluate the closed-form mean in numpy. z_raw: (N, D) RAW (un-normalized)
-    GP inputs. Returns (N, out_dim) real-scale residual."""
-    z_raw = np.atleast_2d(z_raw).astype(np.float64)
-    z_norm = (z_raw - p.X_mean[None, :]) / p.X_std[None, :]
-    out = np.zeros((z_raw.shape[0], p.out_dim), dtype=np.float64)
-    for d in range(p.out_dim):
-        k = _rbf_gram_np(z_norm, p.Z, p.lengthscale[d], p.outputscale[d])  # (N, M)
-        mu = k @ p.alpha[d]                                                # (N,)
-        out[:, d] = mu * p.Y_std[d] + p.Y_mean[d]
-    return out
 
 
 # ────────────────────────────────────────────────────────────────

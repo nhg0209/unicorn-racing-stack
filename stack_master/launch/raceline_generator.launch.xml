@@ -24,7 +24,7 @@
        name doubles as racecar_version (holds racecar_f110.ini + veh_dyn_info/). -->
   <let name="racecar_version" value="SIM" if="$(var sim)"/>
   <let name="racecar_version" value="CAR" unless="$(var sim)"/>
-  <let name="maps_dir" value="$(find-pkg-share stack_master)/maps"/>
+  <let name="maps_dir" value="$(env STACK_MASTER_MAPS_ROOT $(find-pkg-share stack_master)/maps)"/>
 
   <!-- ===== global planner (gb_optimizer): plan from the existing map ===== -->
   <!-- emulate_tty: line-buffer the node's stdout so the optimizer's plain

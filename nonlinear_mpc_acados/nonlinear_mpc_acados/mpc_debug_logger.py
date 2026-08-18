@@ -38,7 +38,7 @@ from visualization_msgs.msg import MarkerArray
 # Must match Nonlinear_MPC_node.DBG_FIELDS order (ROS1 source of truth).
 # C-1 추가: kappa_abs/signed + B 의 q_*_scale (16~21) — MLP 학습 데이터 용도.
 DBG_FIELDS = [
-    "v_cmd", "steer_cmd", "v_actual",
+    "a_x_cmd", "steer_cmd", "v_actual",
     "car_x", "car_y", "car_yaw",
     "current_s", "near_idx", "ref_v",
     "n_obs_in", "sel_dmin", "sel_x", "sel_y",
@@ -53,6 +53,14 @@ DBG_FIELDS = [
     # 2026-06-29 (2단계) atomic EKF 속도상태 — /mpc_debug 인덱스 25,26:
     "vy_ekf",       # 25 x0[4] EKF body lateral velocity
     "r_ekf",        # 26 x0[5] EKF yaw rate
+    # 2026-07-09 ablation 추적 (mpc_node와 동기)
+    "brake_anticip_a",  # 27
+    "slew_down_rate",   # 28
+    "accel_preview_s",  # 29
+    # 2026-07-28: mpc_node 발행 31필드 / 로거 30필드 3중 불일치 정정 — zip()이
+    # 짧은 쪽에서 멈춰 obs_blocked_d 가 조용히 유실되고 있었다 (bag 실측 확인).
+    "obs_blocked_d",    # 30 BLOCK-STOP 진단 거리 (mpc_node :1885)
+    "speed_cmd",        # 31 실제 발행 속도명령 cmd.drive.speed (mpc_node :1887 이전 확정값)
 ]
 
 def csv_header() -> list:
@@ -255,19 +263,23 @@ class MPCDebugLogger(Node):
             return "slow_solve"
         if len(self.ring_before) >= 3:
             past = list(self.ring_before)[-3:]
-            idx_v_cmd = 2 + 0
+            # row = [t, lap] + DBG_FIELDS values + [...] → offset by 2.
+            idx_speed_cmd = 2 + DBG_FIELDS.index("speed_cmd")
             idx_opti  = 2 + 14
             past_costs = [r[idx_opti] for r in past]
             past_med = float(np.median(past_costs)) if past_costs else 0.0
             cur_cost = float(d.get('opti_value', 0.0))
             if past_med > 1.0 and cur_cost > 10.0 * past_med + 100.0:
                 return "cost_spike"
-            past_v = [r[idx_v_cmd] for r in past]
-            if past_v and abs(float(d.get('v_cmd', 0.0)) - past_v[-1]) > 2.0:
+            # 2026-07-28: 원래 의도(속도 명령 급변 감지)로 복원 — 예전엔 'v_cmd'
+            # 필드로 판정했지만 그 필드는 실제로는 a_x(가속도)였다(2026-06-10
+            # 의미 변경, 이름 방치). 신규 speed_cmd(실제 발행 속도명령)로 교체.
+            past_speed = [r[idx_speed_cmd] for r in past]
+            if past_speed and abs(float(d.get('speed_cmd', 0.0)) - past_speed[-1]) > 2.0:
                 return "vcmd_jerk"
         v_actual = float(d.get('v_actual', 0.0))
-        v_cmd = float(d.get('v_cmd', 0.0))
-        if v_actual < 0.3 and v_cmd > 1.0:
+        a_x_cmd = float(d.get('a_x_cmd', 0.0))
+        if v_actual < 0.3 and a_x_cmd > 1.0:
             return "stuck"
         return None
 
@@ -348,7 +360,7 @@ class MPCDebugLogger(Node):
         self.get_logger().info(
             f"[dbg] lap={self.lap}  s={float(d.get('current_s', 0)):6.2f}  "
             f"v={float(d.get('v_actual', 0)):4.2f}  "
-            f"vcmd={float(d.get('v_cmd', 0)):4.2f}  "
+            f"speed_cmd={float(d.get('speed_cmd', 0)):4.2f}  "
             f"steer={float(d.get('steer_cmd', 0)):+5.3f}  "
             f"solve={self.last_solve_ms:5.1f}ms  cost={self.last_cost:8.2f}  "
             f"feas={'Y' if self.last_feasible else 'N'}  margin={margin_str}")

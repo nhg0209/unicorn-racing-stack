@@ -17,8 +17,21 @@
   <arg name="use_estop"     default="false"        description="Use emergency stop (true) or not (false)"/>
   <arg name="virtual"       default="false"        description="Inject virtual opponent/obstacles (scan overlay etc.) onto the real LiDAR"/>
   <arg name="keyboard_teleop" default="false"     description="Make the mux honour keyboard teleop (/joy_keyboard); run keyboard_joy_node on the operator laptop"/>
+  <!-- Opponent bridge: forward our /car_state/odom to the other car over UDP and
+       publish the other car's pose here as /opponent_state/odom (throttled). Both
+       cars must localize on the SAME map. DDS stays local to each car's domain;
+       only UDP crosses machines (their domains are isolated and DDS discovery does
+       not cross this LAN). opponent_ip = the OTHER car's IP. This is PER-MACHINE,
+       so it comes from the OPPONENT_IP env (set in each host's gitignored
+       unicorn.local.sh); the tracked fallback is car2's IP (correct for car1).
+       car2 sets OPPONENT_IP=192.168.70.48 (car1). Update env if the DHCP lease
+       changes, or pass opponent_ip:=... on the command line. -->
+  <arg name="opponent_bridge" default="true"           description="Run the UDP opponent-pose bridge"/>
+  <arg name="opponent_ip"     default="$(env OPPONENT_IP 192.168.70.14)"  description="The opponent car's LAN IP (env OPPONENT_IP; fallback = car2)"/>
+  <arg name="opponent_port"   default="47600"          description="UDP port (same on both cars)"/>
+  <arg name="opponent_rate"   default="50.0"           description="Send-rate cap [Hz]"/>
 
-  <let name="maps_dir"                value="$(find-pkg-share stack_master)/maps"/>
+  <let name="maps_dir"                value="$(env STACK_MASTER_MAPS_ROOT $(find-pkg-share stack_master)/maps)"/>
   <let name="map_path"                value="$(var maps_dir)/$(var map)/$(var map)"/>
   <let name="cartographer_config_dir" value="$(find-pkg-share stack_master)/config"/>
 
@@ -103,25 +116,31 @@
     </node>
   </group>
 
-  <!-- ===== KISS-ICP 2D scan-to-SDF localization ===== -->
+  <!-- ===== KISS-ICP 3D / 2.5D voxel-ICP localization ===== -->
   <!-- No EKF: the node fuses wheel-odom (translation) + gyro (rotation) itself and
        publishes the fused pose DIRECTLY on /car_state/odom + TF map->base_link.
-       Topic names are matched in kiss.yaml (no remap). Two separate maps are
-       injected from the active map folder: loc_2d_map_yaml = <map>.yaml (the
-       cartographer occupancy grid, used for scan-to-SDF localization) and
-       track_map_yaml = <map>_track.yaml (the drivable-region mask for BEV
-       detection; generated separately, only read when detect_en:true). -->
+       Topic names are matched in kiss.yaml (no remap). -->
   <group if="$(eval '\'$(var localization)\' == \'kiss\'')">
     <node pkg="kiss_icp_localization" exec="localization_node" name="kiss_icp_localization" output="screen">
       <param from="$(find-pkg-share stack_master)/config/kiss.yaml"/>
       <!-- The node reads explicit file paths (it does NOT derive them from a map
            name), so inject them from the active map folder here. map_path =
-           maps_dir/<map>/<map>. 3D mode (input_mode:3d) loads map_pcd_3d; the
-           track mask + ground plane feed detection / ground-band geometry. -->
+           maps_dir/<map>/<map>. map_pcd_3d is the ICP target; the 2D grid
+           <map>.yaml (same file map_server loads for /map) is the detection track
+           mask. The ground-band crop (crop_*) is set in kiss.yaml. -->
       <param name="map_pcd_3d"      value="$(var map_path).pcd"/>
-      <param name="track_map_yaml"  value="$(var map_path)_track.yaml"/>
-      <param name="loc_2d_map_yaml" value="$(var map_path)_track.yaml"/>
-      <param name="ground_yaml"     value="$(var map_path)_ground_lidar.yaml"/>
+      <param name="track_map_yaml"  value="$(var map_path).yaml"/>  <!-- kiss는 PCD로 정합하므로 <map>.yaml/pgm은 viz 전용 -> 검출 track mask도 이 파일 하나로 통일(별도 _track 불필요). <map>.pgm을 깨끗한 트랙 래스터로 만들면 viz+검출 겸용. (pf/carto는 여기 대신 occupancy 필요) -->
+    </node>
+  </group>
+
+  <!-- ===== Opponent position bridge (cross-domain) ===== -->
+  <group if="$(var opponent_bridge)">
+    <node pkg="stack_master" exec="opponent_bridge_node.py" name="opponent_bridge" output="screen">
+      <param name="peer_ip"   value="$(var opponent_ip)"/>
+      <param name="port"      value="$(var opponent_port)"/>
+      <param name="in_topic"  value="/car_state/odom"/>
+      <param name="out_topic" value="/opponent_state/odom"/>
+      <param name="rate"      value="$(var opponent_rate)"/>
     </node>
   </group>
 </launch>

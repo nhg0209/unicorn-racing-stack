@@ -9,6 +9,7 @@ import threading
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray
+from ackermann_msgs.msg import AckermannDriveStamped
 
 from nonlinear_mpc_acados.speed_monitor_core import extract_speeds, trim_window
 
@@ -24,6 +25,10 @@ class SpeedMonitor(Node):
         self.declare_parameter('i_cmd', 0)
         self.declare_parameter('i_actual', 2)
         self.declare_parameter('i_ref', 8)
+        # 2026-07-02: mpc_debug[0] 은 unified layout 이후 a_x(가속도)라 속도가
+        # 아님. 기본은 실제 발행 속도명령(/vesc/ackermann_cmd drive.speed)을
+        # v_cmd 로 그린다. 빈 문자열이면 예전처럼 i_cmd 인덱스 사용.
+        self.declare_parameter('cmd_topic', '/vesc/ackermann_cmd')
         gp = self.get_parameter
         self._window = float(gp('window_sec').value)
         self._show_ref = bool(gp('show_ref').value)
@@ -34,8 +39,16 @@ class SpeedMonitor(Node):
         self._t0 = self.get_clock().now().nanoseconds * 1e-9
         self._lock = threading.Lock()
         self._t, self._cmd, self._act, self._ref = [], [], [], []
+        self._last_ack_speed = None
+        self._cmd_topic = str(gp('cmd_topic').value).strip()
+        if self._cmd_topic:
+            self.create_subscription(AckermannDriveStamped, self._cmd_topic,
+                                     self._ack_cb, 10)
         self.create_subscription(Float32MultiArray, str(gp('topic').value), self._cb, 10)
         self.get_logger().info('[speed_monitor] /mpc_debug 구독 시작 — 창 닫으면 종료')
+
+    def _ack_cb(self, msg: AckermannDriveStamped):
+        self._last_ack_speed = float(msg.drive.speed)
 
     def _now(self):
         return self.get_clock().now().nanoseconds * 1e-9 - self._t0
@@ -45,9 +58,15 @@ class SpeedMonitor(Node):
         if s is None:
             return
         now = self._now()
+        # cmd_topic 사용 시: 최신 ackermann drive.speed 를 v_cmd 로 (없으면 NaN 대신 0 유지 회피 위해 skip)
+        cmd_val = s[0]
+        if self._cmd_topic:
+            if self._last_ack_speed is None:
+                return
+            cmd_val = self._last_ack_speed
         with self._lock:
             self._t.append(now)
-            self._cmd.append(s[0])
+            self._cmd.append(cmd_val)
             self._act.append(s[1])
             self._ref.append(s[2])
             k = trim_window(self._t, now, self._window)

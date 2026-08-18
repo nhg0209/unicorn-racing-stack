@@ -56,7 +56,7 @@
        straight from the map's yaml instead (autodeclare_from_overrides=True), so
        they run standalone and produce /global_waypoints_scaled and
        /global_waypoints/overtaking for the state machine & local planners. -->
-  <let name="maps_dir" value="$(find-pkg-share stack_master)/maps"/>
+  <let name="maps_dir" value="$(env STACK_MASTER_MAPS_ROOT $(find-pkg-share stack_master)/maps)"/>
 
   <node pkg="gb_optimizer" exec="global_trajectory_publisher" name="global_republisher" output="screen">
     <param name="map" value="$(var map)"/>

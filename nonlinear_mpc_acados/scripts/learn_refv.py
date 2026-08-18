@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""learn_refv.py — 오프라인 학습 ref_V (3-i).
+
+clean 랩 로거 CSV → s-bin별 그립여유 평가 → 여유 구간 ref_V 상향(그립캡 clamp)
+→ maps/<track>/learned_refv.npz (s, ref_v, speed_target, map, source_laps).
+
+Usage:
+    python3 learn_refv.py --csv-glob '~/mpc_logs/mpc_*.csv' --map f \
+        --L <track_length_m> --out maps/f/learned_refv.npz [--report out.png]
+"""
+from __future__ import annotations
+import argparse, glob, sys
+from pathlib import Path
+import numpy as np
+
+# model_policy.grip_a_lat_limit 재사용 (μgη)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from nonlinear_mpc_acados.mpc_core.model_policy import grip_a_lat_limit
+
+
+def bin_laps(s, vx, kappa, feasible, mpcc_active, refv, L,
+             bin_width=0.5, min_vx=1.0, min_count=3):
+    """clean 샘플을 s-bin 으로 집계. 데이터 없는 bin 은 NaN."""
+    s = np.asarray(s, float); vx = np.asarray(vx, float); kappa = np.abs(np.asarray(kappa, float))
+    feasible = np.asarray(feasible).astype(bool); mpcc_active = np.asarray(mpcc_active).astype(bool)
+    refv = np.asarray(refv, float)
+    # 2026-07-09: 실차 mux 가 /mux/mpcc_active 미발행 -> 열 전부 0 -> clean 전멸.
+    # 열이 한 번도 True 가 아니면 신호 부재로 보고 조건 생략 (경고).
+    if not mpcc_active.any():
+        print("[learn_refv] mpcc_active 신호 없음 (전부 0) — 조건 생략")
+        mpcc_active = np.ones_like(mpcc_active, dtype=bool)
+    clean = feasible & mpcc_active & (vx > min_vx)
+    nb = max(1, int(np.ceil(L / bin_width)))
+    centers = (np.arange(nb) + 0.5) * bin_width
+    vx_med = np.full(nb, np.nan); kap = np.full(nb, np.nan)
+    a_lat_med = np.full(nb, np.nan); base = np.full(nb, np.nan); cnt = np.zeros(nb, int)
+    if clean.sum() == 0:
+        return centers, vx_med, kap, a_lat_med, base, cnt
+    sc = np.mod(s[clean], L); vc = vx[clean]; kc = kappa[clean]; rc = refv[clean]
+    a_lat = vc * vc * kc
+    idx = np.clip((sc / bin_width).astype(int), 0, nb - 1)
+    for b in range(nb):
+        m = idx == b
+        cnt[b] = int(m.sum())
+        if cnt[b] >= min_count:
+            vx_med[b] = float(np.median(vc[m]))
+            kap[b] = float(np.median(kc[m]))
+            a_lat_med[b] = float(np.median(a_lat[m]))
+            base[b] = float(np.median(rc[m]))
+    return centers, vx_med, kap, a_lat_med, base, cnt
+
+
+def _moving_avg(x, win):
+    if win <= 1:
+        return x.copy()
+    out = x.copy()
+    valid = ~np.isnan(x)
+    k = win // 2
+    for i in range(len(x)):
+        lo, hi = max(0, i - k), min(len(x), i + k + 1)
+        seg = x[lo:hi][valid[lo:hi]]
+        if seg.size:
+            out[i] = float(np.mean(seg)) if valid[i] else np.nan
+    return out
+
+
+def learn_profile(base, vx_med, a_lat_med, kap, a_lat_lim, max_speed,
+                  floor=1.0, delta=0.3, g_lo=0.8, g_hi=0.95, smooth_win=3):
+    """그립여유 기반 ref_V 상향 + 안전 clamp. NaN bin 은 NaN 유지."""
+    base = np.asarray(base, float).copy()
+    new = base.copy()
+    g = a_lat_med / a_lat_lim
+    raise_m = g < g_lo
+    hold_m = g > g_hi
+    new[raise_m] = base[raise_m] + delta
+    new[hold_m] = np.minimum(base[hold_m], vx_med[hold_m])
+    grip_cap = np.where(kap > 1e-3, np.sqrt(a_lat_lim / np.maximum(kap, 1e-9)), max_speed)
+    cap = np.minimum(max_speed, grip_cap)
+    valid = ~np.isnan(new)
+    new[valid] = np.clip(new[valid], floor, cap[valid])
+    new = _moving_avg(new, smooth_win)
+    valid = ~np.isnan(new)
+    new[valid] = np.clip(new[valid], floor, cap[valid])
+    st = float(min(max_speed, np.nanmax(new))) if valid.any() else max_speed
+    return new, st
+
+
+def _load_csvs(paths):
+    import pandas as pd
+    need = {"current_s", "v_actual", "kappa_abs", "ref_v", "feasible", "mpcc_active"}
+    cols = {k: [] for k in need}
+    n = 0
+    for p in paths:
+        try:
+            df = pd.read_csv(p)
+        except Exception as e:
+            print(f"  [skip] {p}: {e}"); continue
+        if not need.issubset(df.columns):
+            print(f"  [skip] {p}: 컬럼 부족"); continue
+        for k in need:
+            cols[k].append(df[k].to_numpy())
+        n += 1
+    if n == 0:
+        return None, 0
+    return {k: np.concatenate(v) for k, v in cols.items()}, n
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--csv-glob", default=str(Path.home() / "mpc_logs" / "mpc_*.csv"))
+    p.add_argument("--map", required=True)
+    p.add_argument("--L", type=float, required=True, help="track length [m] (frenet s period)")
+    p.add_argument("--out", required=True)
+    p.add_argument("--mu", type=float, default=0.7)
+    p.add_argument("--ellipse_frac", type=float, default=0.95)
+    p.add_argument("--max_speed", type=float, default=10.0)
+    p.add_argument("--bin_width", type=float, default=0.5)
+    p.add_argument("--delta", type=float, default=0.3)
+    p.add_argument("--report", default="")
+    args = p.parse_args()
+
+    paths = sorted(glob.glob(str(Path(args.csv_glob).expanduser())))
+    d, ncsv = _load_csvs(paths)
+    if d is None:
+        print("유효 CSV 없음."); return
+    a_lat_lim = grip_a_lat_limit(args.mu, args.ellipse_frac)
+    centers, vx_med, kap, a_lat_med, base, cnt = bin_laps(
+        d["current_s"], d["v_actual"], d["kappa_abs"], d["feasible"],
+        d["mpcc_active"], d["ref_v"], L=args.L, bin_width=args.bin_width)
+    new, st = learn_profile(base, vx_med, a_lat_med, kap, a_lat_lim,
+                            args.max_speed, delta=args.delta)
+    valid = ~np.isnan(new)
+    out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(out, s=centers[valid], ref_v=new[valid], speed_target=st,
+             map=args.map, source_laps=ncsv)
+    raised = int(np.nansum(new > base + 1e-6))
+    print(f"learned {valid.sum()} bins ({ncsv} csv), 상향 {raised} bins, "
+          f"speed_target={st:.2f} → {out}")
+
+    if args.report:
+        try:
+            import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+            fig, ax = plt.subplots(2, 1, figsize=(13, 7), sharex=True)
+            ax[0].plot(centers, base, label="base ref_v(CSV)", lw=1)
+            ax[0].plot(centers, new, label="learned ref_v", lw=1.2)
+            ax[0].set_ylabel("ref_v [m/s]"); ax[0].legend(); ax[0].grid(alpha=.3)
+            ax[1].plot(centers, a_lat_med / a_lat_lim, label="grip util g", color="tab:red")
+            ax[1].axhline(0.8, ls="--", c="g"); ax[1].axhline(0.95, ls="--", c="r")
+            ax[1].set_ylabel("g"); ax[1].set_xlabel("s [m]"); ax[1].legend(); ax[1].grid(alpha=.3)
+            plt.tight_layout(); plt.savefig(args.report, dpi=110); print(f"report → {args.report}")
+        except Exception as e:
+            print(f"(report skip: {e})")
+
+
+if __name__ == "__main__":
+    main()

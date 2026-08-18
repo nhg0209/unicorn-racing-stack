@@ -29,12 +29,13 @@
   <arg name="config"        default="$(find-pkg-share nonlinear_mpc_acados)/config/ddrx_unified_params.yaml"/>
   <arg name="odom_topic"    default="/car_state/odom"                  description="localization odom"/>
   <arg name="cmd_topic"     default="/vesc/high_level/ackermann_cmd"   description="unicorn simple_mux input"/>
+  <arg name="speed_monitor" default="true" description="실시간 속도 비교 플롯 자동 실행 (관측 전용)"/>
   <arg name="track_source"  default="raceline"                            description="raceline -> /global_waypoints"/>
   <arg name="obstacle_topic" default="/kiss_loc/obstacle_poses"        description="회피 입력: kiss LiDAR 클러스터 PoseArray (MPCC /external_obstacles 로 remap)"/>
 
   <!-- acados 런타임 libs: unicorn.sh 가 DYLD 를 필터링하므로 launch 에서 직접 주입.
        => run_mpcc.sh 없이 'ros2 launch' 만으로 동작 (IFAC2026 방식). -->
-  <arg name="enable_logger" default="true" description="mpc_debug_logger CSV 기록 노드 on/off"/>
+  <arg name="enable_logger" default="false" description="mpc_debug_logger CSV 기록 노드 on/off (2026-07-16 기본 OFF — GP/refv 데이터 충분히 수집됨. 필요시 enable_logger:=true)"/>
 
   <set_env name="DYLD_LIBRARY_PATH" value="$(env HOME)/acados/lib:$(env DYLD_LIBRARY_PATH '')"/>
   <set_env name="LD_LIBRARY_PATH" value="$(env HOME)/acados/lib:$(env LD_LIBRARY_PATH '')"/>
@@ -63,4 +64,26 @@
   <node pkg="nonlinear_mpc_acados" exec="mpc_debug_logger" name="mpc_debug_logger" output="screen"
         if="$(var enable_logger)"/>
 
+  <!-- 실시간 속도 플롯 (관측 전용, 2026-07-02): ref_v(초록)/v_cmd=발행 drive.speed(파랑)/
+       v_actual(빨강). matplotlib 창 — 디스플레이 없으면 노드가 스스로 경고 후 종료.
+       speed_monitor:=false 로 끔. -->
+  <node pkg="nonlinear_mpc_acados" exec="speed_monitor" name="speed_monitor" output="screen"
+        if="$(var speed_monitor)"/>
+
+  <!-- Lap analyser: 매 랩 lap_time + 횡오차(d) + 벽 최소거리 (2026-07-08) -->
+  <node pkg="lap_analyser" exec="lap_analyser" name="lap_analyser" output="screen"/>
+
+  <!-- lap_analyser 입력 공급: /car_state/odom → /car_state/odom_frenet (2026-07-09.
+       실차 kiss localization launch 에 없어서 lap_analyser 가 침묵했던 원인) -->
+  <node pkg="frenet_odom_republisher" exec="frenet_odom_republisher_node"
+        name="frenet_odom_republisher" output="screen">
+    <remap from="/car_state/frenet/odom" to="/car_state/odom_frenet"/>
+  </node>
+
+  <!-- 벽 침범 경보 (T7 포팅 2026-07-09): margin<0 → ERROR+벨+/wall_alarm/hit, rviz 마커 -->
+  <!-- 2026-07-16: 벽 소스를 raceline(/global_waypoints, d 신뢰불가 — mpc_node 주석과 동일 근거)
+       대신 /centerline_waypoints 로 — 새 IQP 라인에서 전구간 5~9cm 벽 오탐 발생했던 원인 -->
+  <node pkg="nonlinear_mpc_acados" exec="wall_alarm" name="wall_alarm" output="screen">
+    <param name="wpnt_topic" value="/centerline_waypoints"/>
+  </node>
 </launch>

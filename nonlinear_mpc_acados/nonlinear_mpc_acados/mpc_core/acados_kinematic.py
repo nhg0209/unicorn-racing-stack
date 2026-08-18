@@ -19,6 +19,7 @@ via set_track_data() before setup_MPC().
 """
 import os
 import math
+import time
 import numpy as np
 import casadi as ca
 import scipy.linalg
@@ -29,41 +30,154 @@ from .model_policy import (A_MIN_DYN, clamp_a_lat_to_grip, decide_side_window,
 from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
 
 
-def codegen_paths(use_dynamic, lmpc_joint, nx_solver, dyn_mu=None):
+#: 슬랙 벌점 행 순서 — acados h 벡터의 slacked 행(idxsh)과 1:1 대응.
+_SLACK_ROWS = ('obstacle', 'corridor', 'corridor', 'a_lat', 'ellipse',
+               'obstacle2', 'obstacle3')
+
+#: config/mpc_tuning.yaml 이 없거나 깨졌을 때 쓰는 기본값 (파일과 같은 값).
+_SLACK_FALLBACK = {
+    'obstacle':  {'zl': 200.0, 'zu': 40.0, 'Zl': 120.0, 'Zu': 30.0},
+    'corridor':  {'zl': 200.0, 'zu': 20.0, 'Zl': 120.0, 'Zu': 15.0},
+    'a_lat':     {'zl': 50.0,  'zu': 50.0, 'Zl': 15.0,  'Zu': 15.0},
+    'ellipse':   {'zl': 50.0,  'zu': 50.0, 'Zl': 15.0,  'Zu': 15.0},
+    'obstacle2': {'zl': 200.0, 'zu': 40.0, 'Zl': 120.0, 'Zu': 30.0},
+    'obstacle3': {'zl': 200.0, 'zu': 40.0, 'Zl': 120.0, 'Zu': 30.0},
+}
+
+
+#: cost_weights / obstacle 섹션 기본값 (mpc_tuning.yaml 과 같은 값).
+_COST_FALLBACK = {
+    'q_cte': 15.0, 'q_lag': 80.0, 'q_psi': 10.0, 'q_v': 12.0, 'q_dd': 5.0,
+    'q_p': 1.0, 'q_side': 3.0, 'q_d_rate': 80.0, 'q_dv': 15.0,
+    'terminal_cte': 5.0, 'terminal_lag': 5.0, 'terminal_psi': 4.0,
+    'terminal_v': 3.0,
+}
+_OBS_FALLBACK = {
+    'big_m': 5.0, 'sigma_gate': 4.5, 'sigma_side': 0.5, 'line_attenuation': 0.70,
+}
+_COR_FALLBACK = {
+    'r_car_straight': 0.24, 'kappa_ref': 0.5,
+}
+_AVOID_FALLBACK = {
+    'release_fade_end': 3.0,
+    'commit_assoc_radius': 0.6,
+    'commit_follow_alpha': 0.3,
+    'commit_miss_release_s': 0.3,
+}
+
+def _tuning_path():
+    """mpc_tuning.yaml 경로. 소스트리 → ament share 순으로 찾는다.
+
+    2026-07-29: 노드는 build/ 트리에서 실행된다(egg-link). build/config 에는
+    빌드 시점에 만들어진 심링크만 있어서 새 파일은 없다 — __file__ 상대경로만
+    쓰면 조용히 폴백값으로 돌아 "파일을 고쳤는데 안 먹는" 함정이 된다.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = [os.path.normpath(os.path.join(here, '..', '..', 'config', 'mpc_tuning.yaml'))]
+    try:
+        from ament_index_python.packages import get_package_share_directory
+        cands.append(os.path.realpath(os.path.join(
+            get_package_share_directory('nonlinear_mpc_acados'),
+            'config', 'mpc_tuning.yaml')))
+    except Exception:  # noqa: BLE001
+        pass
+    # build/ 에서 돌 때: 같은 config 디렉터리의 다른 파일이 소스로 심링크돼
+    # 있으므로 그 실경로 옆에서 찾는다.
+    sib = os.path.normpath(os.path.join(here, '..', '..', 'config',
+                                        'ddrx_unified_params.yaml'))
+    if os.path.islink(sib) or os.path.exists(sib):
+        cands.append(os.path.join(os.path.dirname(os.path.realpath(sib)),
+                                  'mpc_tuning.yaml'))
+    for c in cands:
+        if os.path.exists(c):
+            return c
+    return cands[0]
+
+
+_TUNING_PATH = _tuning_path()
+
+
+def load_tuning(log=None):
+    """config/mpc_tuning.yaml → {'slack': {...}, 'cost': {...}, 'obs': {...}}.
+
+    제어 거동을 실제로 정하는 값들이라 코드에 박아두지 않고 파일로 뺐다
+    (2026-07-29). 파일이 없거나 키가 빠지면 그 항목만 기본값으로 폴백한다 —
+    튜닝 파일 하나 때문에 제어 노드가 못 뜨는 일은 없어야 한다.
+    """
+    cfg = {}
+    try:
+        import yaml
+        with open(_TUNING_PATH) as f:
+            cfg = yaml.safe_load(f) or {}
+        if log:
+            log.info(f"[tuning] {_TUNING_PATH} 로드")
+    except Exception as e:  # noqa: BLE001 — 없으면 기본값으로 계속
+        if log:
+            log.warn(f"[tuning] {_TUNING_PATH} 로드 실패({e}) — 코드 기본값 사용")
+    sl = cfg.get('slack') or {}
+    slack = {k: np.array([float((sl.get(row) or {}).get(k, _SLACK_FALLBACK[row][k]))
+                          for row in _SLACK_ROWS])
+             for k in ('zl', 'zu', 'Zl', 'Zu')}
+    cw = cfg.get('cost_weights') or {}
+    cost = {k: float(cw.get(k, d)) for k, d in _COST_FALLBACK.items()}
+    ob = cfg.get('obstacle') or {}
+    obs = {k: float(ob.get(k, d)) for k, d in _OBS_FALLBACK.items()}
+    co = cfg.get('corridor') or {}
+    cor = {k: float(co.get(k, d)) for k, d in _COR_FALLBACK.items()}
+    av = cfg.get('avoidance') or {}
+    avoid = {k: float(av.get(k, d)) for k, d in _AVOID_FALLBACK.items()}
+    if log:
+        log.info(f"[tuning] corridor slack zl={slack['zl'][1]:.0f}/Zl={slack['Zl'][1]:.0f}, "
+                 f"q_cte={cost['q_cte']:.1f} q_lag={cost['q_lag']:.1f}, "
+                 f"BIG_OBS={obs['big_m']:.1f} SIGMA_OBS={obs['sigma_gate']:.1f}, "
+                 f"R_car(직선)={cor['r_car_straight']:.2f}@κ_ref={cor['kappa_ref']:.2f}")
+    return {'slack': slack, 'cost': cost, 'obs': obs, 'corridor': cor,
+            'avoid': avoid}
+
+
+def codegen_paths(use_dynamic, nx_solver, dyn_mu=None):
     """Return (export_dir, json_path) keyed to the OCP structure.
 
     Switching kinematic<->dynamic (2026-06-10 unified layout: BOTH nx=8 — the
-    dyn/kin tag alone separates f_kin vs blended-Pacejka codegens) or toggling
-    LMPC joint-α (nx 8<->18) changes the generated solver. A FIXED export dir
-    made acados re-use the previous codegen and silently run the WRONG model —
-    the recurring "stale codegen" trap. Keying the dir/json to (model, nx, lmpc)
-    makes that axis safe (and same config warm-reuses its build instead of
-    regenerating). Tags: dyn8 / kin8 / dyn18_lmpc / kin18_lmpc.
+    dyn/kin tag alone separates f_kin vs blended-Pacejka codegens) changes the
+    generated solver. A FIXED export dir made acados re-use the previous
+    codegen and silently run the WRONG model — the recurring "stale codegen"
+    trap. Keying the dir/json to (model, nx) makes that axis safe (and same
+    config warm-reuses its build instead of regenerating). Tags: dyn8 / kin8.
 
-    NOTE: only the model/nx/lmpc axis is keyed. Other codegen-time knobs —
+    NOTE: only the model/nx axis is keyed. Other codegen-time knobs —
     N_horizon, dT, speed_target, lookahead_m, baked cost weights — are NOT in
     the tag, so changing only those reuses the same dir. Callers that vary them
     (BO/sweep harnesses) must still `rm -rf /tmp/acados_codegen_evompcc*`
     between runs to force regeneration.
     dyn_mu IS keyed (2026-06-10).
     """
-    tag = f"{'dyn' if use_dynamic else 'kin'}{int(nx_solver)}{'_lmpc' if lmpc_joint else ''}"
+    tag = f"{'dyn' if use_dynamic else 'kin'}{int(nx_solver)}"
     if dyn_mu is not None:
         # μ is baked into the tanh tire + friction-ellipse codegen — key it
         # so switching dyn_mu can never reuse a stale build (mu0p600 etc.).
         tag += f"_mu{float(dyn_mu):.3f}".replace('.', 'p')
-    return (f"/tmp/acados_codegen_evompcc_{tag}",
-            f"/tmp/acados_ocp_evompcc_{tag}.json")
+    # 2026-07-16: /tmp -> 홈 (macOS 재부팅마다 /tmp 소실 = 매번 풀빌드 수 분).
+    _base = os.path.expanduser("~/.acados_codegen")
+    os.makedirs(_base, exist_ok=True)
+    return (f"{_base}/acados_codegen_evompcc_{tag}",
+            f"{_base}/acados_ocp_evompcc_{tag}.json")
+
+
+def rebase_angles_to_ref(angles, ref):
+    """2π-주기 각 배열을 ref 근방 브랜치로 리베이스 (반환 각 − ref ∈ [−π, π]).
+
+    H10 (2026-07-03): solve()는 ψ를 unwrap(랩당 ±2π 누적)하는데 LMPC SS 교사의
+    ψ는 wrapped 로 패킹됐다. joint-α anchor 의 ψ 잔차는 raw 차이라(2π-주기 아님)
+    랩 k에서 2πk 로 자라 opti≈(2πk)² 발산 (실차 k=2/4/7 → 156/610/1866, 오프라인
+    재현 1% 이내). SS ψ를 pack 시 현재 unwrapped ψ 브랜치로 옮기면 해소.
+    """
+    a = np.asarray(angles, dtype=float)
+    return a + 2.0 * np.pi * np.round((float(ref) - a) / (2.0 * np.pi))
 
 
 class MPC:
     """acados backend mirroring the IPOPT EVO-MPCC interface."""
-
-    # Forced-reverse (STUCK release) is terminated as soon as the car has
-    # backed away this far from the wedge point, instead of always running the
-    # full ~0.5 s countdown. Bounds the backward travel so the car does not
-    # keep creeping rearward after it has already separated from the wall.
-    STUCK_REVERSE_DIST = 0.20   # [m]
 
     def __init__(self, cost_type, system_model, logger=None):
         self._log = logger if logger is not None else NullLogger("[MPC-acados]")
@@ -88,10 +202,6 @@ class MPC:
         # low-speed trap WITHOUT the unbounded-step startup divergence that
         # uncapped multi-iter SQP hit. Set onto self before setup_MPC (ROS param).
         self.nlp_solver_iters = 1
-        # Phase B3: joint-α LMPC — α as constant-dynamics STATE (nx 8→8+K),
-        # optimized jointly with x/u in the RTI solve. OFF → nx=8 baseline.
-        self._lmpc_joint = False
-        self._lmpc_cog_w = 0.02   # B3 Step2: linear cost-to-go weight (Qᵀα) in ψ_e
         # B4' error-dynamics regression: affine velocity correction added to
         # f_expl rows [vx,vy,r]. Default OFF → p[76:79]=0 → baseline f_expl.
         self._err_regr = False
@@ -207,9 +317,6 @@ class MPC:
         self.ref_v = None    # CasADi interpolant ref_v(s)
 
         # Live (rqt-tunable) weights — same names the IPOPT MPC uses.
-        self.q_cte_live     = 8.0
-        self.q_lag_live     = 200.0
-        self.q_d_delta_live = 25.0
         # R_safe=0.3 (was 0.8 → 0.4 → 0.3): with corridor h-constraint now
         # also active (R_CAR=0.10 from each wall, ≈0.35 m usable each side
         # of centerline), the 0.4 m keepout combined with a 0.4 m D_DETOUR
@@ -219,8 +326,13 @@ class MPC:
         # 0.3 m matches car_R 0.135 + obs_marker 0.135 + 0.03 m margin and
         # keeps the required offset (0.435 m) inside the corridor.
         self.R_safe_live    = 0.3
+        # 2026-08-06 최종리뷰 G1: OT 상태기계가 obstacle 제약(p_arr[7])만
+        # 축소하기 위한 전용 채널. None=비활성(R_safe_live 그대로 사용).
+        # R_safe_live 자체는 side-decide 문턱(w_car_safe)/_full_keep 이
+        # 함께 읽으므로 OT 코드가 더 이상 건드리지 않는다 — rqt 라이브
+        # 튜닝 보존 + 0.10 축소가 side-decide 를 붕괴시키던 결함 제거.
+        self.R_safe_obs_live = None
         self.a_lat_safe_live   = 6.0    # rqt: curvature-speed cap headroom
-        self.D_detour_live     = 0.15   # rqt: side-cost detour offset
         self.D_apex_live       = 0.22   # rqt: apex-bias lateral target offset.
                                         # Pulls e_c toward inside of corner.
                                         # 0 = no apex bias (pure centerline).
@@ -230,17 +342,13 @@ class MPC:
         self.commit_dist_live  = 10.0   # rqt: obstacle commit trigger distance
         self.cost_spike_thr_live = 500.0  # rqt: fallback threshold
         self.alpha_steer_live  = 0.6    # rqt: steer EMA blend (Python only)
+        # 0724 온라인 학습 스케일 조회 함수 (mpc_node 가 set; None=학습 off)
+        self._refv_scale_fn = None
+        self._alat_scale_fn = None
         # Baked codegen-time cost weights (must match q_*_def in
         # setup_MPC). Used to convert rqt-set absolute weights into the
         # scale multiplier pushed via p_sym slots. ALL major cost weights
         # are scale-wired so BO / rqt can sweep without acados rebuild.
-        self.Q_CTE_BAKED    = 9.0
-        self.Q_LAG_BAKED    = 45.0
-        self.Q_PSI_BAKED    = 10.0
-        self.Q_V_BAKED      = 8.0
-        self.Q_DD_BAKED     = 5.0    # steer regularisation |δ|²
-        self.Q_P_BAKED      = 4.0    # progress (p_v - v_max)²
-        self.Q_DRATE_BAKED  = 80.0   # steer rate (Δδ)²
         self.q_cte_scale_live   = 1.0
         self.q_lag_scale_live   = 1.0
         self.q_psi_scale_live   = 1.0
@@ -249,12 +357,12 @@ class MPC:
         self.q_p_scale_live     = 1.0
         self.q_drate_scale_live = 1.0
         self.q_dv_scale_live    = 1.0   # 2026-05-27 #8 — a_x penalty
-        self.M_slack_live   = 2.0e4
         # Static cost weights (set via param dict)
         self.q_v       = 15.0
         self.q_dv      = 15.0
         self.q_mu      = 0.05
         self.q_vp_proj = 60.0   # progress reward gamma
+        self.progress_gamma = 0.0   # B1 선형 진행보상 -gamma*p_v (0=무효). mpc_node가 codegen-time set
 
         # Solver storage
         self.solver = None
@@ -625,22 +733,7 @@ class MPC:
         # Real lateral acceleration (replaces v² tan(δ)/L kinematic form).
         a_lat_expr = vx * r_yaw
 
-        # ── Phase B3 Step 1: α as constant-dynamics STATE (joint-α LMPC) ──
-        # x_aug = [x(8), α(K)],  f_aug = [f_expl; 0_K]  (α constant over the
-        # horizon → solver optimizes α jointly with x/u in one RTI solve).
-        # Built here as AVAILABLE-BUT-UNUSED; setup_MPC wires x_aug/f_aug/
-        # xdot_aug in only when joint-α LMPC is enabled (use_lmpc + lmpc_joint).
-        # Convex-α terminal (Σαᵢ·Qᵢ + soft SS-anchor) replaces the softmin.
-        # Refs: Racing-LMPC-ROS2 racing_mpc.cpp:479-504; LMPC_REBUILD.md.
-        K_aug    = 10  # = K_LMPC (lmpc_ss slots p[18:68])
-        alpha_aug = ca.SX.sym('alpha_lmpc', K_aug)
-        x_aug    = ca.vertcat(x, alpha_aug)
-        f_aug    = ca.vertcat(f_expl, ca.SX.zeros(K_aug))
-        xdot_aug = ca.SX.sym('xdot_aug', 8 + K_aug)
-
         return dict(
-            x_aug=x_aug, f_aug=f_aug, xdot_aug=xdot_aug,
-            alpha_aug=alpha_aug, K_aug=K_aug,
             x=x, u=u, xdot=xdot, f_expl=f_expl,
             x_pos=x_pos, y_pos=y_pos, psi=psi,
             vx=vx, vy=vy, r=r_yaw, s=s, delta_prev=delta_prev,
@@ -655,6 +748,21 @@ class MPC:
     # OCP setup
     # ------------------------------------------------------------------
     def setup_MPC(self):
+        # 2026-07-29: 코드에 박혀 있던 튜닝 상수를 config/mpc_tuning.yaml 로 뺐다.
+        # cost/obstacle 값은 심볼릭 모델·W 행렬에 구워지므로 바꾸면 acados 가
+        # 재생성된다(codegen 해시가 달라짐). slack 은 재시작만으로 반영된다.
+        _tune = load_tuning(self._log)
+        _cw, _ob = _tune['cost'], _tune['obs']
+        # 곡률 비례 R_car 용 (solve 루프에서 사용 — 런타임 파라미터)
+        self._rcar_straight = _tune['corridor']['r_car_straight']
+        self._rcar_kref = max(1e-6, _tune['corridor']['kappa_ref'])
+        # 커밋 해제 페이드 끝점 [m] — 1.5 보다 커야 한다(1.5 가 페이드 시작).
+        self.RELEASE_FADE_END = max(1.6, _tune['avoid']['release_fade_end'])
+        # F3 커밋 추종 (실차 검출 지터 흡수 — 해제 검사부 주석 참조)
+        self.COMMIT_ASSOC_R = _tune['avoid']['commit_assoc_radius']
+        self.COMMIT_FOLLOW_ALPHA = _tune['avoid']['commit_follow_alpha']
+        self.COMMIT_MISS_S = _tune['avoid']['commit_miss_release_s']
+
         ocp = AcadosOcp()
         model_ac = AcadosModel()
         model_ac.name = 'mpcc_evompcc_acados'
@@ -679,20 +787,10 @@ class MPC:
         # warm-start, BO 9D search space — is shared with NO model branch.
         dyn = self._build_dynamic_model()
         u          = dyn['u']
-        # B3: joint-α swaps in the augmented state x_aug=[x(8),α(K)].
-        if self._lmpc_joint:
-            x        = dyn['x_aug']
-            f_expl   = dyn['f_aug']
-            xdot     = dyn['xdot_aug']
-            alpha_sym = dyn['alpha_aug']
-            K_aug    = dyn['K_aug']
-            nx       = 8 + K_aug
-        else:
-            x        = dyn['x']
-            f_expl   = dyn['f_expl']
-            xdot     = dyn['xdot']
-            alpha_sym = None
-            nx       = 8
+        x        = dyn['x']
+        f_expl   = dyn['f_expl']
+        xdot     = dyn['xdot']
+        nx       = 8
         x_         = dyn['x_pos']
         y_         = dyn['y_pos']
         psi        = dyn['psi']
@@ -736,6 +834,13 @@ class MPC:
                 gp_z = ca.vertcat(dyn['vx'], dyn['vy'], dyn['r'],
                                   dyn['delta'], dyn['a_x'])
                 mu = build_casadi_residual(gp_z, gp_p)
+                # 0812 GP 저속 게이트 — GP 는 vx>1.5 데이터로만 학습돼 정지·저속에서
+                # 평균회귀(요가속 편향 주입 → 출발 조향 스윙, 0811 아젠다 ⑤①).
+                # 게이트: vx 1.0 중심 시그모이드 — 정지 0, 1.5 에서 ~0.95, 학습영역 1.0.
+                # 후진(vx<0)도 자연히 0 (GP 학습영역 밖).
+                # (0813: nuc14 트리에서 역이식 — 두 트리 통합)
+                _gp_gate = 0.5 * (1 + ca.tanh((dyn["vx"] - 1.0) / 0.3))
+                mu = _gp_gate * mu
                 # B_d: 3 GP outputs -> state rows vx(3), vy(4), r(5).
                 # Pad residual to f_expl width: 8 (plain) or 18 (joint-α
                 # LMPC appends 10 α-states AFTER the 8 physical, so rows
@@ -792,12 +897,32 @@ class MPC:
         #   72 left_x  73 left_y  74 right_x  75 right_y
         # B4' error regression (3, const across horizon):
         #   76 e_corr_vx  77 e_corr_vy  78 e_corr_r
-        n_p_const = 18 + 54 + 3   # 18 기존 + 50 SS + 4 LMPC scalars + 3 B4' e_corr (const across horizon)
+        # P2 Stage-B (0722o) 2번째 장애물 슬롯 (4):
+        #   79 obs2_x  80 obs2_y  81 side2  82 e_c_obs2
+        #   부재 시 sentinel(x=1e6, side2=0) → gate2=0 → h_obs2 항등만족 = 기존과 동일
+        # 0723b 3번째 장애물 슬롯 (4): 83 obs3_x  84 obs3_y  85 side3  86 e_c_obs3
+        #   (obs2와 동일 sentinel 규약. Stage-B가 전방 최근접 2개를 obs2/obs3에 채움 —
+        #    3개 동시 시야에서 3번째가 무제약이던 한계 제거.)
+        # 0723u A2-확장 (1): 87 obs1_mode — 0=반평면(정적, 기존), 1=유클리드 원형
+        #   (동적 상대: per-stage 예측 위치 keepout → 추종/추월이 최적화에서 자연 발생)
+        n_p_const = 18 + 54 + 3 + 4 + 4 + 1 + 2   # ... + obs1_mode + refv/alat scale
         n_p_stage = 4             # 4 corridor (per-stage)
-        n_p_total = n_p_const + n_p_stage   # 79
+        n_p_total = n_p_const + n_p_stage   # 90
         K_LMPC = 10
         p_sym = ca.SX.sym('p_sym', n_p_total)
         e_corr_sym = p_sym[76:79]   # B4' velocity-row correction (vx,vy,r)
+        # P2 Stage-B: 2번째 장애물 (부재=sentinel)
+        obs2_x = p_sym[79]; obs2_y = p_sym[80]
+        side2_pref = p_sym[81]; e_c_obs2_p = p_sym[82]
+        # 0723b obs3 슬롯
+        obs3_x = p_sym[83]; obs3_y = p_sym[84]
+        side3_pref = p_sym[85]; e_c_obs3_p = p_sym[86]
+        obs1_mode = p_sym[87]   # 0723u: 0=반평면 / 1=원형(동적)
+        # 0724 온라인 학습 속도 프로파일 (docs/superpowers/specs/2026-07-24-refv-*)
+        # per-stage 스케일: 기본 1.0 → 기존 식과 동일. mpc_node 가 학습기
+        # (SpeedProfileLearner) 조회값을 stage 별로 주입.
+        refv_scale_p = p_sym[88]   # ref_v_raw 배율
+        alat_scale_p = p_sym[89]   # a_lat_safe 배율 (κ-cap 상향/하향)
         obs_dmin = p_sym[0]; obs_x = p_sym[1]; obs_y = p_sym[2]
         side_pref = p_sym[3]
         D_detour_p     = p_sym[4]   # side-cost detour offset (rqt)
@@ -874,9 +999,9 @@ class MPC:
         # which stays under the backstop (no per-corner slack spike).
         # Smooth fmin via 0.5·(a+b−sqrt((a−b)²+ε)) — differentiable
         # everywhere, kink rounded over ~0.03 m/s.
-        ref_v_raw  = self.ref_v(s_periodic)
+        ref_v_raw  = self.ref_v(s_periodic) * refv_scale_p
         kappa_at_s = self.abs_kappa_lut(s_periodic)
-        v_kin_max  = ca.sqrt(a_lat_safe_p / (kappa_at_s + 1e-3))
+        v_kin_max  = ca.sqrt(a_lat_safe_p * alat_scale_p / (kappa_at_s + 1e-3))
         EPS_VM     = 1e-3
         # CiMPCC g(κ) 원복 (alpha=2 도 너무 강함, mpc 가 vx=0 local min 갇힘).
         # Heilmeier CSV ref_v 이미 곡률+brake 포함 → 충분.
@@ -919,7 +1044,7 @@ class MPC:
         #   d=2  m: σ=1.0→0.14   σ=1.3→0.31
         #   d=3  m: σ=1.0→0.01   σ=1.3→0.07
         #   d=4  m: σ=1.0→3e-4   σ=1.3→0.008
-        sigma_side = 0.5  # 1.3 → 1.0 → 0.7 → 0.5. Tighter side cost
+        sigma_side = _ob['sigma_side']  # (mpc_tuning.yaml) 원래 0.5 # 1.3 → 1.0 → 0.7 → 0.5. Tighter side cost
                           # window so MPC barely detours unless very close
                           # to obstacle. Proximity at d=1m: 0.14, at
                           # d=0.7m: 0.37 — engagement starts at ~1 m.
@@ -932,8 +1057,10 @@ class MPC:
         # (±0.35 usable), so side cost and corridor cost don't compete.
         # Required clearance from obstacle still met: detour 0.25 + R_safe
         # 0.3 (with car edge buffer) = 0.55 m closest approach center-to-center.
-        # D_DETOUR_SIDE now read from p_sym[4] (rqt-tunable). Default value
-        # in self.D_detour_live = 0.15. Live tunable per-cycle.
+        # D_detour_p (=p_sym[4]) is extracted above but never referenced here —
+        # side_term is hardcoded off, so the slot is unused. Kept as a fixed
+        # 0.0 placeholder (2026-07-28 대청소: 상위 rqt live-param 제거) purely
+        # to preserve p_sym index numbering — do NOT remove the slot itself.
         # |side_pref| ∈ {0, 1}; smooth approx avoids non-differentiable |·|
         # 1e-3 (was 1e-9): keeps sqrt's gradient bounded near 0 — with
         # 1e-9, ∂sqrt/∂x at x=0 is ~16k, which makes the GN Hessian
@@ -965,9 +1092,20 @@ class MPC:
         # detour is "free" and not fighting the centerline pull. Gated by d²
         # to the obstacle (line 837): no obstacle → sentinel → d²≈1e12 →
         # proximity_atten=0 → attenuation=1.0 (Phase-B-identical).
-        sigma_atten     = 1.0
+        # 0722y σ_atten 1.0→4.0: 게이트 σ4.5와 동조. σ1.0은 q_cte(라인당김)가
+        # 장애물 1.5m 밖에서 87~100% 유지 → h_obs slack이 못 이겨 계획이
+        # 0.4~0.55에서 정체(전 bag 공통, "0.3~0.45 접촉"의 진짜 구조 원인).
+        # side_term은 코드상 0(꺼짐) — detour는 오로지 h_obs vs q_cte 균형.
+        sigma_atten     = 4.0
         proximity_atten = ca.exp(-d2 / (2.0 * sigma_atten * sigma_atten))
-        attenuation     = 1.0 - 0.95 * proximity_atten
+        # 0723l 0.95→0.70: 장애물 옆 라인 복원력을 30% 남김. 완전 감쇠(5%)는
+        # U자 정점에서 조향 지연발 다이브(-0.18→-0.40, bag 14_07 FAIL 3/6)를
+        # 되당길 힘이 없음. h_obs 경계는 hard(zl 2000)라 회피 폭은 불변 —
+        # 경계 밖 오버슛에만 복원력 작용. ★codegen 재생성 필요.
+        # 0723v: 원형(동적) 모드에선 감쇠 안 함 — 추종 시 "자기 라인 유지 + 감속"
+        # (bag 15_33: 상대 근처 |e_c| 0.23/0.51로 라인이탈하던 것 차단). 추월은
+        # 라인이탈 비용을 이기는 진행이득이 있을 때만 = "확실할 때만"의 최적화적 표현.
+        attenuation     = 1.0 - _ob['line_attenuation'] * proximity_atten * (1.0 - obs1_mode)
         att_kappa   = ca.SX(1.0)
         sqrt_att    = ca.sqrt(attenuation * att_kappa + 1e-6)
         # 8th residual: δ − δ_prev → steer-rate cost. Penalises stage-to-
@@ -1019,7 +1157,8 @@ class MPC:
                               sqrt_q_p_scale     * (p_v - _spd_tgt),
                               side_term,
                               sqrt_q_drate_scale * (delta - delta_prev),
-                              sqrt_q_dv_scale    * a_x_input)
+                              sqrt_q_dv_scale    * a_x_input,
+                              p_v)   # [9] 선형 진행보상용 (W=0, psi linear)
         # ── LMPC terminal cost addition (Rosolia 2018 §IV.B, simplified) ──
         # 2026-05-28 #18: terminal value-function approximation via softmin
         # over Sampled Safe Set (K=10 nearest historical states).
@@ -1072,22 +1211,7 @@ class MPC:
         # beyond the horizon). Reuses BO-tunable q_v scale; baked terminal emphasis x3.
         # 2026-06-10 unified layout: vx is a state in BOTH modes → vterm everywhere.
         vterm_res = sqrt_q_v_scale * (vx_for_cost - ref_v_expr)
-        if self._lmpc_joint and alpha_sym is not None:
-            # ── B3 Step 2: convex-α terminal (Racing-LMPC racing_mpc.cpp:479-504) ──
-            # x_N soft-anchored to the SS convex hull Σαⱼ·SSⱼ, and the cost-to-go
-            # Qᵀα minimized LINEARLY (CONL ψ_e) → the solver picks the convex combo
-            # of safe-set points with lowest time-to-go that x_N can reach. Gated
-            # by √(lmpc_w_p): inert (= baseline) when LMPC off, engages once the
-            # safe set is populated (lmpc_w>0).
-            _wl   = ca.sqrt(lmpc_w_p + 1e-12)
-            _ssa  = ca.mtimes(lmpc_ss_states, alpha_sym)          # Σαⱼ·SSⱼ  (4: px,py,ψ,vx)
-            _wanc = ca.sqrt(ca.SX([20.0, 20.0, 2.0, 2.0]))        # per-state hull-slack weight
-            _anc  = _wl * (_wanc * (x_N_4 - _ssa))                # 4 soft-anchor residuals
-            _cog  = _wl * ca.dot(lmpc_ss_Q, alpha_sym)            # cost-to-go (linear in ψ_e)
-            y_expr_e = ca.vertcat(e_c, e_l, yaw_err, vterm_res,
-                                  _anc[0], _anc[1], _anc[2], _anc[3], _cog)
-        else:
-            y_expr_e = ca.vertcat(e_c, e_l, yaw_err, vterm_res, lmpc_residual)
+        y_expr_e = ca.vertcat(e_c, e_l, yaw_err, vterm_res, lmpc_residual)
 
         # ---- Constraints (h) — minimal set for stable SQP_RTI ----
         # 1) obstacle half-plane (replaces 2026-05-06 the non-convex annulus
@@ -1123,15 +1247,46 @@ class MPC:
         # or when no obstacle is selected (side_pref≈0). Big-M on the
         # complementary side keeps the constraint trivially satisfied
         # outside the active zone.
-        SIGMA_OBS = 1.0   # 2.0 → 1.4 → 1.0. Half-plane gate fires in
-                          # a tighter window (~0.7 m vs ~1 m). Less
-                          # detour anticipation, smaller swerve.
+        SIGMA_OBS = _ob['sigma_gate']   # (mpc_tuning.yaml) 원래 4.5 # 0722f: 2.5→4.5. σ2.5는 commit(6-10m)에도 게이트≈0.06으로
+                          # 제약이 잠들어, 계획이 2.5m 안에서 0.9m를 급횡이동해야
+                          # 했음(동역학 불가→slack→0.5m 접촉, bag 15_04 계측).
+                          # 4.5: 5m서 게이트 0.54, 3m서 0.80 — 점진 detour 개시.
+                          # (2026-06-29 was 2.5; 원래 1.0)
         prox_obs  = ca.exp(-d2 / (2.0 * SIGMA_OBS * SIGMA_OBS))
         abs_side  = ca.sqrt(side_pref * side_pref + 1e-3)
         gate      = abs_side * prox_obs           # ≈ 1 only when active
-        BIG_OBS   = 50.0
-        h_obs = (gate * (side_pref * (e_c - e_c_obs_p) - (R_safe_p + R_CAR))
-                 + (1.0 - gate) * BIG_OBS)
+        # 0722z BIG-M 누수 픽스 50→5: h = gate·raw + (1−gate)·BIG 구조에서
+        # gate가 근접에서도 1이 아니라(σ4.5, d=0.42 → 0.996) (1−gate)·50 ≈ +0.2가
+        # 위반을 공짜로 허용 — 계획 평형이 정확히 keepout−0.2에 앉음 (bag 20_37
+        # OBSDBG 실증: d=0.41서 raw=−0.23, sl0=0 = solver 눈엔 무위반).
+        # 몇 주간 "간격 0.3~0.45 접촉"의 구조 원인. R_safe/zl 튜닝이 안 먹힌 이유.
+        # 5.0: d=0.42 누수 0.02m(무해) / d=5m 허용 4.3m(원거리 OFF 기능 유지).
+        BIG_OBS   = _ob['big_m']   # (mpc_tuning.yaml) 원래 5.0
+        h_obs_hp = (gate * (side_pref * (e_c - e_c_obs_p) - (R_safe_p + R_CAR))
+                    + (1.0 - gate) * BIG_OBS)
+        # 0723u 원형 모드 (동적 상대, A2-확장): 스테이지별 예측 위치 (obs_x,obs_y)
+        # = pred_obs[k] 중심의 유클리드 keepout. 종+횡 모두 척력 → 상대가 빠르면
+        # 감속(추종), 느리면 우회(추월)가 최적화에서 자연 발생 — 상태머신 없음.
+        # 부재 시 sentinel(1e6) → d² 거대 → 항상 만족 (게이트 불필요).
+        _R_dyn = R_safe_p + R_CAR
+        h_obs_circ = d2 - _R_dyn * _R_dyn
+        h_obs = (1.0 - obs1_mode) * h_obs_hp + obs1_mode * h_obs_circ
+        # ---- (1b) P2 Stage-B: 2번째 장애물 half-plane (동일 형식) ----
+        # #1 release 전에도 #2가 제약에 존재 → 가림 쌍/연속 장애물을 계획이
+        # 하나의 연속 곡선으로 처리 (release 대기 1.5m 갭 제거).
+        d2_2 = (x_ - obs2_x) ** 2 + (y_ - obs2_y) ** 2
+        prox_obs2 = ca.exp(-d2_2 / (2.0 * SIGMA_OBS * SIGMA_OBS))
+        abs_side2 = ca.sqrt(side2_pref * side2_pref + 1e-3)
+        gate2 = abs_side2 * prox_obs2
+        h_obs2 = (gate2 * (side2_pref * (e_c - e_c_obs2_p) - (R_safe_p + R_CAR))
+                  + (1.0 - gate2) * BIG_OBS)
+        # ---- (1c) 0723b: 3번째 장애물 half-plane (동일 형식) ----
+        d2_3 = (x_ - obs3_x) ** 2 + (y_ - obs3_y) ** 2
+        prox_obs3 = ca.exp(-d2_3 / (2.0 * SIGMA_OBS * SIGMA_OBS))
+        abs_side3 = ca.sqrt(side3_pref * side3_pref + 1e-3)
+        gate3 = abs_side3 * prox_obs3
+        h_obs3 = (gate3 * (side3_pref * (e_c - e_c_obs3_p) - (R_safe_p + R_CAR))
+                  + (1.0 - gate3) * BIG_OBS)
         # ---- (2) corridor ----
         w_left  = sin_t * (left_x - ref_x) - cos_t * (left_y - ref_y)
         w_right = sin_t * (right_x - ref_x) - cos_t * (right_y - ref_y)
@@ -1159,11 +1314,7 @@ class MPC:
         # path h-constraint (NOT slacked) it forces servo-feasible steering and
         # kills the cycle-to-cycle hunting that the soft q_drate cost could not.
         steer_rate = (u[1] - delta_prev) / self.dT
-        if self._lmpc_joint and alpha_sym is not None:
-            # B3: α simplex Σα=1 — hard eq row, then steer-rate row (both NOT slacked).
-            model_ac.con_h_expr = ca.vertcat(h_obs, h_corridor_top, h_corridor_bot, a_lat, h_ellipse, ca.sum1(alpha_sym), steer_rate)
-        else:
-            model_ac.con_h_expr = ca.vertcat(h_obs, h_corridor_top, h_corridor_bot, a_lat, h_ellipse, steer_rate)
+        model_ac.con_h_expr = ca.vertcat(h_obs, h_corridor_top, h_corridor_bot, a_lat, h_ellipse, h_obs2, h_obs3, steer_rate)
         # C-STEER node-0: path con_h above covers stages 1..N-1; the PUBLISHED
         # control is u_0 (stage 0). A stage-0 h-constraint with ONLY the steer-
         # rate (state-only rows would be constant at the fixed x0 → drop them)
@@ -1198,11 +1349,11 @@ class MPC:
         # 2026-05-27: baked weights 강화 — 박힘 ↓ 위해 centerline 추종 강.
         # BO 가 scale 0.3~5 학습 → effective q_cte=4.5~75, q_lag=24~400, etc.
         # local minima 회피 위해 baked 는 paper VPMPCC 의 중간 값.
-        q_cte_def     = 15.0    # 9→15 (centerline lateral 추종 강)
-        q_lag_def     = 80.0    # 45→80 (along-track 강)
-        q_psi_def     = 10.0
-        q_v_def       = 12.0
-        q_dd_def      = 5.0
+        q_cte_def     = _cw['q_cte']    # 9→15 (centerline lateral 추종 강)
+        q_lag_def     = _cw['q_lag']    # 45→80 (along-track 강)
+        q_psi_def     = _cw['q_psi']
+        q_v_def       = _cw['q_v']
+        q_dd_def      = _cw['q_dd']
                                 # × 20 stages now totals ~48 vs q_lag 60,
                                 # so solver feels significant cost for
                                 # large |δ|. Without this the solver was
@@ -1213,8 +1364,8 @@ class MPC:
                                 # the solver to commit to moderate δ
                                 # spread across the horizon, killing the
                                 # prediction-line trembling.
-        q_p_def       = 1.0     # progress pull 약화 (4→1) — 보수적 시작, BO 가 scale 학습
-        q_side_def    = 3.0     # very soft hint (was 12 → 3, mirrors
+        q_p_def       = _cw['q_p']     # progress pull 약화 (4→1) — 보수적 시작, BO 가 scale 학습
+        q_side_def    = _cw['q_side']     # very soft hint (was 12 → 3, mirrors
                                 # IPOPT MPCC.py W_SIDE=3). With the new
                                 # attenuation that fades q_cte/q_lag near
                                 # the obstacle, side cost no longer needs
@@ -1223,16 +1374,16 @@ class MPC:
                                 # much: it produced cost spikes when the
                                 # car was forced to choose between the
                                 # detour line and the half-plane edge.
-        q_d_rate_def  = 80.0    # 원복 (S2 100 으로 안 효과)
+        q_d_rate_def  = _cw['q_d_rate']    # 원복 (S2 100 으로 안 효과)
                                 # 30 → 50 → 80. Strong rate cost minimises
                                 # corner→straight transition wobble.
-        q_dv_def      = 15.0    # 2026-05-27 #8: longitudinal accel a_x penalty.
+        q_dv_def      = _cw['q_dv']    # 2026-05-27 #8: longitudinal accel a_x penalty.
                                 # 이전엔 self.q_dv = 15 만 정의되고 cost 연결
                                 # 안 됨 → 9th residual 로 연결.
-        ny   = 9   # 9 residuals (cte, lag, psi, v, dd, p, side, drate, dv)
+        ny   = 10  # 9 + p_v[9] (B1 선형 진행보상용, W=0)
         # terminal: vx cost-to-go residual (vterm) before lmpc_residual — BOTH modes
-        # (2026-06-10 unified layout). B3 joint: lmpc_residual(1) → anchor(4)+cog(1) = +4.
-        ny_e = 9 if self._lmpc_joint else 5
+        # (2026-06-10 unified layout).
+        ny_e = 5
         # ---- Cost: CONVEX_OVER_NONLINEAR (Phase B0, 2026-06-04) ----
         # Migrated from NONLINEAR_LS. With ψ(r) = ½·rᵀWr and r = y_expr this
         # reproduces the LS cost EXACTLY (same Gauss-Newton Hessian), but the
@@ -1240,17 +1391,12 @@ class MPC:
         # progress reward −γ·p_v (B1) that pure NLS cannot express.
         W_mat = np.diag([q_cte_def, q_lag_def, q_psi_def,
                          q_v_def, q_dd_def, q_p_def, q_side_def,
-                         q_d_rate_def, q_dv_def])
+                         q_d_rate_def, q_dv_def, 0.0])   # [9]=p_v: 제곱기여 0
         # W_e: vx terminal cost-to-go (q_v_def*3) before the LMPC residual
         # (last entry 1.0, since residual already carries sqrt(lmpc_w)).
         # 2026-06-10 unified layout: same in both modes.
-        if self._lmpc_joint:
-            # [ec×5, el×5, yaw×4, vterm×3, anchor×4 (√wt in residual→1), cog (linear→0)]
-            W_e_diag = [q_cte_def * 5.0, q_lag_def * 5.0, q_psi_def * 4.0, q_v_def * 3.0,
-                        1.0, 1.0, 1.0, 1.0, 0.0]
-        else:
-            W_e_diag = [q_cte_def * 5.0, q_lag_def * 5.0,
-                        q_psi_def * 4.0, q_v_def * 3.0, 1.0]
+        W_e_diag = [q_cte_def * _cw['terminal_cte'], q_lag_def * _cw['terminal_lag'],
+                    q_psi_def * _cw['terminal_psi'], q_v_def * _cw['terminal_v'], 1.0]
         W_e_mat = np.diag(W_e_diag)
         ocp.cost.cost_type   = 'CONVEX_OVER_NONLINEAR'
         ocp.cost.cost_type_0 = 'CONVEX_OVER_NONLINEAR'
@@ -1266,14 +1412,11 @@ class MPC:
         ocp.model.cost_r_in_psi_expr   = _r_conl
         ocp.model.cost_r_in_psi_expr_0 = _r_conl
         ocp.model.cost_r_in_psi_expr_e = _r_conl_e
-        ocp.model.cost_psi_expr   = 0.5 * ca.mtimes([_r_conl.T,   ca.DM(W_mat),   _r_conl])
-        ocp.model.cost_psi_expr_0 = 0.5 * ca.mtimes([_r_conl.T,   ca.DM(W_mat),   _r_conl])
-        if self._lmpc_joint:
-            # B3 Step2: cost-to-go Qᵀα enters ψ_e LINEARLY (last residual, W_e=0).
-            ocp.model.cost_psi_expr_e = (0.5 * ca.mtimes([_r_conl_e.T, ca.DM(W_e_mat), _r_conl_e])
-                                         + self._lmpc_cog_w * _r_conl_e[ny_e - 1])
-        else:
-            ocp.model.cost_psi_expr_e = 0.5 * ca.mtimes([_r_conl_e.T, ca.DM(W_e_mat), _r_conl_e])
+        # B1 선형 진행보상: -gamma*p_v (r[9]). gamma=0이면 기존과 동일. CONL이라 GN Hessian 불변(PSD).
+        _prog = float(getattr(self, "progress_gamma", 0.0))
+        ocp.model.cost_psi_expr   = 0.5 * ca.mtimes([_r_conl.T,   ca.DM(W_mat),   _r_conl]) - _prog * _r_conl[9]
+        ocp.model.cost_psi_expr_0 = 0.5 * ca.mtimes([_r_conl.T,   ca.DM(W_mat),   _r_conl]) - _prog * _r_conl[9]
+        ocp.model.cost_psi_expr_e = 0.5 * ca.mtimes([_r_conl_e.T, ca.DM(W_e_mat), _r_conl_e])
         ocp.cost.yref   = np.zeros(ny)
         ocp.cost.yref_0 = np.zeros(ny)
         ocp.cost.yref_e = np.zeros(ny_e)
@@ -1287,14 +1430,7 @@ class MPC:
         Tf = ocp.solver_options.tf
 
         # ---- Initial state placeholder ----
-        if self._lmpc_joint:
-            # B3: fix only the 8 physical states at t=0; α(K) left FREE so the
-            # solver optimizes the convex combination jointly with x/u.
-            ocp.constraints.idxbx_0 = np.arange(8)
-            ocp.constraints.lbx_0 = np.zeros(8)
-            ocp.constraints.ubx_0 = np.zeros(8)
-        else:
-            ocp.constraints.x0 = np.zeros(nx)
+        ocp.constraints.x0 = np.zeros(nx)
 
         # ---- Input bounds ----
         # 2026-06-10 unified layout: u = [a_x, δ, p_v] in BOTH modes — bounds on
@@ -1307,7 +1443,7 @@ class MPC:
         # → ACADOS_MINSTEP 캐스케이드. -3.0 이면 충분히 감속 가능하고
         # 솔버가 미친 brake 못 함.
         a_min_dyn = A_MIN_DYN   # 솔버 제동한계 — model_policy 단일소스 (ref_v a_long 과 동기)
-        a_max_dyn =  6.0   # 7.51 → 4.0 (Agent R-round3 Fix 2). F1TENTH RWD @ vx≈0
+        a_max_dyn = 10.0   # 2026-07-03 2차: 8→10 (모터 실가속 ~2.5라 장식 상한, 사용자 결정)
                            # grip ~4 m/s². 7.51 (sim max_accel) 은 saturated 되어
                            # solver 가 "instant fix" 권장 → traj 예측 unrealistic →
                            # zigzag + over-shoot. 4 가 realistic, 차도 추종 가능.
@@ -1323,13 +1459,6 @@ class MPC:
         ocp.constraints.idxbx = np.array([3, 4, 5])
         ocp.constraints.lbx   = np.array([0.0, -10.0, -20.0])
         ocp.constraints.ubx   = np.array([self.v_max + 0.5, 10.0, 20.0])   # 작은 margin (0.5 m/s). v_max 까지 빡빡하게 강제하면 solver IPM 발산 → 12m teleport. 원래 +2 로 풀어줌.
-        if self._lmpc_joint:
-            # B3: α ∈ [0,1] state bound on the K augmented states (all stages).
-            _Ka = int(dyn['K_aug'])
-            self._lmpc_K_aug = _Ka   # needed for per-stage ubx padding below
-            ocp.constraints.idxbx = np.concatenate([ocp.constraints.idxbx, np.arange(8, 8 + _Ka)])
-            ocp.constraints.lbx   = np.concatenate([ocp.constraints.lbx, np.zeros(_Ka)])
-            ocp.constraints.ubx   = np.concatenate([ocp.constraints.ubx, np.ones(_Ka)])
 
         # ---- h bounds (only h_obs + a_lat now) ----
         # uh[0] HUGE: obstacle absence is encoded by setting obs_x/y to a
@@ -1351,21 +1480,17 @@ class MPC:
         #   flat region; the steer-output EMA filter further damps any wobble.
         a_lat_max = max(8.0, float(self.a_lat_safe_eff()) + 1.0)
         self._log.info(f"[MPC-acados] a_lat hard cap = {a_lat_max:.2f} (a_lat_safe={a_lat_max - 1.0:.2f} + 1.0 backstop)")
-        # h order: [h_obs, corr_top, corr_bot, a_lat, ellipse, (Σα if joint)]
+        # h order: [h_obs, corr_top, corr_bot, a_lat, ellipse, h_obs2, h_obs3, steer-rate]
         # ellipse 행: 0 ≤ h ≤ 1 (h 는 제곱합이라 하한 0 은 자연 충족 — 무해).
-        if self._lmpc_joint:
-            ocp.constraints.lh = np.array([0.0, 0.0, 0.0, -a_lat_max, 0.0, 1.0, -self.sv_max])  # Σα=1 eq, steer-rate
-            ocp.constraints.uh = np.array([1e15, 1e15, 1e15, a_lat_max, 1.0, 1.0, self.sv_max])
-        else:
-            ocp.constraints.lh = np.array([0.0, 0.0, 0.0, -a_lat_max, 0.0, -self.sv_max])  # +steer-rate (hard)
-            ocp.constraints.uh = np.array([1e15, 1e15, 1e15, a_lat_max, 1.0, self.sv_max])
+        ocp.constraints.lh = np.array([0.0, 0.0, 0.0, -a_lat_max, 0.0, 0.0, 0.0, -self.sv_max])  # +h_obs2(5)+h_obs3(6), steer-rate (hard)
+        ocp.constraints.uh = np.array([1e15, 1e15, 1e15, a_lat_max, 1.0, 1e15, 1e15, self.sv_max])
         # C-STEER stage-0 bounds: steer-rate only, hard (not slacked).
         ocp.constraints.lh_0 = np.array([-self.sv_max])
         ocp.constraints.uh_0 = np.array([self.sv_max])
         # Slack on first five — corridor, obstacle, a_lat, ellipse can be
         # transiently violated. Slack absorbs without triggering cascade.
-        ocp.constraints.idxsh = np.array([0, 1, 2, 3, 4])   # ellipse(4) 포함, Σα 비slack
-        ns = 5
+        ocp.constraints.idxsh = np.array([0, 1, 2, 3, 4, 5, 6])   # +h_obs2(5)+h_obs3(6); Σα 비slack
+        ns = 7
         ocp.constraints.lsh = np.zeros(ns)
         ocp.constraints.ush = np.zeros(ns)
         # Per-constraint slack tuning — second reduction. Quadratic Zl was
@@ -1382,14 +1507,34 @@ class MPC:
         #   idx 4 (ellipse):     zl=50,  Zl=15   (a_lat 행과 동일 — spec §2)
         # (2026-06-02 corridor 6배 강화 시도 → 역효과 5.1접촉/랩: 강한 corridor
         #  push 가 반대편 클립 유발. 원복.)
-        ocp.cost.zl = np.array([40.0, 20.0, 20.0, 50.0, 50.0])
-        ocp.cost.zu = np.array([40.0, 20.0, 20.0, 50.0, 50.0])
-        ocp.cost.Zl = np.array([30.0, 15.0, 15.0, 15.0, 15.0])
-        ocp.cost.Zu = np.array([30.0, 15.0, 15.0, 15.0, 15.0])
+        # 2026-07-29 재시도 (corridor 20/15 → 200/120, 장애물 행과 동급):
+        #   근거 — 존 없는 bag 15_07 에서 48초 8충돌, 접촉 지점의 실여유가
+        #   s20~22 에서 -0.043 m. 코리도 한계는 벽-R_car(0.30) 인데 차는
+        #   벽-0.155 까지 감 = 0.145 m 위반. 그 비용이 zl+2·Zl·s = 20+2·15·0.145
+        #   ≈ 24 로 진행이득에 밀림. 장애물 행(200/120)의 1/10 이라 벽이 항상
+        #   최약 탈출구였다. 존 4개로 트랙 58% 를 덮던 것은 이 약한 기본값을
+        #   구간마다 손으로 메운 반창고.
+        #   ⚠ 2026-06-02 실패(반대편 클립)를 반드시 재확인할 것 — 좌/우 접촉을
+        #   따로 세고 랩 수를 충분히 볼 것. 악화되면 이 블록만 되돌리면 된다.
+        # 2026-07-29: 값 자체는 config/mpc_tuning.yaml 에서 읽는다 (수정 편의).
+        _slack = _tune['slack']
+        ocp.cost.zl = _slack['zl']
+        ocp.cost.zu = _slack['zu']
+        ocp.cost.Zl = _slack['Zl']
+        ocp.cost.Zu = _slack['Zu']
+        # ── 2026-07-09 국소 corridor 하드닝 ────────────────────────────
+        # 스텁(s≈21.6) 같은 지점에서 soft corridor 가 진행이득에 뚫리는 문제:
+        # slack 기본값을 저장해두고 solve() 가 per-stage 로 존 안에서만 corridor
+        # 행(1,2) 벌금을 corridor_hard_zones 의 factor 배로 cost_set (codegen 불필요).
+        # 위 ocp.cost.* 와 같은 출처(mpc_tuning.yaml)를 쓴다 — 두 곳이 어긋나면
+        # 존 진입/이탈 때 벌점이 튀므로 반드시 같은 dict 에서 복사한다.
+        self._slack_def = {k: v.copy() for k, v in _slack.items()}
+        self._slack_last = {}          # stage → 마지막 적용 factor (전환시에만 cost_set)
+        self.corridor_hard_zones = []  # [(s0, s1, factor)] — mpc_node 가 채움
 
         # ---- Initial parameter values (overridden every cycle) ----
         ocp.parameter_values = np.zeros(n_p_total)
-        ocp.parameter_values[4]  = self.D_detour_live       # D_DETOUR
+        ocp.parameter_values[4]  = 0.0                      # D_DETOUR slot: dead (side_term hardcoded 0), kept for index stability
         ocp.parameter_values[5]  = self.R_car_live          # R_CAR
         ocp.parameter_values[6]  = self.q_cte_scale_live    # q_cte scale
         ocp.parameter_values[7]  = self.R_safe_live         # R_safe
@@ -1402,6 +1547,8 @@ class MPC:
         ocp.parameter_values[15] = self.q_p_scale_live      # q_p scale (progress)
         ocp.parameter_values[16] = self.q_drate_scale_live  # q_d_rate scale
         ocp.parameter_values[17] = self.q_dv_scale_live     # q_dv scale (a_x)
+        ocp.parameter_values[88] = 1.0   # refv_scale (학습 off 기본)
+        ocp.parameter_values[89] = 1.0   # alat_scale
 
         # ---- Solver options ----
         # NONLINEAR_LS form makes the Gauss-Newton Hessian = J^T·W·J
@@ -1461,12 +1608,53 @@ class MPC:
                        % (ocp.solver_options.levenberg_marquardt, self.use_dynamic))
 
         # Codegen + build — dir/json keyed to (model, nx) so kinematic<->dynamic
-        # <->LMPC toggles never reuse a stale codegen (see codegen_paths()).
+        # toggles never reuse a stale codegen (see codegen_paths()).
         ocp.code_export_directory, json_path = codegen_paths(
-            self.use_dynamic, self._lmpc_joint, self._nx_solver,
+            self.use_dynamic, self._nx_solver,
             dyn_mu=float(self.dyn_mu))
-        self._log.info("[MPC-acados] generating solver (~30 s first time)...")
-        self.solver = AcadosOcpSolver(ocp, json_file=json_path)
+        # ── 2026-07-16 warm-reuse: AcadosOcpSolver 기본값은 매 시작 풀 재생성
+        # (generate=True/build=True). GP가 동역학에 구워진 뒤 생성 단계가 수 분 →
+        # dylib+json+스탬프(GP ckpt 경로·mtime)가 일치하면 로드만 한다.
+        # GP ckpt 변경 → 스탬프 불일치 → 자동 풀 재생성. 그 외 codegen-baked
+        # 노브(N/dT/speed_target/lookahead/dyn_mu 외 가중치) 변경 시엔 기존 관례대로
+        # rm -rf /tmp/acados_codegen_evompcc* 필수 (codegen_paths NOTE 참조).
+        _stamp_path = json_path + ".stamp"
+        _gp_ck = os.path.expanduser(getattr(self, 'gp_casadi_ckpt', '') or '')
+        try:
+            _gp_sig = "%s:%d" % (_gp_ck, int(os.path.getmtime(_gp_ck))) if _gp_ck and os.path.isfile(_gp_ck) else "nogp"
+        except OSError:
+            _gp_sig = "nogp"
+        # 0724: p/nx 차원도 스탬프에 포함 — 차원 바뀐 codegen 을 조용히
+        # warm-reuse 하는 함정 방지 (오늘 np 88→90 미감지 실사고).
+        _gp_sig += ":np%d:nx%d" % (int(ocp.dims.np), int(self._nx_solver))
+        # 0729: mpc_tuning.yaml 의 codegen-baked 값(cost_weights/obstacle)도
+        # 스탬프에 포함 — 이전엔 가중치를 바꿔도 스탬프가 못 보고 옛 솔버를
+        # warm-reuse 해서 "yaml 을 고쳤는데 그대로"가 됐다 (rm -rf 수동 관례).
+        # slack/corridor 는 런타임 반영이라 제외 (불필요한 재생성 방지).
+        _gp_sig += ":tw%s" % ",".join(
+            "%g" % _cw[k] for k in sorted(_cw))
+        _gp_sig += ":ob%s" % ",".join(
+            "%g" % _ob[k] for k in sorted(_ob))
+        _lib_ok = os.path.isdir(ocp.code_export_directory) and any(
+            f.startswith("libacados_ocp_solver") for f in os.listdir(ocp.code_export_directory))             if os.path.isdir(ocp.code_export_directory) else False
+        _stamp_ok = False
+        try:
+            _stamp_ok = open(_stamp_path).read().strip() == _gp_sig
+        except OSError:
+            pass
+        _reuse = _lib_ok and os.path.isfile(json_path) and _stamp_ok
+        if _reuse:
+            self._log.info("[MPC-acados] warm-reusing codegen %s (rm -rf /tmp/acados_codegen_evompcc* 로 강제 재생성)",
+                           ocp.code_export_directory)
+        else:
+            self._log.info("[MPC-acados] generating solver (GP 포함 수 분 걸림, 최초/GP변경시)...")
+        self.solver = AcadosOcpSolver(ocp, json_file=json_path,
+                                      generate=not _reuse, build=not _reuse)
+        if not _reuse:
+            try:
+                open(_stamp_path, "w").write(_gp_sig)
+            except OSError:
+                pass
         # GP residual wrap (gp_residual_wrapper.wrap_solver_with_gp) needs the
         # AcadosOcp object — setup_MPC built it as a local, so stash it.
         self.ocp = ocp
@@ -1491,17 +1679,18 @@ class MPC:
         """
         if ox > 1e5 or oy > 1e5 or self.kappa_grid is None:
             return 0.0, 0.0
-        n = len(self.kappa_grid)
-        best_d2 = float("inf"); best_s = 0.0
-        for i in range(n):
-            s = i * self.kappa_ds
-            cxi = float(self.center_lut_x(s))
-            cyi = float(self.center_lut_y(s))
-            d2 = (cxi - ox) ** 2 + (cyi - oy) ** 2
-            if d2 < best_d2:
-                best_d2 = d2; best_s = s
-        rxc = float(self.center_lut_x(best_s))
-        ryc = float(self.center_lut_y(best_s))
+        # 0722q numpy 그리드 캐시: 기존 브루트포스(1541점×CasADi 콜2)는 호출당
+        # 10-20ms — obs2 스캔이 매 사이클 호출하며 solve 8.5→30ms 폭증의 진범
+        # (bag 16_30: 감지0 구간 9.4ms vs 감지시 30.6ms). 1회 샘플링 후 argmin.
+        if getattr(self, '_cgrid_x', None) is None:
+            n0 = len(self.kappa_grid)
+            self._cgrid_s = np.arange(n0) * self.kappa_ds
+            self._cgrid_x = np.array([float(self.center_lut_x(s)) for s in self._cgrid_s])
+            self._cgrid_y = np.array([float(self.center_lut_y(s)) for s in self._cgrid_s])
+        _i = int(np.argmin((self._cgrid_x - ox) ** 2 + (self._cgrid_y - oy) ** 2))
+        best_s = float(self._cgrid_s[_i])
+        rxc = float(self._cgrid_x[_i])
+        ryc = float(self._cgrid_y[_i])
         dxt = float(self.center_lut_dx(best_s))
         dyt = float(self.center_lut_dy(best_s))
         nrm = math.sqrt(dxt * dxt + dyt * dyt) + 1e-9
@@ -1518,14 +1707,41 @@ class MPC:
         right_points = np.zeros((self.N, 2))
         left_points = np.zeros((self.N, 2))
         idx_s = 6
+        # ── 0813 라이브 벽마진 존 (rqt: mzone_*_live) ─────────────────
+        # track_loader 상수존은 기동 시 1회 굽지만, 여기는 매 사이클 벽을
+        # 샘플링하므로 여기서 당기면 rqt 로 즉시 반영된다. A-B 캡슐 안의
+        # "좌벽" 샘플점만 센터 방향으로 extra(램프) 만큼 이동 — 솔버 코리도
+        # 전용이라 side-decide/뷰어의 원 LUT 는 그대로(보수 방향 불일치 없음).
+        _mz_ex = float(getattr(self, 'mzone_extra_live', 0.0))
+        _mz_on = _mz_ex > 1e-4
+        if _mz_on:
+            _mzA = np.array([float(getattr(self, 'mzone_ax_live', 0.0)),
+                             float(getattr(self, 'mzone_ay_live', 0.0))])
+            _mzB = np.array([float(getattr(self, 'mzone_bx_live', 0.0)),
+                             float(getattr(self, 'mzone_by_live', 0.0))])
+            _mzab = _mzB - _mzA
+            _mzab2 = float(_mzab @ _mzab) + 1e-9
+            _mzrf = float(getattr(self, 'mzone_rfull_live', 0.9))
+            _mzrz = max(float(getattr(self, 'mzone_rzero_live', 1.8)), _mzrf + 1e-3)
         for k in range(1, self.N + 1):
             sk = float(prev_soln[k, idx_s]) % self.path_length
             right_points[k - 1, :] = np.array([self.right_lut_x(sk),
                                                self.right_lut_y(sk)],
                                               dtype=object).squeeze()
-            left_points[k - 1, :] = np.array([self.left_lut_x(sk),
-                                              self.left_lut_y(sk)],
-                                             dtype=object).squeeze()
+            lp = np.array([self.left_lut_x(sk),
+                           self.left_lut_y(sk)], dtype=object).squeeze().astype(float)
+            if _mz_on:
+                _t = min(1.0, max(0.0, float((lp - _mzA) @ _mzab) / _mzab2))
+                _dseg = float(np.hypot(*(lp - (_mzA + _t * _mzab))))
+                _w = min(1.0, max(0.0, (_mzrz - _dseg) / (_mzrz - _mzrf)))
+                if _w > 0.0:
+                    _cp = np.array([float(self.center_lut_x(sk)),
+                                    float(self.center_lut_y(sk))])
+                    _dir = _cp - lp
+                    _n = float(np.hypot(*_dir))
+                    if _n > 1e-6:
+                        lp = lp + (_mz_ex * _w / _n) * _dir
+            left_points[k - 1, :] = lp
         return right_points, left_points
 
     def _kappa_at(self, s):
@@ -1576,7 +1792,8 @@ class MPC:
                 best = [d, ox, oy]
         return best
 
-    def decide_side_pref(self, s_obs, e_c_obs,
+    def decide_side_pref(self, s_obs, e_c_obs, obs_xy=None,
+                         extra_up=0.0, extra_dn=0.0,
                          win_back=1.0, win_fwd=2.0, ds=0.25, margin=0.1):
         """Window-aware side decision (2026-06-11). Replaces the
         single-point top-2 boundary-distance compare whose centerline tie
@@ -1602,16 +1819,249 @@ class MPC:
                       - cos_t * (float(self.left_lut_y(sk)) - cy))
             w_r[i] = (sin_t * (float(self.right_lut_x(sk)) - cx)
                       - cos_t * (float(self.right_lut_y(sk)) - cy))
-        return decide_side_window(e_c_obs, w_l, w_r, margin=margin)
+        # 2026-07-21 side 판정 임계 = 실제 solver keepout(R_safe+R_car)에 맞춤.
+        # (기존 기본 0.21은 실제 필요폭 0.60보다 작아, 못 지나갈 좁은 쪽을
+        #  통과가능으로 오판 → 좁은 쪽으로 회피 시도 → 벽·장애물 사이 STALL.
+        #  bag 16_22 s13: obs e_c=-0.50, 오른쪽 gap 0.46<0.60인데 0.21로 통과판정.)
+        w_car_safe = float(self.R_safe_live) + float(self.R_car_live)
+        # ── P1 (2026-07-22): 점유맵 실측 판정 — 첫 시도 정답 ──────────────
+        # w-LUT 기반 room이 실벽과 불일치(bag 0721: "불가"쪽 통과성공/"가능"쪽
+        # STUCK) → mpc_node가 주입한 map_raycast로 장애물 위치에서 solver e_c축
+        # (∇e_c=(sin_t,−cos_t)) 양방향 실벽거리를 직접 측정. 부호=e_c축 그대로.
+        _rc = getattr(self, 'map_raycast', None)
+        if _rc is not None:
+            sk0 = float(s_obs) % L
+            dxt = float(self.center_lut_dx(sk0)); dyt = float(self.center_lut_dy(sk0))
+            nrm = math.hypot(dxt, dyt) + 1e-9
+            sin_t, cos_t = dyt / nrm, dxt / nrm
+            # 0722c 원점 = raw 장애물 xy (LUT 재구성 오차 제거); 없으면 재구성 폴백
+            if obs_xy is not None:
+                obx, oby = float(obs_xy[0]), float(obs_xy[1])
+            else:
+                obx = float(self.center_lut_x(sk0)) + float(e_c_obs) * sin_t
+                oby = float(self.center_lut_y(sk0)) - float(e_c_obs) * cos_t
+            # 0722f 스왑 원복: bag 15_04 LUT계측으로 확정 — 솔버 벽밴드(wl/wr)와
+            # 물리실측이 원래 방향(+e_c=(sin,−cos))에서 일치. 0722c 스왑은
+            # stop-guard 감속을 "통과"로 오독한 데서 나온 오류였음.
+            r_up = _rc(obx, oby, sin_t, -cos_t)    # solver +e_c 방향 실벽거리
+            r_dn = _rc(obx, oby, -sin_t, cos_t)    # solver −e_c 방향
+            if r_up is not None and r_dn is not None:
+                # 0722b: 통과 필요 room = keepout(0.6, 장애물↔차중심) + R_car(벽↔차중심).
+                # 0.6만 보면 "장애물은 피하고 벽에 박는" 쪽 허용 (bag 14_18 s0.1:
+                # room 0.68 쪽 선택→0.70 벌리다 벽 STALL. 헤어핀 불안정의 실체).
+                w_car_safe = w_car_safe + float(self.R_car_live)
+                # 0722g 헤어핀 보너스: 곡률 안쪽 통과시 호 수축으로 유클리드 간극
+                # ≈ e_c간극×(1−e/R) — R1.7·e0.9면 실제 0.47m (bag 15_10 접촉
+                # 0.29-0.4 일치). 곡률 비례로 필요 room 상향 (κ0.6→+0.9).
+                _ik = int((sk0 / self.kappa_ds)) % len(self.kappa_grid)
+                _ko = abs(float(self.kappa_grid[_ik]))
+                # 0723e κ보너스 ½ 재축소 (0.75κ→0.4κ, cap 0.45→0.25): 코너는 공간이
+                # 제일 없는 곳인데 보너스가 keepout을 최대 +0.45 부풀려 좁은 코너
+                # 통과 자체를 막음 (bag 13_21: s7.0 keepout 1.19 / s22.4 1.35 → 벽충돌).
+                w_car_safe = w_car_safe + min(0.25, 0.4 * _ko)
+                # 0722h: 30s 막힌쪽 제외를 여기(room 검사와 함께)서 — 이전엔 commit
+                # 블록이 room 검사 없이 반대쪽 강제 → 재시도가 좁은쪽 돌진(더 깊숙히).
+                _key = round(float(s_obs) % L * 2.0) / 2.0
+                _stuck = set()
+                _rsm = getattr(self, '_recent_stuck', {}).get(_key)
+                # 0722l TTL 30→8s: 30s는 랩(~17s)을 넘겨 다음 랩 fresh까지 차단
+                # (bag 15_52 t=41.7: room 2.13인데 side=0 정지루프). 8s=한 접근 스케일.
+                if _rsm is not None and time.monotonic() - _rsm[1] < 8.0:
+                    _stuck = _rsm[0]
+                # P2 Stage-A: 이웃 병합 — 그 side 최외곽 멤버까지의 폭(extra)만큼
+                # 요구 room 가산 (병합 장애물의 실질 반폭 확장)
+                ok_up = (r_up - float(extra_up) >= w_car_safe) and (+1 not in _stuck)
+                ok_dn = (r_dn - float(extra_dn) >= w_car_safe) and (-1 not in _stuck)
+                # ── 2026-08-13 달성가능 keepout 기반 side 선택 (hall bag2 실측) ──
+                # raw room 비교는 두 문제를 낳는다: ①센터 장애물(e_c≈0)에선 검출
+                # 노이즈 ±5cm 가 side 를 결정(랩마다 반전), ②좁은 쪽이 낙점되면
+                # 아래 _keep_eff 의 max(0.40,…) 플로어가 코리도 한계(_cor_reach)를
+                # 넘어 "장애물 vs 코리도 soft 모순"이 부활 → 실통과 간격 0.26~0.29
+                # (요구 0.30 미달 = 스침, hall_0813 bag2 7/15회). 선택 단계에서
+                # 코리도 한계까지 반영한 달성가능 keepout 을 양쪽 계산해 큰 쪽을
+                # 고른다 — 좁은 쪽은 아예 선택되지 않는다.
+                _kb_o = min(0.15, 0.25 * _ko)
+                # ── 0813 σ-비례 keepout: 트래커 불확실성(σ)만큼 넓게 피한다.
+                # 방금 본 물체(σ 큼)=넓게, 여러 랩 본 물체(σ 수렴 3cm)=타이트.
+                _sig_b = 0.0
+                _hints = getattr(self, 'obs_sigma_hints', None)
+                if _hints and obs_xy is not None:
+                    for _hx, _hy, _hs in _hints:
+                        if (_hx - obx) ** 2 + (_hy - oby) ** 2 < 0.36:
+                            _sig_b = min(0.20, 2.0 * float(_hs))
+                            break
+                _full_keep = (float(self.R_safe_live) + _kb_o + _sig_b
+                              + float(self.R_car_live))
+                _wlx = float(self.left_lut_x(sk0)); _wly = float(self.left_lut_y(sk0))
+                _wrx = float(self.right_lut_x(sk0)); _wry = float(self.right_lut_y(sk0))
+                _cx = float(self.center_lut_x(sk0)); _cy = float(self.center_lut_y(sk0))
+                _wl = sin_t * (_wlx - _cx) - cos_t * (_wly - _cy)
+                _wr = sin_t * (_wrx - _cx) - cos_t * (_wry - _cy)
+                _hi = max(_wl, _wr); _lo = min(_wl, _wr)
+                _cr_up = (_hi - float(self.R_car_live)) - float(e_c_obs)
+                _cr_dn = float(e_c_obs) - (_lo + float(self.R_car_live))
+                _ach_up = min(_full_keep, (r_up - float(extra_up)) - 0.32, _cr_up - 0.12)
+                _ach_dn = min(_full_keep, (r_dn - float(extra_dn)) - 0.32, _cr_dn - 0.12)
+                # ── 0813 D6 side 기억: 같은 물체(0.6m)는 이전에 고른 side 승계.
+                # 검출이 부호를 넘나들어도 랩마다 방향이 안 바뀐다 (동전던지기
+                # 소멸). 그 side 가 여전히 ok/ach 양수일 때만 — 막히면 재결정.
+                if not hasattr(self, '_side_mem'):
+                    self._side_mem = {}
+                _smk = (round(obx * 2.0) / 2.0, round(oby * 2.0) / 2.0)
+                _sm = self._side_mem.get(_smk)
+                _now_sm = time.monotonic()
+                if _sm is not None and _now_sm - _sm[1] > 20.0:
+                    _sm = None
+                if ok_up and ok_dn:
+                    if _sm is not None and (
+                            (_sm[0] > 0 and _ach_up > 0.0)
+                            or (_sm[0] < 0 and _ach_dn > 0.0)):
+                        _side = _sm[0]
+                    else:
+                        _side = +1 if _ach_up >= _ach_dn else -1
+                elif ok_up:
+                    _side = +1
+                elif ok_dn:
+                    _side = -1
+                else:
+                    # 0723c narrow-pass: 풀 요구(0.9+κ)는 미달이어도 물리 최소
+                    # (NARROW_ROOM=0.60 = 장애물↔차중심 0.38 + 차↔벽 0.22)만
+                    # 되면 넓은 쪽으로 서행 통과 — "항상 성공" (bag 13_01: 직선
+                    # 3번째 room 0.7-0.8이 요구 0.9 미달로 매랩 BLOCK-STOP되던 것).
+                    # 0723d 문턱 0.60→0.70: 실측 최소폭 = 장애물쪽 0.31(반폭 합)
+                    # + 벽쪽 코너 0.33 ≈ 0.68 (bag 13_10 산수. gym 직사각형 판정
+                    # 픽스와 세트 — 그 전 원형 0.44 기준으론 0.77도 불가였음).
+                    nk_up = (r_up - float(extra_up) >= 0.70) and (+1 not in _stuck)
+                    nk_dn = (r_dn - float(extra_dn) >= 0.70) and (-1 not in _stuck)
+                    if nk_up and nk_dn:
+                        _side = +1 if (r_up - extra_up) >= (r_dn - extra_dn) else -1
+                    elif nk_up:
+                        _side = +1
+                    elif nk_dn:
+                        _side = -1
+                    else:
+                        _side = 0    # 물리적으로도 불가 → BLOCK-STOP
+                # 0723c keepout 공간맞춤(shift): 선택 side의 실측 room에 keepout이
+                # 안 들어가면 그 차이만큼 solver 경계를 안쪽으로 — h_obs vs corridor
+                # soft 모순(횡마비→정면 STUCK, bag 13_01 s14.5 3/6랩)의 원천 제거.
+                # 적용은 e_c_obs를 pass쪽으로 shift (p만 바뀜, codegen 불필요).
+                # LUT 벽 e_c (shift clamp + 계측 로그 겸용 — 0723e에서 앞으로 이동)
+                _wlx = float(self.left_lut_x(sk0)); _wly = float(self.left_lut_y(sk0))
+                _wrx = float(self.right_lut_x(sk0)); _wry = float(self.right_lut_y(sk0))
+                _cx = float(self.center_lut_x(sk0)); _cy = float(self.center_lut_y(sk0))
+                _wl = sin_t * (_wlx - _cx) - cos_t * (_wly - _cy)
+                _wr = sin_t * (_wrx - _cx) - cos_t * (_wry - _cy)
+                if _side != 0:
+                    _room_s = (r_up - float(extra_up)) if _side > 0 else (r_dn - float(extra_dn))
+                    _kb_o = min(0.15, 0.25 * _ko)   # 0723e 동조
+                    _full_keep = float(self.R_safe_live) + _kb_o + float(self.R_car_live)
+                    # 0723d 벽마진 0.32 (차 코너 도달거리).
+                    # 0723e LUT 코리도 한계 추가: 요구 경계가 solver LUT 벽을 넘으면
+                    # obstacle slack(2000)이 corridor slack(80)을 눌러 계획이 벽 관통
+                    # (bag 13_21: s7.0 경계 +0.87 = LUT wr +0.86 → WALL 충돌,
+                    # s22.4 경계 -0.60 < wl -0.48 → WALL 충돌). 경계를 코리도
+                    # (벽 − R_car) 안으로 강제.
+                    _hi = max(_wl, _wr); _lo = min(_wl, _wr)
+                    if _side > 0:
+                        _cor_reach = (_hi - float(self.R_car_live)) - float(e_c_obs)
+                    else:
+                        _cor_reach = float(e_c_obs) - (_lo + float(self.R_car_live))
+                    # 2026-08-07 통과밴드 0.12 (bag 16_40_59, s35.1 STUCK×2):
+                    # _cor_reach 에 경계를 딱 맞추면 "요구 경계 == 코리도 한계"
+                    # 가 되어 차 중심의 허용 밴드가 정확히 0(한 점) — 6.8 m/s
+                    # 접근 후 횡이동을 못 하고 0.34 m 정면 낑김. 실측: e_obs
+                    # +0.17, 벽 −0.74 → keepout 0.55 요구 e≤−0.39 vs 코리도
+                    # 한계 −0.39. 경계를 한계보다 0.12 안쪽으로 당겨 유한 폭을
+                    # 보장한다 (넓은 곳은 _cor_reach 가 안 물려 무영향).
+                    # 0813 D3 수정: 플로어 0.40 이 _cor_reach 캡을 되엎으면
+                    # "요구 경계 > 코리도 한계" 모순이 부활해 h_obs(2000) vs
+                    # 코리도 슬랙 힘겨루기로 계획이 압축된다 (kftrk1 심 실측:
+                    # 센터 장애물 2곳에서 13/15 STUCK, 실차 hall bag2 0.26~0.29
+                    # 스침). 플로어 자체를 코리도 도달가능치로 캡 — 좁은 곳은
+                    # 얇게라도 "모순 없이" 통과하고, 얇은 만큼은 감속(통과속도
+                    # d_keep 티어)이 보상한다.
+                    _keep_eff = max(min(0.40, _cor_reach - 0.12),
+                                    min(_full_keep, _room_s - 0.32,
+                                        _cor_reach - 0.12))
+                    _shift = _full_keep - _keep_eff
+                    # (0723r tight-pass 속도 티어는 0723s에서 원복 — 흐름 우선)
+                    _nd = getattr(self, '_narrow_shift', None)
+                    if _nd is None:
+                        _nd = {}
+                        self._narrow_shift = _nd
+                    _nkey = (round(obx * 2.0) / 2.0, round(oby * 2.0) / 2.0)
+                    if _shift > 1e-3:
+                        _nd[_nkey] = (_shift, time.monotonic())
+                    else:
+                        _nd.pop(_nkey, None)
+                    if len(_nd) > 32:
+                        _nnow = time.monotonic()
+                        for _k in [k for k, v in _nd.items() if _nnow - v[1] > 10.0]:
+                            _nd.pop(_k, None)
+                # (0722e 계측 _wl/_wr는 0723e에서 shift clamp용으로 위로 이동)
+                _shift_log = 0.0
+                if _side != 0:
+                    _shift_log = float(_shift)
+                    # 0813 D6: side 기억 갱신 (20s TTL, 사용 시 연장)
+                    self._side_mem[_smk] = (_side, _now_sm)
+                    if len(self._side_mem) > 64:
+                        self._side_mem = {
+                            k: v for k, v in self._side_mem.items()
+                            if _now_sm - v[1] < 20.0}
+                self._log.info(
+                    "[MPC] side-decide(MAP) s_obs=%.1f e_c=%+.2f room_up=%.2f "
+                    "room_dn=%.2f keepout=%.2f -> side=%+d shift=%.2f | LUT벽 e_c: wl=%+.2f wr=%+.2f"
+                    " | ach u/d=%.2f/%.2f",
+                    s_obs, e_c_obs, r_up, r_dn, w_car_safe, _side, _shift_log, _wl, _wr,
+                    _ach_up, _ach_dn)
+                return _side
+        # 2026-07-21e 라벨 완전 배제 — e_c 축 직접 판정 (첫 시도 정답이 목표).
+        # 좌/우 "라벨"(w_l/w_r)은 트랙 방향·경계추출 이음새에 따라 뒤집혀 어떤
+        # 라벨→부호 매핑도 전 구간 일관 불가 (bag 20_19/20_25: 같은 보정이 s51.5는
+        # 3/3 성공, s18.3은 반대). 대신 샘플별 상한 hi=max(wl,wr)/하한 lo=min(wl,wr)
+        # 로 코리도 span을 라벨 무관하게 재구성 → +e_c쪽 여유 vs −e_c쪽 여유 비교.
+        # 반환 부호 = e_c 방향 그 자체 (solver h_obs와 동일 축) — 매핑 단계 없음.
+        e = float(e_c_obs)
+        hi = [max(float(a), float(b)) for a, b in zip(w_l, w_r)]
+        lo = [min(float(a), float(b)) for a, b in zip(w_l, w_r)]
+        room_up = min(hi) - e          # +e_c 방향 병목 여유
+        room_dn = e - max(lo)          # −e_c 방향 병목 여유
+        if room_up < w_car_safe and room_dn < w_car_safe:
+            _side = 0                  # 양측 불가 → BLOCK-STOP
+        elif room_up < w_car_safe:
+            _side = -1
+        elif room_dn < w_car_safe:
+            _side = +1
+        else:
+            _side = +1 if room_up >= room_dn else -1
+        self._log.info(
+            "[MPC] side-decide s_obs=%.1f e_c=%+.2f room_up=%.2f room_dn=%.2f "
+            "keepout=%.2f -> side=%+d",
+            s_obs, e_c_obs, room_up, room_dn, w_car_safe, _side)
+        return _side
+
+    def _narrow_shifted(self, ox, oy, side, e_obs):
+        """0723c: narrow-pass keepout shift 적용 — decide가 저장한 shift만큼
+        e_c_obs를 pass쪽으로 옮겨 solver 요구 경계를 실측 room 안으로 клamp.
+        해당 장애물에 shift가 없거나(공간 충분) 오래됐으면(10s) 원값 그대로."""
+        _nd = getattr(self, '_narrow_shift', None)
+        if not _nd or side == 0:
+            return e_obs
+        _it = _nd.get((round(float(ox) * 2.0) / 2.0, round(float(oy) * 2.0) / 2.0))
+        if _it is None or time.monotonic() - _it[1] > 10.0:
+            return e_obs
+        return float(e_obs) - float(side) * _it[0]
 
     # ------------------------------------------------------------------
     # Solve
     # ------------------------------------------------------------------
-    def solve(self, initial_state, obstacles):
+    def solve(self, initial_state, obstacles, pred_obs=None):
         """initial_state: numpy length 7 from ROS node = [x, y, psi, vx, vy, r, s].
         We extend internally to 8: append delta_prev = the steer command we
         sent last cycle (initialised to 0). 2026-06-10 unified layout: SAME
         in both kinematic and dynamic modes.
+        pred_obs: optional (N+1, 2) per-stage predicted obstacle (x, y). None →
+        constant current position for every stage (legacy behaviour).
         """
         L = float(self.path_length)
 
@@ -1700,15 +2150,40 @@ class MPC:
             # seed_v so s grows during warm-start. Skip slip dynamics —
             # vy, r held constant so X0 stays well-conditioned.
             self.u0[:, 0] = 0.0      # a_x (no acceleration in seed)
-            self.u0[:, 1] = 0.0      # delta
+            self.u0[:, 1] = 0.0      # delta (overwritten per-stage below, curvature-aware)
             self.u0[:, 2] = seed_v   # p_v (input, can be set free)
             self.X0[0, :self.n_states] = initial_state
-            if self._lmpc_joint:
-                self.X0[0, self.n_states:] = 1.0 / max(1, self._nx_solver - self.n_states)  # uniform α seed
+            # δ=0 (straight-line) seed is fine off a straight but on a corner
+            # it sends the rollout well outside the corridor before SQP-RTI's
+            # single iteration/cycle can pull it back in (measured: κ=0.5 →
+            # 92 cm off at 2 m ahead, 206 cm off at 3.2 m ahead, vs a track
+            # half-width of only 0.5-1.1 m) → QP infeasible → MINSTEP → first
+            # command corrupt → wall. This path also fires after STUCK
+            # recovery and obstacle commit/release mid-corner (see block
+            # comment above), so it's not just a start-line issue.
+            # Fix: seed steer from the raceline curvature at each rolled-out
+            # s, δ_k = atan(L_wb·κ(s_k)) — the steer the curvature actually
+            # needs, not 0. self.kappa_grid is SIGNED (κ=dθ/ds, θ=unwrap(
+            # atan2(dy,dx)) — see its construction ~line 484); the cost's own
+            # curvature feed-forward term (line ~1149,
+            # atan(self.L·kappa_at_s·sign(_signed_k))) reconstructs this same
+            # signed quantity from abs_kappa_lut × sign(signed_kappa_lut), so
+            # atan(self.L·κ) directly (no extra sign flip) is the confirmed
+            # convention. self.L here is wheelbase (0.307 m, set at __init__
+            # line 192/428) — NOT the local `L` (=self.path_length, track
+            # length) used a few lines above for `s0 % L`; the two must not
+            # be confused.
+            _n_kg = len(self.kappa_grid)
+            _steer_lim = 0.4  # rad — no self.max_steer/delta_max attr in this class
             for k in range(self.N):
                 xk = self.X0[k, :]
                 uk = self.u0[k, :]
-                delta_, p_ = uk[1], uk[2]
+                _sk = float(xk[IDX_S]) % L
+                _idx = int(_sk / self.kappa_ds) % _n_kg
+                _kappa_k = float(self.kappa_grid[_idx])
+                delta_ = float(np.clip(np.arctan(self.L * _kappa_k), -_steer_lim, _steer_lim))
+                uk[1] = delta_
+                p_ = uk[2]
                 psi_ = xk[2]
                 vx_  = xk[3]            # vx stays constant in seed
                 delta_prev_ = xk[7]
@@ -1736,6 +2211,7 @@ class MPC:
         # (No s-wrap fixup needed — solver-internal s is monotonic.)
 
         # ---- Per-cycle parameters ----
+        self._obs_blocked_d = None   # BLOCK-STOP: 매 사이클 리셋 (커밋 성공/장애물 소실시 자동 해제)
         sel = self.select_front_obstacle(initial_state[0], initial_state[1],
                                          initial_state[2], obstacles)
         self.dbg_n_obs_input = len(obstacles) if obstacles is not None else 0
@@ -1752,6 +2228,8 @@ class MPC:
         sel_is_real = sel[1] < 1e5
         if not hasattr(self, '_committed_obs'):
             self._committed_obs = None
+        # 커밋 해제 페이드 배수 (1.0 = 통상, 0.0 = 해제 직전). 아래에서 갱신.
+        self._release_fade = 1.0
 
         # Release current commitment if (a) car drove past it in s, (b) it
         # is no longer in the obstacle list, or (c) we drifted very far.
@@ -1761,19 +2239,84 @@ class MPC:
             delta_s = (s_car - cs_obs) % L
             car_to_obs = math.hypot(initial_state[0] - cox,
                                      initial_state[1] - coy)
-            obs_still_present = False
+            # ── 2026-07-31 F3: 커밋이 검출 지터를 따라가게 (실차 필수) ──
+            # 이전에는 "커밋 좌표 0.3 m 이내 검출 존재"로 유지를 판정했는데,
+            # 실차 라이다 검출은 같은 물체가 프레임마다 0.1~0.3 m 흔들린다
+            # (bag 14_31: 물체 1개가 0.1 m 격자 수십 셀에 퍼짐). 게이트를
+            # 벗어나는 순간 "committed obs removed" 로 즉시 해제되어, 실차
+            # 3개 백 연속 side_pref 0% — 회피가 발동 자체를 못 했다.
+            #   ① 연관: 반경 COMMIT_ASSOC_R 안 최근접 검출 (반경만 넓히면
+            #      옆 물체를 오인하므로 EMA 추종과 세트)
+            #   ② 추종: 커밋 좌표를 EMA 로 검출 쪽으로 끌어당기고 s_obs/제약선도
+            #      같이 이동 (제약이 실제 물체를 따라감). side 는 절대 재계산
+            #      안 함 — 회피 방향 일관성의 기초.
+            #   ③ 해제: 연속 COMMIT_MISS_S 초 미검출일 때만 (검출률 62% 백도
+            #      있었음 — 한 프레임 빠짐으로 끊으면 안 됨)
+            _assoc = None
             if obstacles is not None and len(obstacles) > 0:
-                obs_still_present = any(
-                    (op[0] - cox) ** 2 + (op[1] - coy) ** 2 < 0.09  # 0.3 m
-                    for op in obstacles)
+                # 0813 속도비례 종방향 게이트: 고속에서 정적 장애물 검출이 진행방향으로
+                # v·지연 만큼 밀려 보인다(bag 16_52 v6.7: 0.7s 에 s +3m). 등방 0.6 이면
+                # 새 물체로 오인→커밋 플래핑. 횡은 0.6 유지(옆 물체 보호), 종만 확장.
+                ASSOC_V_GAIN = 0.20          # [s] 6.7m/s → 종 반경 0.6+1.34 ≈ 1.9m
+                _v_now = abs(float(initial_state[3]))
+                _r_lat = self.COMMIT_ASSOC_R
+                _r_lon = self.COMMIT_ASSOC_R + ASSOC_V_GAIN * _v_now
+                _psi = float(initial_state[2])
+                _cpsi, _spsi = math.cos(_psi), math.sin(_psi)
+                _bd = None
+                for op in obstacles:
+                    _dx, _dy = op[0] - cox, op[1] - coy
+                    _lon = _dx * _cpsi + _dy * _spsi      # 차 진행방향 성분
+                    _lat = -_dx * _spsi + _dy * _cpsi
+                    _n2 = (_lon / _r_lon) ** 2 + (_lat / _r_lat) ** 2   # 타원 정규화 거리²
+                    if _n2 < 1.0 and (_bd is None or _n2 < _bd):
+                        _bd = _n2
+                        _assoc = (float(op[0]), float(op[1]))
+            _mono = monotonic_now()
+            if _assoc is not None:
+                _a = self.COMMIT_FOLLOW_ALPHA
+                _nx = cox + _a * (_assoc[0] - cox)
+                _ny = coy + _a * (_assoc[1] - coy)
+                # 제약선(e_eff)은 클러스터 병합값이라 절대치 재계산 대신
+                # 기준 e_c 의 변화량만큼 평행이동한다.
+                _s_old, _e_old = self._obstacle_frenet(cox, coy)
+                _s_new, _e_new = self._obstacle_frenet(_nx, _ny)
+                cox, coy = _nx, _ny
+                cs_obs = _s_new
+                ce_c = ce_c + (_e_new - _e_old)
+                self._committed_obs = (cox, coy, cs_obs, cside, ce_c)
+                self._commit_seen_t = _mono
+            obs_still_present = (
+                _assoc is not None
+                or (getattr(self, '_commit_seen_t', None) is not None
+                    and _mono - self._commit_seen_t < self.COMMIT_MISS_S))
+            # (0722u 조기 release 0.3m 실험은 원복 — #1 옆구리에서 보호가 걷혀
+            #  즉시 #2에 박고, 멀리 있는 다음 단일까지 obs2로 잡혀 단일도 회귀.
+            #  bag 17_24: t=6.2 release Δs0.36 → 1.2s 뒤 STUCK 실증.)
+            # 0723o release 콜드리셋 제거: 제약 해제는 relaxation이라 warm 해가
+            # 그대로 유효 — 리셋하면 통과 직후마다 계획 점프 (장애물 6개 = 랩당
+            # 6회 킥). bag 14_28 조향 출렁임(1.4-2.5Hz, 장애물 스케일)의 주요원.
+            # 커밋 측 콜드리셋(0722v, 로컬미니멈 탈출)은 유지.
+            # 2026-07-31 계단 해제 → 페이드. Δs>1.5 에서 한 사이클에
+            # side_pref ±1 → 0 으로 끊으면 h_obs 제약이 즉시 사라져 계획이 라인으로
+            # 급복귀하고, 그 관성이 반대쪽 오버슛으로 나온다 (bag 17_35: d +0.63 →
+            # -0.22, 0.85 m 왕복 = 눈에 보이는 "헤딩 흔들림"의 실체. 조향 자체는
+            # 오히려 장애물 구간이 더 작다 — |δ| 0.05 vs 장애물 없는 구간 0.17).
+            # side_pref 는 p_sym[3] 으로 연속값을 받고 h_obs 가 |side_pref| 게이트로
+            # 부드럽게 꺼지도록 이미 설계돼 있다 — 계단으로 쓰던 것을 바로잡는다.
+            # 0723o 가 콜드리셋을 없앤 것과 같은 취지(통과 직후 계획 점프 제거).
+            self._release_fade = 1.0
             if 1.5 < delta_s < 0.5 * L:
-                self._log.info("[MPC] passed committed obs (Δs=%.2f m) — release", delta_s)
-                self._committed_obs = None
-                self.WARM_START = False
+                if delta_s >= self.RELEASE_FADE_END:
+                    self._log.info("[MPC] passed committed obs (Δs=%.2f m) — release", delta_s)
+                    self._committed_obs = None
+                else:
+                    self._release_fade = float(
+                        (self.RELEASE_FADE_END - delta_s)
+                        / (self.RELEASE_FADE_END - 1.5))
             elif not obs_still_present:
                 self._log.info("[MPC] committed obs removed — release")
                 self._committed_obs = None
-                self.WARM_START = False
             elif car_to_obs > 12.0:
                 # Drifted way past; safety release.
                 self._committed_obs = None
@@ -1795,46 +2338,158 @@ class MPC:
         # via self.commit_dist_live (default 10 m). Larger = engage
         # detour earlier (smoother but more conservative); smaller =
         # late commit (snappy but riskier).
+        # 2026-07-21 속도비례 commit: 고정 6m는 7m/s에서 반응시간 0.86s뿐 —
+        # 감속+횡이동 물리적으로 부족 → keepout 안(0.43m)까지 파고들어 충돌
+        # (bag 19_48: 실패 5건 전부 진입 v4.8-7.0, side는 정상 ±1, BLOCK-STOP 0).
+        # commit_eff = max(commit_dist, v·t_react). t_react=1.5s: 7m/s→10.5m,
+        # 저속(<4m/s)은 기존 commit_dist 그대로 (민첩성 보존).
+        _v_now = abs(float(initial_state[3]))
+        _commit_eff = max(float(self.commit_dist_live),
+                          _v_now * float(getattr(self, 'commit_treact_live', 1.5)))
+        # 0723t P3 오버테이크 게이트: node가 "추종 모드"로 판단하면(동적 상대 +
+        # 속도우위 부족) 신규 커밋 억제 — 진행 중이던 커밋은 자연 완료(히스테리시스).
         if (self._committed_obs is None and sel_is_real
-                and float(sel[0]) < self.commit_dist_live):
+                and float(sel[0]) < _commit_eff
+                and not getattr(self, 'suppress_commit', False)):
             s_obs_new, e_c_obs_new = self._obstacle_frenet(sel[1], sel[2])
             s_car_now = float(initial_state[IDX_S]) % L
             delta_s_now = (s_car_now - s_obs_new) % L
             # In-front zone (see prior comment block).
             obs_is_ahead = (delta_s_now < 1.5) or (delta_s_now > 0.5 * L)
             if obs_is_ahead:
-                # Cache key: obstacle position to 0.1 m precision so
-                # near-identical obstacles map to same side.
-                key = (round(float(sel[1]), 1), round(float(sel[2]), 1))
-                if key in self._side_history:
-                    sp_new = self._side_history[key]
-                    self._log.info("[MPC] reusing cached side=%+d for obs at %s", sp_new, key)
-                else:
-                    sp_new = self.decide_side_pref(s_obs_new, e_c_obs_new)
-                    if sp_new != 0:
-                        self._side_history[key] = sp_new
+                # 0722d 단순화: 캐시/flip학습/blocked 3종 제거 — fresh(MAP 레이캐스트)가
+                # 이제 신뢰 지오메트리라 매번 fresh 판정. (옛 캐시가 정답 fresh를
+                # 좁은쪽으로 덮던 것이 bag 14_46 "좁은틈 진입"의 실체: t=0.0 fresh -1
+                # 직후 t=0.1 stale cache +1 override.) 남긴 것 하나: 이번 접근에서
+                # 방금 막힌 side 30초 기억 → 같은 쪽 재시도 루프만 방지.
+                key = round(s_obs_new * 2.0) / 2.0
+                # ── P2 Stage-A (0722i): 이웃 장애물을 side별 추가 요구폭으로 반영 ──
+                # detour 창(Δs −1~+5m) 안 다른 장애물의 e_c가 sel보다 위/아래로
+                # 벗어난 만큼(extra) 그 side 필요 room이 늘고, 커밋 제약선(e_c_obs)도
+                # 최외곽 멤버로 이동 = 클러스터·1.3m 슬라럼·회피경로상 장애물 통합.
+                # 장애물 1개면 extra=0, e_eff=e_obs → P1과 바이트 동일 (불침범).
+                e_hi = e_lo = float(e_c_obs_new)
+                if obstacles is not None:
+                    for _ob in obstacles:
+                        if not (hasattr(_ob, '__len__') and len(_ob) >= 2):
+                            continue
+                        _ox2, _oy2 = float(_ob[0]), float(_ob[1])
+                        if (_ox2 - sel[1]) ** 2 + (_oy2 - sel[2]) ** 2 < 0.01:
+                            continue          # sel 자신
+                        _sj, _ej = self._obstacle_frenet(_ox2, _oy2)
+                        _dsj = (_sj - s_obs_new + 0.5 * L) % L - 0.5 * L
+                        # 0722o 창 +5→+2m: 분리형(2~9m)은 이제 obs2 슬롯이 별도
+                        # 제약으로 담당 — 병합과 이중제약(반대 side 충돌) 방지.
+                        if -1.0 <= _dsj <= 2.0:
+                            e_hi = max(e_hi, float(_ej))
+                            e_lo = min(e_lo, float(_ej))
+                extra_up = e_hi - float(e_c_obs_new)
+                extra_dn = float(e_c_obs_new) - e_lo
+                sp_new = self.decide_side_pref(s_obs_new, e_c_obs_new,
+                                               obs_xy=(sel[1], sel[2]),
+                                               extra_up=extra_up,
+                                               extra_dn=extra_dn)
+                # (0722h: 막힌쪽 제외는 decide 내부에서 room 검사와 함께 처리 —
+                #  여기 있던 room-무검사 반대쪽 강제가 "재시도 때 더 깊숙히"의 범인)
                 if sp_new != 0:
+                    # 커밋 제약선 = 선택 side의 최외곽 멤버 (병합 half-plane)
+                    _e_eff = e_hi if sp_new > 0 else e_lo
                     self._committed_obs = (
                         float(sel[1]), float(sel[2]),
-                        s_obs_new, int(sp_new), e_c_obs_new)
+                        s_obs_new, int(sp_new), float(_e_eff))
+                    self._commit_seen_t = monotonic_now()   # F3 추종 기준시각
                     self._log.info(
-                        "[MPC] committed obs=(%.2f,%.2f) s_obs=%.2f e_c_obs=%+.2f side=%+d",
-                        sel[1], sel[2], s_obs_new, e_c_obs_new, sp_new)
+                        "[MPC] committed obs=(%.2f,%.2f) s_obs=%.2f e_c_obs=%+.2f side=%+d"
+                        " (병합 e_eff=%+.2f, extra u/d=%.2f/%.2f)",
+                        sel[1], sel[2], s_obs_new, e_c_obs_new, sp_new,
+                        _e_eff, extra_up, extra_dn)
+                    # 0722v 콜드리셋 복구: 0722s(웜 유지)가 오판 — RTI가 직선 이전해에
+                    # 들러붙어 커밋 후 detour가 아예 안 생김 (bag 17_28: s31 등 6건
+                    # 전부 횡이동 0으로 정면 접촉, 이전 통과 지점 포함). 콜드리셋+X0
+                    # 프라이어 = 계획을 옆으로 점프시키는 의도된 킥 (원저자 설계).
                     self.WARM_START = False  # rebuild with frozen side
                     just_committed = True
+                else:
+                    # 2026-07-16 BLOCK-STOP: 양쪽 다 공간부족(side=0)이면 기존엔
+                    # 장애물 비용이 통째로 꺼져(게이트=|side|) 감속 없이 관통 시도
+                    # (U커브 s19.3 장애물 벽충돌, bag 18:54 실증). 막힘 플래그를
+                    # 세워 노드 명령단이 장애물 앞 정지하도록.
+                    self._obs_blocked_d = float(sel[0])
+                    self._log.warn_throttle(1.0,
+                        "[MPC] obstacle BLOCKED both sides (d=%.2f m) — stop guard",
+                        float(sel[0]))
 
         # Use committed values; if no commitment, fall back to sentinel.
         if self._committed_obs is not None:
             cox, coy, cs_obs, cside, ce_c = self._committed_obs
             sel = [math.hypot(initial_state[0] - cox,
                               initial_state[1] - coy), cox, coy]
-            side_pref = cside
-            e_c_obs_val = ce_c
+            # 0731 페이드: 통과 후 Δs 1.5~3.0 m 구간에서 ±1 → 0 으로 선형 감소.
+            # 장애물이 없으면 이 분기 자체에 안 들어오므로 단일 레이싱은 불변.
+            side_pref = cside * self._release_fade
+            e_c_obs_val = self._narrow_shifted(cox, coy, cside, ce_c)  # 0723c
+            _s_obs1 = float(cs_obs)   # 0723g s-창 게이트용
         else:
             sel = [1e6, 1e6, 1e6]
             side_pref = 0
             e_c_obs_val = 0.0
+            _s_obs1 = None
         self.dbg_side_pref = float(side_pref)
+        # ── P2 Stage-B (0722o): 2번째 장애물 슬롯 — 매 사이클 fresh ──────
+        # sel(#1)·committed 외 장애물 중 차 전방 Δs∈(0.3,9m) 최근접 1개.
+        # side2 = P1 맵실측 fresh (커밋 상태기계 없음 — 순수 예고 제약).
+        # #1 release 전에 #2가 이미 제약에 존재 → 가림쌍 1.5m 갭 소멸,
+        # 계획이 #1→#2를 연속 곡선으로.
+        self._obs2 = None
+        self._obs3 = None
+        try:
+            _s_car2 = float(initial_state[IDX_S]) % L
+            _cands = []
+            for _ob in (obstacles or []):
+                if not (hasattr(_ob, '__len__') and len(_ob) >= 2):
+                    continue
+                _bx, _by = float(_ob[0]), float(_ob[1])
+                if sel_is_real and (_bx - float(sel[1])) ** 2 + (_by - float(sel[2])) ** 2 < 0.25:
+                    continue                      # #1(sel/committed) 자신 제외
+                _s2o, _e2o = self._obstacle_frenet(_bx, _by)
+                _ds2 = (_s2o - _s_car2) % L
+                if 0.3 <= _ds2 <= 9.0:
+                    _cands.append((_ds2, _bx, _by, _s2o, _e2o))
+            # 0723b: 전방 최근접 2개 → obs2/obs3 슬롯 (기존 1개 → 3동시 시야에서
+            # 3번째 무제약이던 한계 제거). 0.5m 이내 중복 후보는 하나로.
+            _cands.sort(key=lambda c: c[0])
+            _picked = []
+            for _c in _cands:
+                if any((_c[1] - _p[1]) ** 2 + (_c[2] - _p[2]) ** 2 < 0.25 for _p in _picked):
+                    continue
+                _picked.append(_c)
+                if len(_picked) == 2:
+                    break
+            # 0722p 스로틀 유지: decide(맵 raycast) 재판정은 후보별 0.25s 캐시.
+            _now2 = time.monotonic()
+            _cache = getattr(self, '_obs23_cache', {})
+            _slots = []
+            for _ds2, _bx, _by, _s2o, _e2o in _picked:
+                _key = (round(_bx / 0.3), round(_by / 0.3))
+                _hit = _cache.get(_key)
+                if _hit is not None and _now2 - _hit[0] < 0.25:
+                    _sd2 = _hit[1]
+                else:
+                    _sd2 = self.decide_side_pref(_s2o, _e2o, obs_xy=(_bx, _by))
+                    _cache[_key] = (_now2, _sd2)
+                if _sd2 != 0:
+                    _slots.append((_bx, _by, float(_sd2),
+                                   float(self._narrow_shifted(_bx, _by, _sd2, _e2o)),
+                                   float(_s2o)))  # 0723c shift / 0723g s-창용 s
+            if len(_cache) > 32:
+                _cache = {k: v for k, v in _cache.items() if _now2 - v[0] < 1.0}
+            self._obs23_cache = _cache
+            if _slots:
+                self._obs2 = _slots[0]
+            if len(_slots) > 1:
+                self._obs3 = _slots[1]
+        except Exception as _e2exc:
+            self._log.warn_throttle(5.0, "[MPC] obs2/3 select skip: %s", _e2exc)
         self.dbg_sel_dmin, self.dbg_sel_x, self.dbg_sel_y = sel
 
         # Avoidance prior on warm-start X0 — Option 2: at the just-committed
@@ -1845,15 +2500,39 @@ class MPC:
         # the obstacle, so the half-plane is near-satisfied from cycle one.
         # After commit (subsequent cycles), the regular gentler push
         # maintains the detour shape as the car approaches.
+        # 0723H 추월 킥 (동적/원형 모드): node가 요청 시 1회 — 추종 로컬미니멈
+        # 탈출용 X0 옆 점프. 커밋 킥과 동일 형식, 원형 제약이 간격은 계속 보장.
+        _otk = getattr(self, '_ot_kick', None)
+        if _otk is not None:
+            self._ot_kick = None
+            _ks, _kx, _ky = _otk
+            for k in range(1, self.N + 1):
+                xk, yk, psik = self.X0[k, 0], self.X0[k, 1], self.X0[k, 2]
+                d2k = (xk - _kx) ** 2 + (yk - _ky) ** 2
+                w = math.exp(-d2k / (2.0 * 4.0))
+                nx_, ny_ = -math.sin(psik), math.cos(psik)
+                self.X0[k, 0] += _ks * 0.5 * w * nx_
+                self.X0[k, 1] += _ks * 0.5 * w * ny_
+            for k in range(self.N + 1):
+                self.solver.set(k, "x", self.X0[k, :])
         if side_pref != 0:
             if just_committed:
                 D_PRIOR     = 0.40   # bigger lateral kick at commit
                 SIGMA_SQ    = 4.0    # σ=2.0 — wider Gaussian, more stages
-                TRIGGER_D   = 8.0    # always push at commit
+                # 0812: 8.0→20.0. 커밋은 max(6, 1.5·v) 거리에서 나는데(7m/s=10.5m)
+                # 킥은 8m 안에서만 → v>5.3 이면 영영 미발동. 킥 없으면 RTI 가 직선
+                # 이전해에 들러붙어 detour 0 (0722v 실증). 커밋 시 항상 킥.
+                TRIGGER_D   = 20.0   # always push at commit
             else:
-                D_PRIOR     = 0.30
+                # 0723j 0.30→0.10 → 0723k 0.10→0.0: 지속 푸시는 매 사이클
+                # "이전 해 + D·w" 가산이라 수렴해를 경계 밖으로 계속 밀어냄.
+                # U자 실측(bag 14_01): PASS 랩 e_c -0.21~-0.27 vs FAIL 랩
+                # -0.30~-0.41 — 통과 밴드 폭이 0.21m뿐이라 0.10 가산도 치명.
+                # 하드제약+shift가 경계를 지키므로 지속 푸시는 완전 제거,
+                # 커밋 킥(0.40, 로컬미니멈 탈출)만 유지.
+                D_PRIOR     = 0.0
                 SIGMA_SQ    = 1.0
-                TRIGGER_D   = 4.0
+                TRIGGER_D   = 0.0   # 지속 푸시 비활성 (TRIGGER 0 = 발동 안 함)
             if float(sel[0]) < TRIGGER_D:
                 ox, oy = sel[1], sel[2]
                 for k in range(1, self.N + 1):
@@ -1872,6 +2551,19 @@ class MPC:
         _alat_eff = float(self.a_lat_safe_eff())   # 사이클당 1회 — stage 루프 불변
         for k in range(self.N + 1):
             sk = float(self.X0[k, IDX_S]) % L
+            # 0724 학습 스케일 (기본 1.0). _vcap(HARD cap)에도 alat 스케일을
+            # 반영해야 cost 의 상향된 코너 목표를 HARD cap 이 막지 않는다.
+            _rsc = _asc = 1.0
+            if self._refv_scale_fn is not None:
+                try:
+                    _rsc = float(self._refv_scale_fn(sk))
+                except Exception:
+                    _rsc = 1.0
+            if self._alat_scale_fn is not None:
+                try:
+                    _asc = float(self._alat_scale_fn(sk))
+                except Exception:
+                    _asc = 1.0
             try:
                 lx = float(self.left_lut_x(sk));  ly = float(self.left_lut_y(sk))
                 rx = float(self.right_lut_x(sk)); ry = float(self.right_lut_y(sk))
@@ -1890,7 +2582,7 @@ class MPC:
             # 로 직접 처리 → u[0] lbu=0 이므로 이 cap 과 무간섭.
             try:
                 _absk = float(self.abs_kappa_lut(sk))
-                _vcap = math.sqrt(_alat_eff / (_absk + 1e-3))
+                _vcap = math.sqrt(_alat_eff * _asc / (_absk + 1e-3))
                 # floor 1.0: κ-스파이크나 cold warm-start 에서 v→0 stall 방지
                 # (가장 타이트한 코너도 √(6/0.84)=2.67 라 floor 는 평소 불활성).
                 _vcap = min(float(self.v_max), max(_vcap, 1.0))
@@ -1903,14 +2595,7 @@ class MPC:
                 # setting ubx there throws (was 61×/run log spam at k=N).
                 if 1 <= k < self.N:
                     _vcap_dyn = min(float(self.v_max) + 0.5, _vcap * 1.6)
-                    # joint-α: idxbx was extended to [3,4,5, 8..8+Ka], so the
-                    # per-stage ubx MUST match that length or acados throws a
-                    # dimension error (previously swallowed by the bare except →
-                    # the per-stage corner speed cap was silently dead the entire
-                    # time joint-α LMPC was on). Pad with the α upper bounds (1.0).
                     _ub = [_vcap_dyn, 10.0, 20.0]
-                    if self._lmpc_joint:
-                        _ub = _ub + [1.0] * int(getattr(self, '_lmpc_K_aug', 10))
                     self.solver.set(k, "ubx", np.array(_ub))
                 # ── kinematic-only p_v grip cap (mode-dependent NUMERIC knob,
                 # same family as the LM damping — NOT an algorithmic difference;
@@ -1940,19 +2625,91 @@ class MPC:
             p_arr = np.zeros(self._n_p_total, dtype=float)
             # 0..17 — 기존 constants
             p_arr[0]  = float(sel[0])               # dmin (debug)
-            p_arr[1]  = float(sel[1])               # obs_x
-            p_arr[2]  = float(sel[2])               # obs_y
+            if pred_obs is not None and k < len(pred_obs):
+                p_arr[1] = float(pred_obs[k][0])    # obs_x (predicted @ stage k)
+                p_arr[2] = float(pred_obs[k][1])    # obs_y
+            else:
+                p_arr[1] = float(sel[1])            # obs_x (legacy: current pos)
+                p_arr[2] = float(sel[2])            # obs_y
+            # 0723g s-창 게이트: h_obs 게이트가 유클리드 거리라 헤어핀에선 반대편
+            # 레그(직선거리 1.5~2m)의 스테이지까지 제약돼 계획이 엉뚱한 곳에서
+            # 밀림 (bag 13_35: s22.4 장애물, 계획 Max d -0.82 부풀며 내벽 충돌 3/4랩).
+            # 스테이지 s가 장애물 s ±2.0m 밖이면 그 스테이지는 sentinel → 게이트 0.
+            # 접근 셰이핑은 장애물 ±2m 스테이지가 담당하므로 직선 거동 불변.
+            # 0723i 비대칭 창: 통과쪽(+)은 0.9m(장애물반경 0.15+차 반길이 0.29+여유)만.
+            # +2.0 대칭창은 통과 후에도 e_c 요구+atten 감쇠를 s+2m까지 유지 —
+            # 헤어핀 출구처럼 하류 벽이 좁아지는 곳(-e_c 벽 0.95→0.50, s23.2-23.7
+            # 실측)에서 계획이 바깥에 눌린 채 출구 진입 → 전면코너 벽접촉 (bag
+            # 13_50: 5/6랩, 계획-추종 오차 3cm인데 계획 자체가 벽으로). 창 밖은
+            # sentinel → 게이트·atten 동시 해제 = 즉시 라인 복귀.
+            if _s_obs1 is not None:
+                _dso1 = (sk - _s_obs1 + 0.5 * L) % L - 0.5 * L
+                if _dso1 < -2.0 or _dso1 > 0.9:
+                    p_arr[1] = 1e6; p_arr[2] = 1e6
             p_arr[3]  = float(side_pref)
-            p_arr[4]  = float(self.D_detour_live)
-            p_arr[5]  = float(self.R_car_live)
-            p_arr[6]  = float(self.q_cte_scale_live)
-            p_arr[7]  = float(self.R_safe_live)
+            p_arr[4]  = 0.0  # D_DETOUR slot: dead (side_term hardcoded 0), kept for index stability
+            # 2026-07-29 곡률 비례 R_car (0722g R_safe 와 같은 패턴):
+            #   직선 r_car_straight ↔ 코너 R_car_live 를 |κ|/κ_ref 로 보간.
+            # 상수 0.30 은 직선에서 레이스라인을 코리도 한계 9cm 앞까지 몰아
+            # 솔버가 물러서는 "직선 S자"를 만들었다 (실측 필요 반치수: 직선
+            # p95 0.245 / 헤어핀 0.256 — mpc_tuning.yaml corridor 절 참고).
+            # min() 가드: R_car_live 를 0.24 밑으로 내리면 그 값이 전 구간 상한.
+            _rcl = float(self.R_car_live)
+            _rcs = min(self._rcar_straight, _rcl)
+            _ik5 = int((sk / self.kappa_ds)) % len(self.kappa_grid)
+            _kf5 = min(1.0, abs(float(self.kappa_grid[_ik5])) / self._rcar_kref)
+            p_arr[5]  = _rcs + (_rcl - _rcs) * _kf5
+            # 2026-07-21 헤어핀 q_cte 존 부스트: corridor_hard_zones 안 스테이지는
+            # q_cte_scale × qcte_zone_factor (기본 1.0=off, live). 헤어핀 라인추종
+            # 타이트닝 — slack 하드닝과 같은 존을 공유 (존=문제 s구간이므로).
+            # 2026-07-21b 회피 우선: committed 장애물 ±3m 스테이지는 부스트 제외 —
+            # 존 안 라인 정중앙 장애물에서 q_cte×2.5가 라인으로 당겨 detour 못 벌리고
+            # v=0 갇힘 (bag 20_10: CONTACT 전부 존 안). LMPC 회피중 off와 같은 원리.
+            _avoid_s = (float(self._committed_obs[2])
+                        if getattr(self, '_committed_obs', None) is not None else None)
+            _near_obs = (_avoid_s is not None
+                         and min((sk - _avoid_s) % L, (_avoid_s - sk) % L) < 3.0)
+            _qzf = float(getattr(self, 'qcte_zone_factor', 1.0))
+            _qf = 1.0
+            if _qzf != 1.0 and not _near_obs:
+                for _z0, _z1, _f in (getattr(self, 'corridor_hard_zones', None) or ()):
+                    if _z0 <= sk <= _z1:
+                        _qf = _qzf
+                        break
+            p_arr[6]  = float(self.q_cte_scale_live) * _qf
+            # 0722g: 스테이지 곡률 비례 R_safe 상향 — 헤어핀에서 solver가 실제로
+            # 더 멀리 벌리도록 (호 수축 보상; decide 임계와 동일 원리, 파라미터라
+            # codegen 불필요). 직선(κ≈0)은 기존값 그대로.
+            # 0722w κ게인 ½: 풀게인은 중간곡률 스팟(s31/s70)에서 요구가 코리도
+            # 허용을 수cm 초과 → soft모순 → 횡거동 마비 → 정면접촉 (bag 17_33:
+            # s31 요구+1.05 vs 상한+1.03). 통과/실패가 이 부등식으로 정확히 갈림.
+            # 0723e κ게인 재축소 0.5κ→0.25κ, cap 0.3→0.15 (decide 0.4κ/0.25와 동조):
+            # 코너 keepout 과대 → 좁은 코너 접근경로가 코리도 밖 → 벽충돌 (bag 13_21).
+            _ikk = int((sk / self.kappa_ds)) % len(self.kappa_grid)
+            # 2026-08-06 최종리뷰 G1: obstacle 제약 전용 R_safe — OT 축소는
+            # R_safe_obs_live(비-None 시)로만 반영, R_safe_live 는 무변경.
+            _rs_obs = self.R_safe_obs_live
+            _base_rs = float(_rs_obs) if _rs_obs is not None else float(self.R_safe_live)
+            p_arr[7]  = _base_rs + min(0.15, 0.25 * abs(float(self.kappa_grid[_ikk])))
             p_arr[8]  = float(self.q_lag_scale_live)
             p_arr[9]  = e_c_obs_val
             p_arr[10] = _alat_eff
             p_arr[11] = float(self.D_apex_live)
             p_arr[12] = float(self.q_psi_scale_live)
-            p_arr[13] = float(self.q_v_scale_live)
+            # ── 2026-07-16 직선 전용 q_v 부스트 (κ-게이트, per-stage) ──
+            # 진단: 고속존 ref-cmd +1.79 / cmd-act -0.02 (bag 0709-19:11) —
+            # 차는 명령을 따라오는데 명령이 ref 를 안 쫓음 = 전역 q_v 가
+            # 코너 타협값이라 직선에서 낮음. 코너캡과 같은 abs_kappa_lut 로
+            # 직선 stage 만 q_v ×factor (1.0=off, codegen 불필요, live).
+            _qv = float(self.q_v_scale_live)
+            _sf = float(getattr(self, "straight_qv_factor", 1.0))
+            if _sf > 1.0:
+                try:
+                    if float(self.abs_kappa_lut(sk)) < float(getattr(self, "straight_kappa_thr", 0.15)):
+                        _qv *= _sf
+                except Exception:
+                    pass
+            p_arr[13] = _qv
             p_arr[14] = float(self.q_dd_scale_live)
             p_arr[15] = float(self.q_p_scale_live)
             p_arr[16] = float(self.q_drate_scale_live)
@@ -1962,6 +2719,12 @@ class MPC:
             ss_states = getattr(self, '_lmpc_ss_states', None)
             ss_Q      = getattr(self, '_lmpc_ss_Q', None)
             if ss_states is not None and ss_Q is not None:
+                # H10 fix (2026-07-03): SS ψ(행 2)를 solver 의 unwrapped ψ 브랜치로
+                # 리베이스 — anchor ψ 잔차가 2πk 로 자라는 발산 차단. initial_state[2]
+                # 는 이 시점에 이미 yaw_offset 이 더해진 unwrapped 값.
+                ss_states = np.array(ss_states, dtype=float, copy=True)
+                ss_states[2, :] = rebase_angles_to_ref(ss_states[2, :],
+                                                       initial_state[2])
                 # ss_states (4, 10) F-order pack, ss_Q (10,)
                 p_arr[18:58] = ss_states.flatten(order='F')  # column-major: [s0_x, s0_y, s0_psi, s0_vx, s1_x, ...]
                 p_arr[58:68] = ss_Q
@@ -1984,11 +2747,83 @@ class MPC:
             # 72..75 — corridor (per-stage)
             p_arr[72] = lx; p_arr[73] = ly
             p_arr[74] = rx; p_arr[75] = ry
+            # 79..82 — P2 Stage-B obs2 (부재 sentinel: x=1e6, side2=0)
+            # 0723g: 슬롯 튜플 5번째 = 장애물 s — 스테이지 s-창(±2m) 밖이면 sentinel.
+            _o2 = getattr(self, '_obs2', None)
+            if _o2 is not None and (len(_o2) < 5 or
+                    -2.0 <= ((sk - _o2[4] + 0.5 * L) % L - 0.5 * L) <= 0.9):
+                p_arr[79] = _o2[0]; p_arr[80] = _o2[1]
+                p_arr[81] = _o2[2]; p_arr[82] = _o2[3]
+            else:
+                p_arr[79] = 1e6; p_arr[80] = 1e6
+                p_arr[81] = 0.0; p_arr[82] = 0.0
+            # 83..86 — 0723b obs3 (동일 sentinel 규약)
+            _o3 = getattr(self, '_obs3', None)
+            if _o3 is not None and (len(_o3) < 5 or
+                    -2.0 <= ((sk - _o3[4] + 0.5 * L) % L - 0.5 * L) <= 0.9):
+                p_arr[83] = _o3[0]; p_arr[84] = _o3[1]
+                p_arr[85] = _o3[2]; p_arr[86] = _o3[3]
+            else:
+                p_arr[83] = 1e6; p_arr[84] = 1e6
+                p_arr[85] = 0.0; p_arr[86] = 0.0
             # 76..78 — B4' e_corr (const across horizon)
             p_arr[76] = float(self._e_corr[0])
             p_arr[77] = float(self._e_corr[1])
             p_arr[78] = float(self._e_corr[2])
+            # 87 — 0723u obs1 모드 (node가 동적 상대 감지 시 1)
+            p_arr[87] = float(getattr(self, 'obs1_mode', 0.0))
+            # 88/89 — 0724 온라인 학습 속도 프로파일 스케일 (기본 1.0)
+            p_arr[88] = _rsc
+            p_arr[89] = _asc
             self.solver.set(k, "p", p_arr)
+            # ── 국소 corridor slack 하드닝 (스텁 존 등) ──
+            if 1 <= k < self.N and getattr(self, '_slack_def', None) is not None:
+                _fac = 1.0
+                # 0721: 경계 계단(1.0↔f 점프)이 존 경계 s24-25/s34-35 조향 진동 유발
+                # → 존 밖 1m 램프로 완만화 (존 안은 풀 강도 유지). 0.25 양자화로 cost_set 캐시 보존.
+                # 0721b 회피 우선: committed 장애물 ±3m 스테이지는 하드닝 제외 (위 q_cte
+                # 부스트와 동일 원리 — 존 slack ×5-6이 detour 공간을 막아 v=0 갇힘).
+                _RAMP = 1.0
+                # _near_obs면 존 목록을 비워 _fac=1.0 → 아래 기존 cost_set 경로가
+                # 자연히 기본 slack으로 복원 (별도 리셋 불필요).
+                for _z0, _z1, _f in (() if _near_obs else (getattr(self, 'corridor_hard_zones', None) or ())):
+                    if (_z0 - _RAMP) <= sk <= (_z1 + _RAMP):
+                        _w = min(1.0, (sk - (_z0 - _RAMP)) / _RAMP, ((_z1 + _RAMP) - sk) / _RAMP)
+                        # 0729 완화 존(factor<1) 지원: max() 는 <1 을 삼켜버린다.
+                        # '1에서 더 멀리 벗어난 쪽'을 채택 — 강화/완화 존이 겹치면
+                        # 효과가 큰 쪽이 이긴다.
+                        _cand = 1.0 + (float(_f) - 1.0) * max(0.0, _w)
+                        if abs(_cand - 1.0) > abs(_fac - 1.0):
+                            _fac = _cand
+                # 0722r near-obs corridor 하한 ×4: 0721b의 완전해제(×1)는 obs행이
+                # ×10(2000)이 된 지금 밸런스 붕괴 — 두 장애물 사이 낑기면 벽(20/15)이
+                # 최약 탈출구 → 계획이 벽 관통 (bag 16_35: 벽너머 계획 4%, 피크 34/41).
+                # ×4(80/60)는 detour 공간은 유지하되 벽이 편법이 되지 않는 수준.
+                if _near_obs:
+                    # 2026-08-05: 4.0 → 1.5. ×4 는 코리도 기본 20/15 시절 보정
+                    # (0722r, 의도 80/60). 기본이 60/400 이 된 지금 ×4 는 240/1600
+                    # — 장애물 부스트(2000/7000)와 양쪽 절벽을 만들어 직선 회피 중
+                    # 채터링(칼날 균형)의 원인 (bag 16_01 실측: s34.9 회피 흔들림).
+                    # 60/400 자체가 이미 "벽=탈출구" 를 막는 세기라 소폭만 남긴다.
+                    _fac = 1.5
+                _fac = round(_fac * 4.0) / 4.0
+                # 0722l 커밋 중 장애물 slack 행(0) ×10: 계획이 keepout을 slack으로
+                # 사던 것 차단 (bag 15_52: plan이 5.3m/s로 violation 0.5m 유지한 채
+                # 접촉 — zl200·0.5=비용 100이 progress에 밀림). 장애물 ±3m 스테이지만.
+                _fobs = 10.0 if _near_obs else 1.0
+                _lkey = (_fac, _fobs)
+                # 0729 기본값 None: 존이 하나도 없어도(=_lkey (1,1)) 첫 사이클에
+                # 한 번은 cost_set 이 돌게 한다. warm-reuse(generate=False) 로 옛
+                # 슬랙값이 생성 C 에 구워져 있으면 _slack_def 변경이 무시되던 문제.
+                if self._slack_last.get(k) != _lkey:
+                    for _key, _base in self._slack_def.items():
+                        _v = _base.copy()
+                        _v[0] *= _fobs                    # 장애물 행
+                        _v[5] *= _fobs                    # 장애물2 행 (Stage-B)
+                        _v[6] *= _fobs                    # 장애물3 행 (0723b)
+                        _v[1] *= _fac; _v[2] *= _fac      # corridor top/bot 행
+                        self.solver.cost_set(k, _key, _v)
+                    self._slack_last[k] = _lkey
 
         # ---- Stage 0 init state via tightened bounds ----
         self.solver.set(0, "lbx", initial_state)
@@ -2025,6 +2860,7 @@ class MPC:
             self.dbg_solver_status = self._status_to_string(status)
             traj = np.array([self.solver.get(k, "x") for k in range(self.N + 1)])
             u_seq = np.array([self.solver.get(k, "u") for k in range(self.N)])
+            # (0722 OBSDBG 임시 계측은 BIG_OBS 누수 확진 후 제거 — 0723 정리)
             # status: 0=OK, 1=NaN/Failure, 2=MaxIter, 3=MinStep, 4=QP_Failure.
             # 3/4 at the hairpin produces a corrupt warm-start that locks
             # subsequent QPs into a 36-iter limit cycle (observed s≈48m
@@ -2127,12 +2963,28 @@ class MPC:
         teleport = v_est > 20.0
         if teleport:
             self._has_moved = False
-            # respawn/teleport mid-release: abort the reverse so the car does
-            # not creep backward right after being moved to a fresh pose.
+            # respawn/teleport mid-release: abort the release so the car does
+            # not sit frozen right after being moved to a fresh pose.
             self._stuck_release_remaining = 0
-            self._stuck_origin = None
-        elif v_est > 0.5:
-            self._has_moved = True
+        # 2026-07-28: _has_moved 래치를 위치차분(v_est)에서 실측 바퀴속도로 교체.
+        # v_est 는 dT=0.04 라 한 사이클 2cm 만 튀어도 0.5 를 넘는데, 바로 아래
+        # stuck 조건의 disp 문턱도 2cm 라 경계가 겹쳤다. 위치추정이 한 번만
+        # 튀면 래치가 영구히 켜지고 이후 출발 전 정지구간이 STUCK 으로 잡혀
+        # "살짝 뒤로 갔다 출발"이 간헐 발생했다(시뮬·실차 양쪽 관측).
+        # initial_state[3] = vx (odom twist, VESC 엔코더) 는 위치추정 노이즈와
+        # 무관하고 정지 중엔 0 이라 이 오탐 경로가 닫힌다.
+        # ⚠ 전제: odom 이 들어와야 vx 가 채워진다. mpc_node._current_state_4 는
+        # pose 는 _last_pose, vx 는 _last_odom 으로 따로 채우고 odom 이 없으면
+        # vx=0 폴백이라, "pose 만 오고 odom 은 안 오는" 구성에서는 이 래치가
+        # 영영 안 켜져 진짜 STUCK 도 못 잡는다. 현재 어떤 launch 도
+        # /car_state/pose 를 발행하지 않아(전 백엔드가 /car_state/odom 만 채움)
+        # 도달 불가지만, 그 토픽을 되살릴 때는 이 지점을 재검토할 것.
+        # ★ 2026-08-03: 래치 ON 은 mpc_node(solve 호출 직전, floor 적용 전
+        # raw_vx 기준)로 이동 — 단일 출처. 여기서 initial_state[3] 을 보면
+        # cold_start_vx_floor(2.0) 주입값이라 정지 상태에서도 첫 solve 에
+        # 래치가 켜져 engage 전 STUCK→텔레포트가 반복됐다 (bag 14_58: engage
+        # 전 odom vx 전부 0.0000 인데 stuck-recover 4회). teleport 시 False
+        # 리셋(위)은 유지한다.
         if (v_est < 0.1 and disp < 0.02 and v_cmd_prev > 0.0
                 and getattr(self, '_has_moved', False)
                 and self._stuck_release_remaining == 0):
@@ -2142,9 +2994,6 @@ class MPC:
         if self._stuck_count > 10:                  # ~0.25 s detect
             self._stuck_release_remaining = 20      # ~0.5 s forced release (ceiling)
             self._stuck_count = 0
-            # Remember where we wedged so the reverse can stop as soon as the
-            # car has backed away STUCK_REVERSE_DIST (early-exit below).
-            self._stuck_origin = (float(initial_state[0]), float(initial_state[1]))
             # 2026-06-11 failure-driven side flip: STUCK while committed to an
             # obstacle (and near it) = the cached side choice FAILED. Without
             # this, _side_history replays the same losing side every lap
@@ -2157,25 +3006,24 @@ class MPC:
                 d_obs = math.hypot(initial_state[0] - cox,
                                    initial_state[1] - coy)
                 if d_obs < 5.0:
-                    key = (round(cox, 1), round(coy, 1))
-                    self._side_history[key] = -cside
+                    # 0722d: 영구 학습(flip캐시/blocked) 제거 — 방금 막힌 side만
+                    # 30초 기억(자동 소멸). 재커밋 시 그 side 제외, 양쪽 다 기억되면
+                    # side=0 → BLOCK-STOP. 오염이 랩을 넘어 살아남지 않음.
+                    key = round(float(cs_obs) * 2.0) / 2.0
+                    if not hasattr(self, '_recent_stuck'):
+                        self._recent_stuck = {}
+                    _sides, _ = self._recent_stuck.get(key, (set(), 0.0))
+                    _sides.add(int(cside))
+                    self._recent_stuck[key] = (_sides, time.monotonic())
+                    self._log.warn(
+                        "[MPC] STUCK during avoidance (d_obs=%.1f m) obs %s side %+d — "
+                        "release (막힌쪽 30s 기억: %s)", d_obs, key, cside, sorted(_sides))
                     self._committed_obs = None
                     self.WARM_START = False
-                    self._log.warn(
-                        "[MPC] STUCK during avoidance (d_obs=%.1f m) — "
-                        "flip side %+d→%+d for obs %s", d_obs, cside, -cside, key)
-        # Early-exit the forced reverse: once the car has separated from the
-        # wedge point by STUCK_REVERSE_DIST, end the release immediately rather
-        # than running the full 20-cycle countdown. Without this the car kept
-        # creeping backward after it had already freed itself ("박힌 뒤 다시
-        # 나오고 그 뒤에 살짝 더 뒤로 갔다가 출발"). The countdown stays as a
-        # ceiling for the rare case the car is still jammed at that distance.
-        if self._stuck_release_remaining > 0 and getattr(self, '_stuck_origin', None):
-            ox, oy = self._stuck_origin
-            back_dist = math.hypot(initial_state[0] - ox, initial_state[1] - oy)
-            if back_dist > self.STUCK_REVERSE_DIST:
-                self._stuck_release_remaining = 0
-                self._stuck_origin = None
+        # 2026-07-28: 후진 거리 기반 조기종료 제거. 해제 중 명령이 후진(-0.5)
+        # 에서 정지(0.0)로 바뀌어 차가 뒤로 물러나지 않으므로 back_dist 가
+        # 문턱을 넘을 수 없다(도달 불가). 해제는 20 사이클 카운트다운으로만
+        # 끝난다.
         is_stuck = self._stuck_release_remaining > 0
         if is_stuck:
             self._stuck_release_remaining -= 1

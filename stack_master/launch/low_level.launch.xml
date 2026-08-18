@@ -24,7 +24,16 @@
        livox network (host 192.168.1.2, see livox_ros_driver2/config/MID360_config.json).
        The wrapper launch also fixes macOS DYLD_LIBRARY_PATH for the plugin dlopen. -->
   <arg name="livox"                default="true" description="Start the Livox MID-360 driver on the real car"/>
-  <arg name="use_system_timestamp" default="true" description="Livox stamp source: true=ROS now() (mapping), false=device HW clock (LIO-only)"/>
+  <arg name="use_system_timestamp" default="false" description="Livox stamp source: false=device HW clock (epoch after mac driver fix; matches car2, header=scan BEGIN -> kiss stamp_at_scan_end=false). true=ROS now() at publish (scan END)."/>
+  <!-- see3cam via opencv_cam. macOS denies /dev/video access to processes not
+       attached to a GUI session (SSH is one such case); headless:=true skips
+       the camera node for exactly that situation, leave false on a GUI login. -->
+  <arg name="camera"        default="true"  description="Start the see3cam (opencv_cam) driver on the real car"/>
+  <arg name="headless"      default="false" description="Skip the camera node (no attached macOS GUI session, e.g. plain SSH)"/>
+  <arg name="camera_index"  default="0"     description="OpenCV device index"/>
+  <arg name="camera_width"  default="1280"  description="Capture width in pixels"/>
+  <arg name="camera_height" default="720"   description="Capture height in pixels"/>
+  <arg name="camera_fps"    default="60"    description="Capture framerate (fps)"/>
   <!-- Hokuyo 2D LiDAR (urg_node -> /scan). Disabled by default; set hokuyo:=true to
        start it. The Livox MID-360 is the primary LiDAR. -->
   <arg name="hokuyo"               default="false" description="Start the Hokuyo (urg_node) 2D LiDAR driver on the real car"/>
@@ -37,7 +46,7 @@
   <arg name="virtual"        default="$(var sim)"          description="Inject virtual opponent/obstacles into the perception stack"/>
 
   <!-- map paths (needed by the simulator and by virtual_perception in both sim and real) -->
-  <let name="maps_dir" value="$(find-pkg-share stack_master)/maps"/>
+  <let name="maps_dir" value="$(env STACK_MASTER_MAPS_ROOT $(find-pkg-share stack_master)/maps)"/>
   <let name="map_path" value="$(var maps_dir)/$(var map)/$(var map)"/>
 
   <!-- ========== REAL HARDWARE SENSORS ========== -->
@@ -94,6 +103,19 @@
       </include>
     </group>
 
+    <!-- see3cam (opencv_cam) -> /image_raw (+ /image_raw/compressed). Skipped
+         entirely when headless:=true (see the arg comment above). -->
+    <node pkg="opencv_cam" exec="opencv_cam_main" name="opencv_cam_node" output="screen"
+          if="$(eval '\'$(var camera)\' == \'true\' and \'$(var headless)\' != \'true\'')">
+      <param name="index"  value="$(var camera_index)"/>
+      <param name="width"  value="$(var camera_width)"/>
+      <param name="height" value="$(var camera_height)"/>
+      <param name="fps"    value="$(var camera_fps)"/>
+      <param name="camera_info_path"
+             value="$(find-pkg-share opencv_cam)/config/see3cam.yaml"/>
+      <param name="image_raw.compressed.jpeg_quality" value="30"/>
+    </node>
+
   </group>
 
   <!-- ========== SIMULATOR ========== -->
@@ -137,7 +159,7 @@
     <param from="$(var vehicle_config)"/>
     <param name="in_topic"      value="/vesc/high_level/ackermann_cmd"/>
     <param name="out_topic"     value="/vesc/ackermann_cmd"/>
-    <param name="joy_max_speed" value="4.0"/>
+    <param name="joy_max_speed" value="$(env JOY_MAX_SPEED 4.0)"/>   <!-- per-car via JOY_MAX_SPEED in unicorn.local.sh; MUST be a float e.g. 7.0 (an int crashes the double param). default 4.0 -->
     <param name="use_estop" value="$(var use_estop)"/>
     <param name="sim" value="$(var sim)"/>
     <!-- start honouring /joy_keyboard immediately when keyboard teleop is on -->

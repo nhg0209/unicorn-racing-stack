@@ -7,12 +7,17 @@ keeps its own duplicate mirror; Task 5's cross-check guards against drift.
 import numpy as np
 
 L_WB = 0.307
-M = 3.54
-IZ = 0.05797
-LF = 0.162
-LR = 0.145
-H_CG = 0.014
-MU = 1.0
+# 2026-07-28: acados_kinematic.py:119-124 배포값과 동기 (기존 값은 6개 상수 모두
+# 어긋나 있었음: m+2%, Iz+23%, lf+2%, lr-15%, h_cg-81%, mu 별도 아래 참조).
+M = 3.47
+IZ = 0.04712
+LF = 0.15875
+LR = 0.17145
+H_CG = 0.074
+# dyn_mu 는 yaml(config/ddrx_unified_params.yaml: dyn_mu: 0.70)로 런타임 변경되는
+# 값이라 yaml이 진실이며, 여기 값은 (actuation_latency_s=0 이라 현재 미사용인)
+# 오프라인 근사치일 뿐이다.
+MU = 0.70
 BF = BR = 10.0
 DF = DR = 1.0
 G = 9.81
@@ -78,3 +83,22 @@ def velocity_residual(state, u, next_state, dt):
     """actual_next[vx,vy,r] - nominal_predicted[vx,vy,r]. Returns (3,)."""
     pred = predict_next(state, u, dt)
     return np.asarray(next_state, float)[3:6] - pred[3:6]
+
+
+def latency_compensate_x0(x0_7, u_last, tau, sub_dt=0.01):
+    """x0(7-dim)를 τ초 앞으로 명목 동역학 전파 — 액추에이션 지연 보상.
+
+    2026-07-03 실측: 조향명령→차체 요 응답 130ms (소프트웨어 20ms + 물리 110ms).
+    solve 는 '지금' 상태 기준 u[0] 를 내지만 차는 τ 뒤에야 반응 → x0 를 τ만큼
+    미리 전진시켜 solve 하면 u[0] 가 '적용 시점' 상태의 최적이 된다.
+    u_last = 직전 적용 컨트롤 [a_x, δ, p_v]. sub_dt Euler substep (0.13/0.01=13회).
+    """
+    u_last = np.ravel(np.asarray(u_last, dtype=float))[:3]  # (3,1)/DM/list 모두 수용
+    s = np.concatenate([np.asarray(x0_7, float).ravel(), [float(u_last[1])]])
+    t = 0.0
+    tau = float(tau)
+    while t < tau - 1e-9:
+        dt = min(float(sub_dt), tau - t)
+        s = predict_next(s, u_last, dt)
+        t += dt
+    return s[:7]

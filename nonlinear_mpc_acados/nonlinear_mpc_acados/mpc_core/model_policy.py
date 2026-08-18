@@ -7,23 +7,6 @@ it must never pull in a heavy/optional solver dependency.
 from __future__ import annotations
 
 
-def effective_lmpc(use_dynamic, use_lmpc):
-    """Resolve whether LMPC is actually usable for the selected model.
-
-    2026-06-10 unified layout: kinematic mode now builds the SAME 8-state
-    layout [x, y, ψ, vx, vy, r, s, δ_prev] as dynamic (f_expl = f_kin, the
-    kinematic single-track branch of the blended model), so slot 3 = vx in
-    BOTH modes and the safe-set terminal cost / SS packing assumptions hold
-    everywhere. LMPC is therefore allowed regardless of use_dynamic.
-
-    Kept as the single policy point (rather than deleting the gate) so any
-    future model whose layout diverges from [.., vx@3, vy@4, r@5, ..] re-gates
-    here instead of silently corrupting the lap database again.
-    """
-    del use_dynamic  # unified 8-state layout — no longer a constraint
-    return bool(use_lmpc)
-
-
 # ─── Grip single source (2026-06-10 friction-ellipse-mu spec) ───────────────
 G_GRAV = 9.81
 # Solver longitudinal brake limit [m/s²]. MUST stay in sync with
@@ -34,7 +17,7 @@ G_GRAV = 9.81
 # 코스팅만으론 5 m/s 불가(둘 중 하나로 수렴). 근본해결=VESC Speed PID로 능동제동 살리기.
 # 그때까지는 -3.0 기준(검증된 baseline, max_speed 4 에서 안 박힘) 유지.
 # 단일소스: acados_kinematic lbu[0] = 솔버 a_x 하한 + 캡 _bf(=|A_MIN|/a_lat) 둘 다.
-A_MIN_DYN = -4.5
+A_MIN_DYN = -7.0  # 2026-07-03 2차 상향: 실측 순간최대 감속 -7.08 근거 (명령단 brake_anticip 5.5 가드)
 
 
 def grip_a_lat_limit(mu, ellipse_frac=0.95):
@@ -52,33 +35,6 @@ def clamp_a_lat_to_grip(a_lat_safe, mu, ellipse_frac=0.95):
     lim = grip_a_lat_limit(mu, ellipse_frac)
     a = float(a_lat_safe)
     return (min(a, lim), a > lim)
-
-
-# ─── LMPC track-anchored safe-set query (2026-06-14 drift fix) ──────────────
-def lmpc_anchor_s(s_now, v_now, n_horizon, dT, track_length, lookahead_floor=1.0):
-    """Arc length (along the TRACK) at which to anchor the LMPC safe-set query.
-
-    Returns where the car will be ~one control horizon ahead, measured from the
-    CURRENT s — NOT from the previous solve's predicted horizon-end x_N.
-
-    Anchoring at x_N created an anchor-less positive-feedback loop: a lateral
-    drift in x_N moved the query point → moved the terminal attractor onto the
-    drifted point → pulled x_N further out, so ec grew monotonically
-    (0.22→0.47 m) until wedge (use_lmpc off, 3691fdb). Pinning the query to
-    track arc length breaks the loop while keeping the attractor one horizon
-    ahead (the forward-progress carrot the horizon-end query was reaching for).
-
-    The look-ahead is the predicted travel v·N·dT, floored at `lookahead_floor`
-    so it never collapses onto the car when stopped, and capped at half the loop
-    so an absurd speed can't wrap the anchor behind the car. Returns
-    q_s ∈ [0, track_length); degenerate track_length ≤ 0 → s_now unchanged.
-    """
-    L = float(track_length)
-    if not (L > 0.0):
-        return float(s_now)
-    ahead = max(float(lookahead_floor), float(v_now) * float(n_horizon) * float(dT))
-    ahead = min(ahead, 0.5 * L)
-    return (float(s_now) + ahead) % L
 
 
 # ─── Avoidance side decision (2026-06-11 window-aware) ──────────────────────
@@ -128,3 +84,21 @@ def decide_side_window(e_c_obs, w_left, w_right,
     if abs(mean_l - mean_r) > margin:
         return +1 if mean_l > mean_r else -1
     return -1
+
+
+def slew_limit_speed(prev: float, target: float, dt: float,
+                     up_rate: float = 8.0, down_rate: float = 5.0) -> float:
+    """발행 drive.speed 슬루 리미터 — 물리 한계를 넘는 1-사이클 스텝 제거.
+
+    2026-07-03: v_plan(브레이크 정직 가드 + brake-distance cap)이 SQP_RTI plan
+    지터를 그대로 전달해 >0.8 m/s 스텝이 46회/분 발생 (지속 median 100ms).
+    실측 제동한계 4.3 m/s², 가속 ~6 m/s² — 그보다 빠른 명령 변화는 차가 따라갈
+    수 없어 정보가 아니라 저크다. down_rate=5.0 은 정직한 풀브레이크(4.3)를
+    통과시키면서 스파이크만 자른다. dt<=0(첫 사이클/클럭 점프) 은 무제한 통과.
+    stuck-release 후진(-0.5 즉시)은 호출측에서 바이패스할 것.
+    """
+    if dt <= 0.0:
+        return float(target)
+    lo = float(prev) - float(down_rate) * float(dt)
+    hi = float(prev) + float(up_rate) * float(dt)
+    return float(min(hi, max(lo, float(target))))

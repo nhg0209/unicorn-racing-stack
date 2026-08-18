@@ -49,6 +49,10 @@ MPC_LOGS = Path.home() / "mpc_logs"
 # 이후 모든 CSV (autoreg v=5/6/7/8 overnight 데이터 포함) 자동 매치.
 POST_TANH_CUTOFF_EPOCH = 1779865200   # 2026-05-27 16:00 KST
 
+# /mpc_debug index 0 컬럼명은 역사적 이유로 "v_cmd" 이지만 실제 값은 a_x 명령이다
+# (mpc_node.py: con_first[0]). ekf source 에서 이 컬럼을 a_x 입력으로 쓴다. 리네임 금지.
+A_X_CMD_COL = "v_cmd"
+
 
 # ────────────────────────────────────────────────────────────────
 # Dynamics (numpy port of mpc_core's f_expl)
@@ -113,24 +117,14 @@ def euler_step(state, u, dt):
 # ────────────────────────────────────────────────────────────────
 # Data extraction from CSV
 # ────────────────────────────────────────────────────────────────
-def process_csv(csv_path: Path,
-                min_vx: float = 0.5,
-                dt_tol: float = 0.5) -> tuple[np.ndarray, np.ndarray]:
-    """Return (x_input [N, 5], y_residual [N, 3]) from one CSV."""
-    try:
-        df = pd.read_csv(csv_path)
-    except Exception as e:
-        print(f"  [skip] {csv_path.name}: {e}")
-        return np.empty((0, 5)), np.empty((0, 3))
-
+def _extract_finitediff(df, min_vx: float, dt_tol: float):
+    """기존 유한차분 추출 (측정 비교군). df 는 이미 로드됨."""
     needed = {"t", "v_actual", "steer_cmd", "car_x", "car_y", "car_yaw",
               "current_s", "mpcc_active", "feasible"}
     if not needed.issubset(df.columns):
         return np.empty((0, 5)), np.empty((0, 3))
 
     n = len(df)
-    if n < 5:
-        return np.empty((0, 5)), np.empty((0, 3))
 
     t = df["t"].to_numpy()
     vx = df["v_actual"].to_numpy()
@@ -233,12 +227,86 @@ def process_csv(csv_path: Path,
     return np.array(x_in_list), np.array(y_out_list)
 
 
+def _extract_ekf(df, csv_path, min_vx: float, dt_tol: float):
+    """로깅된 EKF 속도상태(vy_ekf/r_ekf) + 명령 a_x 직접 사용. 유한차분 없음."""
+    needed = {"t", "v_actual", "steer_cmd", "car_x", "car_y", "car_yaw",
+              "current_s", "feasible", "vy_ekf", "r_ekf", A_X_CMD_COL}
+    if not needed.issubset(df.columns):
+        print(f"  [skip:ekf] {csv_path.name}: vy_ekf/r_ekf/{A_X_CMD_COL} 컬럼 없음 "
+              "(2단계 이전 CSV)")
+        return np.empty((0, 5)), np.empty((0, 3))
+
+    n = len(df)
+    t = df["t"].to_numpy()
+    vx = df["v_actual"].to_numpy()
+    vy = df["vy_ekf"].to_numpy()
+    r = df["r_ekf"].to_numpy()
+    delta = df["steer_cmd"].to_numpy()
+    a_x = df[A_X_CMD_COL].to_numpy()
+    x = df["car_x"].to_numpy()
+    y = df["car_y"].to_numpy()
+    yaw = np.unwrap(df["car_yaw"].to_numpy())
+    s = df["current_s"].to_numpy()
+    feasible = df["feasible"].to_numpy().astype(bool)
+
+    dt = np.diff(t)
+    delta_prev = np.roll(delta, 1)
+    delta_prev[0] = 0.0
+    p_v_proxy = vx
+
+    x_in_list, y_out_list = [], []
+    for k in range(1, n - 1):                  # k+1 필요 (유한차분 없어 k+2 불필요)
+        if not (feasible[k] and feasible[k + 1]):
+            continue
+        if abs(dt[k] - DT) > dt_tol * DT:
+            continue
+        if vx[k] < min_vx:
+            continue
+        # 물리범위(teleport/reset artefact) — finitediff 와 동일 임계값
+        if abs(a_x[k]) > 12.0 or abs(r[k]) > 3.0 or abs(vy[k]) > 0.6:
+            continue
+
+        state_k = np.array([x[k], y[k], yaw[k], vx[k], vy[k], r[k], s[k], delta_prev[k]])
+        u_k = np.array([a_x[k], delta[k], p_v_proxy[k]])
+        x_pred = euler_step(state_k, u_k, dt[k])
+        actual_kp1 = np.array([vx[k + 1], vy[k + 1], r[k + 1]])
+        res = actual_kp1 - x_pred[3:6]
+        if abs(res[0]) > 0.5 or abs(res[1]) > 0.5 or abs(res[2]) > 2.0:
+            continue
+
+        x_in_list.append([vx[k], vy[k], r[k], delta[k], a_x[k]])
+        y_out_list.append(res)
+
+    if not x_in_list:
+        return np.empty((0, 5)), np.empty((0, 3))
+    return np.array(x_in_list), np.array(y_out_list)
+
+
+def process_csv(csv_path: Path,
+                min_vx: float = 0.5,
+                dt_tol: float = 0.5,
+                source: str = "ekf") -> tuple[np.ndarray, np.ndarray]:
+    """source='ekf'(기본): 로깅 EKF/명령 컬럼 사용. 'finitediff': 기존 유한차분."""
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as e:
+        print(f"  [skip] {csv_path.name}: {e}")
+        return np.empty((0, 5)), np.empty((0, 3))
+    if len(df) < 5:
+        return np.empty((0, 5)), np.empty((0, 3))
+    if source == "ekf":
+        return _extract_ekf(df, csv_path, min_vx, dt_tol)
+    return _extract_finitediff(df, min_vx, dt_tol)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--csv", default=None, help="단일 CSV 테스트")
     p.add_argument("--out", default=str(Path.home() / "bo_results" / "gp_train_data.pt"))
     p.add_argument("--min_vx", type=float, default=0.5)
     p.add_argument("--max_csvs", type=int, default=0, help="0 = 전체")
+    p.add_argument("--source", choices=["ekf", "finitediff"], default="ekf",
+                   help="ekf(기본): 로깅 EKF/명령 컬럼 / finitediff: 기존 유한차분(비교군)")
     args = p.parse_args()
 
     if args.csv:
@@ -257,7 +325,7 @@ def main():
 
     X_all, Y_all = [], []
     for f in files:
-        x, y = process_csv(f, min_vx=args.min_vx)
+        x, y = process_csv(f, min_vx=args.min_vx, source=args.source)
         if len(x) > 0:
             X_all.append(x)
             Y_all.append(y)
@@ -300,6 +368,7 @@ def main():
         'output_keys': ['d_vx', 'd_vy', 'd_r'],
         'dt': DT,
         'n_csvs': len(files),
+        'source': args.source,
     }, str(out_path))
     print(f"\nSaved → {out_path}")
 

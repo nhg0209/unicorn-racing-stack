@@ -48,6 +48,11 @@ class TrackData:
     raw_center_lane: np.ndarray = field(default=None)
     raw_right_lane: np.ndarray = field(default=None)
     raw_left_lane: np.ndarray = field(default=None)
+    # 2026-08-03: 각 스테이션에 실제 적용된 벽마진 W_eff (N_orig,).
+    # 코리도 LUT 벽은 실벽에서 이만큼 안쪽이다. refv 학습의 벽여유 게이트가
+    # LUT 벽 기준으로 재면 마진이 이중계상되어(특히 직선, 0.18) 상향이
+    # 과도하게 동결된다 — 실벽 여유 = LUT 여유 + wall_margin(s).
+    wall_margin: np.ndarray = field(default=None)
 
 
 def _read_csv_xy(path: str, with_v: bool = False, vel_scale: float = 1.0):
@@ -184,7 +189,61 @@ def corridor_speed_cap(width: float, v_full: float, v_floor: float = 0.0,
 # 2026-06-02: 0.25→0.18 (final 좁은 트랙: d=0.36m서 0.25면 corridor 0.11m→QP
 # infeasible→fails폭증. car 반폭~0.15 기준 0.18이 최소안전). Both wall-source
 # paths (ref-derived and centerline-derived) use this single value.
+#
+# 2026-08-03: 0.18 → 0.0. **이 여유는 R_car 와 중복이었다.**
+#   여기서 벽 LUT 를 0.18 안쪽으로 당기고, acados_kinematic.py:1283-1286 이
+#   다시 R_CAR(0.30) 을 뺀다 → 총 잠식 0.48 m. 두 상수 모두 근거로 "차 반폭"
+#   을 든다(위 주석 "car half-width ~0.16", ddrx_unified_params.yaml "차 반지름").
+#   실제 반폭은 0.1016 m (차폭 0.2032).
+#   ifac 맵 366 스테이션 재현 계산 (scratchpad/corridor_check.py):
+#     0.18+0.30 → 코리도 역전(상한<하한, 해 없음) 28곳, 최소폭 -0.108 m,
+#                 레이스라인이 자기 코리도 밖 227곳(62%)
+#     0.00+0.30 → 역전 0곳, 최소폭 +0.235 m, 라인 밖 24곳
+#   역전 구간에서는 위아래 제약이 동시에 위반되고 s_top+s_bot 이 기하 상수라
+#   선형항 zl 의 횡방향 기울기가 0 이다 — 슬랙/존 벌점을 아무리 올려도 옆으로
+#   미는 힘이 안 생긴다. 2026-06-02·07-29 의 "벌점이 셀수록 반대벽 클립",
+#   그리고 존 4개로 트랙 58% 를 덮어야 했던 것이 전부 이 증상이었다.
+#   위 0602 이력("0.25면 corridor 0.11m→QP infeasible")도 R_car 가 뒤에서
+#   0.30 을 더 뺀다는 걸 모른 채 이 상수만 깎아 증상을 덮은 것이다.
+#   **그러나 실측은 이 결론을 기각했다 (2026-08-03 심, 130 s / 12랩):**
+#     0.18 → 주행 중 STUCK 0회(기준선) / 랩편차 0.154 s
+#     0.00 → 주행 중 STUCK **14회**, 랩 9.81~12.33 (편차 2.52 s), 최소 벽마진 0.109
+#   기하상 역전은 사라지는데 주행은 크게 악화했다. 즉 0.18 은 "중복된 차 반폭"
+#   이 아니라 **다른 오차를 흡수하고 있었다.** 유력 후보: _walls_from_centerline
+#   이 각 레이스라인 스테이션에 대해 *최근접 센터라인 점*의 벽을 쓰는 재샘플
+#   오차(라인이 센터라인에서 크게 벗어나는 시케인에서 최대) + 문서화된
+#   계획-추종 오차 0.03~0.13 m.
+#   → 0.18 유지. 줄이려면 재샘플 오차부터 없애고(법선 투영으로 정확히 계산)
+#     그 다음에 단계적으로. 0 으로 한 번에 가는 건 확인된 실패다.
 _WALL_MARGIN = 0.18
+
+# 2026-08-03 A안: 마진을 **트랙 폭에 비례**하게. 전 구간 0 은 실패했지만(위),
+# 넓은 곳은 0.18 유지 · 좁은 곳만 축소하는 건 다른 얘기다.
+#
+# 문제의 산수 (ifac 시케인, 폭 ~1.0 m):
+#     가용 반폭 = 1.0/2 − _WALL_MARGIN 0.18 − R_car 0.30 = 0.02 m
+#   → 코리도가 사실상 사라지고 s21.8~23.7 은 상한<하한(역전, 해 없음).
+#   실측(2026-08-03): 레이스라인 중심→실벽 최단거리 최소 0.180 m, 차체 여유
+#   최소 +0.078 m — **물리 공간은 있는데 마진 산수가 다 먹었다.**
+#   레이스라인의 62%(227/366)가 자기 코리도(벽−0.48) 밖이라 q_cte 와 코리도가
+#   상시 충돌하고, 균형이 무너지는 스텁/시케인에서 벽을 친다.
+#
+#   W_eff(s) = min(_WALL_MARGIN, α · 가용반폭_R_car제외(s))
+#   여기서 가용반폭_R_car제외 = (d_left + d_right)/2 − R_car.
+#   넓은 구간은 α·(큰 값) > 0.18 이라 그대로 0.18, 좁은 구간만 자동 축소된다.
+#   α=0.5 → 시케인에서 0.18 → 약 0.10.
+# 0 으로 두면 기능 off (= 전 구간 _WALL_MARGIN 고정, 종전 동작).
+_WALL_MARGIN_WIDTH_ALPHA = 0.5
+_WALL_MARGIN_R_CAR = 0.30   # 코리도가 뒤에서 추가로 빼는 값 (ddrx R_car_live 와 일치시킬 것)
+
+
+def _adaptive_wall_margin(d_left, d_right):
+    """폭 비례 마진. d_left/d_right 는 원본(마진 미적용) 배열 또는 스칼라."""
+    if _WALL_MARGIN_WIDTH_ALPHA <= 0.0:
+        return _WALL_MARGIN
+    avail = (np.asarray(d_left, dtype=float) + np.asarray(d_right, dtype=float)) / 2.0 \
+        - _WALL_MARGIN_R_CAR
+    return np.minimum(_WALL_MARGIN, np.maximum(0.0, _WALL_MARGIN_WIDTH_ALPHA * avail))
 
 
 def _walls_from_centerline(ref_xy: np.ndarray, wall_wpnts) -> tuple:
@@ -199,7 +258,8 @@ def _walls_from_centerline(ref_xy: np.ndarray, wall_wpnts) -> tuple:
     The returned lanes are index-aligned to `ref_xy`, so the LUTs built from them
     share the reference's arc-length frame (what the MPC corridor samples at `sk`).
 
-    Returns (left_lane, right_lane), each shape (len(ref_xy), 2).
+    Returns (left_lane, right_lane, wall_margin), lanes shape (len(ref_xy), 2),
+    wall_margin shape (len(ref_xy),) — 각 스테이션에 적용된 W_eff.
     """
     cx = np.array([float(w.x_m) for w in wall_wpnts], dtype=float)
     cy = np.array([float(w.y_m) for w in wall_wpnts], dtype=float)
@@ -207,8 +267,28 @@ def _walls_from_centerline(ref_xy: np.ndarray, wall_wpnts) -> tuple:
         (w.psi_centerline_rad if abs(getattr(w, 'psi_centerline_rad', 0.0)) > 1e-9
          else w.psi_rad)
         for w in wall_wpnts], dtype=float)
-    d_l = np.maximum(0.05, np.array([float(w.d_left) for w in wall_wpnts]) - _WALL_MARGIN)
-    d_r = np.maximum(0.05, np.array([float(w.d_right) for w in wall_wpnts]) - _WALL_MARGIN)
+    _dl0 = np.array([float(w.d_left) for w in wall_wpnts])
+    _dr0 = np.array([float(w.d_right) for w in wall_wpnts])
+    _wm = _adaptive_wall_margin(_dl0, _dr0)      # 0803: 폭 비례 (스칼라 폴백 가능)
+    # 2026-08-06 좌벽 국소 마진 존 — 아킬레스 돌출부 밴드(런타임 chord s13.4~16.0,
+    # d_left 0.53~0.67 로 좁은 쪽). 라인 수술 없이 스침·쐐기를 코리도로 완화:
+    # 밴드 좌벽만 +0.06 m (라인 xy 앵커 캡슐, 0.9 m 풀 / 1.8 m 페이드 램프 —
+    # 옛 코스트 존의 경계 풍선효과 회피). 실측 근거: lapA 무장애물 42랩에서
+    # 밴드 실벽 min 0.180 m(헐 여유 ~3 cm) + 밴드 내 STUCK 텔레포트, 추월
+    # 쐐기 STUCK 좌표(4.13,4.91)도 이 밴드. d_right 무변(여유 0.73~1.43).
+    # wall_margin 배열엔 미반영 — wall_alarm 실벽 환산이 좌측에서 extra 만큼
+    # 보수적이 될 뿐(안전 방향).
+    # 2026-08-13 hall_0813: MPCC 지름길이 s6~10 좌벽 5cm 까지 접근(32랩 전랩 d+0.31~0.37,
+    # 최협 dL0.51 에서 +0.37 랩만 접촉 = 여유 -1.5cm). 라인·튜닝 무변경, 좌벽만 +0.10.
+    # ⚠ 앵커는 hall_0813 map 좌표 — 다른 맵에서 켜지려면 재앵커 필수 (구 ifac 앵커: (6.182,3.718)-(3.839,5.033))
+    _ZA = np.array([5.713, 5.035]); _ZB = np.array([7.670, 8.612])
+    _ZEXTRA, _ZR_FULL, _ZR_ZERO = 0.10, 0.9, 1.8
+    _ab = _ZB - _ZA
+    _t = np.clip(((np.column_stack((cx, cy)) - _ZA) @ _ab) / (_ab @ _ab), 0.0, 1.0)
+    _dseg = np.hypot(cx - (_ZA[0] + _t * _ab[0]), cy - (_ZA[1] + _t * _ab[1]))
+    _extra_l = _ZEXTRA * np.clip((_ZR_ZERO - _dseg) / (_ZR_ZERO - _ZR_FULL), 0.0, 1.0)
+    d_l = np.maximum(0.05, _dl0 - _wm - _extra_l)
+    d_r = np.maximum(0.05, _dr0 - _wm)
     cs, cc = np.sin(cpsi), np.cos(cpsi)
     # right normal = (+sin, −cos); left normal = (−sin, +cos)
     left_wall = np.column_stack((cx - d_l * cs, cy + d_l * cc))
@@ -217,11 +297,14 @@ def _walls_from_centerline(ref_xy: np.ndarray, wall_wpnts) -> tuple:
     ref_xy = np.asarray(ref_xy, dtype=float)
     left_lane = np.empty_like(ref_xy)
     right_lane = np.empty_like(ref_xy)
+    _wm_arr = np.broadcast_to(np.asarray(_wm, dtype=float), _dl0.shape)
+    wall_margin = np.empty(ref_xy.shape[0])
     for i in range(ref_xy.shape[0]):
         j = int(np.argmin((cx - ref_xy[i, 0]) ** 2 + (cy - ref_xy[i, 1]) ** 2))
         left_lane[i] = left_wall[j]
         right_lane[i] = right_wall[j]
-    return left_lane, right_lane
+        wall_margin[i] = _wm_arr[j]
+    return left_lane, right_lane, wall_margin
 
 
 def build_track_from_wpnts(wpnts, vel_scale: float = 1.0,
@@ -252,6 +335,7 @@ def build_track_from_wpnts(wpnts, vel_scale: float = 1.0,
     right_lane = np.empty((n, 2), dtype=float)
     left_lane = np.empty((n, 2), dtype=float)
     ref_v = np.empty(n, dtype=float)
+    wall_margin_arr = np.zeros(n, dtype=float)   # 0803: 스테이션별 적용 W_eff
 
     # `/centerline_waypoints` carries the centerline tangent in `psi_rad`
     # (the wpnts ARE the centerline). `psi_centerline_rad` is only filled
@@ -274,11 +358,14 @@ def build_track_from_wpnts(wpnts, vel_scale: float = 1.0,
         center_deriv[i] = (c, s)
         if use_fixed_corridor:
             d_r = d_l = corridor_half_width
+            wall_margin_arr[i] = 0.0
         else:
             # Walls inset by _WALL_MARGIN (module const) so the car body clears
             # the wall — corridor bounds the car CENTER. See _WALL_MARGIN docstring.
-            d_r = max(0.05, float(w.d_right) - _WALL_MARGIN)
-            d_l = max(0.05, float(w.d_left) - _WALL_MARGIN)
+            _wm2 = float(_adaptive_wall_margin(float(w.d_left), float(w.d_right)))
+            d_r = max(0.05, float(w.d_right) - _wm2)
+            d_l = max(0.05, float(w.d_left) - _wm2)
+            wall_margin_arr[i] = _wm2
         # right normal = (+sin(psi), -cos(psi)); left normal = (-sin(psi), +cos(psi))
         # NOTE: d_left/d_right are measured along the CENTERLINE normal, so this
         # projection is exact ONLY when psi == centerline tangent. Line 220
@@ -335,18 +422,9 @@ def build_track_from_wpnts(wpnts, vel_scale: float = 1.0,
             j = (i + 1) % n
             ds[i] = float(np.hypot(center_lane[j, 0] - center_lane[i, 0],
                                    center_lane[j, 1] - center_lane[i, 1]))
-        for _ in range(2):   # 2 wrap sweeps to converge across the start seam
-            for i in range(n - 1, -1, -1):          # backward: braking (always)
-                j = (i + 1) % n
-                v_brake = float(np.sqrt(ref_v[j] ** 2 + 2.0 * a_long * ds[i]))
-                if v_brake < ref_v[i]:
-                    ref_v[i] = v_brake
-            if not use_fixed_corridor:               # forward: accel (raceline only)
-                for i in range(n):
-                    k = (i - 1) % n
-                    v_acc = float(np.sqrt(ref_v[k] ** 2 + 2.0 * a_long * ds[k]))
-                    if v_acc < ref_v[i]:
-                        ref_v[i] = v_acc
+        ref_v = velocity_feasibility_pass(
+            ref_v, ds, a_brake=a_long,
+            a_accel=None if use_fixed_corridor else a_long)
         ref_v = np.clip(ref_v, 1.0, default_v)
 
     # Wall-source split: in raceline mode the reference line (raceline) carries
@@ -355,7 +433,8 @@ def build_track_from_wpnts(wpnts, vel_scale: float = 1.0,
     # stays the raceline → LUTs keep the raceline arc-length frame. Skipped for
     # fixed-width corridor (walls are the user-set cap there).
     if wall_wpnts is not None and not use_fixed_corridor:
-        left_lane, right_lane = _walls_from_centerline(center_lane, wall_wpnts)
+        left_lane, right_lane, wall_margin_arr = _walls_from_centerline(
+            center_lane, wall_wpnts)
 
     # Fixed-width corridor already represents the mpc cap → skip inflation
     # (otherwise the boundary would be pulled inside the user-set width).
@@ -363,7 +442,35 @@ def build_track_from_wpnts(wpnts, vel_scale: float = 1.0,
     td = _build_track(center_lane, center_deriv, right_lane, left_lane, ref_v,
                       inflation_factor=eff_inflation, extend_part=extend_part)
     td.ref_v = ref_v.copy()  # stash raw (post-brake-profile) array for tests & diagnostics
+    td.wall_margin = wall_margin_arr.copy()   # 0803: 실벽 여유 복원용 (refv 학습 게이트)
     return td
+
+
+def velocity_feasibility_pass(ref_v, ds, a_brake, a_accel=None, n_sweeps=2):
+    """TUM calc_vel_profile 스타일 forward-backward pass (원형 트랙).
+
+    backward(제동)는 항상, forward(가속)는 a_accel 지정 시만. min-only —
+    기존 프로파일을 절대 올리지 않으므로 strictly safer. build_track_from_wpnts
+    의 inline 구현을 추출한 것 (online 학습기 speed_profile_learner 와 공유).
+    """
+    v = np.asarray(ref_v, float).copy()
+    n = v.size
+    if n < 2:
+        return v
+    ds = np.asarray(ds, float)
+    for _ in range(n_sweeps):   # 2 wrap sweeps to converge across the start seam
+        for i in range(n - 1, -1, -1):          # backward: braking
+            j = (i + 1) % n
+            v_brake = float(np.sqrt(v[j] ** 2 + 2.0 * a_brake * ds[i]))
+            if v_brake < v[i]:
+                v[i] = v_brake
+        if a_accel is not None:                  # forward: accel
+            for i in range(n):
+                k = (i - 1) % n
+                v_acc = float(np.sqrt(v[k] ** 2 + 2.0 * a_accel * ds[k]))
+                if v_acc < v[i]:
+                    v[i] = v_acc
+    return v
 
 
 def find_current_arc_length(track: TrackData, car_pos: np.ndarray,
@@ -413,3 +520,23 @@ def find_current_arc_length(track: TrackData, car_pos: np.ndarray,
     if current_s >= L_orig:
         current_s = current_s % L_orig
     return current_s, nearest
+
+
+def learned_speeds_for_wpnts(wpnts, learned_s, learned_v, L, tol=0.3):
+    """각 wpnt 의 누적 arc-length s 에서, tol[m] 안에 학습 bin 이 있으면 그 ref_v,
+    없으면 기존 wpnt.vx_mps 를 유지(부분 override). 안전 캡은 build_track_from_wpnts
+    가 이후 그대로 적용한다."""
+    import numpy as _np
+    out = _np.array([float(getattr(w, 'vx_mps', 0.0)) for w in wpnts], dtype=float)
+    learned_s = _np.asarray(learned_s, float); learned_v = _np.asarray(learned_v, float)
+    if learned_s.size == 0:
+        return out
+    xy = _np.array([(float(w.x_m), float(w.y_m)) for w in wpnts])
+    seg = _np.sqrt((_np.diff(xy, axis=0) ** 2).sum(axis=1))
+    s_w = _np.insert(_np.cumsum(seg), 0, 0.0)
+    for i, sw in enumerate(s_w):
+        d = _np.abs(((learned_s - (sw % L) + L / 2.0) % L) - L / 2.0)  # 원형거리
+        j = int(_np.argmin(d))
+        if d[j] <= tol:
+            out[i] = float(learned_v[j])
+    return out

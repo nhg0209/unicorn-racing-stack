@@ -135,6 +135,12 @@ class LapAnalyser(Node):
                 self.get_logger().info("LapAnalyser: started first lap")
                 self.lap_count = 0
             else:
+                # 2026-07-09 debounce: 피니시라인 localization 지터로 s-wrap 이중발화
+                # → 0.006s 유령랩이 통계 오염. 3초 미만 재발화는 무시.
+                _elapsed = (self.get_clock().now() - self.lap_start_time).nanoseconds / 1e9
+                if _elapsed < 3.0:
+                    self.last_s = current_s
+                    return
                 self.lap_count += 1
                 self.publish_lap_info()
 

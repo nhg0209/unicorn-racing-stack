@@ -31,6 +31,7 @@ setup(
             'pp_fallback_node = nonlinear_mpc_acados.pp_fallback_node:main',
             'scan_obstacle_detector = nonlinear_mpc_acados.scan_obstacle_detector:main',
             'speed_monitor = nonlinear_mpc_acados.speed_monitor_node:main',
+            'wall_alarm = nonlinear_mpc_acados.wall_alarm_node:main',
         ],
     },
 )

@@ -1,0 +1,45 @@
+name: ROS2 CI
+
+on:
+  pull_request:
+    branches:
+      - 'master'
+  push:
+    branches:
+      - 'master'
+
+jobs:
+  test_environment:
+    runs-on: [ubuntu-latest]
+    strategy:
+      fail-fast: false
+      matrix:
+        ros_distribution:
+          - foxy
+          - galactic
+          - humble
+          - iron
+        include:
+          - docker_image: rostooling/setup-ros-docker:ubuntu-focal-ros-foxy-ros-base-latest
+            ros_distribution: foxy
+          - docker_image: rostooling/setup-ros-docker:ubuntu-focal-ros-galactic-ros-base-latest
+            ros_distribution: galactic
+          - ros_distribution: humble
+            docker_image: rostooling/setup-ros-docker:ubuntu-jammy-ros-humble-ros-base-latest
+          - ros_distribution: iron
+            docker_image: rostooling/setup-ros-docker:ubuntu-jammy-ros-iron-ros-base-latest
+    container:
+      image: ${{ matrix.docker_image }}
+    steps:
+      - name: setup directories
+        run: mkdir -p ros_ws/src
+      - name: checkout
+        uses: actions/checkout@v2
+        with:
+          path: ros_ws/src
+      - name: build and test
+        uses: ros-tooling/action-ros-ci@master
+        with:
+          package-name: opencv_cam
+          target-ros2-distro: ${{ matrix.ros_distribution }}
+          vcs-repo-file-url: "https://raw.githubusercontent.com/${{github.repository}}/${{github.sha}}/workspace.repos"

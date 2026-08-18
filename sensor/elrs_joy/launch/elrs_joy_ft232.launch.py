@@ -31,6 +31,7 @@ PORT_CANDIDATES = [
     "/dev/ttyUSB1",                # Linux, generic
     "/dev/tty.usbserial-10",       # macOS
     "/dev/tty.usbserial-310",      # macOS
+    "/dev/tty.usbserial-21130",
 ]
 
 

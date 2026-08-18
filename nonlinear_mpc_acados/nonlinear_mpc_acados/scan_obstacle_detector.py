@@ -22,7 +22,7 @@ import math
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, DurabilityPolicy
+from rclpy.qos import QoSProfile, DurabilityPolicy, qos_profile_sensor_data
 
 from geometry_msgs.msg import Pose, PoseArray
 from nav_msgs.msg import OccupancyGrid, Odometry
@@ -66,8 +66,12 @@ class ScanObstacleDetector(Node):
         self.create_subscription(OccupancyGrid, '/map', self._map_cb, map_qos)
         self.create_subscription(Odometry, str(g('odom_topic')),
                                  self._odom_cb, 1)
+        # /scan is BEST_EFFORT from the sim gym bridge (and sensor lidars),
+        # RELIABLE from some real drivers. A sensor_data (best-effort) sub
+        # receives from BOTH; a reliable sub silently drops the sim scan
+        # (QoS-incompatible) → detector never sees obstacles.
         self.create_subscription(LaserScan, str(g('scan_topic')),
-                                 self._scan_cb, 1)
+                                 self._scan_cb, qos_profile_sensor_data)
 
         self._free = None          # bool [H,W] — True = 트랙 안 (벽 margin 제외)
         self._map_info = None

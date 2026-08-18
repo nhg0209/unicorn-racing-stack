@@ -119,10 +119,13 @@ rcl_interfaces::msg::SetParametersResult VescToOdom::onSetParameters(
 
 void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
 {
-  // check that we have a last servo command if we are depending on it for angular velocity
-  if (use_servo_cmd_ && !last_servo_cmd_) {
-    return;
-  }
+  // Publish odom from wheel speed even before the first servo command arrives
+  // (idle / no drive command yet). Steering -- hence angular velocity -- is only
+  // known once a servo command has been seen; until then assume 0 steering. This
+  // keeps /vesc/odom flowing from startup so consumers aren't left without wheel
+  // odometry (kiss_icp uses twist.vx for translation prediction; with no odom its
+  // ICP wandered/spun at startup). Previously odom only began after human-drive
+  // commands started publishing a servo command.
 
   // convert to engineering units
   double current_speed = (state->state.speed - speed_to_erpm_offset_) / speed_to_erpm_gain_;
@@ -130,7 +133,7 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
     current_speed = 0.0;
   }
   double current_steering_angle(0.0), current_angular_velocity(0.0);
-  if (use_servo_cmd_) {
+  if (use_servo_cmd_ && last_servo_cmd_) {
     current_steering_angle =
       (last_servo_cmd_->data - steering_to_servo_offset_) / steering_to_servo_gain_;
     current_angular_velocity = current_speed * tan(current_steering_angle) / wheelbase_;
@@ -151,7 +154,7 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
   double y_dot = current_speed * sin(yaw_);
   x_ += x_dot * dt.seconds();
   y_ += y_dot * dt.seconds();
-  if (use_servo_cmd_) {
+  if (use_servo_cmd_ && last_servo_cmd_) {
     yaw_ += current_angular_velocity * dt.seconds();
   }
 

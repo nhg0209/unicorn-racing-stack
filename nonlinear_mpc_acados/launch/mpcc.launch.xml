@@ -29,11 +29,17 @@
   <arg name="odom_topic" default="/car_state/odom" description="Localization odom topic (sim: gym /car_state/odom; real+KISS: /kiss_loc/odometry)"/>
   <arg name="cmd_topic" default="/vesc/high_level/ackermann_cmd" description="mpc drive output topic (sim mux input; real-mac mux input: /vesc/high_level/ackermann_cmd_mux/input/nav_1)"/>
   <arg name="obstacle_topic" default="/external_obstacles" description="obstacle PoseArray source (real+KISS detection: /kiss_loc/obstacle_poses)"/>
+  <arg name="lap_analyser" default="true" description="per-lap lap_time+lateral error(d)+boundary dist (needs /car_state/odom_frenet + /global_waypoints)"/>
 
   <!-- Global waypoints publisher (loads stack_master/maps/<map>/centerline.csv + global_waypoints.csv) -->
   <node pkg="global_planner" exec="waypoint_publisher" name="waypoint_publisher" output="screen">
     <param name="map_name" value="$(var map)"/>
   </node>
+
+  <!-- Lap analyser: 매 랩 lap_time + 횡오차(d from raceline) + 벽 최소거리. 2026-07-08 추가. -->
+  <group if="$(var lap_analyser)">
+    <node pkg="lap_analyser" exec="lap_analyser" name="lap_analyser" output="screen"/>
+  </group>
 
   <!-- Nonlinear MPCC controller.
        sim : gym_bridge publishes /vesc/odom directly (GT), no remap needed.

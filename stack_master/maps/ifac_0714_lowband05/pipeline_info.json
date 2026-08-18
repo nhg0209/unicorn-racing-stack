@@ -1,0 +1,46 @@
+{
+  "bag": "/media/leesh/T7/bag/ifac_mapping/rosbag2_2026_07_14-15_24_34_lowband05",
+  "glim_config": "/home/leesh/ros2_ws/glim_config_gpu",
+  "use_gpu": true,
+  "z_band_m": [
+    0.02,
+    0.5
+  ],
+  "png_resolution": 0.05,
+  "ground_normal": [
+    -0.0013886825181543827,
+    0.05386247858405113,
+    0.998547375202179
+  ],
+  "ground_d": 0.10593283921480179,
+  "ground_tilt_deg": 3.088637113571167,
+  "ground_lidar_normal": [
+    -0.26730459157146674,
+    -0.01293260917898385,
+    0.9635252995872163
+  ],
+  "ground_lidar_offset": 0.12974070755481673,
+  "n_points_full": 94920,
+  "n_points_band": 58122,
+  "grid": {
+    "W": 536,
+    "H": 445,
+    "res": 0.05,
+    "occ": 6126,
+    "free": 209961,
+    "origin": [
+      -7.121645450592041,
+      -8.213153839111328
+    ],
+    "track": {
+      "W": 536,
+      "H": 445,
+      "res": 0.05,
+      "cells": 209961,
+      "origin": [
+        -7.121645450592041,
+        -8.213153839111328
+      ]
+    }
+  }
+}

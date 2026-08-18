@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ROS2 wrapper for the EVO-MPCC core (acados / IPOPT backends).
+"""ROS2 wrapper for the EVO-MPCC core (acados backend).
 
 This is the **skeleton** of the ROS2 node — full feature parity with the
 original ROS1 `Nonlinear_MPC_node.py` (56 KB) is reached incrementally.
@@ -32,12 +32,10 @@ in follow-up commits):
 
 The numerical MPC code (`mpc_core.acados_kinematic.MPC`) is unchanged
 from the ROS1 version after Phase 1's ROS-decoupling — the wrapper here
-only handles ROS2 IO. Replace `MPC` with `mpc_core.ipopt_kinematic.MPC`
-to swap the backend (mirrors the ROS1 `mpc_backend` parameter).
+only handles ROS2 IO.
 """
 from __future__ import annotations
 
-import json
 import math
 import os
 import time
@@ -49,37 +47,25 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
 
+from .opp_bins import OppBins
+from .opp_tracker import OppTracker
 from .track_loader import TrackData, build_track_from_wpnts, find_current_arc_length, load_track
-from .mpc_core.model_policy import A_MIN_DYN, clamp_a_lat_to_grip, lmpc_anchor_s
-# 2026-05-28 #18 LMPC integration
-from .mpc_core.lmpc.lap_database import LapDatabase
-from .mpc_core.lmpc.safe_set import SafeSetLookup
-from .mpc_core.lmpc.nominal_dynamics import predict_next
+from .mpc_core.acados_kinematic import MPC
+from .mpc_core.model_policy import A_MIN_DYN, clamp_a_lat_to_grip, slew_limit_speed
+from .mpc_core.opp_prediction_sampler import stage_times, sample_opp_xy, project_s
+from nonlinear_mpc_acados.ot_planner import build_windows, OtPlanner
 
-from std_msgs.msg import Bool, ColorRGBA, Float32MultiArray, Float64, Header, Int32
+from std_msgs.msg import Bool, ColorRGBA, Float32MultiArray, Float64, Header
 from geometry_msgs.msg import (
     Point, PointStamped, PoseArray, PoseStamped, PoseWithCovarianceStamped,
     Quaternion, Vector3,
 )
-from nav_msgs.msg import Odometry, Path
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from visualization_msgs.msg import Marker, MarkerArray
 from ackermann_msgs.msg import AckermannDriveStamped
 
 from osuf1_common.msg import MPCTrajectory, MPCPrediction
 from f110_msgs.msg import LapData, WpntArray  # noqa: F401  (used in TODO sections)
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# Backend selection — keep symmetric with ROS1 `mpc_backend` parameter
-# ──────────────────────────────────────────────────────────────────────────
-def _load_mpc_backend(name: str):
-    if name == 'acados':
-        from .mpc_core.acados_kinematic import MPC
-        return MPC
-    if name == 'ipopt':
-        from .mpc_core.ipopt_kinematic import MPC
-        return MPC
-    raise ValueError(f"unknown mpc_backend: {name!r} (expected 'acados' or 'ipopt')")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -128,13 +114,8 @@ class _RclpyLoggerAdapter:
 # Updated via `on_set_parameters_callback` (replaces ROS1 dyn_reconfigure).
 # ──────────────────────────────────────────────────────────────────────────
 LIVE_PARAMS = [
-    ('q_cte_live', 8.0),
-    ('q_lag_live', 200.0),
-    ('q_d_delta_live', 25.0),
     ('R_safe_live', 0.3),
-    ('M_slack_live', 2.0e4),
     ('a_lat_safe_live', 6.0),
-    ('D_detour_live', 0.15),
     ('D_apex_live', 0.22),
     ('R_car_live', 0.0),
     ('commit_dist_live', 10.0),
@@ -164,10 +145,8 @@ class MPCNode(Node):
         )
 
         # ── Parameters ──────────────────────────────────────────────
-        self.declare_parameter('mpc_backend', 'acados')
         self.declare_parameter('odom_topic_name', '/car_state/odom')
         self.declare_parameter('localized_pose_topic_name', '/car_state/pose')
-        self.declare_parameter('goal_topic_name', '/move_base_simple/goal')
         self.declare_parameter('cmd_vel_topic_name',
                                '/vesc/high_level/ackermann_cmd_mux/input/nav_1')
         # Track / MPC sizing
@@ -179,13 +158,6 @@ class MPCNode(Node):
         # Fixed-width corridor (centerline ± half). >0 = enabled, 0 = raw
         # wpnt.d_left/d_right + inflation (기존 동작). 자세한 설명: ddrx_unified_params.yaml.
         self.declare_parameter('mpc_corridor_half_width', 0.0)
-        # Corridor-width speed cap (complements κ-cap; fixes narrow-but-straight
-        # wall clips). v_floor<=0 disables. width=usable corridor (d_l+d_r,
-        # post-margin); ramp speed from floor (at tight) to v_max (at wide).
-        self.declare_parameter('corridor_v_floor', 0.0)
-        self.declare_parameter('corridor_v_tight_width', 1.0)
-        self.declare_parameter('corridor_v_wide_width', 1.6)
-        self.declare_parameter('vehicle_L', 0.307)
         self.declare_parameter('max_speed', 6.0)
         self.declare_parameter('max_speed_p', 6.0)
         self.declare_parameter('mpc_max_steering', 0.4)
@@ -202,32 +174,13 @@ class MPCNode(Node):
         # floor=0 → 비활성 (기존 동작). 둘 다 같은 root cause (저속 ill-cond) 해결.
         self.declare_parameter('cold_start_vx_floor', 2.0)
         self.declare_parameter('startup_speed', 1.5)
-        # multi-dt time_steps mode: 'uniform' (모든 step dt=dT) | 'pyramidal' (가까이 sharp, 멀리 long).
-        # pyramidal 은 horizon 늘어남 — 다음 코너까지 보여 racing line 발견 ↑.
-        self.declare_parameter('time_steps_mode', 'uniform')
-        self.declare_parameter('integration_mode', 'Euler')
-        self.declare_parameter('params_file', 'BO_params_LTM')
         # Track source: 'centerline' (/centerline_waypoints) or 'raceline'
         # (/global_waypoints, IQP 사전 최적 raceline). raceline 사용 시 mpc
         # 가 racing line 추종 — 코너에서 자연스럽게 apex 통과 (EVO-MPCC /
         # Liniger MPCC 의 표준 패턴).
         self.declare_parameter('track_source', 'centerline')
-        # auto_tune=true → max_speed 만 사용자 설정, 나머지 cost weights /
-        # corridor / EMA 등은 _auto_tune_from_max_speed() 의 heuristic 매핑
-        # 으로 자동 결정. mpc init 시 1회 적용.
-        self.declare_parameter('auto_tune', False)
-        # C: MLP weight scaler (학습된 모델로 q_*_scale_live 결정).
-        # use_ml_scale=true 면 B heuristic 대신 NN 추론 사용.
-        # ml_model_path: TorchScript .pt 경로. 빈 문자열이면 default 위치.
-        self.declare_parameter('use_ml_scale', False)
-        self.declare_parameter('ml_model_path', '')
-        # BO sweep / 수동 override 모드.
-        #   'off'        → MLP/B 그대로 (기본)
-        #   'fixed'      → override_q_*_scale 4개 고정값 적용
-        #   'bucketed'   → κ_abs 기반 3 bucket × 4 scale = 12 param 적용 (BO 학습용)
-        #   'polynomial' → BO 결과로 학습된 poly(v) → bucket 별 scale (실시간 deploy)
-        self.declare_parameter('override_mode', 'off')
-        self.declare_parameter('poly_path', '')   # polynomial JSON 경로 (override_mode='polynomial')
+        # (2026-07-09 대청소: auto_tune / use_ml_scale / override_mode / poly_path
+        #  등 실험 스캐폴딩 제거 — q_*_scale_live 직접 튜닝이 유일 경로)
         # ── 모델 선택 (2026-06-10 unified 8-state layout — 양 모드 동일 구조) ──
         # use_dynamic=False (kinematic f_kin, 8-state): tire slip 미모델 (고그립 차용)
         # use_dynamic=True  (dynamic blended Pacejka, 8-state): tire slip 정확 (저그립 차용)
@@ -248,19 +201,129 @@ class MPCNode(Node):
         # and more consistent cycle-to-cycle predictions, but over-damped if
         # too large. Exposed as a param so it can be swept / BO-tuned.
         self.declare_parameter('lm_dynamic', 1.0)
-        # Phase D — GP residual learning (L4acados ResidualLearningMPC wrap).
-        # use_gp_residual=true & gp_ckpt_path 존재 → setup_MPC 후 GP 적용.
-        self.declare_parameter('use_gp_residual', False)
-        self.declare_parameter('gp_ckpt_path', '')
+        # Phase 3-i learned ref_V toggle.
+        self.declare_parameter('use_learned_refv', False)
+        self.declare_parameter('learned_refv_path', '')   # 빈 값 → maps/<track_name>/learned_refv.npz
+        # 0724 온라인 학습 속도 프로파일 (스펙 docs/superpowers/specs/2026-07-24-refv-*)
+        self.declare_parameter('use_refv_learning', False)
+        self.declare_parameter('refv_step_delta', 0.05)
+        # v2 (성과 기반 hill-climb, 2026-07-24 방향 B): 하한 = baseline(1.0) —
+        # 학습이 스케일을 baseline 아래로 내리지 않음.
+        self.declare_parameter('refv_scale_min', 1.0)
+        self.declare_parameter('refv_scale_max', 1.5)
+        self.declare_parameter('alat_scale_min', 1.0)
+        self.declare_parameter('alat_scale_max', 1.3)
+        self.declare_parameter('refv_min_samples', 2)
+        self.declare_parameter('refv_learn_path', '')  # 빈 값 → ~/mpc_logs/refv_scales_<track>.npz
+        self.declare_parameter('refv_lt_tol', 0.02)          # 랩타임 악화 판정 허용치
+        self.declare_parameter('refv_raise_cooldown', 2)     # 악화/dirty 후 재상향 쉬는 랩 수
+        # task-8 (2026-07-27): 방향성 벽여유 게이트 — 실측 벽여유 0.31m·
+        # 모서리 0.14-0.19m에서 충돌한 ifac s≈14 사고 기준.
+        self.declare_parameter('refv_min_margin_m', 0.35)
         # Phase D (closed-form) — adds the trained GP posterior mean as a pure
         # CasADi expression to the dynamics ONLY (cost/p_sym untouched).
-        # Independent of use_gp_residual (l4acados). Default OFF.
         self.declare_parameter('use_gp_casadi', False)
-        self.declare_parameter('use_error_regression', False)
-        self.declare_parameter('err_regr_bandwidth', 1.0)   # Epanechnikov h (× max neighbour vel-dist)
-        self.declare_parameter('err_regr_ema', 0.8)          # B4' e_corr temporal EMA: β·prev+(1-β)·new
+        # 2026-07-03 지연보상: 실측 명령→요응답 130ms. 0.0=off.
+        self.declare_parameter('actuation_latency_s', 0.0)
+        # 2026-07-02: gp_casadi ckpt 경로를 yaml 에서 지정 (빈 문자열 = 코드 기본값
+        # realvy). 재학습(post-fix 데이터) ckpt 교체를 위해 추가.
+        self.declare_parameter('gp_casadi_ckpt', '')
+        self.declare_parameter('gp_casadi_train_data', '')
         # R3 decouple max_speed: 0 → derive from max_speed (behaviour unchanged).
         self.declare_parameter('speed_target', 0.0)          # q_p progress target (0 → max_speed)
+        self.declare_parameter('progress_reward_gamma', 0.0)  # B1 선형 진행보상 gamma. 0=off
+        self.declare_parameter('slew_up_rate', 8.0)    # 발행 speed 슬루 상승률 [m/s2] (ablation용 param화 2026-07-09)
+        self.declare_parameter('slew_up_rate_straight', 8.0)  # 0805: 직선(κ_eq<thr) 전용 상승률 — 곡률 게이트 슬루
+        self.declare_parameter('slew_gate_settle_s', 0.5)  # 0805b: 게이트 정착시간 — 코너탈출 잔류동역학 위 풀스로틀 방지
+        self.declare_parameter('slew_down_rate', 5.0)  # 하강률. 크게(50) 하면 사실상 off
+        self.declare_parameter('brake_preview_s', 0.0)  # 2026-07-16 brake min-guard 창 분리 [s]. 0=accel_preview_s와 동일(기존). accel preview 1.0s 확대가 제동개시도 6m 전으로 당겨 직선 후반 2m/s2 순한제동 손실 -> 짧게(0.4) 두면 제동은 anticip+d_min이 거리기반으로 담당
+        self.declare_parameter('brake_anticip_d_min', 0.0)  # 2026-07-16 anticip 캡 근거리 제외 [m]: d_i<d_min 스테이지는 캡 후보서 제외. 0=기존(직선서 캡≈v_next=가속목줄, bag 재계산으로 확정). 코너 정직성은 brake min-guard+원거리 캡이 유지.
+        self.declare_parameter('speed_cmd_err_max', 0.0)  # 2026-07-16 발행 v_cmd <= v_now+err_max [m/s]. d_min 해방 후 cmd 7.8>erpm캡 6.74 슬래밍+plan지터 증폭(톱니 0.2/실속출렁 0.6) → 캡이 물리면 cmd=실속+상수(매끈)+VESC 최대구동 유지. 0=off
+        self.declare_parameter('speed_cmd_gain', 1.0)  # 2026-07-09 가속 오차증폭 G: v_cmd=v_now+G*(v_plan-v_now), 가속국면만. VESC 약한 속도PID의 소프트웨어 보상. 1.0=off
+        # 2026-07-09 국소 corridor 하드닝: s∈[s0,s1] 예측 스테이지의 corridor slack
+        # 벌금을 factor배 (스텁 s≈21.6 soft-corridor 뚫림 대응). factor<=1 = off. live.
+        self.declare_parameter('corridor_hard_s0', 20.8)
+        self.declare_parameter('corridor_hard_s1', 23.5)
+        self.declare_parameter('corridor_hard_factor', 10.0)
+        # 2026-07-16 존2 (d_min 가속해방 후 s12-13 마진 0.084 재발 대응). factor<=1 = off.
+        self.declare_parameter('corridor_hard2_s0', 11.5)
+        self.declare_parameter('corridor_hard2_s1', 14.5)
+        self.declare_parameter('corridor_hard2_factor', 1.0)
+        # 2026-07-16 존3/4 (직선해방 후 s1-9 첫섹터 얕은관통 대응). factor<=1 = off.
+        self.declare_parameter('corridor_hard3_s0', 5.0)
+        self.declare_parameter('corridor_hard3_s1', 7.5)
+        self.declare_parameter('corridor_hard3_factor', 1.0)
+        self.declare_parameter('corridor_hard4_s0', 0.5)
+        self.declare_parameter('corridor_hard4_s1', 2.5)
+        self.declare_parameter('corridor_hard4_factor', 1.0)
+        # 2026-07-21 존 슬롯 4→6 확장 (f맵 랩경계 s0-8/s74-77 커버). 기본 factor 1.0=off.
+        self.declare_parameter('corridor_hard5_s0', 0.0)
+        self.declare_parameter('corridor_hard5_s1', 0.0)
+        self.declare_parameter('corridor_hard5_factor', 1.0)
+        self.declare_parameter('corridor_hard6_s0', 0.0)
+        self.declare_parameter('corridor_hard6_s1', 0.0)
+        self.declare_parameter('corridor_hard6_factor', 1.0)
+        # 2026-07-21 헤어핀 q_cte 존 부스트: corridor_hard 존 안 스테이지의
+        # q_cte_scale ×factor (라인추종 타이트닝). 1.0=off. live.
+        self.declare_parameter('qcte_zone_factor', 1.0)
+        # 2026-07-28: corridor_hard 존/ s 눈금자를 /mpc/zone_markers 로 발행.
+        # 발행 전용(제어 무영향). 존 구성이 바뀐 사이클에만 다시 그린다.
+        self.declare_parameter('publish_zone_markers', True)
+        # 존 드래그 편집 — 기본 OFF. 주행 중 실수로 존이 움직이면 위험하므로
+        # 튜닝할 때만 켠다. 켜면 RViz InteractiveMarkers 로 경계를 끌 수 있다.
+        self.declare_parameter('zone_edit_enable', False)
+        # 저장 대상 yaml. 비우면 이 노드가 로드한 config 를 자동 추정한다.
+        self.declare_parameter('zone_yaml_path', '')
+        # 2026-07-21 속도비례 commit 반응시간 [s]: commit_eff=max(commit_dist, v·t).
+        # 고속 회피 실패(늦은 commit) 수정. live.
+        self.declare_parameter('commit_treact', 1.5)
+        # 2026-07-21 장애물 통과속도 [m/s]: committed 장애물 d_keep(0.8m) 지점 목표속도.
+        # 회피 중 종방향 감속 정책 (횡 half-plane만으론 고속 돌진; bag 19_48). live.
+        # 0722n 2.5→3.3: 2.5 플로어가 "회피가 너무 느림" 체감의 정체 (순항 4.5 대비).
+        # slack×10으로 계획이 keepout을 지키게 된 뒤라 감속 의존도 낮아짐.
+        self.declare_parameter('obs_pass_speed', 3.3)
+        # 0723z: 동적 상대 추월 허용 스위치 — 기본 False(트레일링만). 추후 GP
+        # 예측 신뢰도가 충분할 때 True로 (사용자 로드맵: 학습되면 오버테이킹).
+        self.declare_parameter('overtake_enabled', False)
+        # 2026-08-05 추월 재설계 (specs/2026-08-05-overtake-redesign-design.md)
+        # A/B 는 이 4개만 (스펙 4.4). ot_shadow=True 면 판정/전이 로그만 내고
+        # 액션(R_safe/킥/간격)은 미적용 — 검증 사다리 2단.
+        self.declare_parameter('ot_keepout', 0.35)
+        self.declare_parameter('ot_launch_gap', 1.5)
+        self.declare_parameter('ot_pass_margin', 0.8)
+        self.declare_parameter('ot_cooldown', 5.0)
+        self.declare_parameter('ot_shadow', True)
+        # 2026-08-06 최종리뷰 G5: spec 부록 A 의 "하드코딩 추정치" 두 개를
+        # 라이브 파라미터로 노출 (기존 4종과 동일 패턴 — 매 사이클 재조회).
+        self.declare_parameter('ot_commit_gap', 4.0)
+        self.declare_parameter('ot_engage_gap', 6.0)
+        # 2026-08-07: 1대1 경주 전제 — 상대가 바뀌지 않는 한 항상 같은 차이므로
+        # 소실(라이다 시야 이탈) 만으로 GP-bins 학습을 버릴 이유가 없다. 라이브 심
+        # 실측(추월 5사이클): 소실→decay→재포착(+18s)→재학습(+15s, 최악 +150s) 후에야
+        # 추월 재시도 — 매 랩 같은 상대를 재학습하는 낭비. 기본 False(보존).
+        # True 로 켜면 종전 동작(소실 시에도 decay) 복원 가능.
+        self.declare_parameter('ot_bins_decay_on_lost', False)
+        self._ot_planner = None
+        self._ot_decision = None
+        # 2026-08-06 최종리뷰 C1: R_safe 축소 래치. 비섀도 적용 경로가
+        # _dec.r_safe(!=0.3, 즉 축소) 를 실제로 mpc.R_safe_obs_live 에 쓸 때만
+        # True — 이후 어떤 이유로든(섀도 전환·overtake off·planner 부재·
+        # 트래커 비활성 등으로 _dec=None) 그 경로가 실행되지 않는 사이클에
+        # dirty 면 1회 None 으로 복원하고 해제한다. dirty 가 아닐 때는
+        # R_safe_obs_live 를 절대 건드리지 않는다.
+        # 2026-08-06 최종리뷰 G1: 대입 대상을 R_safe_live → R_safe_obs_live 로
+        # 전환 — R_safe_live 는 obstacle 제약뿐 아니라 side-decide 문턱
+        # (w_car_safe)/_full_keep 도 함께 읽어, OT 의 0.10 축소가 그 문턱까지
+        # 붕괴시켜 STALL(쐐기 접촉) 실패모드를 재현했다(bag 16_22). R_safe_obs_live
+        # 는 obstacle p_arr[7] 계산에만 쓰여 rqt R_safe_live 튜닝을 완전히
+        # 보존한다.
+        self._ot_rsafe_dirty = False
+        # M11 최종리뷰: getattr 기본값 의존 제거 — QP 결과 갱신 전 상태를 명시.
+        self._last_qp_ok = True
+        # 2026-07-16 직선 전용 q_v 부스트: |κ(s_k)|<thr 인 예측 스테이지만
+        # q_v_scale ×factor (명령이 ref_v 를 더 세게 쫓음). 1.0=off. live.
+        self.declare_parameter('straight_qv_factor', 1.0)
+        self.declare_parameter('straight_kappa_thr', 0.15)
         self.declare_parameter('lookahead_m', 0.0)           # ref_v κ window [m] (0 → max(6, v²/6))
         # brake-distance-aware 속도명령의 가정 감속도 [m/s²]. 낮을수록 코너를 더
         # 일찍/느리게 진입 (코너 안에선 friction-circle 로 못 서니까 미리 줄이려면 ↓).
@@ -275,85 +338,107 @@ class MPCNode(Node):
         # 실차 모드: /sim/initialpose 없음. STUCK recovery 시도해도 무의미 + 위험.
         # sim=true (default) / real=false.
         self.declare_parameter('enable_sim_reset', True)
-        # fixed mode (W1) — 단일 4 scale.
-        self.declare_parameter('override_scales', False)  # legacy: true → 'fixed' 와 동일
-        self.declare_parameter('override_q_cte_scale', 1.0)
-        self.declare_parameter('override_q_lag_scale', 1.0)
-        self.declare_parameter('override_q_v_scale', 1.0)
-        self.declare_parameter('override_q_drate_scale', 1.0)
-        # bucketed mode (W2) — bucket boundaries (κ_abs):
-        #   b0: κ ∈ [0,         bucket_kappa_b01)    → 직선/완만
-        #   b1: κ ∈ [b01,       bucket_kappa_b12)    → medium corner
-        #   b2: κ ∈ [b12,       +∞)                  → hairpin
-        self.declare_parameter('bucket_kappa_b01', 0.3)
-        self.declare_parameter('bucket_kappa_b12', 0.6)
-        for b in (0, 1, 2):
-            self.declare_parameter(f'override_q_cte_scale_b{b}',   1.0)
-            self.declare_parameter(f'override_q_lag_scale_b{b}',   1.0)
-            self.declare_parameter(f'override_q_v_scale_b{b}',     1.0)
-            self.declare_parameter(f'override_q_drate_scale_b{b}', 1.0)
-        # 데이터 수집 모드: lap 마다 effective max_speed 자동 증가.
-        # codegen v_max (yaml max_speed) 는 end_speed 로 고정 → ubu cap.
-        # 시작 시 mpc.v_max = start_speed → 매 lap_per_step 마다 step 증가.
-        self.declare_parameter('auto_step_enable', False)
-        self.declare_parameter('auto_step_start', 4.0)
-        self.declare_parameter('auto_step_end', 12.0)
-        self.declare_parameter('auto_step_size', 1.0)
-        self.declare_parameter('auto_step_laps', 5)
-
-        # ── LMPC (Learning MPC) parameters (2026-05-28 #18) ──
-        self.declare_parameter('use_lmpc', False)
-        self.declare_parameter('lmpc_w', 1.0)
-        self.declare_parameter('lmpc_alpha', 1.0)
-        self.declare_parameter('lmpc_beta', 0.05)
-        self.declare_parameter('lmpc_reg_w', 0.001)
-        self.declare_parameter('lmpc_K_points', 10)
-        self.declare_parameter('lmpc_K_laps', 4)
-        self.declare_parameter('lmpc_slice_window', 50)
-        self.declare_parameter('lmpc_enable_after_real_laps', 1)
-        self.declare_parameter('lmpc_load_path', '')
-        self.declare_parameter('lmpc_save_path', '')
-        self.declare_parameter('lmpc_seed_from_raceline', True)
-        # IQP raceline json for the apex seed (grip-clamped). Set by launch to
-        # maps/<map>/global_waypoints.json. Empty → centerline seed fallback.
-        self.declare_parameter('lmpc_raceline_json', '')
-        self.declare_parameter('lmpc_max_resets', 0)  # 2026-06-08: teleport된 랩은 safe-set에서 거부
-        self.declare_parameter('lmpc_max_abs_ec_m', 1.0)
-        self.declare_parameter('lmpc_max_lap_time_ratio', 1.5)
-        self.declare_parameter('lmpc_max_stuck_seconds', 5.0)
-        self.declare_parameter('lmpc_buffer_per_bucket', 10)
-        # Vehicle dynamics (only `l_wb` consumed in kinematic mode; full set
-        # used by acados dynamic Pacejka mode — kept here so swapping
-        # use_dynamic doesn't require config changes.)
+        # Vehicle dynamics — only `l_wb` is consumed (kinematic mode via
+        # vheid['l_wb']; acados dynamic Pacejka mode uses its own
+        # hardcoded dyn_lf/dyn_lr/dyn_m constants, not this param).
         self.declare_parameter('vehicle.l_wb', 0.307)
-        self.declare_parameter('vehicle.l_f', 0.162)
-        self.declare_parameter('vehicle.l_r', 0.145)
-        self.declare_parameter('vehicle.m', 3.54)
         for name, default in LIVE_PARAMS:
             self.declare_parameter(name, default)
 
-        backend_name = self.get_parameter('mpc_backend').value
         odom_topic = self.get_parameter('odom_topic_name').value
         pose_topic = self.get_parameter('localized_pose_topic_name').value
-        goal_topic = self.get_parameter('goal_topic_name').value
         cmd_topic = self.get_parameter('cmd_vel_topic_name').value
 
         # ── MPC instance (numerical core) ───────────────────────────
-        MPC = _load_mpc_backend(backend_name)
         self._mpc_log = _RclpyLoggerAdapter(self.get_logger())
         self.mpc = MPC(cost_type=None, system_model=None, logger=self._mpc_log)
         self.mpc.boundary_hook = self._on_boundary_points
+        # ── P1 (2026-07-22): 점유맵 레이캐스트 주입 ──────────────────────
+        # fresh side 판정의 w-LUT 지오메트리가 실벽과 불일치(bag 0721 20_45:
+        # "불가" 판정쪽으로 실제 통과 / "가능"쪽 STUCK) → solver가 실측 벽거리로
+        # 판정하도록 raycast 함수를 주입. /map은 latched(transient_local).
+        self._map_grid = None      # (np.uint8 HxW, res, ox, oy) — 0=free
+        _map_qos = QoSProfile(depth=1)
+        _map_qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
+        self.create_subscription(OccupancyGrid, '/map', self._map_cb, _map_qos)
+        self.mpc.map_raycast = self._map_raycast   # solver decide_side_pref가 사용
         self._push_live_params_to_mpc()
+
+        # 2026-08-06 동적상대 모드별 q-가중치 (BO bo_live_20260806_201659):
+        # FAST(부팅 yaml=BO, 무장애물 9.48~9.59 + 정적회피 클린) ↔
+        # SAFE(0805 검증세트 — 추종/추월 전 검증 통과. BO 세트는 동적상대에서
+        # 접촉 8/STUCK 9(ot_bo) → _dyn_obs 동안만 SAFE 로 라이브 전환).
+        # rqt 로 이 7종을 손튜닝하면 다음 전이에서 덮임 — 세트 수정은 여기서.
+        self._Q_KEYS = ('q_cte_scale_live', 'q_lag_scale_live',
+                        'q_psi_scale_live', 'q_v_scale_live',
+                        'q_p_scale_live', 'q_drate_scale_live',
+                        'q_dv_scale_live')
+        self._q_safe = {'q_cte_scale_live': 4.9469, 'q_lag_scale_live': 0.6392,
+                        'q_psi_scale_live': 1.7526, 'q_v_scale_live': 2.0,
+                        'q_p_scale_live': 6.5, 'q_drate_scale_live': 27.8138,
+                        'q_dv_scale_live': 0.15}
+        self._q_fast = None   # 첫 전이 시 현재값(부팅 yaml=BO) 캡처
+        # 2026-08-07 (bag 15_08_38): FAST 는 "빈 트랙" 전용 — 정적 장애물
+        # 커밋 중에도 SAFE 로 전환한다(수정 A, 아래 사이클 루프 참조).
+        self._q_mode_safe = None      # None=미결정, True=SAFE, False=FAST
+        self._safe_last_true_t = None  # SAFE→FAST 복귀 2.0s 히스테리시스 기준시각
 
         # ── Publications ────────────────────────────────────────────
         self.ackermann_pub = self.create_publisher(AckermannDriveStamped, cmd_topic, 10)
         self.mpc_traj_pub = self.create_publisher(Path, '/mpc_trajectory', 10)
-        # MarkerArray twin of /mpc_trajectory — small magenta spheres, one per
-        # mpc stage. Matches the visual style of /center_path etc. The Path
-        # version is kept for mpc_debug_logger / other consumers.
+        # MarkerArray twin of /mpc_trajectory — 속도별로 색이 변하는 LINE_STRIP
+        # + 지평선 끝점 구슬 (아래 _publish_trajectory 참조). RViz 에서는 이쪽만
+        # 보면 된다. Path 쪽(/mpc_trajectory)은 mpc_debug_logger 등 다른 소비자를
+        # 위해 유지하는 것이지 시각화용이 아니다 — MarkerArray 디스플레이를
+        # /mpc_trajectory 에 걸면 타입이 안 맞아 아무것도 안 나온다(2026-07-29).
         self.mpc_traj_markers_pub = self.create_publisher(
             MarkerArray, '/mpc_trajectory/markers', 10)
         self.boundary_pub = self.create_publisher(MarkerArray, '/boundary_marker', 10)
+        # 2026-07-28 zone 시각화 — corridor_hard 존과 s 눈금자를 RViz 에 그린다.
+        # 존 파라미터는 매 사이클 get_parameter 로 읽히므로(아래 _control_loop_cb)
+        # `ros2 param set` 으로 재시작 없이 옮길 수 있다. 이 마커가 그 결과를
+        # 눈으로 확인시켜 준다. latched(TRANSIENT_LOCAL) 라 늦게 뜬 RViz 도 받는다.
+        self.zone_markers_pub = self.create_publisher(
+            MarkerArray, '/mpc/zone_markers', self._latched_qos)
+        # 2026-07-29 s 눈금자를 별도 토픽으로 분리 — 존과 한 토픽에 섞여 있으면
+        # 눈금자만 끌 수가 없어 화면이 텍스트 마커로 뒤덮였다. RViz 체크박스
+        # 하나로 껐다 켜지게 한다.
+        self.s_ruler_pub = self.create_publisher(
+            MarkerArray, '/mpc/s_ruler', self._latched_qos)
+        self._zone_marker_sig = None   # 마지막으로 그린 존 구성(변경 감지용)
+        # ── 존 드래그 편집 + 저장 ──────────────────────────────────
+        # interactive_markers 는 튜닝용 선택 의존성 — 없거나 실패해도 제어
+        # 노드는 정상 기동해야 하므로 import·생성 전부 감싼다.
+        self._imk_server = None
+        self._imk_map = {}
+        self._zone_yaml_path = self._find_zone_yaml()
+        if bool(self.get_parameter('zone_edit_enable').value):
+            try:
+                from interactive_markers import InteractiveMarkerServer
+                self._imk_server = InteractiveMarkerServer(self, 'mpc_zone_edit')
+                self.get_logger().info(
+                    "[zone-edit] 드래그 편집 ON — RViz 에 InteractiveMarkers "
+                    "디스플레이(topic: /mpc_zone_edit)를 추가하세요")
+            except Exception as e:  # noqa: BLE001
+                self.get_logger().warn(f"[zone-edit] 비활성(초기화 실패): {e}")
+        from std_srvs.srv import Trigger
+        self._save_zones_srv = self.create_service(
+            Trigger, '~/save_zones', self._save_zones_cb)
+        # rqt_reconfigure 에서 체크박스 하나로 저장하기 위한 파라미터.
+        # (sector_tuner 의 save_params 관례와 동일) 켜면 저장 후 스스로 꺼져
+        # 버튼처럼 동작한다. 실제 저장은 제어 루프 밖(하우스키핑 타이머)에서.
+        self.declare_parameter('save_params', False)
+        self._save_params_req = False
+        self._housekeep_timer = self.create_timer(0.5, self._housekeep_cb)
+        # 0812 rqt 라이브 섹터 튜너 — "start-end:factor,..." (wpnt id 구간별 ref_v 배율).
+        # 빈 문자열 = maps/<map>/speed_scaling.yaml 사용. rqt 로 바꾸면 하우스키핑
+        # 타이머가 트랙 ref_v 를 재구축한다(제어루프 1~3s 유휴 — 저속/정지 중 변경 권장).
+        self.declare_parameter('sector_refv_spec', '')
+        self._sector_respec_req = False
+        self._ref_vx_orig = None      # 스케일 전 원본 vx (재적용 기준점)
+        # ⚠함수내 from-import 금지: 위쪽 QoSProfile 사용(141행)을 지역변수화해 죽인다
+        self._refv_marker_pub = self.create_publisher(
+            MarkerArray, '/mpc/refv_markers', self._latched_qos)
         self.prediction_pub = self.create_publisher(MPCTrajectory, '/mpc/prediction', 1)
         self.cost_pub = self.create_publisher(Float64, '/mpc/cost', 10)
         self.solve_time_pub = self.create_publisher(Float64, '/mpc/solve_time', 10)
@@ -366,12 +451,6 @@ class MPCNode(Node):
         self.initialpose_pub = self.create_publisher(
             PoseWithCovarianceStamped, '/sim/initialpose', 10)
         self._stuck_release_total = 0
-        # Per-lap teleport (safe-reset) count for LMPC lap-acceptance. Counted in
-        # _publish_safe_reset (the single choke point both kinematic & dynamic
-        # branches pass through), read+reset at each lap boundary. Replaces the
-        # old _stuck_release_total sync which only incremented in the kinematic
-        # branch → dynamic-mode teleports counted as 0 → crash laps polluted SS.
-        self._lmpc_lap_teleports = 0
         self._last_reset_t = 0.0
         # Latched (TRANSIENT_LOCAL) viz publishers — small-sphere MarkerArray
         # in the style of race-stack's /centerline_waypoints/markers (type=2
@@ -389,7 +468,6 @@ class MPCNode(Node):
         # ── Subscriptions ───────────────────────────────────────────
         self.create_subscription(Odometry, odom_topic, self._odom_cb, 1)
         self.create_subscription(PoseStamped, pose_topic, self._pose_cb, 1)
-        self.create_subscription(PoseStamped, goal_topic, self._goal_cb, 1)
         self.create_subscription(PointStamped, '/clicked_point',
                                  self._clicked_point_cb, 4)
         self.create_subscription(PoseArray, '/external_obstacles',
@@ -406,10 +484,18 @@ class MPCNode(Node):
         # ── State cache (most-recent message snapshots) ─────────────
         self._last_odom: Odometry | None = None
         self._last_pose: PoseStamped | None = None
-        self._goal: PoseStamped | None = None
         self._obstacles: list[tuple[float, float]] = []
         self._obstacles_stamp: float = 0.0
+        # ── opponent prediction (v1: raceline projection + constant velocity) ──
+        self.declare_parameter('use_opp_prediction', True)    # NOTEBOOK(sim 전용): 기본 ON. Mac/실차 기본은 False 유지
+        self._opp_prev_s: float | None = None    # last projected opponent s [m]
+        self._opp_prev_t: float | None = None    # monotonic time of that projection
+        self._opp_v: float = 0.0                 # EMA-smoothed opponent speed [m/s]
         self._lap_count: int = 0  # TODO: subscribe to LapData
+        # 0724 온라인 학습 속도 프로파일 — _try_build_track 전에도 record 호출 경로에서
+        # 참조될 수 있으므로 선행 초기화 (실제 학습기는 _try_build_track에서 조건부 생성)
+        self._spl = None
+        self._spl_path: str | None = None
         self._mpc_ready: bool = False
         self._track: TrackData | None = None
 
@@ -455,82 +541,7 @@ class MPCNode(Node):
         self._track_fallback_timer = self.create_timer(
             self._track_csv_fallback_sec, self._track_csv_fallback_cb)
 
-        # ── C: ML weight scaler load (use_ml_scale=true 면) ────────────
-        self._load_ml_scaler()
-        # ── D: BO-learned polynomial coefficients (override_mode='polynomial' 시) ──
-        self._load_polynomial()
-
-        # ── 자동 max_speed stepper (auto_step_enable=true 면) ──
-        # 같은 launch 안에서 lap 카운트 기반으로 effective v_max 자동 증가.
-        # codegen ubu cap 은 yaml max_speed (예: 12) 로 고정 — 그게 절대 상한.
-        # mpc.v_max (cost target) 만 step 마다 변경.
-        self._auto_step_state = {
-            'enabled':      bool(self.get_parameter('auto_step_enable').value),
-            'start':        float(self.get_parameter('auto_step_start').value),
-            'end':          float(self.get_parameter('auto_step_end').value),
-            'size':         float(self.get_parameter('auto_step_size').value),
-            'laps':         int(self.get_parameter('auto_step_laps').value),
-            'last_lap':     -1,
-            'lap_at_step':  0,
-            'current_step': 0,
-        }
-        # /mpc/lap_count subscription drives BOTH auto_step max_speed ramp AND
-        # LMPC lap-end buffering (_on_lap_count_step → _lmpc_on_lap_end).
-        # BUG (2026-05-29): this was gated on auto_step only, so with auto_step
-        # off (BO/normal default) LMPC never received a lap-end event → the
-        # safe set never accumulated real laps → LMPC was silently a no-op
-        # (laps stayed flat at ~19s, 0 buffered). Subscribe if EITHER needs it.
-        if self._auto_step_state['enabled'] or bool(self.get_parameter('use_lmpc').value):
-            self.create_subscription(Int32, '/mpc/lap_count',
-                                     self._on_lap_count_step, 10)
-        if self._auto_step_state['enabled']:
-            # 시작 시 mpc.v_max 를 start_speed 로 (auto_tune 동시 트리거).
-            # 단 mpc 초기화 후에야 self.mpc 존재 → wpnt callback 안의 후처리
-            # 가 더 안전하므로 여기선 state 만 저장. 실제 적용은 _initialize_mpc
-            # 끝에서 _set_effective_max_speed() 호출 (아래 추가).
-            self.get_logger().info(
-                f"[auto_step] enabled: {self._auto_step_state['start']:.1f} → "
-                f"{self._auto_step_state['end']:.1f} m/s, "
-                f"+{self._auto_step_state['size']:.1f} / "
-                f"{self._auto_step_state['laps']} lap")
-
-        # ── LMPC infrastructure (2026-05-28 #18) ────────────────────
-        self._lmpc_use = bool(self.get_parameter('use_lmpc').value)
-        self._lmpc_db = LapDatabase(
-            buffer_per_bucket=int(self.get_parameter('lmpc_buffer_per_bucket').value),
-            max_resets_accept=int(self.get_parameter('lmpc_max_resets').value),
-            min_lap_steps=50,
-            max_lap_time_ratio=float(self.get_parameter('lmpc_max_lap_time_ratio').value),
-            max_abs_ec_m=float(self.get_parameter('lmpc_max_abs_ec_m').value),
-            max_stuck_seconds=float(self.get_parameter('lmpc_max_stuck_seconds').value),
-        )
-        self._lmpc_ss = SafeSetLookup(
-            self._lmpc_db,
-            K_points=int(self.get_parameter('lmpc_K_points').value),
-            K_laps=int(self.get_parameter('lmpc_K_laps').value),
-            slice_window=int(self.get_parameter('lmpc_slice_window').value),
-        )
-        self._lmpc_enable_after = int(self.get_parameter('lmpc_enable_after_real_laps').value)
-        self._lmpc_load_path = str(self.get_parameter('lmpc_load_path').value).strip()
-        self._lmpc_save_path = str(self.get_parameter('lmpc_save_path').value).strip()
-        self._lmpc_seed_raceline = bool(self.get_parameter('lmpc_seed_from_raceline').value)
-        # cost weights (passed through mpc.lmpc_*_live attrs every cycle)
-        self._lmpc_w_target     = float(self.get_parameter('lmpc_w').value)
-        self._lmpc_alpha        = float(self.get_parameter('lmpc_alpha').value)
-        self._lmpc_beta         = float(self.get_parameter('lmpc_beta').value)
-        self._lmpc_reg_w        = float(self.get_parameter('lmpc_reg_w').value)
-        # Per-lap state/input/timestep accumulator (cleared on lap end)
-        self._lmpc_lap_buf = {
-            'state': [], 'input': [], 'time': [],
-            'lap_start_t': None, 'last_lap': -1,
-            'max_abs_ec': 0.0, 'stuck_seconds_accum': 0.0,
-        }
-        self.get_logger().info(
-            f"[LMPC] use_lmpc={self._lmpc_use}  enable_after_real_laps={self._lmpc_enable_after}  "
-            f"seed_raceline={self._lmpc_seed_raceline}  load={self._lmpc_load_path or '(none)'}  "
-            f"save={self._lmpc_save_path or '(none)'}")
-        # Defer raceline seed + npz load until after track loaded (mpc setup) —
-        # called in `_initialize_mpc` end-of-setup hook.
+        # (2026-07-09 대청소: ML 스케일러/BO polynomial/auto_step 로드 블록 제거)
 
         # ── Control loop ────────────────────────────────────────────
         # period = yaml dT 와 일치 (MPC 의 첫 step dt 와 같게).
@@ -541,7 +552,7 @@ class MPCNode(Node):
         self.control_timer = self.create_timer(period, self._control_loop_cb)
 
         self.get_logger().info(
-            f"MPC node up — backend={backend_name}, "
+            f"MPC node up — backend=acados, "
             f"rate={self.CONTROLLER_FREQ:.0f} Hz, ready={self._mpc_ready} "
             f"(waiting up to {self._track_csv_fallback_sec:.1f}s for "
             "/centerline_waypoints, then CSV fallback)")
@@ -559,15 +570,6 @@ class MPCNode(Node):
         # Default: share/tracks/ inside this installed package
         return os.path.join(self._share_dir(), 'tracks')
 
-    def _resolve_bo_params(self) -> dict:
-        """Load Bayesian-Opt MPC weights (BO_params_*.json) from share/config/mpc/."""
-        params_file = self.get_parameter('params_file').value
-        json_path = os.path.join(self._share_dir(), 'config', 'mpc', f'{params_file}.json')
-        if not os.path.isfile(json_path):
-            raise FileNotFoundError(f"MPC weights JSON not found: {json_path}")
-        with open(json_path) as f:
-            return json.load(f)
-
     def _a_lat_eff_for_track(self) -> float:
         """track ref_v 용 a_lat — μgη clamp (BO 가 뭘 요청하든 물리 그립 상한)."""
         eff, clamped = clamp_a_lat_to_grip(
@@ -580,27 +582,25 @@ class MPCNode(Node):
                 f"[grip] a_lat_safe_live > μgη → track ref_v 는 {eff:.2f} 로 clamp")
         return eff
 
-    def _build_param_dict(self, bo: dict) -> dict:
-        """Match `getPreDefinedParas()` from the ROS1 node — keys mpc_core consumes."""
+    def _build_param_dict(self) -> dict:
+        """Match `getPreDefinedParas()` from the ROS1 node — keys mpc_core consumes.
+
+        (2026-07-28 대청소: Bayesian-Opt weights json 으로 채우던 mpc_v_track/
+        mpc_w_*/mpc_vp_project 키 제거 — acados_kinematic.set_initial_params() 은 이
+        키들을 self.q_v/self.q_dv/self.q_vp_proj 에 넣지만 그 attribute 들은
+        cost 어디서도 다시 읽히지 않는 ghost weight였다 [W_mat 은 로컬 상수
+        q_v_def/q_dv_def 사용]. 제거해도 acados 경로 동작 불변.)
+        """
         gp = self.get_parameter
         return {
             'is_jit': False,
-            'mpc_v_track':    float(bo.get('q_v', 0.0)),
-            'mpc_w_cte':      float(bo['q_cte']),
-            'mpc_w_lag':      float(bo['q_lag']),
-            'mpc_w_accel':    float(bo['q_dv']),
-            'mpc_w_delta_d':  float(bo['q_d_delta']),
-            'mpc_w_delta_vp': float(bo['q_dvp']),
-            'mpc_vp_project': float(bo['gamma']),
             'N': int(gp('N_horizon').value),
             'dT': float(gp('dT').value),
-            'time_steps_mode': str(gp('time_steps_mode').value) if self.has_parameter('time_steps_mode') else 'uniform',
+            'time_steps_mode': 'uniform',   # pyramidal 실험 폐기 (2026-07-09 대청소)
             'theta_max': float(gp('mpc_max_steering').value),
             'v_max': float(gp('max_speed').value),
             'p_min': 0.0,
             'p_max': float(gp('max_speed_p').value),
-            'INTEGRATION_MODE': str(gp('integration_mode').value),
-            'L': float(gp('vehicle_L').value),
             'x_min': -200.0, 'x_max': 200.0,
             'y_min': -200.0, 'y_max': 200.0,
             'psi_min': -1000.0, 'psi_max': 1000.0,
@@ -620,6 +620,8 @@ class MPCNode(Node):
         if self._track_init_done:
             return
         self._ref_wpnts = msg.wpnts
+        # 섹터 배율은 in-place 곱이라 라이브 재적용의 기준점을 남겨둔다
+        self._ref_vx_orig = [float(w.vx_mps) for w in msg.wpnts]
         self._try_build_track()
 
     def _on_wall_wpnts(self, msg: WpntArray) -> None:
@@ -671,429 +673,7 @@ class MPCNode(Node):
             f"reference waypoints not seen in {self._track_csv_fallback_sec:.1f}s — falling back to CSV")
         self._finish_track_init(None, None)
 
-    def _set_effective_max_speed(self, v: float) -> None:
-        """Live update of mpc cost target v_max (acados ubu cap unchanged).
-        auto_tune 매핑도 재계산하여 q_lag/q_cte/EMA 등 effective 기반 갱신."""
-        v = float(v)
-        try:
-            self.mpc.v_max = v       # cost target (p_v - v_max) residual
-            self.mpc.p_max = v       # progress upper bound
-        except Exception:
-            pass
-        # auto_tune 매핑 즉시 적용 (q_lag, q_cte, alpha 등)
-        if bool(self.get_parameter('auto_tune').value):
-            self._auto_tune_from_max_speed(v_override=v)
-        self.get_logger().info(f"[auto_step] effective v_max → {v:.2f} m/s")
-
-    # =================================================================
-    # LMPC integration helpers (2026-05-28 #18)
-    # =================================================================
-    def _lmpc_load_or_seed(self) -> None:
-        """After mpc setup, optionally load SS from npz or seed from raceline."""
-        if not hasattr(self, 'mpc') or self.mpc is None:
-            return
-        # 1) npz load (highest priority — pre-trained SS)
-        if self._lmpc_load_path:
-            from os.path import expanduser
-            path = expanduser(self._lmpc_load_path)
-            try:
-                self._lmpc_db.load_all(path)
-                self.get_logger().info(f"[LMPC] loaded SS from {path}: {self._lmpc_db.summary()}")
-            except Exception as e:
-                self.get_logger().warn(f"[LMPC] load failed ({path}): {e}")
-
-        # 2) raceline seed (cold start). Step 3: PREFER the IQP raceline (apex line)
-        #    with GRIP-CLAMPED speed min(v_max, √(a_lat/|κ_raceline|)) — gives the
-        #    SS Q-function a feasible FASTER target than centerline. Falls back to
-        #    centerline geometry if no raceline json. (joint-α + soft anchor + hard
-        #    corridor keeps the car drivable even where the raceline is outside it.)
-        if self._lmpc_seed_raceline and self._track is not None:
-            try:
-                v_max_now = float(getattr(self.mpc, 'v_max', 5.0))
-                _eff_fn = getattr(self.mpc, 'a_lat_safe_eff', None)  # μgη clamp (5번째 소비 지점)
-                a_lat = float(_eff_fn()) if _eff_fn else float(getattr(self.mpc, 'a_lat_safe_live', 9.0))
-                tr = self._track
-                xy = psi = s_arr = v_arr = None
-                rl_json = str(self.get_parameter('lmpc_raceline_json').value)
-                if rl_json and os.path.exists(rl_json):
-                    import json as _json
-                    gw = _json.load(open(rl_json))
-                    w = gw.get('global_traj_wpnts_iqp', {}).get('wpnts', [])
-                    if len(w) >= 10:
-                        xy = np.array([[p['x_m'], p['y_m']] for p in w], dtype=float)
-                        psi = np.array([p['psi_rad'] for p in w], dtype=float)
-                        s_arr = np.array([p['s_m'] for p in w], dtype=float)
-                        kap = np.abs(np.array([p['kappa_radpm'] for p in w], dtype=float))
-                        v_arr = np.minimum(v_max_now, np.sqrt(a_lat / np.maximum(kap, 1e-3)))
-                        # Clamp seed LATERAL to the corridor (raceline reaches ±0.97 >
-                        # corridor ±0.75): SS ⊂ corridor → α target ⊂ corridor → the car
-                        # cuts apex only to the corridor edge (no wall overshoot).
-                        _clh = max(0.10, float(self.get_parameter('mpc_corridor_half_width').value) - 0.15)
-                        _cl = np.asarray(tr.center_lane)
-                        _ang = getattr(tr, 'center_point_angles', None)
-                        for _i in range(len(xy)):
-                            _j = int(np.argmin(np.linalg.norm(_cl[:, :2] - xy[_i, :2], axis=1)))
-                            _ps = float(_ang[_j]) if (_ang is not None and _j < len(_ang)) else 0.0
-                            _lat = math.sin(_ps) * (xy[_i, 0] - _cl[_j, 0]) - math.cos(_ps) * (xy[_i, 1] - _cl[_j, 1])
-                            if abs(_lat) > _clh:
-                                _ex = _lat - max(-_clh, min(_clh, _lat))
-                                xy[_i, 0] -= _ex * math.sin(_ps)
-                                xy[_i, 1] -= _ex * (-math.cos(_ps))
-                        self.get_logger().info(
-                            f"[LMPC] IQP apex seed: {len(w)} pts, v∈"
-                            f"[{v_arr.min():.1f},{v_arr.max():.1f}] grip-clamped @ a_lat={a_lat:.1f}")
-                if xy is None:
-                    cl = tr.raw_center_lane if tr.raw_center_lane is not None else tr.center_lane
-                    xy = np.asarray(cl, dtype=float)
-                    s_arr = np.asarray(tr.element_arc_lengths_orig, dtype=float)[:len(xy)]
-                    if tr.center_point_angles is not None and len(tr.center_point_angles) >= len(xy):
-                        psi = np.asarray(tr.center_point_angles, dtype=float)[:len(xy)]
-                    else:
-                        dx = np.diff(xy[:, 0], append=xy[0, 0]); dy = np.diff(xy[:, 1], append=xy[0, 1])
-                        psi = np.arctan2(dy, dx)
-                    try:
-                        v_arr = np.array([float(tr.lut_ref_v(s)) for s in s_arr])
-                    except Exception:
-                        v_arr = np.full(len(xy), v_max_now * 0.8)
-                    self.get_logger().info("[LMPC] centerline seed (no IQP raceline json)")
-                ok = self._lmpc_db.seed_from_raceline(v_max_now, xy, psi, v_arr, s_arr)
-                if ok:
-                    self.get_logger().info(
-                        f"[LMPC] raceline-seeded synthetic lap @ v={v_max_now:.1f}: "
-                        f"{self._lmpc_db.summary()}")
-                else:
-                    self.get_logger().warn("[LMPC] raceline seed rejected (filter)")
-            except Exception as e:
-                import traceback
-                self.get_logger().warn(f"[LMPC] raceline seed failed: {e}\n{traceback.format_exc()}")
-
-    def _lmpc_update_per_cycle(self, x0: np.ndarray, s_now: float) -> None:
-        """Every control cycle: (a) accumulate state into lap buffer, (b) SS query → set mpc attrs."""
-        # Cleared each cycle; set only when a state is buffered for this cycle. The
-        # post-solve lockstep append consumes it, so a raise / early-return / failed
-        # solve leaves no stale state and never appends a state without its input.
-        self._lmpc_pending_state = None
-        if not self._lmpc_use:
-            # LMPC OFF — ensure weights are 0 (in case toggled at runtime)
-            self.mpc.lmpc_w_live = 0.0
-            self.mpc._e_corr = np.zeros(3)
-            return
-
-        # Accumulate per-lap stuck time so the lmpc_max_stuck_seconds filter is
-        # actually fed (previously unwired → meta['stuck_seconds'] stayed 0 →
-        # filter inert). One dT per cycle the car is in stuck-recovery.
-        if getattr(self.mpc, '_stuck_release_active', False):
-            self._lmpc_lap_buf['stuck_seconds_accum'] += float(self.get_parameter('dT').value)
-
-        # (a) Accumulate this cycle's 8-state x0 (extended) + estimate e_c.
-        # x0 from _current_state_4 is 7-dim [x,y,ψ,vx,vy,r,s] (unified layout,
-        # both modes) — we need 8-state for LapDatabase (… + δ_prev).
-        state8 = np.zeros(8)
-        state8[0:7] = x0[0:7]
-        state8[7] = float(getattr(self.mpc, '_v_cmd_for_stuck', 0.0))   # δ_prev proxy
-        # Defer the state/time append to the post-solve lockstep block (see the
-        # input append in the control loop). Appending here pre-solve meant a
-        # solve exception left a state with no paired input → every later
-        # (state,input) pair in the lap was misaligned by one.
-        self._b4_state8 = state8.copy()   # B4' pred-error gate: paired with u_seq[0] after solve
-        self._lmpc_pending_state = state8.copy()
-        self._lmpc_pending_time = time.monotonic()
-        # max |e_c| running max (e_c estimated via CasADi center LUT)
-        try:
-            cx = float(self._track.center_lut_x(s_now))
-            cy = float(self._track.center_lut_y(s_now))
-            ec_est = float(np.hypot(state8[0] - cx, state8[1] - cy))
-            self._lmpc_lap_buf['max_abs_ec'] = max(self._lmpc_lap_buf['max_abs_ec'], ec_est)
-        except Exception:
-            pass
-
-        # (b) SS query → set mpc attrs (these are picked up by p_arr builder
-        # at next set call in mpc.solve()).
-        v_bucket = float(getattr(self.mpc, 'v_max', 5.0))
-        # Activate only after enough real laps in this v bucket
-        n_real = self._lmpc_db.n_real_laps(v_bucket)
-        if n_real < self._lmpc_enable_after:
-            self.mpc.lmpc_w_live = 0.0
-            self.mpc._e_corr = np.zeros(3)
-            return
-
-        # Query SS at a TRACK-ANCHORED point one horizon ahead of the CURRENT
-        # car position — NOT at the previous solve's predicted x_N. The terminal
-        # cost attracts x_N toward ss_states[:,0]; we still want that attractor
-        # ~one horizon ahead (forward pull), but anchoring it at x_N made the
-        # query depend on x_N, which the cost was simultaneously moving — an
-        # anchor-less positive-feedback loop: a lateral drift in x_N moved the
-        # query → moved the attractor onto the drift → pulled x_N further out, so
-        # ec grew monotonically (0.22→0.47 m) until wedge (use_lmpc off, 3691fdb).
-        # Pinning the query to track arc length (current s + v·N·dT look-ahead)
-        # breaks the loop while keeping the carrot ahead. z_t is built from track
-        # geometry at q_s (centerline px,py,ψ + ref_v) so the weighted-L2 SS
-        # match is to where the car SHOULD be, not where x_N drifted to.
-        try:
-            track_L = float(self._track.element_arc_lengths_orig[-1]) if (
-                self._track.element_arc_lengths_orig is not None
-                and len(self._track.element_arc_lengths_orig) > 0
-            ) else 80.0
-            v_now = float(state8[3])
-            n_h = int(getattr(self.mpc, 'N', None) or self.get_parameter('N_horizon').value)
-            dT = float(self.get_parameter('dT').value)
-            q_s = lmpc_anchor_s(s_now, v_now, n_h, dT, track_L)
-            psi_a = float(np.arctan2(self._track.center_lut_dy(q_s),
-                                     self._track.center_lut_dx(q_s)))
-            v_a = float(self.mpc.ref_v(q_s)) if self.mpc.ref_v is not None else v_now
-            q_state = np.array([
-                float(self._track.center_lut_x(q_s)),
-                float(self._track.center_lut_y(q_s)),
-                psi_a, v_a, 0.0, 0.0, q_s, 0.0,
-            ], dtype=float)
-            res = self._lmpc_ss.query(q_state, v_bucket, s_curr=q_s, track_length=track_L)
-        except Exception as e:
-            self.get_logger().warn(f"[LMPC] query failed: {e}", throttle_duration_sec=2.0)
-            self.mpc.lmpc_w_live = 0.0
-            self.mpc._e_corr = np.zeros(3)
-            return
-
-        if not res.is_ready:
-            self.mpc.lmpc_w_live = 0.0
-            self.mpc._e_corr = np.zeros(3)
-            return
-
-        # Pack SS into (4, K) state matrix (px, py, ψ, vx) + (K,) Q
-        K = 10  # acados-side hardcoded
-        ss_states = np.zeros((4, K))
-        ss_Q = np.full(K, 1e6)  # padding = 1e6 → exp(-β·1e6)≈0 자연 무시
-        for i in range(min(res.K, K)):
-            ss_states[0, i] = res.states[i, 0]
-            ss_states[1, i] = res.states[i, 1]
-            ss_states[2, i] = res.states[i, 2]
-            ss_states[3, i] = res.states[i, 3]
-            ss_Q[i] = res.cost_to_go[i]
-        self.mpc._lmpc_ss_states = ss_states
-        self.mpc._lmpc_ss_Q = ss_Q
-        # B4'.3: local error regression over the SAME SS neighbours just queried.
-        if getattr(self.mpc, '_err_regr', False) and res.residuals.shape[0] > 0:
-            from .mpc_core.lmpc.error_regression import epanechnikov_e_corr
-            _dt = float(self.get_parameter('dT').value)
-            # e_corr enters f_expl (a RATE, ẋ). The stored residual is a velocity
-            # delta (actual_next − nominal_next). acados integrates x+dt·f_expl, so
-            # to make dt·e_corr cancel the residual we inject residual/dt (a rate).
-            # R1: weight by VELOCITY-space distance (current vx,vy,r ↔ neighbour
-            # vx,vy,r = res.states[:,3:6]), NOT the position-heavy SS distance —
-            # so the Epanechnikov kernel picks velocity-local neighbours (the
-            # regime e_corr actually corrects). Reuses the same K neighbours;
-            # leaves the LMPC position-near terminal query untouched. h scales to
-            # the velocity neighbourhood (kernel spans the K returned points).
-            _qv = np.asarray(state8, float)[3:6]
-            _nv = np.asarray(res.states, float)[:, 3:6]
-            _vel_d = np.linalg.norm(_nv - _qv[None, :], axis=1)
-            _h = float(self.get_parameter('err_regr_bandwidth').value) * max(float(_vel_d.max()), 1e-6)
-            _newc = epanechnikov_e_corr(res.residuals, _vel_d, h=_h) / max(_dt, 1e-6)
-            # R2: temporal EMA low-pass — SS neighbours change cycle-to-cycle, so
-            # raw e_corr jitters → the injected model offset (hence the predicted
-            # trajectory) shakes. Smooth it.
-            _beta = float(self.get_parameter('err_regr_ema').value)
-            _prev = np.asarray(getattr(self.mpc, '_e_corr', np.zeros(3)), float)
-            self.mpc._e_corr = _beta * _prev + (1.0 - _beta) * _newc
-        else:
-            self.mpc._e_corr = np.zeros(3)
-        # Post-crash robustness: while STUCK / in stuck-recovery the state x0 is bad
-        # (against a wall, vx≈0) → SQP_RTI prediction diverges and the LMPC terminal
-        # fights the recovery. Gate LMPC OFF during recovery so pure-MPCC (the proven
-        # stuck-release) pulls the car out; re-enable once moving again.
-        _vx_low = (x0 is not None and len(x0) > 3 and float(x0[3]) < 0.3)
-        _stuck = bool(getattr(self.mpc, '_stuck_release_active', False)) or _vx_low
-        self.mpc.lmpc_w_live     = 0.0 if _stuck else self._lmpc_w_target
-        self.mpc.lmpc_alpha_live = self._lmpc_alpha
-        self.mpc.lmpc_beta_live  = self._lmpc_beta
-        self.mpc.lmpc_reg_w_live = self._lmpc_reg_w
-
-    def _b4_pred_error_log(self, state8_now, u_now, dt):
-        """B4' correctness gate: compare the PREVIOUS cycle's nominal vs
-        corrected one-step velocity prediction against the realized current
-        state. 'Working' iff mean corrected-error < mean nominal-error over a
-        window. e_corr is paired with the control it was active for."""
-        prev = getattr(self, '_b4_prev', None)
-        if prev is not None:
-            ps, pu, pe, pdt = prev
-            pred = predict_next(ps, pu, pdt)
-            now_v = np.asarray(state8_now, float)[3:6]
-            nominal_err = float(np.linalg.norm(now_v - pred[3:6]))
-            corrected_err = float(np.linalg.norm(now_v - (pred[3:6] + pdt * np.asarray(pe))))
-            self._b4_nom_acc = getattr(self, '_b4_nom_acc', 0.0) + nominal_err
-            self._b4_cor_acc = getattr(self, '_b4_cor_acc', 0.0) + corrected_err
-            self._b4_cnt = getattr(self, '_b4_cnt', 0) + 1
-            if self._b4_cnt % 100 == 0:
-                self.get_logger().info(
-                    f"[B4'-pred] mean|err| nominal={self._b4_nom_acc / self._b4_cnt:.4f} "
-                    f"corrected={self._b4_cor_acc / self._b4_cnt:.4f} (n={self._b4_cnt})")
-        self._b4_prev = (np.asarray(state8_now, float).copy(),
-                         np.asarray(u_now, float).copy(),
-                         np.asarray(getattr(self.mpc, '_e_corr', np.zeros(3)), float).copy(),
-                         float(dt))
-
-    def _lmpc_on_lap_end(self, lap_idx: int) -> None:
-        """Called from _on_lap_count_step when lap counter increments —
-        finalize current lap buffer, push to LapDatabase if filters pass."""
-        buf = self._lmpc_lap_buf
-        if not buf['state'] or buf['last_lap'] < 0:
-            # First lap_count event ever — reset buffer for next lap
-            buf['state'] = []; buf['input'] = []; buf['time'] = []
-            buf['lap_start_t'] = time.monotonic()
-            buf['max_abs_ec'] = 0.0
-            buf['stuck_seconds_accum'] = 0.0   # reset per-lap (wired: incremented in _lmpc_update_per_cycle while stuck)
-            self._lmpc_lap_teleports = 0       # start counting teleports for lap 1
-            buf['last_lap'] = lap_idx
-            return
-
-        # Build arrays
-        states = np.array(buf['state'])
-        T = states.shape[0]
-        # B4'.2: real applied-control log (3-wide [a_x,delta,p_v]). Truncate to the
-        # common prefix so state[t]→state[t+1] always has its control input[t].
-        inlog = np.array(buf['input'], dtype=float) if buf['input'] else np.zeros((0, 3))
-        if inlog.ndim != 2 or inlog.shape[1] != 3:
-            inlog = inlog.reshape(-1, 3) if inlog.size else np.zeros((0, 3))
-        n = min(states.shape[0], inlog.shape[0])
-        if n >= 2:
-            states = states[:n]
-            inputs = inlog[:n - 1]          # input[t] pairs state[t]->state[t+1]
-            T = states.shape[0]
-        else:
-            inputs = np.zeros((max(T - 1, 1), 3))   # not enough logged input → safe fallback
-        t_arr = np.array(buf['time']) - buf['lap_start_t'] if buf['lap_start_t'] else np.linspace(0, T * 0.04, T)
-        t_arr = t_arr[:T]   # keep length == T after possible state truncation
-        lap_time = float(t_arr[-1] - t_arr[0]) if T > 1 else 0.0
-        # n_resets in this lap = teleport(safe-reset) count THIS lap, counted in
-        # _publish_safe_reset. With lmpc_max_resets=0 any teleport rejects the lap.
-        n_resets = int(self._lmpc_lap_teleports)
-
-        v_bucket = float(getattr(self.mpc, 'v_max', 5.0))
-        meta = {
-            'lap_idx': lap_idx,
-            'max_abs_ec': float(buf['max_abs_ec']),
-            'stuck_seconds': float(buf.get('stuck_seconds_accum', 0.0)),
-        }
-        ok = self._lmpc_db.add_lap(v_bucket, states, inputs, t_arr,
-                                    lap_time, n_resets=n_resets,
-                                    dt=float(self.get_parameter('dT').value),
-                                    metadata=meta)
-        reject_reason = getattr(self._lmpc_db, 'last_reject_reason', '') if not ok else ''
-        self.get_logger().info(
-            f"[LMPC] lap {lap_idx} buffered: v_bucket={v_bucket:.1f} T={T} "
-            f"lap_time={lap_time:.2f}s n_resets={n_resets} accepted={ok}"
-            + (f" reject_reason='{reject_reason}'" if reject_reason else "")
-            + f" max_abs_ec={meta['max_abs_ec']:.2f}m\n  db: {self._lmpc_db.summary()}")
-
-        # Reset buffer for next lap
-        buf['state'] = []; buf['input'] = []; buf['time'] = []
-        buf['lap_start_t'] = time.monotonic()
-        buf['max_abs_ec'] = 0.0
-        buf['stuck_seconds_accum'] = 0.0   # reset per-lap (wired — see _lmpc_update_per_cycle)
-        self._lmpc_lap_teleports = 0       # start counting teleports for the next lap
-        buf['last_lap'] = lap_idx
-
-    def _lmpc_save_on_shutdown(self) -> None:
-        if not self._lmpc_save_path:
-            return
-        try:
-            from os.path import expanduser
-            self._lmpc_db.save_all(expanduser(self._lmpc_save_path))
-            self.get_logger().info(f"[LMPC] saved SS to {self._lmpc_save_path}")
-        except Exception as e:
-            self.get_logger().warn(f"[LMPC] save failed: {e}")
-
-    def _on_lap_count_step(self, msg) -> None:
-        """매 `auto_step_laps` lap 마다 effective max_speed 증가."""
-        lap = int(msg.data)
-        # LMPC: lap end detection + buffer flush
-        try:
-            self._lmpc_on_lap_end(lap)
-        except Exception as e:
-            self.get_logger().warn(f"[LMPC] lap_end failed: {e}")
-        st = self._auto_step_state
-        # auto_step v_max ramp runs ONLY when explicitly enabled. The
-        # /mpc/lap_count subscription may now exist solely for LMPC lap-end
-        # buffering above; without this guard the v_max ramp would fire even
-        # with auto_step disabled (observed: v ramped 5→6 during a fixed-v=5
-        # LMPC test, splitting laps across buckets).
-        if not st['enabled']:
-            return
-        if lap == st['last_lap']:
-            return
-        # lap 0→1 첫 진입은 무시 (시작 상태 유지)
-        if st['last_lap'] >= 0 and lap > 0 and (lap - st['lap_at_step']) >= st['laps']:
-            st['current_step'] += 1
-            new_v = st['start'] + st['current_step'] * st['size']
-            if new_v > st['end'] + 1e-6:
-                self.get_logger().info(
-                    f"[auto_step] reached end ({st['end']:.1f}). holding.")
-                st['last_lap'] = lap
-                return
-            st['lap_at_step'] = lap
-            # 2026-05-28 #20: v step 시 LMPC SS warm_transfer
-            # 이전 v bucket 의 best lap → 새 v bucket 의 seed.
-            # 새 bucket 의 첫 real lap 도착 전까지 LMPC 활성 (synthetic 보다 real warm-transfer 가 좋음).
-            old_v = st['start'] + (st['current_step'] - 1) * st['size']
-            try:
-                ok = self._lmpc_db.warm_transfer(old_v, new_v)
-                if ok:
-                    self.get_logger().info(
-                        f"[LMPC] warm_transfer v={old_v:.1f}→v={new_v:.1f} (best from old bucket)"
-                    )
-            except Exception as e:
-                self.get_logger().warn(f"[LMPC] warm_transfer failed: {e}")
-            self._set_effective_max_speed(new_v)
-        st['last_lap'] = lap
-
-    def _auto_tune_from_max_speed(self, v_override: float | None = None) -> None:
-        """v_max 한 변수만 사용자 설정. 나머지 cost weights / corridor / EMA
-        를 heuristic 매핑으로 자동 결정. `on_set_parameters_callback` 가 자동
-        호출되어 live attrs (mpc.q_*_live 등) 도 같이 갱신됨.
-
-        매핑 식 (kinematic + raceline 가정, 안전 위주):
-            max_speed_p          = v_max * 0.95
-            q_lag_live           = max(50, 12 * v_max)
-            q_cte_live           = max(2, 8 - v_max * 0.4)
-            q_d_delta_live       = 25 (ROS1 검증값 고정 — 동적 조정은 MLP q_drate_scale 이 담당)
-            alpha_steer_live     = max(0.4, 0.7 - v_max * 0.02)  # 빠를수록 smooth
-            mpc_corridor_half_width = yaml 값 그대로 (auto override 제거 — 사용자 직접 결정)
-            D_apex_live          = 0 (raceline 자체가 apex 통과)
-            cost_spike_thr_live  = max(100, 250 - 5 * v_max)
-        """
-        from rclpy.parameter import Parameter as P
-        v = float(v_override) if v_override is not None else float(self.get_parameter('max_speed').value)
-        track_src = str(self.get_parameter('track_source').value).strip().lower()
-        # Agent R3 fix: D_apex=0.35 centerline 기본값이 random 트랙의 uniform 3m
-        # corridor 에서 effective margin (0.95 − 0.15 − 0.35 = 0.45) 너무 빠듯 →
-        # cost slack 폭증 → solver 가 감속 회피 → stuck. 0 으로 고정 (BO 가 13번째
-        # 차원으로 학습한 D_apex 값이 우선).
-        d_apex = 0.0
-        # 주의: mpc_corridor_half_width 는 auto 매핑에서 제외 (yaml 값 보존).
-        #       이전 auto 식 max(0.3, 0.8 - 0.03*v) 가 yaml 의 1.0 등 큰 값을 0.68 로
-        #       덮어써서 좌우 반경이 항상 작게 강제되는 회귀가 있었음. 사용자가
-        #       yaml 에서 직접 1.0~1.5 등으로 키우면 그대로 적용되어야 함.
-        auto = {
-            'max_speed_p':              v * 0.95,
-            'q_lag_live':               max(50.0, 12.0 * v),
-            'q_cte_live':               max(2.0, 8.0 - v * 0.4),
-            'q_d_delta_live':           25.0,
-            'alpha_steer_live':         max(0.4, 0.7 - v * 0.02),
-            'D_apex_live':              d_apex,
-            # Agent R-round2 Fix 2: cost_spike_thr_live 매핑 제거.
-            # 옛 식 `max(100, 250 - 5·v_max)` = 230 @ v=4 → 정상 cost ~330 도
-            # 매 cycle spurious fallback → MPC 의 정상 plan 거의 ignored.
-            # yaml 의 600 (N=120 시대 검증) 또는 N=80 면 yaml 에서 ~400 으로
-            # 직접 set. v_max 와 무관 (weight scale / N_horizon 에 의존).
-        }
-        params = [P(k, P.Type.DOUBLE, float(val)) for k, val in auto.items()]
-        self.set_parameters(params)
-        self.get_logger().info(
-            f"[auto_tune] v_max={v:.1f} → " +
-            ", ".join(f"{k.replace('_live', '')}={val:.2f}" for k, val in auto.items()))
-
     def _initialize_mpc(self, wpnts=None, wall_wpnts=None) -> None:
-        if bool(self.get_parameter('auto_tune').value):
-            self._auto_tune_from_max_speed()
         vel_scale = float(self.get_parameter('vel_scale').value)
         inflation = float(self.get_parameter('inflation_factor').value)
         extend_part = int(self.get_parameter('extend_part').value)
@@ -1106,16 +686,95 @@ class MPCNode(Node):
             self.get_logger().info(
                 f"building track from /centerline_waypoints ({len(wpnts)} wpnts, "
                 f"vel_scale={vel_scale}, {mode_desc})")
+            # 3-i 학습 ref_V 주입 (토글 ON & 파일 존재 시 wpnt.vx_mps override).
+            # 이후 build_track_from_wpnts 의 κ/corridor/clip 캡이 그대로 적용된다.
+            if bool(self.get_parameter('use_learned_refv').value):
+                # 2026-08-03: `import os` 제거 — 모듈 레벨(40줄)에 이미 있다.
+                # 함수 안 조건부 import 는 os 를 함수 전체의 지역이름으로 만들어,
+                # use_learned_refv=false + use_refv_learning=true 조합에서 뒤쪽
+                # 학습기 init 의 os.path 가 UnboundLocalError 로 죽었다
+                # (bag 19_41 rosout: "[refv-learn] init 실패(cannot access local
+                # variable 'os' ...)"). 0727 검증 땐 learned_refv=true 라 잠복.
+                import numpy as _np
+                from .track_loader import learned_speeds_for_wpnts
+                _p = str(self.get_parameter('learned_refv_path').value).strip() \
+                    or os.path.expanduser(
+                        f"maps/{self.get_parameter('track_name').value}/learned_refv.npz")
+                if os.path.isfile(_p):
+                    # 실차 안전: npz 손상/키누락/길이불일치 → 크래시 대신 해석적 ref_V 폴백.
+                    try:
+                        _z = _np.load(_p, allow_pickle=True)
+                        _s = _np.asarray(_z['s'], float)
+                        _rv = _np.asarray(_z['ref_v'], float)
+                        if _s.size == 0 or _s.size != _rv.size:
+                            raise ValueError(f"s({_s.size})/ref_v({_rv.size}) 비거나 길이불일치")
+                        # L = wpnt 루프 둘레(ground truth) — 닫힌 구간 포함. 학습기가 저장한
+                        # sparse max(s) 가 아니라 실제 트랙 길이여야 seam 원형거리가 맞다.
+                        _xy = _np.array([(float(w.x_m), float(w.y_m)) for w in wpnts])
+                        _seg = _np.sqrt((_np.diff(_xy, axis=0) ** 2).sum(axis=1))
+                        _L = float(_seg.sum()
+                                   + _np.sqrt(((_xy[0] - _xy[-1]) ** 2).sum()))
+                        _spd = learned_speeds_for_wpnts(wpnts, _s, _rv, _L)
+                        for _w, _v in zip(wpnts, _spd):
+                            _w.vx_mps = float(_v)
+                        # speed_target 은 여기서 mpc 에 바로 넣지 않는다(아래 R3 블록이
+                        # 덮어씀). stash 해 두고 R3 에서 학습값 우선 적용.
+                        self._learned_speed_target = float(min(
+                            float(self.get_parameter('max_speed').value),
+                            float(_z['speed_target'])))
+                        self.get_logger().info(
+                            f"[learned_refv] {_p} 적용: {_s.size} bins, L={_L:.1f}m, "
+                            f"speed_target→{self._learned_speed_target:.2f}")
+                    except Exception as _e:
+                        self.get_logger().warn(
+                            f"[learned_refv] {_p} 로드 실패({_e}) — 해석적 ref_V 사용")
+                else:
+                    self.get_logger().warn(f"[learned_refv] 파일 없음: {_p} — 해석적 ref_V 사용")
+            # ── 0812 섹터별 ref_v 배율 (nuc [sector_refv] 이식 + 라이브 spec 우선) ──
+            # spec 파라미터("s-e:f,...") 가 있으면 그걸, 없으면 maps/<map>/speed_scaling.yaml.
+            # wpnt.vx_mps 에 곱한 뒤 build_track_from_wpnts 의 κ/a_lat 캡이 물리로 자른다(과상향 안전).
+            try:
+                _secs = []
+                _spec = str(self.get_parameter('sector_refv_spec').value).strip()
+                if _spec:
+                    for _tok in _spec.split(','):
+                        _rng, _f = _tok.split(':')
+                        _a, _b = _rng.split('-')
+                        _secs.append((int(_a), int(_b), float(_f)))
+                else:
+                    from ament_index_python.packages import get_package_share_directory as _gpsd
+                    import yaml as _yaml
+                    _ssp = os.path.join(_gpsd('stack_master'), 'maps',
+                                        str(self.get_parameter('track_name').value),
+                                        'speed_scaling.yaml')
+                    if os.path.isfile(_ssp):
+                        _sp = _yaml.safe_load(open(_ssp))['speed_sector_tuner']['ros__parameters']
+                        _gl = float(_sp.get('global_limit', 1.0))
+                        for _si in range(int(_sp.get('n_sectors', 0))):
+                            _sec = _sp.get(f'Sector{_si}', {})
+                            _secs.append((int(_sec.get('start', 0)),
+                                          int(_sec.get('end', -1)),
+                                          float(_sec.get('scaling', 1.0)) * _gl))
+                _applied = []
+                for _a, _b, _f in _secs:
+                    if abs(_f - 1.0) < 1e-6:
+                        continue
+                    for _w in wpnts:
+                        if _a <= int(_w.id) <= _b:
+                            _w.vx_mps = float(_w.vx_mps) * _f
+                    _applied.append(f'[{_a}-{_b}]x{_f:.2f}')
+                if _applied:
+                    self.get_logger().warn('[sector_refv] ' + ' '.join(_applied))
+                self._publish_refv_markers(wpnts)
+            except Exception as _e:
+                self.get_logger().warn(f'[sector_refv] 적용 실패({_e}) — 프로파일 원본 사용')
             self._track = build_track_from_wpnts(
                 wpnts, wall_wpnts=wall_wpnts, vel_scale=vel_scale,
                 inflation_factor=inflation, extend_part=extend_part,
                 default_v=float(self.get_parameter('max_speed').value),
                 corridor_half_width=corridor_half,
                 a_lat_max=self._a_lat_eff_for_track(),
-                a_long_max=abs(A_MIN_DYN),
-                corridor_v_floor=float(self.get_parameter('corridor_v_floor').value),
-                corridor_v_tight=float(self.get_parameter('corridor_v_tight_width').value),
-                corridor_v_wide=float(self.get_parameter('corridor_v_wide_width').value))
+                a_long_max=abs(A_MIN_DYN))
             try:
                 import numpy as _np
                 _rv = _np.asarray(self._track.ref_v)
@@ -1142,17 +801,15 @@ class MPCNode(Node):
             f"track loaded: N_orig={len(self._track.element_arc_lengths_orig)}, "
             f"L_orig={L_orig:.2f} m, L_ext={L_ext:.2f} m")
 
-        bo = self._resolve_bo_params()
-        param = self._build_param_dict(bo)
+        param = self._build_param_dict()
         param['s_max'] = L_ext  # match ROS1 (extended)
-        is_ot = bool(bo.get('overtaking', False))
+        # is_ot: 예전엔 BO json 의 'overtaking' 플래그. self.mpc.is_ot 는 어디서도
+        # 다시 읽히지 않는 ghost — 클래스 기본값(False)과 동일하게 고정 (2026-07-28).
+        is_ot = False
 
         # Vehicle dynamics dict — kinematic mode only consumes `l_wb`
         vheid = {
             'l_wb': float(self.get_parameter('vehicle.l_wb').value),
-            'l_f':  float(self.get_parameter('vehicle.l_f').value),
-            'l_r':  float(self.get_parameter('vehicle.l_r').value),
-            'm':    float(self.get_parameter('vehicle.m').value),
         }
 
         self.mpc.set_initial_params(param, vheid, is_ot)
@@ -1178,54 +835,80 @@ class MPCNode(Node):
         )
         # ── Dynamic Pacejka 모드 토글 — setup_MPC() 전에 적용해야 codegen 반영 ──
         self.mpc.use_dynamic = bool(self.get_parameter('use_dynamic').value)
+        self.mpc.progress_gamma = float(self.get_parameter('progress_reward_gamma').value)  # B1 (codegen-time)
         self.mpc.nlp_solver_iters = int(self.get_parameter('nlp_solver_iters').value)
         self.mpc.dyn_tire_model = str(self.get_parameter('dyn_tire_model').value)
         # LM regularization (read before setup_MPC so codegen picks it up).
         self.mpc.lm_dynamic = float(self.get_parameter('lm_dynamic').value)
         self.mpc.dyn_use_pacejka = (self.mpc.dyn_tire_model == 'pacejka')
-        # 2026-06-10 unified layout: kinematic mode builds the SAME 8-state
-        # layout (slot 3 = vx in both modes) → LMPC is allowed for both.
-        # effective_lmpc() stays the single policy point (re-gates if a future
-        # model layout diverges).
-        from .mpc_core.model_policy import effective_lmpc
-        _req_lmpc = bool(self.get_parameter('use_lmpc').value)
-        _eff_lmpc = effective_lmpc(self.mpc.use_dynamic, _req_lmpc)
-        if _req_lmpc and not _eff_lmpc:
-            self.get_logger().warn(
-                "[LMPC] use_lmpc=true but effective_lmpc() gated it OFF "
-                "(model layout incompatible with safe-set packing).")
-        # Reconcile the runtime LMPC bookkeeping gate too: _lmpc_use was set from
-        # the raw param in __init__ (before use_dynamic was known). Without this,
-        # kinematic mode would still record laps / run the SS query (slot 3 = s
-        # packed as vx) and poison the LapDatabase. _lmpc_use gates the per-cycle
-        # update (→ empty buffer → lap-end no-ops) and the query-state stash.
-        self._lmpc_use = _eff_lmpc
-        # LMPC codegen flag (Step 4): when LMPC active, drop the terminal contour/yaw
-        # W_e emphasis so the joint-α apex target — not centerline tracking — sets x_N.
-        self.mpc._lmpc_codegen = _eff_lmpc
-        # Phase B3: joint-α LMPC (α as state + convex-α terminal). Tie activation
-        # to use_lmpc so the OCP is built with the augmented state (nx=8+K).
-        self.mpc._lmpc_joint = _eff_lmpc
         # R3: decouple max_speed — set progress target / κ-lookahead independently
         # of the hard cap BEFORE setup_MPC (codegen-time). 0 → derive from v_max.
         _st = float(self.get_parameter('speed_target').value)
         _lk = float(self.get_parameter('lookahead_m').value)
-        self.mpc.speed_target = _st if _st > 0 else None
+        # 3-i: 학습 ref_V 가 권장 speed_target 을 산출했으면 그것을 우선(천장 상향이
+        # 이 토글의 목적). 없으면 기존 param 경로(0 → None=v_max 유도).
+        _learned_st = getattr(self, '_learned_speed_target', None)
+        if _learned_st is not None:
+            self.mpc.speed_target = _learned_st
+        else:
+            self.mpc.speed_target = _st if _st > 0 else None
         self.mpc.lookahead_m  = _lk if _lk > 0 else None
+        # ── 0724 온라인 학습 속도 프로파일 학습기 ──────────────────────
+        self._spl = None
+        if bool(self.get_parameter('use_refv_learning').value):
+            try:
+                from .mpc_core.lmpc.speed_profile_learner import SpeedProfileLearner
+                _L = float(self._track.element_arc_lengths_orig[-1])
+                self._spl = SpeedProfileLearner(
+                    _L,
+                    kappa_of_s=lambda s: float(self.mpc.abs_kappa_lut(s)),
+                    base_refv_of_s=lambda s: float(self.mpc.ref_v(s)),
+                    step_delta=float(self.get_parameter('refv_step_delta').value),
+                    refv_scale_min=float(self.get_parameter('refv_scale_min').value),
+                    refv_scale_max=float(self.get_parameter('refv_scale_max').value),
+                    alat_scale_min=float(self.get_parameter('alat_scale_min').value),
+                    alat_scale_max=float(self.get_parameter('alat_scale_max').value),
+                    min_samples=int(self.get_parameter('refv_min_samples').value),
+                    a_lat_base=float(self.mpc.a_lat_safe_eff()),
+                    # 2026-08-04: 학습기 마찰천장 √(μg/κ)의 μ 기본이 1.0 이라
+                    # 코너 천장이 33% 과대 → 시케인 진입 상류(s19~22) 과상향 →
+                    # s23 착좌 +0.13→+0.15 밀림 + 꼬리 접촉. 실제 μ 전달.
+                    mu=float(getattr(self.mpc, 'dyn_mu', 0.75)),
+                    lt_tol=float(self.get_parameter('refv_lt_tol').value),
+                    raise_cooldown_laps=int(self.get_parameter('refv_raise_cooldown').value),
+                    min_margin_m=float(self.get_parameter('refv_min_margin_m').value),
+                )
+                _p = str(self.get_parameter('refv_learn_path').value).strip()
+                if not _p:
+                    _tn = str(self.get_parameter('track_name').value)
+                    # NOTE: bare `Path` is NOT pathlib here — `nav_msgs.msg.Path`
+                    # (ROS message) shadows it at module scope (imported below in
+                    # the `from nav_msgs.msg import (... Path)` block). Use
+                    # os.path to avoid the name collision entirely.
+                    _p = os.path.expanduser(
+                        os.path.join('~', 'mpc_logs', f'refv_scales_{_tn}.npz'))
+                self._spl_path = _p
+                if self._spl.load(_p):
+                    self.get_logger().info(
+                        f"[refv-learn] {_p} 로드 (laps={self._spl.laps_learned}, "
+                        f"scale [{self._spl.refv_scale.min():.2f},"
+                        f"{self._spl.refv_scale.max():.2f}])")
+                else:
+                    self.get_logger().info(f"[refv-learn] 새 학습 시작 → {_p}")
+                self.mpc._refv_scale_fn = self._spl.refv_scale_at
+                self.mpc._alat_scale_fn = self._spl.alat_scale_at
+            except Exception as _e:
+                self.get_logger().error(f"[refv-learn] init 실패({_e}) — 학습 off")
+                self._spl = None
         # Phase D closed-form CasADi GP residual flag — set BEFORE setup_MPC()
-        # so the dynamics codegen picks it up. Independent of use_gp_residual.
+        # so the dynamics codegen picks it up.
         self.mpc.use_gp_casadi = bool(self.get_parameter('use_gp_casadi').value)
-        # B4' error regression. Coupled to use_lmpc (it reuses the SS-neighbour
-        # query). With use_lmpc off -> _err_regr off -> pure baseline f_expl.
-        _use_err = bool(self.get_parameter('use_error_regression').value)
-        self.mpc._err_regr = _use_err and _eff_lmpc
-        if _use_err and self.mpc.use_gp_casadi:
-            # e_corr and GP residual BOTH add to f_expl velocity rows -> double
-            # correction. They are alternatives (B4' supersedes the GP residual).
-            self.get_logger().warn(
-                "[B4'] use_error_regression AND use_gp_casadi both set -> "
-                "disabling GP residual to avoid double-correcting f_expl.")
-            self.mpc.use_gp_casadi = False
+        _gpc = str(self.get_parameter('gp_casadi_ckpt').value).strip()
+        _gpt = str(self.get_parameter('gp_casadi_train_data').value).strip()
+        if _gpc:
+            self.mpc.gp_casadi_ckpt = _gpc
+        if _gpt:
+            self.mpc.gp_casadi_train_data = _gpt
         # 이전에 set_track_data 가 print 한 "MODEL = KINEMATIC" 은 toggle 이전 상태라 잘못됨.
         # 명확하게 다시 announce.
         self.get_logger().info(
@@ -1255,28 +938,52 @@ class MPCNode(Node):
                 self._latched_qos if hasattr(self, '_latched_qos') else 10)
         self._model_info_pub.publish(_String(data=f"{kind} | n_states={actual_n_states} | n_controls={actual_n_controls}"))
 
-        # ── LMPC: raceline seed + npz load (2026-05-28 #18) ─────────────
-        try:
-            self._lmpc_load_or_seed()
-        except Exception as _e:
-            self.get_logger().warn(f"[LMPC] seed/load skipped: {_e}")
-
-        # ── Phase D: GP residual learning wrap ──────────────────────────
-        # use_gp_residual=true 면 setup_MPC() 결과 (acados ocp) 를 L4acados
-        # 의 ResidualLearningMPC 로 wrap. 미설정 시 plain acados 사용.
-        # 추가 codegen ~30s (첫 launch 만). gp_residual.pt 로드 실패 시
-        # 자동 fallback (plain acados 그대로).
-        if bool(self.get_parameter('use_gp_residual').value):
-            from .mpc_core.gp_residual_wrapper import wrap_solver_with_gp
-            ckpt = str(self.get_parameter('gp_ckpt_path').value).strip() \
-                   or os.path.expanduser('~/bo_results/gp_residual.pt')
-            ok = wrap_solver_with_gp(self.mpc, ckpt, logger=self.get_logger())
-            if ok:
-                self.get_logger().info("[Phase D] GP residual ACTIVE")
-            else:
-                self.get_logger().warn("[Phase D] GP wrap failed — plain acados fallback")
-
+        # (2026-07-09 대청소: l4acados GP wrap 경로 제거 — casadi GP만 사용)
         self._mpc_ready = True
+
+        # ---- 추월 창 계산 (기동 1회, 스펙 4.1) ----
+        # 폭은 LUT 벽으로: 상대는 레이스라인(d=0) 주행이므로 room = wl/wr 자체.
+        # 수식은 구 _ot_feasible(0723I, 삭제됨)의 수식을 그대로 옮김.
+        try:
+            m = self.mpc
+            L_ot = float(self._track.element_arc_lengths_orig[-1])
+            kg, dsg = m.kappa_grid, float(m.kappa_ds)
+
+            def _ot_sample(s):
+                cx = float(m.center_lut_x(s)); cy = float(m.center_lut_y(s))
+                dxt = float(m.center_lut_dx(s)); dyt = float(m.center_lut_dy(s))
+                nrm = math.hypot(dxt, dyt) + 1e-9
+                st_, ct_ = dyt / nrm, dxt / nrm
+                wl = st_ * (float(m.left_lut_x(s)) - cx) \
+                    - ct_ * (float(m.left_lut_y(s)) - cy)
+                wr = st_ * (float(m.right_lut_x(s)) - cx) \
+                    - ct_ * (float(m.right_lut_y(s)) - cy)
+                room_up, room_dn = max(wl, wr), -min(wl, wr)
+                k = abs(float(kg[int(s / dsg) % len(kg)]))
+                return (room_up, room_dn, k, float(m.ref_v(s % L_ot)))
+
+            _wins = build_windows(
+                _ot_sample, L_ot,
+                keepout=float(self.get_parameter('ot_keepout').value))
+            self._ot_planner = OtPlanner(
+                _wins, L_ot,
+                keepout_r_safe=max(
+                    0.05, float(self.get_parameter('ot_keepout').value) - 0.25),
+                launch_gap=float(self.get_parameter('ot_launch_gap').value),
+                pass_margin=float(self.get_parameter('ot_pass_margin').value),
+                cooldown=float(self.get_parameter('ot_cooldown').value),
+                commit_gap=float(self.get_parameter('ot_commit_gap').value),
+                engage_gap=float(self.get_parameter('ot_engage_gap').value))
+            for w in _wins:
+                self.get_logger().info(
+                    f"[OT] window s{w.s_start:.1f}~{w.s_end:.1f} "
+                    f"({w.length:.1f} m) side={w.side:+d} v_min={w.v_min:.2f}")
+            if not _wins:
+                self.get_logger().warn("[OT] 추월 창 0개 — 추월 비활성 동작")
+        except Exception as e:
+            self.get_logger().warn(f"[OT] 창 계산 실패 — 추월 비활성: {e}")
+            self._ot_planner = None
+
         # Startup ramp — MPC ready 직후 N 초 동안은 MPC output 무시하고 작은
         # forward push (0.5 m/s, steer=0) 강제. 정지에서 dynamic 모드의
         # Pacejka singularity (vx=0) 회피 + solver 가 plausible warm-start
@@ -1285,10 +992,6 @@ class MPCNode(Node):
         self.get_logger().info(
             "MPC ready — control loop active (cold-start: vx-floor + speed-floor, "
             "MPCC steering from t=0)")
-        # auto_step 활성 시, codegen 끝난 직후 effective v_max = start 로 강제.
-        # (codegen ubu cap 은 yaml max_speed = end_speed 그대로 12 인 상태)
-        if getattr(self, '_auto_step_state', {}).get('enabled', False):
-            self._set_effective_max_speed(self._auto_step_state['start'])
 
         # Latched RViz viz: raw (un-inflated) lanes. /boundary_marker (cycle)
         # shows inflated corridor — comparing the two reveals how much
@@ -1352,6 +1055,14 @@ class MPCNode(Node):
         from rcl_interfaces.msg import SetParametersResult
         live_names = {n for n, _ in LIVE_PARAMS}
         for p in params:
+            # rqt_reconfigure 의 체크박스를 저장 버튼으로 쓴다 — 켜면 존 값을
+            # yaml 에 되쓴다. 이 콜백은 파라미터가 적용되기 "전"에 불리므로
+            # 여기서 파일 IO 를 하거나 파라미터를 다시 set 하면 재귀·지연이
+            # 생긴다. 플래그만 세우고 실제 저장은 하우스키핑 타이머가 한다.
+            if p.name == 'save_params' and bool(p.value):
+                self._save_params_req = True
+            if p.name == 'sector_refv_spec':
+                self._sector_respec_req = True
             if p.name in live_names:
                 try:
                     setattr(self.mpc, p.name, float(p.value))
@@ -1416,9 +1127,6 @@ class MPCNode(Node):
     def _pose_cb(self, msg: PoseStamped):
         self._last_pose = msg
 
-    def _goal_cb(self, msg: PoseStamped):
-        self._goal = msg
-
     def _clicked_point_cb(self, msg: PointStamped):
         # Mirrors ROS1: RViz click adds a static obstacle for dev
         self._obstacles.append((msg.point.x, msg.point.y))
@@ -1428,8 +1136,228 @@ class MPCNode(Node):
             f"now {len(self._obstacles)} obstacles")
 
     def _external_obs_cb(self, msg: PoseArray):
-        self._obstacles = [(p.position.x, p.position.y) for p in msg.poses]
-        self._obstacles_stamp = time.monotonic()
+        # 2026-07-09 감지 깜빡임 latch: 감지기가 한 프레임 장애물을 놓치면 빈 배열이
+        # 와서 mpc 가 commit release -> warm-start 리셋 -> 재commit 진동 (실측: 장애물
+        # 가시중 steer 지터 p90 +25%). 빈 수신은 아래 TTL 3s 동안 이전 목록 유지.
+        new = [(p.position.x, p.position.y) for p in msg.poses]
+        # ── 0807 실차: 트랙 밖 클러스터 게이트 (노트북 8f1c90a 동일) ──
+        # kiss 클러스터 raw 입력이라 트랙 밖 6.5~7.5 m 피트/구조물이
+        # side-decide 스팸 + 유령 동적 래치(vs=-0.73)를 만들던 것 차단.
+        try:
+            _rlf = self._rl_arrays()
+            if _rlf is not None:
+                _, rxF, ryF = _rlf
+                new = [(x, y) for x, y in new
+                       if float(np.min((rxF - x) ** 2 + (ryF - y) ** 2)) <= 6.25]
+        except Exception:
+            pass
+        now = time.monotonic()
+        # ── P2 Stage-A' (0722j): 장애물 단기기억 TTL 3s ──────────────────
+        # 라이다 가림: detour길 위 #2가 #1 뒤에 가려져 커밋 순간 리스트에 없음
+        # → 병합(extra) 미발동, 회피 중 #2 돌출로 재커밋·접촉 (bag 15_40:
+        # extra 전부 0.00, t=18.2 #2 늦은 출현, s48 매랩 STUCK). 프레임 대체
+        # 대신 위치별 last-seen 유니온(0.3m 격자, 3s TTL). 랩학습 아님 —
+        # 초 단위 인지 지속성. 이동 장애물은 새 위치가 새 셀로 갱신됨.
+        # 0723x 정적/동적 셀 구분: 같은 셀에서 0.25s 이상 재관측 = 정적 확정(0723y 반응성 단축)(TTL 3s
+        # 가림 지속성 유지). 미확정 셀은 "지금 보이는 것"만 유효 — 이동 상대가
+        # 남기던 최대 6m 잔상 열(breadcrumb, 유령 커밋·obs2/3 오염의 원인) 즉시 소멸.
+        if not hasattr(self, '_obs_trk'):
+            self._obs_trk = []   # [{x,y,P,t0,t,hits,inn,miss}]
+        _R = 0.15 ** 2           # 측정분산 (kiss BEV 지터 ~0.15 m)
+        for tr in self._obs_trk:
+            tr['upd'] = False
+        for x, y in new:
+            best = None
+            bd = None
+            for tr in self._obs_trk:
+                d2 = (tr['x'] - x) ** 2 + (tr['y'] - y) ** 2
+                gate = max(0.45, 3.0 * math.sqrt(tr['P'] + _R))
+                if d2 < gate * gate and (bd is None or d2 < bd):
+                    best, bd = tr, d2
+            if best is None:
+                self._obs_trk.append({'x': x, 'y': y, 'P': 0.35 ** 2,
+                                      't0': now, 't': now, 'hits': 1,
+                                      'inn': 0.0, 'miss': 0, 'upd': True})
+            else:
+                inn = math.sqrt(bd)
+                best['inn'] = 0.7 * best['inn'] + 0.3 * inn
+                K = best['P'] / (best['P'] + _R)
+                best['x'] += K * (x - best['x'])
+                best['y'] += K * (y - best['y'])
+                best['P'] = max(0.03 ** 2, (1.0 - K) * best['P'])
+                best['t'] = now
+                best['hits'] += 1
+                best['miss'] = 0
+                best['upd'] = True
+        # ── 0813 D6 랩 지속 기억 + 부정증거 퇴출 ─────────────────────
+        # 정적확정 트랙은 TTL 없이 랩을 넘겨 기억한다 (안 보여도 제약 유지 —
+        # 가림·사거리 밖·검출 게이트 지연 전부 무시하고 다음 랩 즉시 커밋).
+        # 삭제는 "봤어야 하는데 안 보임" 누적으로만: 전방 ±80°·6 m 내이고
+        # 더 가까운 다른 확정 트랙이 시선을 막지 않는 사이클에 무검출이면
+        # miss+1, 10회(≈0.4 s) 연속이면 치워진 것으로 보고 삭제.
+        _pose = getattr(self, '_last_pose_xy', None)
+        _conf = [tr for tr in self._obs_trk
+                 if tr['t'] - tr['t0'] >= 0.25 and tr['hits'] >= 4
+                 and tr['inn'] < 0.25]
+        if _pose is not None:
+            px, py, pyaw = _pose
+            for tr in _conf:
+                if tr['upd']:
+                    continue
+                dx, dy = tr['x'] - px, tr['y'] - py
+                dist = math.hypot(dx, dy)
+                brg = math.atan2(dy, dx) - pyaw
+                brg = (brg + math.pi) % (2 * math.pi) - math.pi
+                if dist > 6.0 or abs(brg) > 1.4:
+                    continue          # 시야 밖 — 부정증거 아님
+                _occl = False
+                for o in _conf:
+                    if o is tr:
+                        continue
+                    od = math.hypot(o['x'] - px, o['y'] - py)
+                    ob = math.atan2(o['y'] - py, o['x'] - px) - pyaw
+                    ob = (ob + math.pi) % (2 * math.pi) - math.pi
+                    if od < dist - 0.2 and abs(ob - brg) < 0.18:
+                        _occl = True  # 다른 장애물이 가림
+                        break
+                if not _occl:
+                    tr['miss'] += 1
+        _confset = set(id(tr) for tr in _conf)
+        self._obs_trk = [tr for tr in self._obs_trk
+                         if (id(tr) in _confset and tr['miss'] < 10)
+                         or (id(tr) not in _confset and now - tr['t'] <= 3.0)]
+        # σ 힌트 수출 → acados keepout 이 불확실성 비례로 넓힘
+        try:
+            if getattr(self, 'mpc', None) is not None:
+                self.mpc.obs_sigma_hints = [
+                    (tr['x'], tr['y'], math.sqrt(tr['P']))
+                    for tr in self._obs_trk if id(tr) in _confset]
+        except Exception:
+            pass
+        # 정적 확정: 0.25 s + 4히트 + 혁신 EMA<0.25 (이동체 배제)
+        _static = [(tr['x'], tr['y']) for tr in self._obs_trk
+                   if tr['t'] - tr['t0'] >= 0.25 and tr['hits'] >= 4
+                   and tr['inn'] < 0.25]
+        _fresh_dyn = [(tr['x'], tr['y']) for tr in self._obs_trk
+                      if not (tr['t'] - tr['t0'] >= 0.25 and tr['hits'] >= 4
+                              and tr['inn'] < 0.25)
+                      and now - tr['t'] < 0.15]
+        self._obstacles = _static + _fresh_dyn
+        self._obstacles_stamp = now
+        # ── 0723E OppTracker: 정적 확정 셀을 제외한 감지를 Frenet으로 투영해
+        # 단일 상대 트래커에 공급 (predict→associate→update, 가림 coast).
+        # 기존 이벤트 속도추정/홀드/신선도 밴드에이드 일괄 대체.
+        try:
+            _rl = self._rl_arrays()
+            if _rl is not None and self._track is not None:
+                rs_, rx_, ry_ = _rl
+                if getattr(self, '_opp_trk', None) is None:
+                    self._opp_trk = OppTracker(
+                        float(self._track.element_arc_lengths_orig[-1]))
+                dets = []
+                for x, y in new:
+                    # 2026-08-05 제외반경 0.35→0.55: 0.4 m 박스 장애물의 라이다
+                    # 히트는 면을 따라 ~0.5 m 퍼져, 가장자리 검출이 0.35 망을
+                    # 빠져나가 트래커에 "동적 후보"로 들어갔다 (LATCHED 13건의
+                    # 공급원). 0.55 = 장애물 반치수 + 검출 지터 여유.
+                    if any((x - sx) ** 2 + (y - sy) ** 2 < 0.3025
+                           for sx, sy in _static):
+                        continue   # 정적 확정 제외
+                    j = int(np.argmin((rx_ - x) ** 2 + (ry_ - y) ** 2))
+                    j2 = (j + 1) % len(rs_)
+                    tx, ty = rx_[j2] - rx_[j], ry_[j2] - ry_[j]
+                    nrm = float(np.hypot(tx, ty)) + 1e-9
+                    d_ = (ty * (x - rx_[j]) - tx * (y - ry_[j])) / nrm
+                    # 2026-07-31 s 양자화 제거: 최근접 점의 s(rs_[j]) 를 그대로 쓰면
+                    # 0.1 m 격자에 스냅된다. OppTracker 의 속도갱신이
+                    # vs += BETA·(ds/dt) 이고 감지가 25 Hz(dt≈0.04 s)라, 격자 한 칸
+                    # 점프 1회가 0.35·(0.1/0.04)=0.875 로 DYN_V(0.8) 을 단독으로
+                    # 넘긴다 — 정지 장애물이 상대차로 확정되어 2.1초간 추종 모드로
+                    # 빠지던 원인(bag 17_35: vs=-0.62 로 LATCHED). 세그먼트 위
+                    # 투영 비율로 보간하면 ds 가 실제 감지 지터(수 cm)가 된다.
+                    # tx,ty 는 바로 위 d_ 계산에 쓰는 것과 같은 세그먼트 벡터다.
+                    _u = ((x - rx_[j]) * tx + (y - ry_[j]) * ty) / (nrm * nrm)
+                    _u = min(1.0, max(0.0, float(_u)))
+                    _ds_seg = (float(rs_[j2]) - float(rs_[j])) % self._opp_trk.L
+                    dets.append((float(rs_[j]) + _u * _ds_seg, float(d_)))
+                hit = self._opp_trk.update(dets, now)
+                # GP-bins 학습: 트래커가 동적 확정 상태로 감지를 먹었을 때만
+                if hit and self._opp_trk.confirmed_dynamic(now):
+                    if (getattr(self, '_opp_bins', None) is None
+                            or abs(self._opp_bins.L - self._opp_trk.L) > 1.0):
+                        self._opp_bins = OppBins(self._opp_trk.L)
+                    self._opp_bins.add(self._opp_trk.s, self._opp_trk.d,
+                                       self._opp_trk.vs)
+        except Exception as _te:
+            self.get_logger().warn(f"[trk] update skip: {_te}",
+                                   throttle_duration_sec=5.0)
+
+    def _rl_arrays(self):
+        """raceline numpy 배열 캐시 (rs, rx, ry) — 트래커/예측용."""
+        if getattr(self, '_rl_np', None) is None and self._ref_wpnts is not None:
+            self._rl_np = (
+                np.array([w.s_m for w in self._ref_wpnts]),
+                np.array([w.x_m for w in self._ref_wpnts]),
+                np.array([w.y_m for w in self._ref_wpnts]))
+        return getattr(self, '_rl_np', None)
+
+    def _map_cb(self, msg: OccupancyGrid):
+        """P1: /map → 점유 배열 캐시 (occ>=50 or unknown(-1)=벽 취급)."""
+        h, w = msg.info.height, msg.info.width
+        arr = np.array(msg.data, dtype=np.int16).reshape(h, w)
+        occ = ((arr >= 50) | (arr < 0)).astype(np.uint8)
+        self._map_grid = (occ, float(msg.info.resolution),
+                          float(msg.info.origin.position.x),
+                          float(msg.info.origin.position.y))
+        self.get_logger().info(
+            f"[P1] map cached {w}x{h} res={msg.info.resolution:.3f} (raycast ready)")
+
+    def _map_raycast(self, x, y, dx, dy, max_d=3.0):
+        """(x,y)에서 (dx,dy) 방향 첫 벽까지 실측 거리 [m]. 맵 없으면 None.
+        solver decide_side_pref가 ±e_c 방향 room 측정에 사용 (P1)."""
+        if self._map_grid is None:
+            return None
+        occ, res, ox, oy = self._map_grid
+        h, w = occ.shape
+        n = math.hypot(dx, dy)
+        if n < 1e-9:
+            return None
+        ux, uy = dx / n, dy / n
+        step = res            # 0722p: res*0.5→res (0.05m) — 해상도 충분, 비용 절반
+        d = 0.0
+        while d < max_d:
+            px = int((x + ux * d - ox) / res)
+            py = int((y + uy * d - oy) / res)
+            if not (0 <= px < w and 0 <= py < h) or occ[py, px]:
+                return d
+            d += step
+        return max_d
+
+    def _compute_pred_obs(self):
+        """Per-stage 상대 예측 (x,y) 또는 None.
+
+        0723E: 위치·속도 소스 = OppTracker (가림 coast 포함). 트래커가 없으면
+        None → 솔버는 현위치 legacy 동작 (정적엔 그게 정답). 추월 ON이면
+        GP-bins 학습 라인+속도, 아니면 등속 전진 (A2)."""
+        if not bool(self.get_parameter('use_opp_prediction').value):
+            return None
+        _trk = getattr(self, '_opp_trk', None)
+        if _trk is None or not _trk.active:
+            return None
+        _rl = self._rl_arrays()
+        if _rl is None:
+            return None
+        rs, rx, ry = _rl
+        track_len = _trk.L
+        s0 = float(_trk.s)
+        v = max(0.0, float(_trk.vs))
+        times = stage_times(self.mpc.dT, self.mpc.N)
+        _ob = getattr(self, '_opp_bins', None)
+        if (_ob is not None
+                and bool(self.get_parameter('overtake_enabled').value)):
+            return _ob.predict_xy(rs, rx, ry, s0=s0, times=times, fallback_v=v)
+        return sample_opp_xy(rs, rx, ry, s0=s0, v=v,
+                             times=times, track_len=track_len)
 
     # ─────────────────────────────────────────────────────────────────
     # Boundary visualization hook — called by mpc_core every solve()
@@ -1483,178 +1411,6 @@ class MPCNode(Node):
             r  = float(tw.angular.z)
         return np.array([p.x, p.y, psi, vx, vy, r, s], dtype=float)
 
-    def _load_ml_scaler(self) -> None:
-        """C: TorchScript WeightScaleMLP 로드. mpc_node init 시 1회 호출.
-        실패 시 self._ml_scaler = None — B heuristic 폴백."""
-        self._ml_scaler = None
-        if not bool(self.get_parameter('use_ml_scale').value):
-            return
-        try:
-            from .ml.inference import WeightScaleInference, default_model_path
-            path = self.get_parameter('ml_model_path').value or default_model_path()
-            self._ml_scaler = WeightScaleInference(path)
-            self.get_logger().info(f"[ml] WeightScaleMLP loaded from {path}")
-        except Exception as e:
-            self.get_logger().warn(
-                f"[ml] WeightScaleMLP load failed: {e} — falling back to B heuristic")
-
-    def _load_polynomial(self) -> None:
-        """BO 결과로 학습된 polynomial coefficients 로드 (override_mode='polynomial').
-        실패 시 self._poly = None — bucketed/B 폴백."""
-        self._poly = None
-        path = str(self.get_parameter('poly_path').value).strip()
-        if not path:
-            return
-        try:
-            import json, os
-            if not os.path.isfile(path):
-                self.get_logger().warn(f"[poly] file not found: {path} — fallback")
-                return
-            with open(path) as f:
-                d = json.load(f)
-            self._poly = {
-                'polys': {k: list(map(float, v)) for k, v in d['polys'].items()},
-                'bounds': tuple(d.get('scale_bounds', (0.3, 5.0))),
-                'speed_range': d.get('speed_range', [0, 100]),
-            }
-            self.get_logger().info(
-                f"[poly] loaded from {path}: degree {d.get('degree', '?')}, "
-                f"speed_range {d.get('speed_range', '?')}, "
-                f"{len(self._poly['polys'])} polynomials")
-        except Exception as e:
-            self.get_logger().warn(f"[poly] load failed: {e} — fallback")
-            self._poly = None
-
-    # ── Corner-exit detection (Method C: spatial-aware q_cte) ──
-    # 코너에서 직선으로 전환되는 시점 (s_exit) 기록. 그 후 EXIT_BLEND_M 동안
-    # q_cte 점진적 회복 (0 → 1). 코너 직후 centerline 강제 복귀 → 휘청 방지.
-    EXIT_BLEND_M = 5.0           # 출구 후 5m 동안 점진 회복
-    EXIT_KAPPA_HIGH = 0.3        # 코너 in/out 경계
-    EXIT_KAPPA_LOW  = 0.15
-
-    def _corner_exit_factor(self, s_now: float, kappa_abs_now: float) -> float:
-        """코너 출구 후 q_cte 감소 factor 계산.
-        반환: 0~1 (코너 출구 직후 0, EXIT_BLEND_M 후 1).
-        코너 안 또는 멀리 직선이면 1.0 (변경 X).
-        """
-        # 이전 cycle 의 kappa hi/lo 트래킹
-        prev_kappa = getattr(self, '_prev_kappa_abs', 0.0)
-        self._prev_kappa_abs = kappa_abs_now
-        # 코너→직선 전환 감지
-        if prev_kappa > self.EXIT_KAPPA_HIGH and kappa_abs_now < self.EXIT_KAPPA_LOW:
-            self._last_exit_s = s_now   # 출구 시점 기록
-        # 출구 이후 거리
-        last_exit_s = getattr(self, '_last_exit_s', None)
-        if last_exit_s is None:
-            return 1.0
-        d = s_now - last_exit_s
-        if d < 0 or d > self.EXIT_BLEND_M:
-            return 1.0
-        # 0 → 1 점진 회복
-        return float(d / self.EXIT_BLEND_M)
-
-    def _adaptive_weight_update(self, s_now: float) -> None:
-        """B: κ-aware online weight adaptation. 매 cycle 호출.
-
-        mpc_core 의 q_*_scale_live 가 cost residual multiplier (default 1.0).
-        forward-max κ_lookahead (6m 앞) 에 따라 동적 매핑:
-          - 직선 (κ ≈ 0): scale = 1.0 (yaml 기본값 유지)
-          - 코너 (κ ↑): cte/lag 약화, v 추종 강화, rate cost 강화
-                       → mpc 가 자동으로 코너 진입 감속 + smooth steering
-
-        매핑 (heuristic, kinematic + raceline 가정):
-          q_cte_scale   = max(0.3, 1 − 2·κ)   # 코너 path 자유도 ↑
-          q_lag_scale   = max(0.5, 1 − 1.5·κ) # 코너 progress 압박 ↓
-          q_v_scale     = 1 + 2·κ              # 코너 ref_v(=raceline IQP) 추종 ↑ → 감속
-          q_drate_scale = 1 + 3·κ              # 코너 steering rate cost ↑ → smooth
-        """
-        if self._track is None or not getattr(self, '_mpc_ready', False):
-            return
-        # BO sweep / 수동 override 분기 — auto_tune 보다 우선. 외부 평가용.
-        # 결정: override_mode == 'bucketed' OR ('fixed' / legacy override_scales=true).
-        mode = str(self.get_parameter('override_mode').value).lower()
-        if mode in ('fixed',) or bool(self.get_parameter('override_scales').value):
-            self.mpc.q_cte_scale_live   = float(self.get_parameter('override_q_cte_scale').value)
-            self.mpc.q_lag_scale_live   = float(self.get_parameter('override_q_lag_scale').value)
-            self.mpc.q_v_scale_live     = float(self.get_parameter('override_q_v_scale').value)
-            self.mpc.q_drate_scale_live = float(self.get_parameter('override_q_drate_scale').value)
-            return
-        if mode == 'bucketed':
-            # 현재 cycle 의 κ_abs 로 bucket 결정.
-            try:
-                L = float(self._track.element_arc_lengths_orig[-1])
-                kappa_abs_now = float(self.mpc.abs_kappa_lut(s_now % L))
-            except Exception:
-                kappa_abs_now = 0.0
-            b01 = float(self.get_parameter('bucket_kappa_b01').value)
-            b12 = float(self.get_parameter('bucket_kappa_b12').value)
-            b = 0 if kappa_abs_now < b01 else (1 if kappa_abs_now < b12 else 2)
-            self.mpc.q_cte_scale_live   = float(self.get_parameter(f'override_q_cte_scale_b{b}').value)
-            self.mpc.q_lag_scale_live   = float(self.get_parameter(f'override_q_lag_scale_b{b}').value)
-            self.mpc.q_v_scale_live     = float(self.get_parameter(f'override_q_v_scale_b{b}').value)
-            self.mpc.q_drate_scale_live = float(self.get_parameter(f'override_q_drate_scale_b{b}').value)
-            # ── C: Corner-exit spatial blending (2026-05-26 비활성) ──
-            # try/except 로 안전화 + 비활성 (BO startup fail 원인 진단 중).
-            # 원인 파악 후 재활성. 현재 BO 가 spatial-aware 없는 Hybrid 그대로.
-            # try:
-            #     exit_factor = self._corner_exit_factor(s_now, kappa_abs_now)
-            #     self.mpc.q_cte_scale_live *= exit_factor
-            # except Exception:
-            #     pass
-            return
-        if mode == 'polynomial' and getattr(self, '_poly', None) is not None:
-            # BO-learned polynomial: (v, κ_bucket) → 4 scales. 매 cycle eval, ~수 μs.
-            try:
-                L = float(self._track.element_arc_lengths_orig[-1])
-                kappa_abs_now = float(self.mpc.abs_kappa_lut(s_now % L))
-            except Exception:
-                kappa_abs_now = 0.0
-            b01 = float(self.get_parameter('bucket_kappa_b01').value)
-            b12 = float(self.get_parameter('bucket_kappa_b12').value)
-            b = 0 if kappa_abs_now < b01 else (1 if kappa_abs_now < b12 else 2)
-            v = float(getattr(self.mpc, 'v_max', 4.0))  # 현재 cost target (auto_step aware)
-            lo, hi = self._poly['bounds']
-            def _eval(key: str) -> float:
-                import numpy as _np
-                return float(_np.clip(_np.polyval(self._poly['polys'][key], v), lo, hi))
-            self.mpc.q_cte_scale_live   = _eval(f'q_cte_b{b}')
-            self.mpc.q_lag_scale_live   = _eval(f'q_lag_b{b}')
-            self.mpc.q_v_scale_live     = _eval(f'q_v_b{b}')
-            self.mpc.q_drate_scale_live = _eval(f'q_drate_b{b}')
-            return
-        if not bool(self.get_parameter('auto_tune').value):
-            return  # auto_tune=false 면 yaml 의 yaml 기본 scale 그대로
-        try:
-            L = float(self._track.element_arc_lengths_orig[-1])
-            kappa = float(self.mpc.abs_kappa_lut(s_now % L))
-            kappa_signed = float(self.mpc.signed_kappa_lut(s_now % L))
-        except Exception:
-            return
-
-        # C: NN inference 우선 (use_ml_scale=true 면)
-        if getattr(self, '_ml_scaler', None) is not None:
-            try:
-                v_act = self._last_odom.twist.twist.linear.x if self._last_odom else 0.0
-                ref_v = float(self.mpc.ref_v(s_now % L))
-                v_max_cost = float(getattr(self.mpc, 'v_max', 0.0))
-                qcte, qlag, qv, qdrate = self._ml_scaler(
-                    abs(kappa), kappa_signed, v_act, ref_v, v_max_cost)
-                self.mpc.q_cte_scale_live   = qcte
-                self.mpc.q_lag_scale_live   = qlag
-                self.mpc.q_v_scale_live     = qv
-                self.mpc.q_drate_scale_live = qdrate
-                return
-            except Exception as e:
-                self._mpc_log.warn_throttle(5.0, "[ml] inference failed: %s — fallback to B", str(e))
-
-        # B fallback (heuristic) — train.py 의 target 공식과 동일하게 유지!
-        # MLP 가 학습한 매핑과 일관성 — MLP 실패 시 폴백이 같은 동작.
-        k = min(max(abs(kappa), 0.0), 1.0)  # cap
-        self.mpc.q_cte_scale_live   = max(0.3, 1.0 - 2.0 * k)  # 코너 path 자유도 ↑
-        self.mpc.q_lag_scale_live   = max(0.5, 1.0 - 1.5 * k)  # 코너 progress 압박 ↓
-        self.mpc.q_v_scale_live     = 1.5 + 1.5 * k             # ref_v 추종 강화
-        self.mpc.q_drate_scale_live = 1.5 + 4.0 * k             # 강화 (2.5→4.0). κ=0.82→4.78
-
     def _publish_safe_reset(self, x0) -> None:
         """Agent A: gym `in_collision` latch escape.
 
@@ -1672,6 +1428,23 @@ class MPCNode(Node):
                 self._track, np.array([x, y]))
             L = float(self._track.element_arc_lengths_orig[-1])
             s_safe = (s_now + 2.0) % L     # 2m ahead on centerline
+            # 0723a: 착지점이 감지 장애물 근처(<1.2m)면 앞으로 밀며 재시도 —
+            # bag 0723 12_49: s14.5 STUCK 후 착지점이 장애물 0.14m 옆에 떨어져
+            # 이후 영구 BLOCK 크립. 전부 막히면 장애물서 가장 먼 후보 선택.
+            _obs_now = [(float(o[0]), float(o[1])) for o in (self._obstacles or [])]
+            if _obs_now:
+                _best_s, _best_clr = s_safe, -1.0
+                for _ds in (2.0, 3.0, 4.0, 5.0, 6.5, 8.0):
+                    _st = (s_now + _ds) % L
+                    _tx = float(self._track.center_lut_x(_st))
+                    _ty = float(self._track.center_lut_y(_st))
+                    _clr = min(math.hypot(_tx - ox, _ty - oy) for ox, oy in _obs_now)
+                    if _clr >= 1.2:
+                        _best_s = _st
+                        break
+                    if _clr > _best_clr:
+                        _best_s, _best_clr = _st, _clr
+                s_safe = _best_s
             rx = float(self._track.center_lut_x(s_safe))
             ry = float(self._track.center_lut_y(s_safe))
             dx = float(self._track.center_lut_dx(s_safe))
@@ -1688,56 +1461,492 @@ class MPCNode(Node):
         msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
         msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
         self.initialpose_pub.publish(msg)
-        # Single source of truth for LMPC lap rejection: every teleport, in any
-        # control branch, lands here. Count it so the current lap is flagged as
-        # corrupted and rejected from the safe set.
-        self._lmpc_lap_teleports += 1
         self.get_logger().warn(
             f"[stuck-recover] /initialpose → ({rx:.2f},{ry:.2f},{yaw:.2f}) "
-            f"after {self._stuck_release_total} stuck cycles "
-            f"(lap teleports={self._lmpc_lap_teleports})")
+            f"after {self._stuck_release_total} stuck cycles")
 
-    # Recovery-steer sign during reverse. +1 / -1, validated empirically.
-    # 후진 중 steer→yaw 가 전진과 반대 → 이 부호로 검증/뒤집기.
-    _RECOVERY_STEER_SIGN = -1.0
+    def _publish_zone_markers(self, zone_specs):
+        """corridor_hard 존과 s 눈금자를 RViz MarkerArray 로 그린다.
 
-    def _recovery_steer(self, x0):
-        """후진(STUCK release) 중 centerline 으로 되돌아가도록 조향각 계산.
+        존 파라미터는 매 사이클 읽히므로 `ros2 param set corridor_hard2_s0 12.0`
+        같은 명령으로 주행 중에도 옮길 수 있다. 이 마커는 그 결과를 즉시
+        보여주기 위한 것이며, 존 구성이 실제로 바뀐 사이클에만 다시 그린다
+        (제어 루프 부담 최소화). 발행 전용 — 제어 경로에 영향 없음.
 
-        car (x,y,psi) 를 centerline 에 투영해 signed lateral error e_c 와
-        heading error 를 구하고, 이에 비례하는 조향각을 ±max_steer 로 clamp.
-        벽에서 멀어지는 방향으로 후진하게 만들어 재끼임 CASCADE 를 차단.
+        zones: [(s0, s1, factor), ...] — factor > 1.0 인 활성 존만 들어온다.
         """
-        if self._track is None or x0 is None or len(x0) < 3:
-            return 0.0
+        # 2026-07-28: 변경 시 1회만 발행하면 RViz 가 못 받는다 — latched
+        # (TRANSIENT_LOCAL) 발행이라도 RViz MarkerArray 디스플레이 기본 QoS 가
+        # VOLATILE 이라 늦게 뜬 구독자는 지나간 샘플을 받지 못한다(bag 18_03:
+        # 발행 1건 확인, 화면엔 안 나옴). 이 스택의 다른 마커 토픽들처럼
+        # 주기 재발행한다. 구성이 바뀌면 즉시, 아니면 1초마다.
+        sig = tuple(zone_specs)
+        now = time.monotonic()
+        changed = (sig != self._zone_marker_sig)
+        if not changed and (now - getattr(self, '_zone_marker_t', 0.0)) < 1.0:
+            return
+        self._zone_marker_sig = sig
+        self._zone_marker_t = now
+
+        arr = MarkerArray()
+        now = self.get_clock().now().to_msg()
+        L = float(self._track.element_arc_lengths_orig[-1])
+
+        def _xy(s):
+            s_ = float(s) % L
+            return (float(self._track.center_lut_x(s_)),
+                    float(self._track.center_lut_y(s_)))
+
+        def _base(mid, mtype):
+            m = Marker()
+            m.header.frame_id = "map"
+            m.header.stamp = now
+            m.ns = "mpc_zones"
+            m.id = mid
+            m.type = mtype
+            m.action = Marker.ADD
+            m.pose.orientation.w = 1.0
+            return m
+
+        # 존 개수가 줄면 이전 마커가 남으므로 매번 네임스페이스를 비우고 다시
+        # 그린다(DELETEALL 이 배열 첫 원소여야 뒤의 ADD 가 살아남는다).
+        _clr = _base(0, Marker.SPHERE)
+        _clr.action = Marker.DELETEALL
+        arr.markers.append(_clr)
+
+        mid = 0
+        # ── 존: 반투명 커튼(TRIANGLE_LIST) + 양끝 기둥 + 라벨 ──────────
+        # 2026-07-28 가시성 개선: 바닥에 깔린 얇은 선은 경계선·궤적·센터라인
+        # 마커에 묻혀 안 보였다 → 세운 벽으로 교체.
+        # 2026-07-29 정리: 그 벽이 CUBE_LIST(0.30 큐브 × 0.35 간격)라 울퉁불퉁한
+        # 블록 담장이 됐고, 높이 0.9 m 가 궤적을 가렸다. 이음매 없는 커튼으로
+        # 바꾸고 높이를 0.5 m 로 낮춘다 — 존은 보이되 궤적을 안 가리게.
+        ZW = 0.5        # 커튼 높이 [m]
+        for zi, (pfx, s0, s1, fac) in enumerate(zone_specs):
+            span = (s1 - s0) if s1 >= s0 else (s1 + L - s0)
+            t = min(max((float(fac) - 1.0) / 5.0, 0.0), 1.0)   # 1.0~6.0 → 0~1
+
+            curtain = _base(mid, Marker.TRIANGLE_LIST); mid += 1
+            curtain.scale.x = curtain.scale.y = curtain.scale.z = 1.0  # TRIANGLE_LIST 는 1 고정
+            curtain.color.r, curtain.color.g, curtain.color.b, curtain.color.a = \
+                1.0, 1.0 - t, 0.0, 0.35
+            n = max(2, int(span / 0.35) + 1)
+            pts = [_xy(s0 + span * k / (n - 1)) for k in range(n)]
+
+            def _P(x, y, z):
+                p = Point(); p.x, p.y, p.z = float(x), float(y), float(z)
+                return p
+
+            for k in range(n - 1):
+                x0, y0 = pts[k]
+                x1, y1 = pts[k + 1]
+                a, b = _P(x0, y0, 0.0), _P(x1, y1, 0.0)
+                c, d = _P(x1, y1, ZW),  _P(x0, y0, ZW)
+                # 앞면 2장 + 뒷면 2장. RViz 가 backface culling 을 하면 한쪽에서
+                # 커튼이 통째로 사라지므로 양쪽 와인딩을 다 넣는다. 두 면이 정확히
+                # 겹쳐 알파만 균일하게 두 번 곱해질 뿐 얼룩지지 않는다.
+                for tri in ((a, b, c), (a, c, d), (c, b, a), (d, c, a)):
+                    curtain.points.extend(tri)
+            arr.markers.append(curtain)
+
+            # 양끝 기둥 — 존 경계를 정확히 짚어준다(시작=초록, 끝=파랑)
+            for end_s, (cr, cg, cb) in ((s0, (0.1, 1.0, 0.2)), (s1, (0.2, 0.5, 1.0))):
+                px, py = _xy(end_s)
+                pil = _base(mid, Marker.CYLINDER); mid += 1
+                pil.scale.x = pil.scale.y = 0.10
+                pil.scale.z = ZW * 1.6
+                pil.color.r, pil.color.g, pil.color.b, pil.color.a = cr, cg, cb, 0.95
+                pil.pose.position.x, pil.pose.position.y = px, py
+                pil.pose.position.z = ZW * 0.8
+                arr.markers.append(pil)
+
+            lab = _base(mid, Marker.TEXT_VIEW_FACING); mid += 1
+            lx, ly = _xy(s0 + span * 0.5)
+            lab.pose.position.x, lab.pose.position.y, lab.pose.position.z = lx, ly, ZW + 0.45
+            lab.scale.z = 0.40
+            lab.color.r, lab.color.g, lab.color.b, lab.color.a = 1.0, 1.0, 1.0, 1.0
+            lab.text = f"{pfx}  s{s0:.1f}~{s1:.1f}  x{fac:.1f}"
+            arr.markers.append(lab)
+
+        self.zone_markers_pub.publish(arr)
+        self._publish_s_ruler(now, L, _xy)
+        if changed:
+            self.get_logger().info(
+                f"[zone-viz] {len(zone_specs)} active zone(s) drawn on /mpc/zone_markers "
+                f"(track L={L:.1f} m)")
+            # 존이 바뀌었으면 드래그 핸들도 새 위치로 다시 세운다.
+            if self._imk_server is not None:
+                try:
+                    self._zone_edit_setup(zone_specs)
+                except Exception as e:  # noqa: BLE001
+                    self.get_logger().warn(f"[zone-edit] 핸들 갱신 실패: {e}")
+
+    def _publish_s_ruler(self, stamp, L, _xy):
+        """s 눈금자를 존과 **별도 토픽**(/mpc/s_ruler)에 그린다.
+
+        2026-07-29: 원래 존 마커와 같은 배열에 섞여 있었다. 트랙 전체에 5 m 마다
+        기둥+텍스트를 뿌리니 텍스트 마커 수십 개가 화면을 덮는데, 같은 토픽이라
+        눈금자만 끌 수가 없었다. 토픽을 나눠 RViz 체크박스로 끄게 하고 간격도
+        10 m 로 늘린다. 존 좌표를 눈으로 찍을 때만 켜면 된다.
+
+        내용은 트랙에만 의존해 변하지 않지만, 늦게 뜬 RViz 구독자를 위해
+        _publish_zone_markers 와 같은 주기로 재발행한다.
+        """
+        arr = MarkerArray()
+        clr = Marker()
+        clr.header.frame_id = "map"
+        clr.header.stamp = stamp
+        clr.ns = "mpc_s_ruler"
+        clr.action = Marker.DELETEALL
+        arr.markers.append(clr)
+
+        mid = 0
+        for s_tick in range(0, int(L) + 1, 10):
+            x, y = _xy(s_tick)
+            for mtype in (Marker.CYLINDER, Marker.TEXT_VIEW_FACING):
+                m = Marker()
+                m.header.frame_id = "map"
+                m.header.stamp = stamp
+                m.ns = "mpc_s_ruler"
+                m.id = mid; mid += 1
+                m.type = mtype
+                m.action = Marker.ADD
+                m.pose.orientation.w = 1.0
+                m.pose.position.x, m.pose.position.y = x, y
+                m.color.r, m.color.g, m.color.b = 0.4, 0.95, 1.0
+                if mtype == Marker.CYLINDER:
+                    m.scale.x = m.scale.y = 0.05
+                    m.scale.z = 0.35
+                    m.pose.position.z = 0.18
+                    m.color.a = 0.85
+                else:
+                    m.scale.z = 0.25
+                    m.pose.position.z = 0.50
+                    m.color.a = 1.0
+                    m.text = f"s={s_tick}"
+                arr.markers.append(m)
+
+        self.s_ruler_pub.publish(arr)
+
+    def _find_zone_yaml(self):
+        """존을 되쓸 yaml 경로. 파라미터 우선, 없으면 소스 트리에서 추정.
+
+        install 은 심링크(--symlink-install)라 share 쪽을 고쳐도 소스가 안 바뀌면
+        재빌드 때 되돌아간다. 소스 트리의 config 를 1순위로 찾는다.
+        """
+        p = str(self.get_parameter('zone_yaml_path').value or '').strip()
+        if p:
+            return p
+        here = os.path.dirname(os.path.abspath(__file__))          # .../nonlinear_mpc_acados
+        cand = os.path.normpath(os.path.join(
+            here, '..', 'config', 'ddrx_unified_params.yaml'))      # 소스 트리
+        if os.path.exists(cand):
+            return cand
         try:
-            x = float(x0[0]); y = float(x0[1]); psi = float(x0[2])
-            s_now, _ = find_current_arc_length(self._track, np.array([x, y]))
-            cx = float(self._track.center_lut_x(s_now))
-            cy = float(self._track.center_lut_y(s_now))
-            dx = float(self._track.center_lut_dx(s_now))
-            dy = float(self._track.center_lut_dy(s_now))
-            tnorm = math.hypot(dx, dy)
-            if tnorm < 1e-9:
-                return 0.0
-            dx /= tnorm; dy /= tnorm
-            # signed lateral error: (car - center) · left-normal(-dy, dx)
-            # e_c > 0 → 차가 centerline 의 왼쪽 → 오른쪽으로 복귀해야 함.
-            e_c = (x - cx) * (-dy) + (y - cy) * dx
-            # heading error vs centerline tangent (전진 기준), wrap to [-pi,pi]
-            psi_t = math.atan2(dy, dx)
-            e_psi = math.atan2(math.sin(psi - psi_t), math.cos(psi - psi_t))
-            max_steer = float(getattr(self.mpc, 'theta_max', 0.3) or 0.3)
-            # lateral + heading 항을 합쳐 복귀 조향 산출.
-            k_lat = 0.6; k_psi = 0.5
-            raw = -(k_lat * e_c + k_psi * e_psi)
-            steer = self._RECOVERY_STEER_SIGN * raw
-            return float(max(-max_steer, min(max_steer, steer)))
+            from ament_index_python.packages import get_package_share_directory
+            sh = os.path.join(get_package_share_directory('nonlinear_mpc_acados'),
+                              'config', 'ddrx_unified_params.yaml')
+            if os.path.exists(sh):
+                return os.path.realpath(sh)   # 심링크면 소스 실제 경로로
+        except Exception:  # noqa: BLE001
+            pass
+        return ''
+
+    # ══════════ 존 드래그 편집 + 저장 (튜닝 도구) ══════════════════════
+    def _zone_edit_setup(self, zone_specs):
+        """존 경계에 드래그 핸들을 세운다. zone_edit_enable=true 일 때만.
+
+        핸들을 끌면 놓는 순간(MOUSE_UP) xy 를 트랙 s 로 역투영해 해당
+        파라미터(corridor_hardN_s0/_s1)를 set 한다. 존 파라미터는 매 제어
+        주기마다 다시 읽히므로 즉시 반영된다. 드래그 중(POSE_UPDATE)에는
+        반응하지 않아 끄는 도중 제어가 흔들리지 않는다.
+        """
+        if self._imk_server is None:
+            return
+        from visualization_msgs.msg import (InteractiveMarker,
+                                            InteractiveMarkerControl)
+        self._imk_server.clear()
+        self._imk_map = {}
+        L = float(self._track.element_arc_lengths_orig[-1])
+        for pfx, s0, s1, _fac in zone_specs:
+            for which, s_val, (cr, cg, cb) in (('s0', s0, (0.1, 1.0, 0.2)),
+                                               ('s1', s1, (0.2, 0.5, 1.0))):
+                name = f"{pfx}_{which}"
+                sv = float(s_val) % L
+                im = InteractiveMarker()
+                im.header.frame_id = "map"
+                im.name = name
+                im.description = ""
+                im.scale = 1.0
+                im.pose.position.x = float(self._track.center_lut_x(sv))
+                im.pose.position.y = float(self._track.center_lut_y(sv))
+                im.pose.position.z = 1.6
+                im.pose.orientation.w = 1.0
+
+                knob = Marker()
+                knob.type = Marker.SPHERE
+                knob.scale.x = knob.scale.y = knob.scale.z = 0.34
+                knob.color.r, knob.color.g, knob.color.b, knob.color.a = cr, cg, cb, 1.0
+
+                ctl = InteractiveMarkerControl()
+                ctl.always_visible = True
+                ctl.interaction_mode = InteractiveMarkerControl.MOVE_PLANE
+                # 평면 법선 = world Z (바닥 위를 자유롭게 끌게)
+                ctl.orientation.w = 0.7071068
+                ctl.orientation.y = 0.7071068
+                ctl.markers.append(knob)
+                im.controls.append(ctl)
+
+                self._imk_server.insert(im, feedback_callback=self._zone_edit_feedback)
+                self._imk_map[name] = (pfx, which)
+        self._imk_server.applyChanges()
+
+    def _zone_edit_feedback(self, fb):
+        """드래그를 놓는 순간 xy → s 역투영 후 파라미터 반영."""
+        from visualization_msgs.msg import InteractiveMarkerFeedback
+        if fb.event_type != InteractiveMarkerFeedback.MOUSE_UP:
+            return
+        ent = self._imk_map.get(fb.marker_name)
+        if ent is None or self._track is None:
+            return
+        pfx, which = ent
+        try:
+            s_new, _ = find_current_arc_length(
+                self._track, np.array([fb.pose.position.x, fb.pose.position.y]))
+            s_new = round(float(s_new), 2)
+            other = 's1' if which == 's0' else 's0'
+            s_other = float(self.get_parameter(f"{pfx}_{other}").value)
+            # 뒤집힌 존(s0 >= s1) 방지 — 무시하고 원위치로 되돌린다.
+            if (which == 's0' and s_new >= s_other) or (which == 's1' and s_new <= s_other):
+                self.get_logger().warn(
+                    f"[zone-edit] {pfx}_{which}={s_new:.2f} 은 {other}={s_other:.2f} 와 "
+                    f"뒤집힘 — 무시")
+                self._zone_marker_sig = None      # 핸들 원위치 복구 유도
+                return
+            self.set_parameters([Parameter(f"{pfx}_{which}",
+                                           Parameter.Type.DOUBLE, s_new)])
+            self.get_logger().info(f"[zone-edit] {pfx}_{which} → {s_new:.2f} m "
+                                   f"(저장하려면 ros2 service call "
+                                   f"{self.get_name()}/save_zones std_srvs/srv/Trigger)")
+            self._zone_marker_sig = None          # 마커 즉시 갱신
         except Exception as e:  # noqa: BLE001
-            self.get_logger().warn(
-                f"[stuck-recover] recovery steer calc failed: {e}",
-                throttle_duration_sec=2.0)
-            return 0.0
+            self.get_logger().warn(f"[zone-edit] feedback 처리 실패: {e}")
+
+    def _publish_refv_markers(self, wpnts) -> None:
+        """섹터 배율 적용된 ref_v 를 RViz 로. 구슬 색 = 속도(파랑 느림→빨강 빠름),
+        16점마다 'id:속도' 텍스트. TRANSIENT_LOCAL 이라 RViz 늦게 켜도 보인다.
+        RViz: MarkerArray 디스플레이 → topic /mpc/refv_markers."""
+        try:
+            ma = MarkerArray()
+            _wipe = Marker()
+            _wipe.action = Marker.DELETEALL
+            ma.markers.append(_wipe)
+            vals = [float(w.vx_mps) for w in wpnts]
+            vmin, vrng = min(vals), max(max(vals) - min(vals), 1e-3)
+            now = self.get_clock().now().to_msg()
+            for i, w in enumerate(wpnts):
+                if i % 4:
+                    continue
+                m = Marker()
+                m.header.frame_id = 'map'
+                m.header.stamp = now
+                m.ns, m.id, m.type = 'refv', i, Marker.SPHERE
+                m.pose.position.x = float(w.x_m)
+                m.pose.position.y = float(w.y_m)
+                m.pose.position.z = 0.05
+                m.pose.orientation.w = 1.0
+                m.scale.x = m.scale.y = m.scale.z = 0.08
+                t = (float(w.vx_mps) - vmin) / vrng
+                m.color.r, m.color.g, m.color.b, m.color.a = t, 0.2, 1.0 - t, 1.0
+                ma.markers.append(m)
+                if i % 16 == 0:
+                    tm = Marker()
+                    tm.header.frame_id = 'map'
+                    tm.header.stamp = now
+                    tm.ns, tm.id, tm.type = 'refv_txt', i, Marker.TEXT_VIEW_FACING
+                    tm.pose.position.x = float(w.x_m)
+                    tm.pose.position.y = float(w.y_m)
+                    tm.pose.position.z = 0.25
+                    tm.pose.orientation.w = 1.0
+                    tm.scale.z = 0.15
+                    tm.color.r = tm.color.g = tm.color.b = 1.0
+                    tm.color.a = 0.9
+                    tm.text = f'{int(w.id)}:{float(w.vx_mps):.1f}'
+                    ma.markers.append(tm)
+            self._refv_marker_pub.publish(ma)
+            self._last_refv_ma = ma   # RViz 늦참여(volatile 구독) 대비 주기 재발행용
+        except Exception as e:
+            self.get_logger().warn(f'[refv-viz] 발행 실패: {e}')
+
+    def _housekeep_cb(self):
+        """제어 루프 밖에서 도는 저속(2 Hz) 잡무 — 현재는 존 저장 요청 처리.
+
+        save_params 체크박스가 켜지면 여기서 저장하고 스스로 되돌려(false)
+        버튼처럼 동작하게 한다. 파일 IO 를 25 Hz 제어 루프에 넣지 않기 위해
+        별도 타이머를 쓴다.
+        """
+        # 드래그 편집 토글을 실행 중에도 반영 — 서버를 __init__ 에서만 만들면
+        # 켜려고 재시작해야 해서 튜닝 흐름이 끊긴다. 여기서 필요할 때 만든다.
+        try:
+            _want = bool(self.get_parameter('zone_edit_enable').value)
+            if _want and self._imk_server is None:
+                from interactive_markers import InteractiveMarkerServer
+                self._imk_server = InteractiveMarkerServer(self, 'mpc_zone_edit')
+                self._zone_marker_sig = None     # 다음 주기에 핸들 생성
+                self.get_logger().info(
+                    "[zone-edit] ON — RViz 에 InteractiveMarkers 디스플레이"
+                    "(topic: /mpc_zone_edit) 추가하세요")
+            elif (not _want) and self._imk_server is not None:
+                self._imk_server.clear()
+                self._imk_server.applyChanges()
+                self._imk_server = None
+                self._imk_map = {}
+                self.get_logger().info("[zone-edit] OFF")
+        except Exception as e:  # noqa: BLE001 — 편집 기능 실패가 제어를 죽이면 안 됨
+            self.get_logger().warn(f"[zone-edit] 토글 처리 실패: {e}",
+                                   throttle_duration_sec=5.0)
+
+        # RViz 가 volatile 로 구독해도 보이도록 마커 주기 재발행 (0.5Hz 타이머 2틱=1s)
+        _ma = getattr(self, '_last_refv_ma', None)
+        if _ma is not None:
+            self._refv_tick = getattr(self, '_refv_tick', 0) + 1
+            if self._refv_tick % 2 == 0:
+                self._refv_marker_pub.publish(_ma)
+        # 0812 섹터 spec 변경 → 원본 vx 복원 후 트랙 재구축 (제어루프 잠깐 유휴)
+        if self._sector_respec_req:
+            self._sector_respec_req = False
+            try:
+                if self._ref_wpnts is not None and self._ref_vx_orig is not None:
+                    for _w, _v in zip(self._ref_wpnts, self._ref_vx_orig):
+                        _w.vx_mps = _v
+                    self._initialize_mpc(wpnts=self._ref_wpnts,
+                                         wall_wpnts=self._wall_wpnts)
+                    self.get_logger().info('[sector_refv] 라이브 재적용 완료')
+                else:
+                    self.get_logger().warn(
+                        '[sector_refv] wpnts 원본 미보유 — 재적용 불가 (CSV 트랙 경로?)')
+            except Exception as e:
+                self.get_logger().error(f'[sector_refv] 라이브 재적용 실패: {e}')
+        if not self._save_params_req:
+            return
+        self._save_params_req = False
+        try:
+            from std_srvs.srv import Trigger
+            resp = self._save_zones_cb(Trigger.Request(), Trigger.Response())
+            lvl = self.get_logger().info if resp.success else self.get_logger().error
+            lvl(f"[save_params] {resp.message}")
+        except Exception as e:  # noqa: BLE001 — 저장 실패가 제어를 죽이면 안 됨
+            self.get_logger().error(f"[save_params] 저장 실패: {e}")
+        finally:
+            try:    # 체크박스를 되돌려 다음 클릭이 다시 트리거되게
+                self.set_parameters([Parameter('save_params',
+                                               Parameter.Type.BOOL, False)])
+            except Exception:  # noqa: BLE001
+                pass
+
+    @staticmethod
+    def _yaml_num(v):
+        """yaml 숫자 리터럴 — 선언 타입을 보존한다.
+
+        float 을 `1` 로 쓰면 rclpy 가 INTEGER 로 읽어, DOUBLE 로 선언된
+        파라미터에서 InvalidParameterTypeException 이 나며 노드가 기동조차
+        못한다(2026-07-28 `vel_scale: 1`). 반대로 int 를 `1.0` 으로 쓰면
+        INTEGER 선언 쪽(N_horizon 등)이 같은 이유로 죽는다.
+        """
+        if isinstance(v, bool):                     # bool 이 int 서브클래스라 먼저
+            return 'true' if v else 'false'
+        if isinstance(v, int):
+            return str(v)
+        s = f"{float(v):g}"
+        if 'e' in s or 'E' in s:                    # 1e-06 → 1.0e-06
+            sep = 'e' if 'e' in s else 'E'
+            mant, _, exp = s.partition(sep)
+            return f"{mant if '.' in mant else mant + '.0'}e{exp}"
+        return s if '.' in s else s + '.0'
+
+    def _save_zones_cb(self, request, response):
+        """현재 존 값을 yaml 에 되쓴다 — 값만 교체하고 주석은 보존.
+
+        ddrx_unified_params.yaml 은 줄마다 날짜별 튜닝 근거 주석이 달려 있어
+        yaml.dump 로 통째 덮어쓰면 그 이력이 전부 사라진다. 해당 키의 값
+        부분만 정규식으로 바꿔 쓴다. 원본은 .bak_zonesave 로 남긴다.
+        """
+        import re as _re
+        path = getattr(self, '_zone_yaml_path', '') or ''
+        if not path or not os.path.exists(path):
+            response.success = False
+            response.message = (f"yaml 경로를 찾을 수 없음: '{path}' — "
+                                f"zone_yaml_path 파라미터로 지정하세요")
+            return response
+        # 2026-07-28b: 존만이 아니라 yaml 에 이미 있는 모든 파라미터를 현재
+        # 런타임 값으로 동기화한다. rqt 에서 아무 값이나 바꾸고 save_params 를
+        # 누르면 그게 저장되는 게 자연스럽다(초판은 존 키만 저장해 다른 튜닝이
+        # 조용히 유실됐다). yaml 에 없는 키는 건드리지 않는다 — 단, 존 키는
+        # 없으면 새로 넣는다(아래 삽입 로직).
+        _src_peek = open(path).read()
+        keys = {}
+        for _m in _re.finditer(r"^\s*([A-Za-z_][\w.]*)\s*:\s*([-\d.eE+]+)\s*(?:#.*)?$",
+                               _src_peek, _re.MULTILINE):
+            _k = _m.group(1)
+            if _k in ('save_params',):        # 트리거 자신은 저장하지 않음
+                continue
+            try:
+                _v = self.get_parameter(_k).value
+            except Exception:  # noqa: BLE001 — 이 노드 파라미터가 아니면 건너뜀
+                continue
+            if isinstance(_v, bool) or _v is None:
+                continue                       # 숫자 줄만 대상(문자/불리언 서식 보존)
+            if isinstance(_v, (int, float)):
+                keys[_k] = _v            # int/float 구분 유지 (_yaml_num 참조)
+        # 존 키는 yaml 에 없더라도 반드시 기록(없으면 재시작 시 유실)
+        for pfx in ('corridor_hard', 'corridor_hard2', 'corridor_hard3',
+                    'corridor_hard4', 'corridor_hard5', 'corridor_hard6'):
+            for suf in ('_s0', '_s1', '_factor'):
+                try:
+                    keys[pfx + suf] = float(self.get_parameter(pfx + suf).value)
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            keys['qcte_zone_factor'] = float(self.get_parameter('qcte_zone_factor').value)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            src = open(path).read()
+            open(path + '.bak_zonesave', 'w').write(src)
+            out, hit = src, []
+            for k, v in keys.items():
+                vs = self._yaml_num(v)
+                pat = _re.compile(rf"^(\s*{_re.escape(k)}\s*:\s*)([-\d.eE+]+)(.*)$",
+                                  _re.MULTILINE)
+                m = pat.search(out)
+                if m is None:
+                    # yaml 에 없는 키(예: qcte_zone_factor)는 마지막 corridor_hard*
+                    # 줄 뒤에 새로 끼워 넣는다 — 없으면 저장해도 재시작 시 유실된다.
+                    anchor = None
+                    for am in _re.finditer(r"^(\s*)corridor_hard\w*\s*:.*$",
+                                           out, _re.MULTILINE):
+                        anchor = am
+                    if anchor is None:
+                        continue
+                    indent = anchor.group(1)
+                    ins = f"\n{indent}{k}: {vs}   # zone-save 자동 추가"
+                    out = out[:anchor.end()] + ins + out[anchor.end():]
+                    hit.append(f"{k}: (신규)→{vs}")
+                    continue
+                if abs(float(m.group(2)) - v) > 1e-9:
+                    hit.append(f"{k}: {m.group(2)}→{vs}")
+                out = pat.sub(lambda mm: f"{mm.group(1)}{vs}{mm.group(3)}", out, count=1)
+            open(path, 'w').write(out)
+            response.success = True
+            response.message = (f"{len(keys)}개 키 기록 ({len(hit)}개 변경): "
+                                + (", ".join(hit) if hit else "변경 없음")
+                                + f" | 백업 {path}.bak_zonesave")
+            self.get_logger().info(f"[zone-save] {response.message}")
+        except Exception as e:  # noqa: BLE001
+            response.success = False
+            response.message = f"쓰기 실패: {e}"
+            self.get_logger().error(f"[zone-save] {response.message}")
+        return response
 
     def _control_loop_cb(self):
         if not self._mpc_ready:
@@ -1747,14 +1956,39 @@ class MPCNode(Node):
             return
         # unified 7-dim state [x,y,ψ,vx,vy,r,s] (both modes) → s = x0[6].
         s_now = float(x0[6])
-        # B: κ-aware online weight adaptation (auto_tune=true 시 활성)
-        self._adaptive_weight_update(s_now)
-        # 2026-05-28 #18 LMPC: 매 cycle SS query → set mpc._lmpc_* attrs
-        try:
-            self._lmpc_update_per_cycle(x0, s_now)
-        except Exception as _e:
-            self.get_logger().warn(f"[LMPC] cycle update skipped: {_e}",
-                                    throttle_duration_sec=2.0)
+        # 국소 corridor 하드닝 존 전달 (live 튜닝 가능)
+        _chf = float(self.get_parameter('corridor_hard_factor').value)
+        self.mpc.straight_qv_factor = float(self.get_parameter('straight_qv_factor').value)
+        self.mpc.straight_kappa_thr = float(self.get_parameter('straight_kappa_thr').value)
+        # _zone_specs 는 (파라미터 접두어, s0, s1, factor) — 시각화/드래그 편집이
+        # "이 존이 어느 파라미터인지" 알아야 하므로 함께 담는다. 활성 존만 담기니
+        # 리스트 인덱스만으로는 접두어를 역산할 수 없다.
+        # 2026-07-29: factor<1 = 완화 존(벌점을 기본보다 낮춤)도 허용.
+        # 좁은 시케인(s21-24, 폭 ±0.13-0.23)은 강한 corridor push 가 반대편
+        # 클립을 유발해(0602 재현) 오히려 벌점을 낮춰야 통과한다 (아침 bag:
+        # 실효 60/45 로 통과, 200/120+ 로 매랩 충돌). 1.0 만 '비활성'.
+        _zone_specs = []
+        if _chf != 1.0 and _chf > 0.0:
+            _zone_specs.append(('corridor_hard',
+                                float(self.get_parameter('corridor_hard_s0').value),
+                                float(self.get_parameter('corridor_hard_s1').value), _chf))
+        for _zn in ('corridor_hard2', 'corridor_hard3', 'corridor_hard4',
+                    'corridor_hard5', 'corridor_hard6'):
+            _zf = float(self.get_parameter(_zn + '_factor').value)
+            if _zf != 1.0 and _zf > 0.0:
+                _zone_specs.append((_zn,
+                                    float(self.get_parameter(_zn + '_s0').value),
+                                    float(self.get_parameter(_zn + '_s1').value), _zf))
+        _zones = [(a, b, c) for _, a, b, c in _zone_specs]
+        self.mpc.corridor_hard_zones = _zones
+        if bool(self.get_parameter('publish_zone_markers').value):
+            try:
+                self._publish_zone_markers(_zone_specs)
+            except Exception as e:  # noqa: BLE001 — 시각화 실패가 제어를 죽이면 안 됨
+                self.get_logger().warn(f"[zone-viz] marker publish failed: {e}",
+                                       throttle_duration_sec=5.0)
+        self.mpc.qcte_zone_factor = float(self.get_parameter('qcte_zone_factor').value)
+        self.mpc.commit_treact_live = float(self.get_parameter('commit_treact').value)
         # ── Cold-start vx floor (MPPI init_vel) — STARTUP ONLY ──
         # 정지 출발 시 dynamic Pacejka 가 ill-conditioned → solver x0 의 vx 를 floor.
         # ★ 2026-05-29 BUG FIX: 기존엔 startup 게이트 없이 매 cycle raw_vx<floor 면
@@ -1767,74 +2001,205 @@ class MPCNode(Node):
         vx_floor = float(self.get_parameter('cold_start_vx_floor').value) \
             if self.has_parameter('cold_start_vx_floor') else 0.0
         raw_vx = float(x0[3])
+        # ★ 2026-08-03: _has_moved 래치를 floor 적용 **전의 실측 vx** 로 여기서
+        # 갱신한다 (단일 출처). 종전엔 solve() 안에서 |initial_state[3]|>0.5 로
+        # 래치했는데, initial_state 는 아래에서 floor(2.0)가 주입된 x0_solve 라
+        # **차가 한 번도 안 움직였어도 첫 solve 에서 래치가 켜졌다** — 그러면
+        # engage 전(뮤 미연결, v_est=0, v_cmd>0)에 STUCK 판정 → 텔레포트 반복.
+        # 실측: bag 14_58 에서 engage 전 odom vx 는 320 샘플 전부 0.0000 인데
+        # +0.46/1.47/2.50/3.50 s 에 stuck-recover 텔레포트 4회. floor 가 자기
+        # 게이트(_has_moved)를 스스로 무너뜨리는 순환이었다.
+        if abs(raw_vx) > 0.5:
+            self.mpc._has_moved = True
         x0_solve = x0
         if (vx_floor > 0.0 and raw_vx < vx_floor
                 and not getattr(self.mpc, '_has_moved', False)):
             x0_solve = x0.copy()
             x0_solve[3] = vx_floor
+        # ── C-LATENCY (2026-07-03): x0 를 실측 지연(τ)만큼 전진 후 solve ──
+        # u[0] 는 τ 뒤에야 차에 반영되므로, '적용 시점' 상태 기준 최적이 되게.
+        _lat_tau = float(self.get_parameter('actuation_latency_s').value)
+        _u_prev = getattr(self, '_last_con_first', None)
+        if _lat_tau > 0.0 and raw_vx > 0.5 and _u_prev is not None:
+            try:
+                from .mpc_core.lmpc.nominal_dynamics import latency_compensate_x0
+                x0_solve = latency_compensate_x0(
+                    x0_solve if x0_solve is not x0 else x0.copy(), _u_prev, _lat_tau)
+            except Exception as _le:
+                # 보상 실패 시 무보상으로 진행 — 제어 루프는 절대 죽이지 않는다
+                # (2026-07-03: (3,1) 컨트롤 미평탄화로 12사이클 후 루프사망 사고)
+                self.get_logger().warn(f"[C-LATENCY] skip: {_le}",
+                                       throttle_duration_sec=5.0)
         t0 = time.monotonic()
         try:
-            con_first, traj, u_seq, opti_value = self.mpc.solve(x0_solve, self._obstacles)
+            pred_obs = self._compute_pred_obs()
+            # ── 0723E: 동적 판정/속도 = OppTracker 단일 소스 (predict-associate-
+            # update, 가림 coast). 동적이면 commit/side 기계 미적용 + 원형 keepout
+            # (obs1_mode=1) — 단일 MPCC 철학 (A2). 정적은 기존 반평면+커밋.
+            _dyn_prev = bool(getattr(self, '_dyn_obs', False))
+            _now_dyn = time.monotonic()
+            _trk = getattr(self, '_opp_trk', None)
+            if _trk is not None:
+                _trk.predict(_now_dyn)
+            _dyn = _trk is not None and _trk.confirmed_dynamic(_now_dyn)
+            if _dyn != _dyn_prev:
+                self.get_logger().info(
+                    "[P3] dynamic opp %s (vs=%.2f)" % (
+                        "LATCHED — circle mode" if _dyn else "released",
+                        float(_trk.vs) if _trk is not None and _trk.active else 0.0))
+            self._dyn_obs = _dyn
+            # ── 0807 수정 A (bag 15_08_38): FAST 는 "빈 트랙" 전용 ──────────
+            # FAST(BO) 가중치 솔로주행의 자연 호가 시케인 출구(s26)→직선에서
+            # 라인 왼쪽으로 크게 벌어지는데, 정적 장애물이 그 호 위에 있으면
+            # 라인추종 감쇠 + σ-게이트 틈에서 차가 제약 반대편(위반측)으로
+            # 들어가 4.3 m/s 에서 복귀 못하고 충돌한다(동일 패턴 3회). 그래서
+            # "동적 상대 확정" 뿐 아니라 "정적 장애물 커밋" 도 SAFE 전환 사유.
+            _static_commit = getattr(self.mpc, '_committed_obs', None) is not None
+            _need_safe = _dyn or _static_commit
+            if _need_safe:
+                self._safe_last_true_t = _now_dyn
+            # SAFE→FAST 복귀만 2.0s 지연 — _committed_obs 는 장애물 통과 후
+            # release 되므로 연속 배치 구간에서 _need_safe 가 왕복(채터)한다.
+            _hold = bool(self._q_mode_safe) and not _need_safe and (
+                self._safe_last_true_t is not None
+                and (_now_dyn - self._safe_last_true_t) < 2.0)
+            _want_safe = bool(_need_safe or _hold)
+            if _want_safe != self._q_mode_safe:
+                try:
+                    if self._q_fast is None:
+                        self._q_fast = {k: float(getattr(self.mpc, k))
+                                        for k in self._Q_KEYS}
+                    _qset = self._q_safe if _want_safe else self._q_fast
+                    for _k, _v in _qset.items():
+                        setattr(self.mpc, _k, float(_v))
+                    _reason = 'dyn' if _dyn else (
+                        'static' if _static_commit else ('hold' if _hold else '-'))
+                    self.get_logger().info(
+                        "[Q] weights → %s (%s)" % (
+                            'SAFE(추종/추월)' if _want_safe else 'FAST(BO)', _reason))
+                except Exception as _qe:
+                    self.get_logger().warn(f"[Q] weight switch skipped: {_qe}")
+                self._q_mode_safe = _want_safe
+            # ── 0723A GP-bins 완전자동 게이트: 커버리지≥80% & σv≤0.5 (0.5s 지속)
+            # → overtake_enabled ON. σv>1.0 지속 또는 상대 소실 → OFF + 분산감쇠.
+            _ob = getattr(self, '_opp_bins', None)
+            _ot_on = bool(self.get_parameter('overtake_enabled').value)
+            _rdy = _dyn and _ob is not None and _ob.ready()
+            self._gp_rdy_t = (getattr(self, '_gp_rdy_t', None) or _now_dyn) if _rdy else None
+            _bad = _dyn and _ob is not None and _ob.v_sigma_median() > 1.0
+            self._gp_bad_t = (getattr(self, '_gp_bad_t', None) or _now_dyn) if _bad else None
+            if (not _ot_on) and self._gp_rdy_t is not None and _now_dyn - self._gp_rdy_t > 0.5:
+                self.set_parameters([Parameter('overtake_enabled', value=True)])
+                self.get_logger().info(
+                    "[GP] opponent learned (cov %.0f%%, σv %.2f) — OVERTAKE ON"
+                    % (100 * _ob.coverage(), _ob.v_sigma_median()))
+            elif _ot_on and ((self._gp_bad_t is not None
+                              and _now_dyn - self._gp_bad_t > 0.5) or not _dyn):
+                self.set_parameters([Parameter('overtake_enabled', value=False)])
+                # 2026-08-07: OFF 사유를 분리 — 분산 스파이크(_spike)만 decay 대상.
+                # 상대 소실(라이다 시야 이탈, not _dyn)은 1대1 경주에서 같은 차가
+                # 다시 보일 뿐이므로 기본적으로 학습(bins) 보존. 재포착 시 bins 가
+                # 남아 있으면 _ob.ready() 가 즉시 참이 되어 0723A 위 0.5s 지속
+                # 게이트만 지나면 바로 ON — 별도 "즉시 ON" 코드 불필요. 만에 하나
+                # 그 사이 상대가 바뀌었다면 σ_d·σv 가 커져 추월 판정(σ_d≤0.35)과
+                # 이 분산 스파이크 게이트가 스스로 다시 막아 안전.
+                _spike = (self._gp_bad_t is not None
+                          and _now_dyn - self._gp_bad_t > 0.5)
+                if _ob is not None and (
+                        _spike or bool(self.get_parameter(
+                            'ot_bins_decay_on_lost').value)):
+                    _ob.decay()
+                self.get_logger().info(
+                    "[GP] OVERTAKE OFF (%s)"
+                    % ("variance spike — 학습 감쇠" if _dyn
+                       else "opponent lost — 학습 보존"))
+            # 0723w 위치안정 게이트: 커밋은 "0.25s 이상 같은 자리(<0.35m)"에서 관측된
+            # 장애물만 허용. 움직이는 상대는 자리가 계속 바뀌어 원천 커밋 불가 —
+            # _opp_v 추정(수백 ms 워밍업)과 커밋(즉시) 사이의 경쟁 제거 (bag 15_39:
+            # 감지 재출현 순간마다 분류 전에 커밋이 먼저 물던 것).
+            _young = False
+            _memorized = False
+            if self._obstacles:
+                _now_cls = time.monotonic()
+                # 0813 D6: 트래커 퇴출 판정용 최신 pose 스탬프
+                self._last_pose_xy = (float(x0[0]), float(x0[1]), float(x0[2]))
+                _seen = getattr(self, '_commit_seen', {})
+                _nx, _ny = min(self._obstacles,
+                               key=lambda o: (float(o[0]) - float(x0[0])) ** 2
+                               + (float(o[1]) - float(x0[1])) ** 2)[:2]
+                # 0813 D6: 확정 트랙(기억 1s+)이면 위치안정 게이트 우회 플래그 —
+                # 이미 오래 본 물체라 0.25s 재관찰이 불필요 (랩당 커밋지연 제거).
+                # 아래 최종 대입에서 (_young and not _memorized) 로 반영.
+                _memorized = any(
+                    (_tr['t'] - _tr['t0'] >= 1.0 and _tr['hits'] >= 4
+                     and _tr['inn'] < 0.25
+                     and (_tr['x'] - float(_nx)) ** 2
+                     + (_tr['y'] - float(_ny)) ** 2 < 0.25)
+                    for _tr in getattr(self, '_obs_trk', []))
+                _best = None; _bd = 0.35
+                for _k2 in _seen:
+                    _d2k = math.hypot(_k2[0] - float(_nx), _k2[1] - float(_ny))
+                    if _d2k < _bd:
+                        _bd = _d2k; _best = _k2
+                if _best is None:
+                    _seen[(float(_nx), float(_ny))] = _now_cls
+                    _young = True
+                else:
+                    _young = (_now_cls - _seen[_best]) < 0.25
+                if len(_seen) > 64:
+                    _seen = {k: v for k, v in _seen.items() if _now_cls - v < 5.0}
+                self._commit_seen = _seen
+            self.mpc.suppress_commit = _dyn or (_young and not _memorized)
+            # 2026-08-07 정지 상대 핸드오프 (bag 12_14_53/12_19_35 추돌 0.57/0.40 m ×2):
+            # 저속 0.7 s 로 동적 확정이 풀려도 트래커가 위치를 아는 동안(active)
+            # 상대가 전방 근접(<8 m)이면 원형 keepout 을 유지한다 — 정적 검출
+            # (persist 2/3 프레임)·side-decide 승계까지의 제약 공백 동안 ego 가
+            # 2.5~4 m/s × 0.7 s+ = 2~3 m 무방비 전진하던 것을 차단. vs≈0 이라
+            # pred_obs 는 정지 예측 = 원형 제약에 그대로 유효. 상대를 지나쳐
+            # 뒤가 되면(원이 뒤) 제약은 자동 비활성 상태나 다름없다. obs1_mode 만
+            # 다룬다 — _dyn_obs(추종 캡·모드스위치·OT 게이트)는 무변경이라 핸드오프
+            # 중 추종 속도캡은 안 걸리지만(정지물엔 상대속도 정렬 자체가 무의미)
+            # 이 원형 하드제약 + 전방 콘 가드(정적 검출 후)가 감속·회피를 담당한다.
+            # 2026-08-07 회귀 수정 (bag 15_41_57): 아래 조건에 "직전까지 동적이었나"
+            # 가 빠져 있어, 트래커가 **정적 장애물**을 잡고 있을 때도(active=True)
+            # 원형 keepout 으로 전환됐다 — 정적 회피의 반평면+side 커밋과 모드가
+            # 어긋나 낑김/조기정지(0.43 m, 2.6 m). 핸드오프는 "방금 전까지 동적이던
+            # 상대가 멈춘" 경우 전용이므로 최근 확정 이력(_last_dyn_t, 3 s)을 요구한다.
+            if _dyn:
+                self._last_dyn_t = _now_dyn
+            _hand_ok = (_now_dyn - getattr(self, '_last_dyn_t', -1e9)) < 3.0
+            _obs1 = 1.0 if _dyn else 0.0
+            if (not _dyn) and _hand_ok:
+                try:
+                    _trk_h = getattr(self, '_opp_trk', None)
+                    _rl_h = self._rl_arrays()
+                    if _trk_h is not None and _trk_h.active and _rl_h is not None:
+                        _hx, _hy = _trk_h.xy(*_rl_h)
+                        if math.hypot(_hx - float(x0[0]),
+                                      _hy - float(x0[1])) < 8.0:
+                            _obs1 = 1.0
+                            if not getattr(self, '_handoff_on', False):
+                                self.get_logger().info(
+                                    "[P3] 정지상대 핸드오프 — keepout 유지")
+                            self._handoff_on = True
+                        else:
+                            self._handoff_on = False
+                    else:
+                        self._handoff_on = False
+                except Exception:
+                    self._handoff_on = False
+            else:
+                self._handoff_on = False
+            self.mpc.obs1_mode = _obs1
+            con_first, traj, u_seq, opti_value = self.mpc.solve(x0_solve, self._obstacles, pred_obs=pred_obs)
+            self._last_qp_ok = bool(opti_value < 1e8)
         except Exception as e:
             import traceback
             self.get_logger().error(f"mpc.solve raised: {e}\n{traceback.format_exc()}")
             return
         solve_dt = time.monotonic() - t0
 
-        # Joint-α terminal debug — confirms whether the terminal actually targets
-        # the APEX (tgt_lat≈±0.9) or centerline. (The SS query is now anchored to
-        # track arc length in _lmpc_update_per_cycle, so the previous horizon-end
-        # x_N stash is gone — it was the drift-feedback source.)
-        if getattr(self, '_lmpc_use', False) and traj is not None and traj.shape[0] > 1:
-            try:
-                ss = getattr(self.mpc, '_lmpc_ss_states', None)
-                if traj.shape[1] >= 18 and ss is not None and self._track is not None:
-                    a = np.asarray(traj[-1, 8:18], dtype=float); a = a / (a.sum() + 1e-6)
-                    ssm = np.asarray(ss)            # (4,K)
-                    tgt = ssm @ a                   # (4,)
-                    cl = np.asarray(self._track.center_lane)
-                    ang = getattr(self._track, 'center_point_angles', None)
-
-                    def _lat(xy):
-                        i = int(np.argmin(np.linalg.norm(cl[:, :2] - xy[:2], axis=1)))
-                        psi = float(ang[i]) if (ang is not None and i < len(ang)) else 0.0
-                        return math.sin(psi) * (xy[0] - cl[i, 0]) - math.cos(psi) * (xy[1] - cl[i, 1])
-                    ssl = [_lat(ssm[:2, j]) for j in range(ssm.shape[1])]
-                    self.get_logger().info(
-                        f"[αdbg] tgt_lat={_lat(tgt):+.2f} car_lat={_lat(np.asarray(x0_solve)):+.2f} "
-                        f"amax={a.max():.2f}@{int(a.argmax())} ssLat[{min(ssl):+.2f},{max(ssl):+.2f}]",
-                        throttle_duration_sec=0.5)
-            except Exception:
-                pass
-
-        # B4'.2: log the applied control [a_x,delta,p_v] in lockstep with the
-        # per-cycle state append (state appended pre-solve in _lmpc_update_per_cycle;
-        # u_seq[0] is the control applied from that state). Needed for the lap
-        # residual = actual - f_expl(state, u); a zero/stub input would make the
-        # residual absorb the control effect instead of model error.
-        try:
-            if (getattr(self, '_lmpc_use', False) and u_seq is not None and len(u_seq) > 0
-                    and getattr(self, '_lmpc_pending_state', None) is not None):
-                # Lockstep: append state[t], time[t], input[t] together, ONLY after a
-                # successful solve, so the lap buffer stays 1:1 aligned. (state/time
-                # were deferred from pre-solve; a failed solve appends nothing.)
-                self._lmpc_lap_buf['state'].append(self._lmpc_pending_state)
-                self._lmpc_lap_buf['time'].append(self._lmpc_pending_time)
-                self._lmpc_lap_buf['input'].append(np.asarray(u_seq[0], float).copy())
-                self._lmpc_pending_state = None
-        except Exception:
-            pass
-
-        # B4' prediction-error gate: realized state8 (stashed this cycle) vs the
-        # prediction from the previous (state, control). Guarded — never breaks control.
-        try:
-            if getattr(self, '_b4_state8', None) is not None and u_seq is not None and len(u_seq) > 0:
-                self._b4_pred_error_log(
-                    self._b4_state8, np.asarray(u_seq[0], float),
-                    float(self.get_parameter('dT').value))
-        except Exception:
-            pass
-
+        self._last_con_first = np.ravel(np.asarray(con_first, dtype=float))[:3]  # C-LATENCY 용 ((3,1) DM 평탄화)
         # Output: AckermannDrive
         cmd = AckermannDriveStamped()
         cmd.header.stamp = self.get_clock().now().to_msg()
@@ -1851,6 +2216,75 @@ class MPCNode(Node):
             #
             # Fix 3: STUCK release active → cmd=0/steer=0 강제 (wall contact 해제).
             v_now = float(x0[3]) if (x0 is not None and len(x0) > 3) else 0.0
+            # ── 0724 refv 학습 record (예외 격리 — 학습 실패가 제어를 못 죽임) ──
+            if self._spl is not None:
+                try:
+                    # task-8 (2026-07-27) 방향성 벽여유: ifac s≈14 실측 벽충돌
+                    # — 그립기반 게이트는 저곡률 구간(κ≈0.1, a_lat 여유)을
+                    # "안전"으로 오판하지만 실제로는 커브 바깥쪽(=드리프트
+                    # 방향) 벽까지 0.31 m 뿐이었다. margin_left/margin_right
+                    # 는 실제 좌/우 벽까지 거리, kappa_signed 로 학습기가
+                    # "바깥쪽"만 골라 게이팅한다. 계산 실패는 None으로 격리
+                    # (학습기는 데이터 없음으로 취급 — 게이트 비활성, 제어에
+                    # 영향 없음).
+                    margin_left = margin_right = kappa_signed = None
+                    # 2026-08-03: s_now 가 이 스코프에 정의돼 있지 않았다
+                    # (1067/1244 는 다른 메서드의 지역변수) → 아래 margin
+                    # 계산과 record() 가 매 사이클 NameError → except 가 삼켜
+                    # "[refv-learn] record 실패" 스팸만 남고 **학습이 0 사이클
+                    # 실행**되던 버그. bag 19_30 (use_refv_learning=true,
+                    # 240s/19랩)에서 npz 미생성으로 발각. 여기(마진 계산 앞)서
+                    # 정의해야 task-8 벽여유 게이트도 같이 산다.
+                    s_now, _ = find_current_arc_length(
+                        self._track, np.array([float(x0[0]), float(x0[1])]))
+                    s_now %= float(self._track.element_arc_lengths_orig[-1])
+                    try:
+                        m = self.mpc
+                        _L_spl = float(self._track.element_arc_lengths_orig[-1])
+                        s = s_now % _L_spl
+                        cx = float(m.center_lut_x(s)); cy = float(m.center_lut_y(s))
+                        dxt = float(m.center_lut_dx(s)); dyt = float(m.center_lut_dy(s))
+                        n = math.hypot(dxt, dyt) + 1e-9
+                        st_, ct_ = dyt / n, dxt / n
+                        e_wall_l = st_ * (float(m.left_lut_x(s)) - cx) - ct_ * (float(m.left_lut_y(s)) - cy)
+                        e_wall_r = st_ * (float(m.right_lut_x(s)) - cx) - ct_ * (float(m.right_lut_y(s)) - cy)
+                        e_car    = st_ * (float(x0[0]) - cx) - ct_ * (float(x0[1]) - cy)
+                        # 부호 검증 (acados_kinematic.py:1048 "e_c<0=left,
+                        # >0=right" + apex-bias 주석 "left turn(κ>0)→apex on
+                        # the left→e_c_ref<0"): +e_c=오른쪽, -e_c=왼쪽.
+                        # hi=max(e_wall_l,e_wall_r)는 (좌/우 라벨링이 뒤집히지
+                        # 않는 한) e_wall_r(우측벽, e_c 더 큼)이므로 "hi=left"
+                        # 가정은 역방향 — 실제 좌/우에 맞게 스왑해서 배정.
+                        hi, lo = max(e_wall_l, e_wall_r), min(e_wall_l, e_wall_r)
+                        # 2026-08-03: LUT 벽은 실벽에서 W_eff 만큼 안쪽이라 이대로
+                        # 게이트하면 마진이 이중계상된다 — 특히 직선(W_eff 0.18)이
+                        # 0.45 게이트에 걸려 상향이 전부 동결(bag 20_36: s30 scale
+                        # 1.000 고정, 랩 10.31 정체). 실벽 여유 = LUT 여유 + W_eff(s).
+                        _wm_s = 0.0
+                        _wma = getattr(self._track, 'wall_margin', None)
+                        if _wma is not None:
+                            _wm_s = float(np.interp(
+                                s, self._track.element_arc_lengths_orig[:len(_wma)],
+                                _wma))
+                        margin_left  = e_car - lo + _wm_s   # 실벽 좌측 여유
+                        margin_right = hi - e_car + _wm_s   # 실벽 우측 여유
+                        kappa_signed = float(m.signed_kappa_lut(s))
+                    except Exception:
+                        margin_left = margin_right = kappa_signed = None
+                    _ev = self._spl.record(
+                        s_now, float(x0[3]), float(x0[3]) * float(x0[5]),
+                        incident=(self._stuck_release_total > 0),
+                        margin_left=margin_left, margin_right=margin_right,
+                        kappa_signed=kappa_signed)
+                    if _ev is not None:
+                        _sc = self._spl.refv_scale
+                        self.get_logger().info(
+                            f"[refv-learn] {_ev} laps={self._spl.laps_learned} "
+                            f"refv_scale[{_sc.min():.2f},{_sc.max():.2f}] "
+                            f"a_acc={self._spl.a_acc:.2f}")
+                        self._spl.save(self._spl_path)
+                except Exception as _e:
+                    self.get_logger().warn(f"[refv-learn] record 실패: {_e}")
             # C-SPEED startup ramp (2026-06-19): ramp the MPC's COST TARGET
             # (mpc.v_max / p_max) — not just the output speed — from 2.5→v_max
             # over RAMP_T s. The veer comes from the MPC PLANNING aggressively for
@@ -1858,7 +2292,12 @@ class MPCNode(Node):
             # the cost target makes the plan itself gentle so the car settles on
             # the line first. _startup_t resets on each stuck-recovery.
             _rt = time.monotonic() - getattr(self, '_startup_t', time.monotonic())
-            _RAMP_T = 1.5
+            # 2026-08-04: 1.5 → 4.0. 출발 +2.7~4.5 s 의 첫 시케인 통과 접촉이
+            # 실행 대부분에서 반복 (bag 20_24 +3.8s / 0804 16_28 +2.7s 등) —
+            # 램프가 1.5 s 에 풀리는데 차가 첫 시케인에 ~2.5~4 s 에 도달해
+            # 웜스타트/GP 콜드 상태로 전속 진입했다. 첫 통과를 램프가 덮는다.
+            # 비용: 세션당 1랩(첫 랩)만 느려짐.
+            _RAMP_T = 4.0
             _vm_full = float(self.get_parameter('max_speed').value)
             try:
                 if _rt < _RAMP_T:
@@ -1876,13 +2315,13 @@ class MPCNode(Node):
             # → stuck 감지 즉시 /initialpose publish (5s cooldown).
             if getattr(self.mpc, '_stuck_release_active', False):
                 self._stuck_release_total += 1
-                cmd.drive.speed = -0.5
-                # ── Recovery steer toward centerline (was steering=0) ──
-                # 이전: reverse 중 steer=0 → 같은 나쁜 heading 으로 직선 후진 →
-                # 같은 각도로 벽 재접근 → 재끼임 CASCADE.
-                # Fix: 후진 중 centerline 방향으로 조향해 벽에서 멀어지게 함.
-                # ★ 후진 시 steer→yaw 관계가 전진과 반대 → 부호 검증 필요.
-                cmd.drive.steering_angle = self._recovery_steer(x0)
+                # 2026-07-28: 강제 후진(-0.5) 제거 → 정지(0.0).
+                # 실차는 enable_sim_reset=false 라 STUCK 시 후진 명령만 나갔고,
+                # 후방 센서가 없어 맹목 후진이었다. 출발 시 오탐(아래 _has_moved
+                # 참고)이 걸리면 "살짝 뒤로 갔다 출발"로 관측됐다 — 시뮬·실차 양쪽.
+                # 정지 후 해제되면 MPC 가 다시 전진을 시도한다.
+                cmd.drive.speed = 0.0
+                cmd.drive.steering_angle = 0.0
                 # 즉시 reset (5s cooldown 만 유지). 실차 (enable_sim_reset=false)
                 # 에선 publish 해도 무의미 → skip + warn 만.
                 if (time.monotonic() - self._last_reset_t) > 1.0:   # 2026-06-02: 5s→1s. 5s 쿨다운이 첫 리스폰 후 재시도를 막아 stuck-loop 지속. 1s 면 gym latch 안 풀려도 빠르게 재리스폰.
@@ -1946,11 +2385,21 @@ class MPCNode(Node):
                 n_prev = min(max(2, int(round(_prev_s / max(1e-3, _dT))) + 1),
                              traj.shape[0])  # accel-preview 창 (param; 실차 VESC 보정)
                 if n_prev > 1:
-                    v_brk = float(np.min(traj[1:n_prev, 3]))
+                    # 2026-07-16 brake min-guard 창 분리: accel preview(1.0s)와
+                    # 별도로 짧은 창만 즉시-브레이크 트리거로 사용 (0=동일=기존).
+                    _brk_s = float(self.get_parameter('brake_preview_s').value)
+                    n_brk = n_prev if _brk_s <= 0.0 else \
+                        min(max(2, int(round(_brk_s / max(1e-3, _dT))) + 1), traj.shape[0])
+                    v_brk = float(np.min(traj[1:n_brk, 3]))
                     if v_brk < v_now - 0.05:             # 감속 계획 → 즉시 브레이크
                         v_plan = v_brk
-                    else:                                # 가속/유지 → τ-preview 속도
-                        v_plan = float(traj[n_prev - 1, 3])
+                    else:
+                        # 2026-07-16 크레스트 수정: preview 끝값은 plan 정점이 창 안에
+                        # 있으면 이미 내리막 값 → 직선 후반 조기감속 (bag 18:15 확증,
+                        # brake_preview 분리로도 프로파일 불변이었던 원인). 가속 branch 는
+                        # 창 안 최대 plan 속도(크레스트)를 명령 — 제동 정직성은 위
+                        # min-guard(0.4s)와 brake_anticip 거리캡이 담당.
+                        v_plan = float(np.max(traj[1:n_prev, 3]))
                 else:
                     v_plan = float(traj[-1, 3])
                 # 2026-06-15 BRAKE-DISTANCE-AWARE 속도명령 (실차 bag 진단):
@@ -1970,12 +2419,283 @@ class MPCNode(Node):
                     # FUTURE stages only (i>=1). Including i=0 (d=0 → v_allow=v_now)
                     # would cap the command at the current speed → blocks all
                     # acceleration (car crawls). Only upcoming slowdowns should bind.
-                    if _vallow.shape[0] > 1:
+                    # 2026-07-16: i=1 도 d≈0.03m 라 사실상 같은 문제(√항 무의미 →
+                    # 츄1≈v_next → 직선 가속목줄, bag 재계산으로 확정) → d_min
+                    # 플로어로 근거리 제외. 0=기존 동작.
+                    _dmin_a = float(self.get_parameter('brake_anticip_d_min').value)
+                    _cand = (_d >= max(1e-9, _dmin_a)) if _dmin_a > 0.0 else None
+                    if _cand is not None:
+                        _cand[0] = False
+                        if _cand.any():
+                            v_plan = min(v_plan, float(np.min(_vallow[_cand])))
+                    elif _vallow.shape[0] > 1:
                         v_plan = min(v_plan, float(np.min(_vallow[1:])))
                 except Exception:
                     pass
                 if v_now < 0.5:                          # launch-from-rest assist
                     v_plan = max(v_plan, min(v_cap, v_now + 0.5))
+                # ── 2026-07-09 speed_cmd_gain: 가속국면 오차증폭 (VESC PID 보상) ──
+                # VESC 전류 ~ (v_cmd - v_act). G>1 이면 같은 plan 에서 PID 구동력 G배.
+                # 가속(v_plan>v_now)에만 — 제동 정직성(min-guard/anticip)은 불변.
+                _G = float(self.get_parameter('speed_cmd_gain').value)
+                if _G > 1.0 and v_plan > v_now:
+                    v_plan = v_now + _G * (v_plan - v_now)
+                # 2026-07-16 err-cap: 가속국면 명령-실속 오차 상한 (지터·캡슬래밍 방지)
+                _emax = float(self.get_parameter('speed_cmd_err_max').value)
+                if _emax > 0.0 and v_plan > v_now + _emax:
+                    v_plan = v_now + _emax
+                # 2026-07-16 BLOCK-STOP: 양측 회피불가 장애물 앞 제동거리 정지
+                _bd = getattr(self.mpc, '_obs_blocked_d', None)
+                if _bd is not None and _bd < 8.0:
+                    v_plan = min(v_plan, math.sqrt(max(0.0, 2.0 * 4.0 * (_bd - 0.6))))
+                # 2026-07-21 장애물 통과속도 가드 v2: 회피 half-plane은 횡방향뿐이라
+                # committed 상태에서 MPC가 장애물로 가속(bag 19_48: v 3.2→5.1로
+                # sel_d 0.43까지 돌진→충돌). v1(sel_d만 보고 무조건 캡)은 이미 옆으로
+                # 빠진 뒤에도 2.5로 기어가는 부자연(bag 20_00) → v2: 차체 기준 장애물
+                # 횡편차 lat 계산, **정면(lat<0.55m)일 때만** 캡. detour가 벌어지는
+                # 즉시 재가속 = 자연스러운 회피. d_keep(0.8m)서 v_pass 목표.
+                # 0722k v3: sel(커밋체)만 보던 것 → 감지된 **모든** 장애물 정면콘 검사.
+                # #1 detour 중엔 #1이 정면을 벗어나 가드 해제 → #2로 5.2m/s 돌진이
+                # bag 15_46 "회피중 뒤 장애물 박음"의 직접 원인 (t=2.9 재커밋 0.4s뒤
+                # STUCK, v_cmd 5.26). 커밋 여부 무관 — 정면에 있으면 감속.
+                # (0723f/h/n/r 헤어핀·tight-pass 감속 계열은 0723s에서 원복 —
+                #  U자 안쪽어깨 배치는 물리 한계로 인정, 레이싱 흐름 우선)
+                # 0723z/E 트레일링: 동적 확정(트래커) 상대의 속도에 max speed 정렬 —
+                # 갭 2.5m에서 상대속도, 멀면 +0.5·(갭−2.5)로 완만 접근, 가까우면
+                # 갭 회복. 트래커가 가림 중에도 coast로 위치·속도를 유지하므로
+                # 신선도/문턱 밴드에이드(0723B/C) 불필요. overtake_enabled면 해제.
+                _ot_on = bool(self.get_parameter('overtake_enabled').value)
+                _ot_shadow = bool(self.get_parameter('ot_shadow').value)
+                _dec = None
+                # 2026-08-06 최종리뷰 G3: 과거엔 `_dyn_obs and 트래커 active` 일
+                # 때만 update() 를 호출해, COMMIT 중 트래커가 잠깐 소실되면
+                # planner 상태가 그대로 동결되고(다음 프레임에 다시 잡히면
+                # 아무 일 없었던 것처럼 이어짐) COMMIT 의 `not opp_active`
+                # ABORT 분기가 데드코드였다. 이제 트래커 유효성과 무관하게
+                # 매 사이클 반드시 update() 를 호출한다 — 트래커가 없으면
+                # opp_s=None 으로 호출해 planner 스스로 TRAIL 이탈/ABORT 를
+                # 판단하게 한다(ot_planner.OtPlanner.update 의 opp_s=None 처리).
+                if _ot_on and self._ot_planner is not None:
+                    _trk_ot = getattr(self, '_opp_trk', None)
+                    _rl_ot = self._rl_arrays()
+                    _L_ot = self._ot_planner.L
+                    _s_ego, _ = find_current_arc_length(
+                        self._track,
+                        np.array([float(x0[0]), float(x0[1])]))
+                    if _trk_ot is not None and _trk_ot.active \
+                            and _rl_ot is not None:
+                        _ob = getattr(self, '_opp_bins', None)
+                        _sig_ok = True
+                        if _ob is not None:
+                            _i = _ob._bin(float(_trk_ot.s) % _L_ot)
+                            _sig_ok = (_ob.d_M2[_i]
+                                       / max(1, _ob.n[_i])) ** 0.5 <= 0.35
+                        # 2026-08-05 Task 6b-④: ot_keepout/ot_launch_gap/
+                        # ot_pass_margin/ot_cooldown/ot_commit_gap/ot_engage_gap
+                        # 이 __init__ 에서 1회만 읽혀 ros2 param set 이 무효였던
+                        # 것이 실측 확정됨(ot_live1) — 매 사이클 재조회해
+                        # planner.p 에 반영. 주의: 창 기하(build_windows)는
+                        # 기동 시 1회뿐이라 ot_keepout 변경은 창 배치엔
+                        # 반영되지 않는다(재기동 필요) — 여기서 라이브
+                        # 반영되는 건 keepout_r_safe(판정용 keepout 마진)와
+                        # commit/engage 게이트 거리뿐이다.
+                        _ot_keepout_live = float(
+                            self.get_parameter('ot_keepout').value)
+                        self._ot_planner.p['keepout_r_safe'] = max(
+                            0.05, _ot_keepout_live - 0.25)
+                        self._ot_planner.p['launch_gap'] = float(
+                            self.get_parameter('ot_launch_gap').value)
+                        self._ot_planner.p['pass_margin'] = float(
+                            self.get_parameter('ot_pass_margin').value)
+                        self._ot_planner.p['cooldown'] = float(
+                            self.get_parameter('ot_cooldown').value)
+                        # 2026-08-06 최종리뷰 G5: commit_gap/engage_gap 라이브 노출
+                        # (spec 부록 A "하드코딩 추정치" 두 개).
+                        self._ot_planner.p['commit_gap'] = float(
+                            self.get_parameter('ot_commit_gap').value)
+                        self._ot_planner.p['engage_gap'] = float(
+                            self.get_parameter('ot_engage_gap').value)
+                        # 2026-08-06 최종리뷰 G4: opp_s 를 ego 와 동일한
+                        # s-프레임(트랙로더 chord 재계산, ifac L=35.45)으로
+                        # 투영한다. 기존 `_trk_ot.s` 는 waypoint s_m 프레임
+                        # (L=36.5)이라 최대 0.95 m 편향이 gap 판정(창 진입/
+                        # commit/engage 게이트)을 오염시켰다. O(366) 1회/
+                        # 사이클 투영 비용은 무시 가능.
+                        _okx_ot, _oky_ot = _trk_ot.xy(*_rl_ot)
+                        _s_opp, _ = find_current_arc_length(
+                            self._track,
+                            np.array([float(_okx_ot), float(_oky_ot)]))
+                        _dec = self._ot_planner.update(
+                            time.monotonic(), float(_s_ego) % _L_ot,
+                            float(x0[3]), float(_s_opp) % _L_ot,
+                            float(_trk_ot.vs), True, _sig_ok,
+                            bool(getattr(self, '_last_qp_ok', True)))
+                    else:
+                        # G3: 트래커 비활성/부재 — opp_s=None 으로도 반드시
+                        # update() 를 호출해 COMMIT 진행정체/ABORT, APPROACH
+                        # 판정상실 이탈, 일반 복원규칙이 계속 동작하게 한다.
+                        _dec = self._ot_planner.update(
+                            time.monotonic(), float(_s_ego) % _L_ot,
+                            float(x0[3]), None, 0.0, False, False,
+                            bool(getattr(self, '_last_qp_ok', True)))
+                    if _dec.log:
+                        self.get_logger().info(
+                            _dec.log + (" [shadow]" if _ot_shadow else ""))
+                # planner.update() 를 못 돈 사이클(overtake_enabled=False/
+                # planner 부재 등)엔 _dec 가 위 초기화값 None 그대로 — 매
+                # 사이클 무조건 대입해 스테일 값이 남지 않게 한다(아래
+                # 추종 간격 블록이 이걸 읽음).
+                self._ot_decision = _dec
+                # ---- 결정 적용 (섀도 모드면 로그만) ----
+                if _dec is not None and not _ot_shadow:
+                    _rs_ot = float(_dec.r_safe)
+                    # G1: obstacle 제약 전용 채널로만 적용 — R_safe_live(side-decide
+                    # 문턱 w_car_safe/_full_keep 이 공유) 는 절대 건드리지 않는다.
+                    self.mpc.R_safe_obs_live = _rs_ot if _rs_ot != 0.3 else None
+                    self._ot_rsafe_dirty = (_rs_ot != 0.3)
+                    if _dec.kick_side is not None:
+                        _kx_ot, _ky_ot = _trk_ot.xy(*_rl_ot)
+                        self.mpc._ot_kick = (int(_dec.kick_side),
+                                             float(_kx_ot), float(_ky_ot))
+                elif self._ot_rsafe_dirty:
+                    # 2026-08-06 최종리뷰 C1: 위 적용 분기가 이번 사이클 실행
+                    # 되지 않은 사유(섀도 전환·overtake off·planner 부재·
+                    # 트래커 비활성으로 _dec=None 등) 를 전부 포괄하는 단일
+                    # 복원 경로. dirty 였던 축소만 1회 되돌리고 해제 —
+                    # dirty 가 아니면(=우리가 손댄 적 없으면) 이 분기 자체가
+                    # 실행되지 않아 rqt 라이브 튜닝을 보존한다.
+                    self.mpc.R_safe_obs_live = None
+                    self._ot_rsafe_dirty = False
+                if getattr(self, '_dyn_obs', False):
+                    _trk2 = getattr(self, '_opp_trk', None)
+                    _rl2 = self._rl_arrays()
+                    if _trk2 is not None and _trk2.active and _rl2 is not None:
+                        _tx2, _ty2 = _trk2.xy(*_rl2)
+                        _dgap = math.hypot(_tx2 - float(x0[0]),
+                                           _ty2 - float(x0[1]))
+                        # s-부호 게이트: 상대가 s 기준 뒤(추월 완료 후)면
+                        # 추종 캡을 걸지 않는다. 2026-08-06 실측(추월 직후
+                        # 상대 뒤 0.8~1.3 m): 유클리드 _dgap 만으로는 앞/
+                        # 뒤를 구분 못해 뒤차도 "앞차"로 오인 →
+                        # v_plan ≤ opp_vs+0.5·(_dgap-2.5) 상한(≈1.4 m/s)에
+                        # 걸려 4.33→1.78 m/s 로 급감, 거리 2.5 m 넘게
+                        # 벌어지는 ~2.5 초 뒤에야 회복(재추월 위험). 캡
+                        # 크기 계산(_dgap 유클리드)은 기존 튜닝(목표 2.5,
+                        # 곡률 플로어 4.5)이 이 기준으로 실측됐으므로
+                        # 그대로 두고, 적용 조건에만 부호를 추가한다.
+                        # 차체 전방 내적이 아닌 s 부호를 쓰는 이유는 급
+                        # 코너에서 전방 내적이 오판할 수 있어서다.
+                        try:
+                            _L2 = float(
+                                self._track.element_arc_lengths_orig[-1])
+                            _s_e2, _ = find_current_arc_length(
+                                self._track,
+                                np.array([float(x0[0]), float(x0[1])]))
+                            _s_o2, _ = find_current_arc_length(
+                                self._track, np.array([float(_tx2),
+                                                        float(_ty2)]))
+                            _sgap2 = ((_s_o2 - _s_e2 + _L2 / 2.0) % _L2
+                                      - _L2 / 2.0)  # + = 상대가 앞
+                        except Exception:
+                            _sgap2 = 1.0  # 폴백: 캡 적용 유지(보수적)
+                        if _sgap2 > 0.0 and _dgap < 8.0:
+                            # 2026-08-05 곡률 인지 추종 간격: 직선 2.5 m, 고곡률
+                            # (κ_eq≥0.5, 시케인/헤어핀) 접근 시 4.5 m. 폭 1.0 m
+                            # 시케인에서 4 m 뒤 추종 중 앞차 keepout 원이 ego
+                            # 호라이즌의 계획 튜브를 반쪽 내 벽 접촉 (bag 16_31:
+                            # 접촉 6건 전부 s24~28 추종 통과 중, 상대추돌 0).
+                            # 좁은 곳 진입 전 간격을 벌려 keepout 오염을 차단.
+                            # 2026-08-05 추월 재설계: planner 목표(_ot_decision)와
+                            # 곡률 플로어(위)를 max 로 합성 — 플로어는 절대 하한.
+                            _gap_tgt = 2.5
+                            _dec_g = getattr(self, '_ot_decision', None)
+                            if _dec_g is not None and not _ot_shadow:
+                                if _dec_g.gap_target is None:
+                                    _gap_tgt = None      # COMMIT: 캡 해제
+                                else:
+                                    _gap_tgt = float(_dec_g.gap_target)
+                            if _gap_tgt is not None:
+                                try:
+                                    # _s_e2/_L2 는 위 s-부호 게이트에서 이미
+                                    # 동일 함수·동일 인자로 구했으므로 재사용.
+                                    # 2026-08-07 발동 판정 교체: abs_kappa_lut
+                                    # 는 제동용 κ_eq(거리 감쇠)라 시케인이
+                                    # 2.3 m 앞이면 1.2→0.34 로 깎여 문턱(0.5)
+                                    # 미달 — 플로어가 한 박자 늦게 켜져 돌출부
+                                    # 밴드(s15.7)에서 추종 쐐기 3회(관전 세션
+                                    # 실측). 간격 문제는 제동 여유가 아니라
+                                    # 전방 κ 그 자체가 기준이므로 감쇠 없는
+                                    # 전방최대 |κ| (3.5 m 창)로 판정한다.
+                                    _kg_f = self.mpc.kappa_grid
+                                    _dsg_f = float(self.mpc.kappa_ds)
+                                    _i0_f = int((_s_e2 % _L2) / _dsg_f)
+                                    _n_f = max(1, int(3.5 / _dsg_f))
+                                    _k_fw = max(
+                                        abs(float(_kg_f[(_i0_f + _j) % len(_kg_f)]))
+                                        for _j in range(_n_f))
+                                    if _k_fw >= 0.5:
+                                        # 곡률 플로어(1696533)는 APPROACH 보다
+                                        # 우선 — 시케인 keepout 오염 방지.
+                                        # 2026-08-07 ego 속도 기반으로 교체:
+                                        # 필요한 간격의 바닥은 예측 호라이즌
+                                        # 기하(1.6 s × **ego v** − keepout)가
+                                        # 정한다(0805d 확정). 구식(상대 2.5
+                                        # 기준 4.5 + Δv 보정)은 빠른 상대를
+                                        # 고속 추격할 때 보정이 0 이 되어
+                                        # 시케인 감속 순간 낑김 (0807 관전
+                                        # bag: 상대 4.5→1.5 감속, ego 4.2
+                                        # 추격, s22~25 접촉 2회). ego v 기반
+                                        # 이면 느린 상대(추격 빠름)·빠른 상대
+                                        # (추격 더 빠름) 모두 자동 커버.
+                                        _floor_k = max(
+                                            4.5, 1.6 * float(x0[3]) + 0.5)
+                                        _gap_tgt = max(_gap_tgt, _floor_k)
+                                except Exception:
+                                    pass
+                                v_plan = min(v_plan, max(
+                                    0.3, float(_trk2.vs)
+                                    + 0.5 * (_dgap - _gap_tgt)))
+                _cy, _sy = math.cos(float(x0[2])), math.sin(float(x0[2]))
+                for _ox, _oy in (self._obstacles or []):
+                    _dx, _dy = float(_ox) - float(x0[0]), float(_oy) - float(x0[1])
+                    _long = _cy * _dx + _sy * _dy          # 차체 전방 거리
+                    _lat = abs(-_sy * _dx + _cy * _dy)     # 차체 횡편차
+                    # 0722n 콘 0.85→0.55 원복: 0.85는 순항 4.6→3.8 하락 + STUCK 2→6
+                    # 악화 (bag 16_08) — 문제 못 풀고 속도만 죽임. 가림쌍의 해법은
+                    # 감속이 아니라 계획 즉응(slack×10)+Stage-B 2슬롯.
+                    # 0722t 2단 콘: 원거리(≤8m)는 0.55 유지(과감속 방지, bag 16_08 교훈),
+                    # 근거리(<3m)만 keepout 폭 1.0 — 가림 출현(reveal lat 0.6~0.7,
+                    # 2~3m)시 즉시 감속. 남은 stall 2지점(s50.2/s69.7)이 이 클래스.
+                    if 0.0 < _long < 8.0 and (_lat < 0.55 or (_long < 3.0 and _lat < 1.0)):
+                        # 0722z2 계획-간극 게이트: BIG_OBS 누수 픽스 후 계획이 실제
+                        # keepout(0.6+)을 지키므로, 계획 최근접 스테이지가 이 장애물을
+                        # 이미 >0.5m로 비켜가면 감속 생략. 콘 가드는 "계획이 아직 못
+                        # 비킨" 순간만 담당: 커밋 직후 1~2사이클, 가림 출현(2~3m),
+                        # BLOCK-STOP. 회피 중 3.3 바닥 정체(사용자, bag 20_43) 해소.
+                        try:
+                            _pd = float(np.hypot(traj[:, 0] - float(_ox),
+                                                 traj[:, 1] - float(_oy)).min())
+                        except Exception:
+                            _pd = 0.0
+                        if _pd > 0.5:
+                            continue
+                        _vp = float(self.get_parameter('obs_pass_speed').value)
+                        # 0723c narrow-pass 감속: 계획 간극이 좁을수록 통과속도를
+                        # 비례 축소 (0.5m→vp 그대로, 0.3m→~2.2, 바닥 2.0).
+                        # keepout 공간맞춤으로 좁은 통로를 "지나가게" 된 대신
+                        # 속도로 안전 보상.
+                        if _pd > 0.0:
+                            _vp = max(2.5, _vp * min(1.0, _pd / 0.5))   # 0723z 바닥 2.0→2.5
+                        else:
+                            _vp = 2.5
+                        _va = math.sqrt(max(0.0, _vp * _vp + 2.0 * 4.0 * max(0.0, _long - 0.8)))
+                        v_plan = min(v_plan, _va)
+                # (0807 '커밋 역방향 서행 가드'는 삭제 — bag 16_29/16_18 실측:
+                # 라인 위 장애물은 접근 시작 시점엔 **항상** 위반측이므로 정상
+                # 접근·통과·해제 전 구간이 통째로 1.5 클램프에 걸려 직선에서
+                # 6.8 s 크롤(ref_v 8.9 인데 cmd 2.0). 원래 막으려던 15_08_38
+                # 사고 클래스(FAST 호의 위반측 진입)는 정적 커밋 시 SAFE 전환이
+                # 근본 차단하고, 정면 접근 감속은 콘 가드가 담당한다.)
                 cmd.drive.speed = max(0.0, min(v_cap, v_plan))
         else:
             # traj missing (defensive — solve() always returns one). u[0] is a_x
@@ -1993,9 +2713,61 @@ class MPCNode(Node):
         # stuck-release(후진) 중이면 floor 적용 안 함. unified: 양 모드.
         startup_speed = float(self.get_parameter('startup_speed').value) \
             if self.has_parameter('startup_speed') else 0.0
+        # 0812: _has_moved 게이트 추가 — 솔버측 플로어(위쪽)엔 있는데 여기만 없어서
+        # BLOCK-STOP 제동으로 2.0 밑에 내려가는 순간 3.0 으로 되밀어 장애물에 박았다
+        # (BLOCKED→STUCK→후진 루프의 직접 원인). 출발 1회만 플로어가 맞는 설계.
         if (vx_floor > 0.0 and raw_vx < vx_floor
+                and not getattr(self.mpc, '_has_moved', False)
                 and not getattr(self.mpc, '_stuck_release_active', False)):
             cmd.drive.speed = max(float(cmd.drive.speed), startup_speed)
+
+        # ── C-SPEED-SLEW (2026-07-03): 발행 drive.speed 스텝 제한 ──
+        # v_plan 이 RTI plan 지터를 그대로 전달해 >0.8 m/s 스파이크 46회/분
+        # (지속 100ms — 물리적으로 무의미한 저크, VESC 급제동 펄스 유발).
+        # down 5.0 은 실측 제동한계 4.3 을 통과시키고 스파이크만 자른다.
+        # stuck-release(후진 -0.5 즉시 적용) 중엔 바이패스.
+        _now_sp_t = self.get_clock().now().nanoseconds * 1e-9
+        if not getattr(self.mpc, '_stuck_release_active', False):
+            _prev_sp = getattr(self, '_last_speed_pub', None)
+            _prev_sp_t = getattr(self, '_last_speed_t', None)
+            if _prev_sp is not None and _prev_sp_t is not None:
+                # 2026-08-05 곡률 게이트 슬루: 직선(κ_eq<thr)에서만 고속 상승률.
+                # 전역 slew 8 실측(bag 0805): 직선 5.9→7.5 성공했으나 스위퍼
+                # (s13~15, 중간 κ) 한복판에서도 세게 가속 → v²κ 한계 초과 →
+                # 39접촉. κ_eq(abs_kappa_lut)는 forward-max 라 "앞에 코너가
+                # 없을 때만" 직선으로 읽힘 = 가속 게이트로 안전한 성질.
+                _up = float(self.get_parameter('slew_up_rate').value)
+                try:
+                    _sqthr = float(self.get_parameter('straight_kappa_thr').value)
+                    _sup = float(self.get_parameter('slew_up_rate_straight').value) \
+                        if self.has_parameter('slew_up_rate_straight') else _up
+                    _L_sl = float(self._track.element_arc_lengths_orig[-1])
+                    _s_sl, _ = find_current_arc_length(
+                        self._track, np.array([float(x0[0]), float(x0[1])]))
+                    _is_straight = float(self.mpc.abs_kappa_lut(_s_sl % _L_sl)) < _sqthr
+                    # 2026-08-05b 정착 히스테리시스: κ_eq 가 thr 미만으로 **연속
+                    # settle 초** 유지된 뒤에만 고속 상승률. 게이트가 코너 탈출
+                    # 순간 즉시 열리면(s13→14, κ 0.34→0.14) 잔류 횡동역학 위에
+                    # 풀스로틀이 얹혀 스로틀-와이드(+0.3~0.5 좌)로 s13.6~15.8
+                    # 벽을 긁는다 (0805 실측: 접촉 4~5회/23랩, 전부 이 밴드).
+                    _settle = float(self.get_parameter('slew_gate_settle_s').value) \
+                        if self.has_parameter('slew_gate_settle_s') else 0.5
+                    if _is_straight:
+                        if getattr(self, '_kgate_since', None) is None:
+                            self._kgate_since = _now_sp_t
+                        if _now_sp_t - self._kgate_since >= _settle:
+                            _up = _sup
+                    else:
+                        self._kgate_since = None
+                except Exception:
+                    pass   # 게이트 실패 시 보수적(코너용) 상승률 유지
+                cmd.drive.speed = slew_limit_speed(
+                    _prev_sp, float(cmd.drive.speed),
+                    min(0.1, _now_sp_t - _prev_sp_t),
+                    up_rate=_up,
+                    down_rate=float(self.get_parameter('slew_down_rate').value))
+        self._last_speed_pub = float(cmd.drive.speed)
+        self._last_speed_t = _now_sp_t
 
         # C-STEER (2026-06-19): hard OUTPUT steering-rate limit to servo slew.
         # The solver's first control jumps full-lock on the flat cost surface
@@ -2128,7 +2900,8 @@ class MPCNode(Node):
             ref_v_now = float(self.mpc.ref_v(current_s % float(self._track.element_arc_lengths_orig[-1])))
         except Exception:
             ref_v_now = 0.0
-        # C-1 학습 데이터: κ_lookahead + B 의 동적 scale 4개 추가 (총 22 필드)
+        # C-1 학습 데이터: κ_lookahead + B 의 동적 scale 4개 추가
+        # (+ 2026-06-29 atomic t_ctrl/feasible 2개 append → /mpc_debug 총 25 필드)
         kappa_abs, kappa_signed = 0.0, 0.0
         if self._track is not None:
             try:
@@ -2137,13 +2910,17 @@ class MPCNode(Node):
                 kappa_signed = float(self.mpc.signed_kappa_lut(current_s % L))
             except Exception:
                 pass
+        # 정확도: 제어루프 시각을 atomic하게 동봉 (수신시각 지터/ wall-clock 제거).
+        # get_clock() 사용 → use_sim_time 에서 sim time 자동 반영.
+        # float32 전송이라 절대 epoch 은 정밀도 붕괴(ULP~128s) → node 첫 발행 기준
+        # 상대초로 보냄(작은 값 → sub-ms 유지). dt=diff(t) 라 offset 무관.
         _now_s = self.get_clock().now().nanoseconds * 1e-9
         if getattr(self, "_dbg_t0", None) is None:
             self._dbg_t0 = _now_s
         t_ctrl = _now_s - self._dbg_t0
         dbg = Float32MultiArray()
         dbg.data = [
-            float(con_first[0]),       # 0  a_x cmd (unified u[0]; was v_cmd pre-2026-06-10)
+            float(con_first[0]),       # 0  a_x_cmd (unified u[0]; renamed from v_cmd 2026-07-28, value was always a_x)
             float(con_first[1]),       # 1  steer_cmd
             v_actual,                  # 2  v_actual
             float(x0[0]),              # 3  car_x
@@ -2153,24 +2930,35 @@ class MPCNode(Node):
             float(near_idx),           # 7  near_idx
             ref_v_now,                 # 8  ref_v
             float(len(self._obstacles)),  # 9  n_obs_in
-            0.0,                       # 10 sel_dmin  (obstacle TODO)
-            0.0,                       # 11 sel_x
-            0.0,                       # 12 sel_y
-            0.0,                       # 13 side_pref
+            float(getattr(self.mpc, 'dbg_sel_dmin', 0.0)) if getattr(self.mpc, 'dbg_sel_dmin', float('inf')) < 1e5 else 0.0,  # 10 sel_dmin (선택 장애물 거리)
+            float(getattr(self.mpc, 'dbg_sel_x', 0.0)) if getattr(self.mpc, 'dbg_sel_x', float('inf')) < 1e5 else 0.0,      # 11 sel_x
+            float(getattr(self.mpc, 'dbg_sel_y', 0.0)) if getattr(self.mpc, 'dbg_sel_y', float('inf')) < 1e5 else 0.0,      # 12 sel_y
+            float(getattr(self.mpc, 'dbg_side_pref', 0.0)),  # 13 side_pref (+1/-1/0; 0=미회피 or BLOCK-STOP)
             float(opti_value),         # 14 opti_value
             float(solve_dt * 1000.0),  # 15 solve_ms
             # C-1 추가 — MLP 학습 input (state) + B output (scale):
             kappa_abs,                 # 16 kappa_abs (forward-max κ, B input)
             kappa_signed,              # 17 kappa_signed (apex 방향)
-            float(getattr(self.mpc, 'q_cte_scale_live', 1.0)),    # 18
-            float(getattr(self.mpc, 'q_lag_scale_live', 1.0)),    # 19
-            float(getattr(self.mpc, 'q_v_scale_live', 1.0)),      # 20
-            float(getattr(self.mpc, 'q_drate_scale_live', 1.0)),  # 21
+            float(getattr(self.mpc, 'q_cte_scale_live', 1.0)),    # 18 q_cte_scale
+            float(getattr(self.mpc, 'q_lag_scale_live', 1.0)),    # 19 q_lag_scale
+            float(getattr(self.mpc, 'q_v_scale_live', 1.0)),      # 20 q_v_scale
+            float(getattr(self.mpc, 'q_drate_scale_live', 1.0)),  # 21 q_drate_scale
             float(getattr(self.mpc, 'v_max', 0.0)),                # 22 v_max_cost
             float(t_ctrl),                                         # 23 t_ctrl (node clock; sim-time aware)
-            1.0 if opti_value < 1e8 else 0.0,                      # 24 feasible (== /mpc/is_feasible)
-            float(x0[4]),                                          # 25 vy  (EKF body lateral vel, x0[4])
-            float(x0[5]),                                          # 26 r   (EKF yaw rate, x0[5])
+            1.0 if opti_value < 1e8 else 0.0,                      # 24 feasible_msg (== /mpc/is_feasible)
+            float(x0[4]),                                          # 25 vy_ekf (EKF body lateral vel, x0[4])
+            float(x0[5]),                                          # 26 r_ekf (EKF yaw rate, x0[5])
+            # 2026-07-09 ablation 실험 추적: rqt live 변경값이 bag에 매 사이클 남게
+            float(self.get_parameter('brake_anticip_a').value),   # 27 brake_anticip_a
+            float(self.get_parameter('slew_down_rate').value),    # 28 slew_down_rate
+            float(self.get_parameter('accel_preview_s').value),   # 29 accel_preview_s
+            # 2026-07-21 회피 진단: BLOCK-STOP 발동 거리(_obs_blocked_d). >0 = 양쪽막힘
+            # 판정으로 장애물 앞 정지. side_pref(13)=0 인데 이게 >0 이면 회피실패=BLOCK-STOP,
+            # 이게 0(=inf sentinel) 이면 단순 장애물 없음/미커밋.
+            float(getattr(self.mpc, '_obs_blocked_d', None) or 0.0),  # 30 obs_blocked_d
+            # 2026-07-28: 실제 발행 속도명령(cmd.drive.speed, 확정·발행 이후 값) 추가.
+            # 인덱스 0(a_x_cmd)와 혼동 금지 — 이건 진짜 speed 명령.
+            float(cmd.drive.speed),    # 31 speed_cmd
         ]
         self.mpc_debug_pub.publish(dbg)
 
@@ -2183,6 +2971,11 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        if getattr(node, '_spl', None) is not None:
+            try:
+                node._spl.save(node._spl_path)
+            except Exception:
+                pass
         node.destroy_node()
         rclpy.shutdown()
 

@@ -764,7 +764,11 @@ class GlobalPlanner(Node):
             if self.test_on_car and math.fabs(cent_length / line_length - 1.0) < 0.15:
                 line_lengths[i] = line_length
             if not self.test_on_car or self.map_editor:
-                line_lengths[i] = line_length
+                # 2026-07-16: skeleton의 기생 소형 루프(교차점 사이클 등)가 min()에
+                # 잡혀 ~30셀 센터라인 → smooth_centerline 브로드캐스트 크래시
+                # (ifac_0714 맵에서 실증). 실제 트랙 루프는 수십 m — 10m 미만 제외.
+                if line_length > 10.0:
+                    line_lengths[i] = line_length
 
         # take the shortest line
         min_line_length = min(line_lengths)

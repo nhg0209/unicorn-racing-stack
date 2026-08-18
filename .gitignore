@@ -34,11 +34,16 @@ COLCON_IGNORE
 # rosbag recordings (local debugging only; keep the folder, ignore contents)
 /bags/*
 !/bags/.gitkeep
-stack_master/maps/ifac/ifac.pcd
+# 맵 포인트클라우드/메시는 용량이 커서 절대 추적하지 않는다 (수백 MB)
+stack_master/maps/**/*.pcd
+stack_master/maps/**/*.ply
 cyclonedds.log
-*.bak
+*.bak*
 
 # per-machine local overrides (see unicorn.sh §5 and the CYCLONEDDS_URI block).
 # Base configs stay tracked; anything host-specific goes in these, never committed.
 unicorn.local.sh
 cyclonedds.local.xml
+
+# macOS Finder metadata
+.DS_Store
