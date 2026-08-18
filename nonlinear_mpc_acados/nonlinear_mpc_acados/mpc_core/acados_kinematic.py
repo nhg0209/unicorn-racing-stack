@@ -148,7 +148,7 @@ def codegen_paths(use_dynamic, nx_solver, dyn_mu=None):
     NOTE: only the model/nx axis is keyed. Other codegen-time knobs —
     N_horizon, dT, speed_target, lookahead_m, baked cost weights — are NOT in
     the tag, so changing only those reuses the same dir. Callers that vary them
-    (BO/sweep harnesses) must still `rm -rf /tmp/acados_codegen_evompcc*`
+    (BO/sweep harnesses) must still `rm -rf ~/.acados_codegen/*`
     between runs to force regeneration.
     dyn_mu IS keyed (2026-06-10).
     """
@@ -514,9 +514,10 @@ class MPC:
         # the ref_v step when a corner crosses the window edge. On this ultra-tight
         # map the forward window is SATURATED (a corner is always within ~6 m →
         # p95≈max), so there is no edge step to smooth and R4 is a no-op here; it
-        # only helps open maps with sparse corners + long straights. Kept as a
-        # tested module (mpc_core/refv_smoothing.py) for that case; baseline uses
-        # the plain hard max.
+        # only helps open maps with sparse corners + long straights. baseline uses
+        # the plain hard max. (2026-08-18: 그 모듈 mpc_core/refv_smoothing.py 는
+        # import 0회라 삭제. 개방형 맵에서 필요해지면 커밋 e7e2e52 에서 복구:
+        #   git show e7e2e52:nonlinear_mpc_acados/nonlinear_mpc_acados/mpc_core/refv_smoothing.py)
         # 2026-06-08 (사용자 통찰): plain forward-MAX 가 완만(저-κ) 구간서도 멀리
         # 있는 tight 코너 κ로 ref_v 를 눌러 가속을 막음(twisty 맵서 p95≈max 포화).
         # → brake-distance-aware 등가 κ 로 교체: 거리 d 만큼 떨어진 코너는 제동거리
@@ -1617,7 +1618,7 @@ class MPC:
         # dylib+json+스탬프(GP ckpt 경로·mtime)가 일치하면 로드만 한다.
         # GP ckpt 변경 → 스탬프 불일치 → 자동 풀 재생성. 그 외 codegen-baked
         # 노브(N/dT/speed_target/lookahead/dyn_mu 외 가중치) 변경 시엔 기존 관례대로
-        # rm -rf /tmp/acados_codegen_evompcc* 필수 (codegen_paths NOTE 참조).
+        # rm -rf ~/.acados_codegen/* 필수 (codegen_paths NOTE 참조).
         _stamp_path = json_path + ".stamp"
         _gp_ck = os.path.expanduser(getattr(self, 'gp_casadi_ckpt', '') or '')
         try:
@@ -1644,7 +1645,7 @@ class MPC:
             pass
         _reuse = _lib_ok and os.path.isfile(json_path) and _stamp_ok
         if _reuse:
-            self._log.info("[MPC-acados] warm-reusing codegen %s (rm -rf /tmp/acados_codegen_evompcc* 로 강제 재생성)",
+            self._log.info("[MPC-acados] warm-reusing codegen %s (rm -rf ~/.acados_codegen/* 로 강제 재생성)",
                            ocp.code_export_directory)
         else:
             self._log.info("[MPC-acados] generating solver (GP 포함 수 분 걸림, 최초/GP변경시)...")

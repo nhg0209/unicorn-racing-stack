@@ -12,17 +12,16 @@
 #  [회피]  R_safe_live(0.40)  commit_dist_live(8)  obstacle_hold_s(0.3)
 #  [안정]  q_drate_scale_live  slew_up/down_rate  cost_spike_thr_live
 #  유령(무효): a_lat_safe_live>6.52는 clamp / (mpc_v_track·vp_project는 삭제됨)
-#  codegen 값 바꾸면: rm -rf /tmp/acados_codegen_evompcc* 후 relaunch
+#  codegen 값 바꾸면: rm -rf ~/.acados_codegen/* 후 relaunch
+#  (2026-07-16 부로 캐시가 /tmp -> ~/.acados_codegen 로 이동했다. 예전 주석의
+#   /tmp 경로로 지우면 아무것도 안 지워지고 옛 솔버를 그대로 쓴다.)
 # ══════════════════════════════════════════════════════════════════════
 mpc_node:
   ros__parameters:
-    # Backend: 'acados' (SQP_RTI+HPIPM, ~1-5ms) or 'ipopt' (CasADi NLP, ~20-70ms)
-    mpc_backend: acados
 
     # Topics — match unicorn race_stack convention
     odom_topic_name: /car_state/odom
     localized_pose_topic_name: /car_state/pose
-    goal_topic_name: /move_base_simple/goal
     cmd_vel_topic_name: /vesc/high_level/ackermann_cmd   # car stack simple_mux input (matches PP controller)
 
     # Track loader
@@ -34,7 +33,6 @@ mpc_node:
     extend_part: 2                 # loop overlap (extend_part=2 → +50%)
 
     # MPC sizing / vehicle limits
-    vehicle_L: 0.307               # F1TENTH (unicorn FIESTA1) wheelbase
     # Conservative IFAC-demo baseline. event_stuck CSV 에서 차가 outside
     # over-shoot 후 reverse stuck → 박히기 전에 막아야. 6 → 4 (코너 과속 ↓).
     max_speed: 3.0   # 0813 회피 신패키지 첫 검증용 저속캡 (사용자 지시). 이전 10.0   # 0813d 슬라이드 해결(slew3) 후 사용자 지시로 캡 복원. 이전 6.0   # 0813 벽관통(s26, 캡10 첫판) 후 사다리 재시작점. 이전 10.0   # 0811 10→8 (흔들림 완화 사다리 하향). 이전: 0807 밤: 심(현재 4.0 재현실험 구성)과 통일 — 사용자 지시 && 0812: 8→10 (후행 추월차 — nuc3 과 속도차 실험, 원복 .bak_0812)
@@ -100,10 +98,7 @@ mpc_node:
     #   = [0.04]*20 + [0.06]*30 + [0.10]*30 → 0.8 + 1.8 + 3.0 = 5.6s horizon
     #   v=4: 22m, v=7: 39m — 다음 코너 + α 보임 → outside-inside-outside racing line 학습.
     # solve_ms 영향 거의 없음 (N=80 그대로). codegen 처음 한 번 ~30s.
-    integration_mode: Euler
 
-    # MPC weights file (BO_params_LTM.json bundled in share/config/mpc/)
-    params_file: BO_params_LTM
 
     # Reference path source for mpc:
     #   centerline → /centerline_waypoints (트랙 한가운데, racing line 거동
@@ -187,24 +182,23 @@ mpc_node:
     # → 랩타임↑·완만커브 가속 사라짐(사용자 지적). 폭 단일캡은 이 트랙엔 부적합.
     # crash(s≈60 좁고직선) 진짜 해법 = racing-line(코너컷) / steer-hunting 잡기.
 
-    # Vehicle dynamics — only `l_wb` consumed in kinematic mode (current default)
+    # Vehicle dynamics — kinematic mode 는 l_wb 만 쓴다.
+    # (2026-08-18: 아무도 안 읽던 l_f/l_r/m 삭제. 동역학 모드 도입 시 재추가)
     vehicle.l_wb: 0.307
-    vehicle.l_f: 0.162
-    vehicle.l_r: 0.145
-    vehicle.m: 3.54
 
     # Live-tunable weights (rqt_reconfigure 대체). Defaults mirror mpc_core.
     # ROS1 unicorn 검증값으로 환원 (cycle-flat cost surface 의 oscillation 은
     # corridor / D_apex 로 잡고, cost weights 는 검증된 값 유지).
-    q_cte_live: 1.0        # B 0.3 → Hybrid 1.0 (2026-05-26). 느슨한 centerline 추종 + corridor 자유 동시.
-    q_lag_live: 8.0        # B 2.0 → Hybrid 8.0. progress 어느 정도 강제 — 안정 baseline.
-    q_d_delta_live: 25.0   # base 값. 동적 조정은 MLP q_drate_scale_live (1~3×) 가 담당.
+    # 2026-08-18: q_cte_live / q_lag_live / q_d_delta_live 삭제 —
+    # 노드가 선언조차 안 하는 키였다(고쳐도 아무 일 안 일어남). 실제 손잡이는
+    # 아래 q_*_scale_live 다. 삭제 전 값은 1.0 / 8.0 / 25.0.
     # 회피 거리 공식: projection ≥ R_safe + R_car. R_car 는 차 반지름,
     # R_safe 는 장애물 자체 반지름 + 안전 margin. 둘 분리해서 튜닝.
     # 회피 범위 좁힘: 0.35 → 0.25 (장애물 반지름 0.15 + 차 외곽 margin 0.10).
     # 차 외곽 ↔ 장애물 외곽 빈 공간 ≈ 0.10m. 더 가까이 통과 가능.
     R_safe_live: 0.5   # 0813 회피범위 확대: 심 실측 실행 undershoot 0.16 흡수 (계획 0.57→실행 ~0.41>필요 0.355). 이전 0.3   # 2026-07-09 keepout 0.85->0.70 (넓은 회피 완화)
-    M_slack_live: 20000.0
+    # M_slack_live: 삭제 (2026-08-18, 선언 안 되는 키. 삭제 전 값 20000.0).
+    # 슬랙 벌금은 config/mpc_tuning.yaml 의 slack 절에서 관리한다.
     # a_lat_safe_live: 코너 측방 가속도 한계. 크면 코너에서 더 공격적 (ref_v cap = √(a_lat/κ) 증가).
     # rand_a 의 κ_max=0.4417 (R_min=2.26m) → v_cap @ a_lat=30 = √(30/0.4417) = 8.24 m/s.
     # 6→10→15→30 history. v=6 sweep 위해 30 까지 올림 — 그러나 30(=3g)은 그립 한계
@@ -212,10 +206,8 @@ mpc_node:
     # 진단: 남은 stall 13/13 over-speed entry). 물리적 그립으로 복원: 8 > 6 (코드 주석의
     # 의도값, a_lat_max=8 hard 아래 headroom). ref_v cap = √(a_lat/κ) 가 코너서 실제 작동.
     a_lat_safe_live: 8.0
-    # D_detour_live: 회피 시 lateral offset [m]. 0.3 → 0.2 → 0.1.
-    # R_safe (hard constraint, 0.25m) 가 충돌 회피 보장하므로 D_detour 는
-    # soft target 만이라 작아도 안전. 회피 후 raceline 복귀 시 over-shoot ↓.
-    D_detour_live: 0.30
+    # D_detour_live: 삭제 (2026-08-18, 선언 안 되는 키. 삭제 전 값 0.30).
+    # 회피 lateral offset 은 현재 R_safe_live / D_apex_live 가 결정한다.
     # D_apex_live: ACTIVE (2026-06-01 복원). e_c_ref = -D_apex·tanh(signed_κ/0.20)
     # 로 contour reference 를 코너 안쪽(apex)으로 bias (acados_kinematic.py ~L888).
     # 0 = off (pure centerline). ★주의: ref_v κ-cap 은 centerline-κ 기반이라 apex 가

@@ -15,7 +15,6 @@ setup(
         ('share/' + package_name + '/launch', glob('launch/*.launch.xml')
                                               + glob('launch/*.launch.py')),
         ('share/' + package_name + '/config', glob('config/*.yaml')),
-        ('share/' + package_name + '/config/mpc', glob('config/mpc/*.json')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
