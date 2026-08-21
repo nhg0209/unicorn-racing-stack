@@ -46,6 +46,14 @@ import trajectory_planning_helpers as tph
 from frenet_conversion.frenet_converter import FrenetConverter
 
 from vel_planner.vel_planner import calc_vel_profile
+
+# OPTIONAL BY DESIGN. rate_check only ever prints a warning, so a workspace where it has not been
+# built yet loses the warning and nothing else -- which is exactly the state every node was in
+# before it existed. Hard-failing a live node on a missing diagnostic would be a worse trade.
+try:
+    from rate_check.rate_check import RateCheck
+except ImportError:                          # pragma: no cover - deployment shape, not logic
+    RateCheck = None
 from state_machine.states_types import StateType
 from state_machine import states
 from state_machine import state_transitions
@@ -138,6 +146,12 @@ class StateMachine(Node):
         # Convenience aliases (kept as attributes for parity with the ROS1 code which
         # read these directly off `self`). They mirror self.params.* values.
         self.rate_hz = self.params.rate_hz
+        self._rate_check = (RateCheck(
+            self, nominal_hz=self.rate_hz, name="state_machine",
+            consequence="every timeout counted in cycles rather than seconds -- the "
+                        "static-deadlock timer, the feasibility-loss timer, the "
+                        "relax repeat -- fires late by the same factor")
+            if RateCheck else None)
         self.n_loc_wpnts = self.params.n_loc_wpnts
         self.timetrials_only = self.params.timetrials_only
         self.racecar_version = self.params.racecar_version
@@ -2452,6 +2466,8 @@ class StateMachine(Node):
     # MAIN LOOP #
     #############
     def loop(self):
+        if self._rate_check is not None:
+            self._rate_check.tick()
         self._handle_momentary_params()
         if self.measuring:
             start = time.perf_counter()

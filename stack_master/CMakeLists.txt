@@ -42,6 +42,7 @@ install(PROGRAMS
   scripts/static_tf_publisher.py
   scripts/vesc_calibration_node.py
   scripts/opponent_bridge_node.py
+  scripts/vehdyn_test_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

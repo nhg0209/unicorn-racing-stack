@@ -194,7 +194,7 @@ def run_one_sim(map_name: str, n_laps: int, wall_timeout: int, stuck_timeout: in
     cmd = ['bash', '-c',
            f'source $HOME/unicorn_ws/src/unicorn-racing-stack/unicorn.sh >/dev/null 2>&1 && export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && '
            f'export CYCLONEDDS_URI=file://$HOME/cyclonedds_laptop.xml && '
-           f'rm -rf /tmp/acados_codegen_evompcc* /tmp/acados_ocp_evompcc* ; '
+           f'rm -rf ~/.acados_codegen/acados_codegen_evompcc* ~/.acados_codegen/acados_ocp_evompcc* ; '
            f'ros2 launch stack_master low_level.launch.xml sim:=true map:={map_name} use_estop:=false >/tmp/bo_lowlevel.log 2>&1 & sleep 16; ros2 run nonlinear_mpc_acados mpc_debug_logger >/tmp/bo_logger.log 2>&1 & ros2 launch nonlinear_mpc_acados mpcc.launch.xml map:={map_name} sim:=true detector:=false'
            + (f' dyn_mu:={DYN_MU}' if DYN_MU is not None else '')]
     # stderr 를 file 로 redirect (debug 용 — startup fail 원인 파악).

@@ -13,6 +13,7 @@ import rclpy
 from f110_msgs.msg import Obstacle, ObstacleArray
 from nav_msgs.msg import Odometry
 from f110_msgs.msg import WpntArray, Wpnt
+from std_msgs.msg import Int32MultiArray
 
 from gb_optimizer.static_obstacle_layer import StaticObstacleLayer
 
@@ -238,64 +239,89 @@ def published_xy(node):
             for m in pub[-1].markers if m.action == 0]
 
 
+def establish_hold(node, x, y, s, closest_gap=1.0, n_obs=8, t0_ns=5_000_000_000):
+    """Confirm a track and drive the car PAST it, which is what seeds the hold now.
+
+    The published position freezes on the closest-approach estimate, so a test that wants a held
+    position has to supply an approach. Returns the track.
+    """
+    dt_ns = int(1e9 / DET_HZ)
+    gaps = np.linspace(closest_gap + 3.0, closest_gap, n_obs)
+    for k, g in enumerate(gaps):
+        node.frenet_cb(odom(s - float(g)))
+        msg = obs_msg(x, y, s, t0_ns + k * dt_ns)
+        for _ in range(REPEATS):
+            node.obstacles_cb(msg)
+            node.publish_cb()
+    node.frenet_cb(odom(s + 5.0))          # past it -> the hold is taken
+    node.publish_cb()
+    return node._tracks[0]
+
 def test_publish_position_holds_still_under_estimate_noise():
     # The estimate never settles -- the same physical box wanders 0.04-0.06 m lap to lap because
     # each approach sees a different face of it. Every wander was an obstacle-set change
     # downstream: 12 of 25 set changes in one run were nothing else, and each cost a re-solve, a
     # swap and a FrenetConverter rebuild in three consumers.
     node = make_node()
-    t = confirm_obstacle(node, x=3.0, y=0.0, s=10.0, settle=True)
-    assert published_xy(node) == [(3.0, 0.0)], published_xy(node)
+    t = establish_hold(node, 3.0, 0.0, 10.0)
+    held = published_xy(node)[0]
+    assert abs(held[0] - 3.0) < 1e-6 and abs(held[1]) < 1e-6, held
     for dx, dy in ((0.05, 0.02), (-0.04, 0.03), (0.06, -0.05), (0.03, 0.06)):
         for _ in range(6):                      # let the EMA settle on the wandered position
             node.obstacles_cb(arr(det(3.0 + dx, 0.0 + dy, 10.0)))
-        assert published_xy(node) == [(3.0, 0.0)], \
+        assert published_xy(node) == [held], \
             f"a {np.hypot(dx, dy):.3f} m wander must not move the published position"
     assert np.hypot(t.x - 3.0, t.y - 0.0) > 0.0, "…while the internal estimate did follow it"
     print(f"PASS the published position holds still through wanders up to "
           f"{max(np.hypot(*d) for d in ((0.05,0.02),(0.04,0.03),(0.06,0.05),(0.03,0.06))):.3f} m")
 
 
-def test_the_hold_seeds_only_once_the_estimate_has_settled():
-    # The hold used to be seeded the first time a CONFIRMED track was published -- at confirm_hits
-    # sightings, the moment the EMA has seen the least. With a = 0.3 the residual after k updates
-    # is 0.7^k, so 17% of the initial error was still in the number that then got frozen for good,
-    # and every later refinement inside the 0.12 m dead-band was discarded. The re-opt fits its
-    # humps to that number: floor 0.35 - 0.12 = 0.23 m of real clearance, under the state
-    # machine's 0.25 m static-GB requirement, i.e. TRAILING behind a box the line clears.
+def test_the_hold_is_not_taken_while_the_estimate_is_still_biased():
+    """The hold used to be seeded by SIGHTING COUNT -- originally at confirm_hits, then at
+    publish_seed_hits. Both are "the first N frames", and on the car those frames are the ones
+    taken at the range the box becomes visible from (~7 m) off the sparsest returns. With a = 0.3
+    the EMA still carries 17% of the initial error at 5 updates, so what got frozen for good was
+    the least-informed number the track would ever hold, and every refinement the approach bought
+    was then thrown away inside the dead-band. The re-opt fits its humps to that number: floor
+    0.35 - 0.12 = 0.23 m of real clearance, under the state machine's 0.25 m static-GB
+    requirement, i.e. TRAILING behind a box the line actually clears.
+
+    The count is gone as the trigger. The hold is taken when the car has PASSED, at the estimate
+    from the closest point of that pass, and nothing freezes before then.
+    """
     first, true = (3.00, 0.0), (3.10, 0.0)         # first sightings biased 0.10 m off
-    out = {}
-    for seed_hits in (5, 15):                      # 5 == confirm_hits, i.e. the old behaviour
-        node = make_node()
-        node.publish_seed_hits = seed_hits
-        for _ in range(node.confirm_hits):
-            node.obstacles_cb(arr(det(first[0], first[1], 10.0)))
-        assert node._tracks[0].confirmed
-        published_xy(node)                          # the publish timer ticks while it is settling
-        for _ in range(40):                         # the estimate converges on the true position
-            node.obstacles_cb(arr(det(true[0], true[1], 10.0)))
-            published_xy(node)
-        out[seed_hits] = published_xy(node)[0]
-    seeded_early, held = out[5], out[15]
-    assert abs(seeded_early[0] - first[0]) < 0.01, (
-        "the harness must reproduce the failure: seeding at confirm_hits freezes the biased "
-        f"estimate, got {seeded_early}")
-    assert abs(held[0] - true[0]) < 0.01, (
-        f"the published position froze at {seeded_early} and never learned the settled estimate "
-        f"{node._tracks[0].x:.3f}: got {held}")
-    # ...and once settled it IS held: further sub-dead-band noise does not move it
     node = make_node()
-    for _ in range(node.publish_seed_hits + 5):
-        node.obstacles_cb(arr(det(true[0], true[1], 10.0)))
-        published_xy(node)
-    settled = published_xy(node)[0]
-    assert abs(settled[0] - true[0]) < 0.01, settled
+    dt_ns = int(1e9 / DET_HZ)
+    t0 = 5_000_000_000
+    k = 0
+    for _ in range(node.confirm_hits):             # biased frames, taken far out
+        node.frenet_cb(odom(10.0 - 7.0))
+        msg = obs_msg(first[0], first[1], 10.0, t0 + k * dt_ns); k += 1
+        for _ in range(REPEATS):
+            node.obstacles_cb(msg)
+            node.publish_cb()
+    assert node._tracks[0].confirmed
+    assert node._tracks[0].pub_x is None, \
+        "the hold was taken while the car was still 7 m away, on the biased frames"
+    for g in (5.0, 4.0, 3.0, 2.0, 1.0, 0.5):       # the estimate converges as the car closes
+        node.frenet_cb(odom(10.0 - g))
+        msg = obs_msg(true[0], true[1], 10.0, t0 + k * dt_ns); k += 1
+        for _ in range(REPEATS):
+            node.obstacles_cb(msg)
+            node.publish_cb()
+    node.frenet_cb(odom(15.0))                     # past it
+    node.publish_cb()
+    held = published_xy(node)[0]
+    assert abs(held[0] - true[0]) < 0.02, (
+        f"held {held}, which is nearer the biased first sightings {first} than the converged "
+        f"estimate {node._tracks[0].x:.3f} the closest pass measured")
+    # ...and once taken it IS held: sub-dead-band noise does not move it
     for _ in range(20):
         node.obstacles_cb(arr(det(true[0] + 0.05, true[1] + 0.03, 10.0)))
-        published_xy(node)
-    assert published_xy(node)[0] == settled, "after settling the dead-band must still hold"
-    print(f"PASS the hold seeds after the estimate settles "
-          f"(early seed {seeded_early} -> held {held}, true {true})")
+        node.publish_cb()
+    assert published_xy(node)[0] == held, "after the pass the dead-band must still hold"
+    print(f"PASS nothing freezes at 7 m; the hold is the closest-approach estimate {held}, "
+          f"true {true}")
 
 
 def test_the_live_estimate_is_published_alongside_the_held_pose():
@@ -305,10 +331,10 @@ def test_the_live_estimate_is_published_alongside_the_held_pose():
     # the same stale number: the safety net could not fire by construction. The live estimate now
     # travels in points[0], which a CYLINDER marker does not use and no existing consumer reads.
     node = make_node()
-    confirm_obstacle(node, x=3.0, y=0.0, s=10.0, settle=True)
-    assert published_xy(node) == [(3.0, 0.0)]             # settled -> the hold is seeded here
+    establish_hold(node, 3.0, 0.0, 10.0)
+    assert published_xy(node) == [(3.0, 0.0)]             # the pass seeded the hold here
     for _ in range(20):
-        node.obstacles_cb(arr(det(3.08, 0.05, 10.0)))     # inside the 0.12 m dead-band
+        node.obstacles_cb(arr(det(3.08, 0.05, 10.0)))     # inside the dead-band
     pub = []
     node.pub = types.SimpleNamespace(publish=lambda a: pub.append(a))
     node.publish_cb()
@@ -368,6 +394,188 @@ def test_raw_detection_suppresses_the_streak_but_a_removed_box_still_unlatches()
         node2.obstacles_cb(arr())
     assert not node2._tracks[0].confirmed, "a detection elsewhere must not suppress the streak"
     print("PASS a raw detection suppresses the streak; a removed box still unlatches")
+
+
+def test_reopt_line_active_suspends_the_streak_even_at_d_zero():
+    """THE BUG. Reopt line active + ego reads d ~ 0 + no detection -> must NOT unlatch.
+
+    /car_state/odom_frenet is computed against /global_waypoints, and on a reopt lap that IS the
+    re-optimized line. The car passes the box half a metre wide while reading d ~ 0, so the
+    ego_d guard -- whose whole job is "do not count a miss while avoiding" -- switches itself
+    off in exactly the lap it is needed. The streak then ran free, demoted the box mid-avoidance,
+    emptied the set, and the clean line came back; next lap the box was re-detected and the whole
+    thing repeated. Observed as reopt/clean laps alternating indefinitely.
+
+    static_reopt_node names the obstacles its ACTIVE line is shaped around on
+    /static_reopt/active_cover; that, not d, is the evidence.
+    """
+    node = make_node()
+    t = confirm_obstacle(node, s=10.0)
+    node.frenet_cb(odom(7.0, d=0.0))                # ON the published line -- but it is the
+    node.reopt_cover_cb(Int32MultiArray(data=[t.marker_id]))   # ...line built for THIS box
+    for _ in range(3 * node.unlatch_clear_msgs):
+        node.obstacles_cb(arr())                    # no detection at all, for three streaks
+    assert node._tracks[0].confirmed, (
+        "the global line is shaped around this box and the car is driving it, but the streak "
+        "ran anyway -- d ~ 0 was read as 'not avoiding'")
+    assert node._tracks[0].clear_streak == 0, "the streak accumulated instead of suspending"
+    print("PASS a box the ACTIVE reopt line covers does not unlatch at d ~ 0")
+
+
+def test_the_suspension_lifts_when_the_clean_line_comes_back():
+    """The suspension must not be a latch of its own: swapping back to clean re-enables removal.
+
+    static_reopt_node publishes an EMPTY active_cover on the clean swap, in the same handler that
+    swaps the line, so this arrives without waiting for anything else.
+    """
+    node = make_node()
+    t = confirm_obstacle(node, s=10.0)
+    node.frenet_cb(odom(7.0, d=0.0))
+    node.reopt_cover_cb(Int32MultiArray(data=[t.marker_id]))
+    for _ in range(node.unlatch_clear_msgs):
+        node.obstacles_cb(arr())
+    assert node._tracks[0].confirmed
+    node.reopt_cover_cb(Int32MultiArray(data=[]))   # swapped back to the CLEAN line
+    for _ in range(node.unlatch_clear_msgs):
+        node.obstacles_cb(arr())
+    assert not node._tracks[0].confirmed, (
+        "with the clean line driving, a box that is really gone must still unlatch")
+    print("PASS the suspension lifts with the clean line, it is not a second latch")
+
+
+def test_only_the_covered_box_is_suspended():
+    """A cover set names ids; a box the line is NOT shaped around must still unlatch normally."""
+    node = make_node()
+    # both boxes confirmed together, so each gets its own marker_id (confirm_obstacle returns
+    # _tracks[0] whichever one you meant, which is why this does not use it)
+    for _ in range(node.confirm_hits):
+        node.obstacles_cb(arr(det(3.0, 0.0, 10.0), det(3.0, 6.0, 16.0)))
+    assert len(node._tracks) == 2 and all(t.confirmed for t in node._tracks), node._tracks
+    covered = min(node._tracks, key=lambda t: t.s)
+    other = max(node._tracks, key=lambda t: t.s)
+    assert covered.marker_id != other.marker_id
+    node.reopt_cover_cb(Int32MultiArray(data=[covered.marker_id]))
+    node.frenet_cb(odom(13.0, d=0.0))               # window over `other`
+    for _ in range(3 * node.unlatch_clear_msgs):
+        node.obstacles_cb(arr())
+    by_id = {t.marker_id: t for t in node._tracks}
+    assert by_id[covered.marker_id].confirmed, "the covered box was unlatched"
+    assert not by_id[other.marker_id].confirmed, (
+        "an uncovered box stopped unlatching -- the suspension is too broad")
+    print("PASS suspension applies per obstacle id, not to the whole set")
+
+
+# ---------------------------------------------------------------------------------------
+# 40 Hz republish of a 10 Hz detection -- the real car's chain
+# ---------------------------------------------------------------------------------------
+
+DET_HZ, PUB_HZ = 10.0, 40.0
+REPEATS = int(PUB_HZ / DET_HZ)          # 4 timer messages carry each detection
+
+
+def obs_msg(x, y, s, stamp_ns, vs=0.0, visible=True, size=0.3):
+    """One /tracking/obstacles message. The stamp is the DETECTION's, which is what the real
+    tracker publishes: multi_tracking stamps every timer message with self.current_stamp, and
+    that only advances when /detect/raw_obstacles delivers a new frame."""
+    m = arr(det(x, y, s, vs=vs, visible=visible, size=size))
+    m.header.stamp.sec = int(stamp_ns // 1_000_000_000)
+    m.header.stamp.nanosec = int(stamp_ns % 1_000_000_000)
+    return m
+
+
+def feed_approach(node, xs, ys, ss, ego_s, t0_ns=1_000_000_000,
+                  det_hz=DET_HZ, pub_hz=PUB_HZ):
+    """Drive `len(xs)` REAL observations through a pub_hz timer, repeating each one.
+
+    Returns the wall-clock seconds consumed, so a test can say what a message count is worth.
+    """
+    reps = int(round(pub_hz / det_hz))
+    dt_ns = int(1e9 / det_hz)
+    for k, (x, y, s) in enumerate(zip(xs, ys, ss)):
+        node.frenet_cb(odom(ego_s[k]))
+        msg = obs_msg(x, y, s, t0_ns + k * dt_ns)
+        for _ in range(reps):           # the timer republishes the SAME detection
+            node.obstacles_cb(msg)
+            node.publish_cb()           # ...and the publish timer runs alongside it
+    return len(xs) / det_hz
+
+
+def test_a_repeated_detection_is_not_new_evidence():
+    """THE BUG. /tracking/obstacles runs on a 40 Hz timer and republishes the same detection four
+    times per real 10 Hz frame. `hits` counted messages, so confirm_hits 5 was 1.25 observations
+    and publish_seed_hits 15 was 3.75 -- the published position froze on under four looks, all of
+    them taken at the range the box was first visible from (~7 m), which is the worst data the
+    track will ever have. The estimate improved as the car closed in and the dead-band threw it
+    away.
+    """
+    node = make_node()
+    # eight REAL observations, ego closing from 7 m to 0.5 m away from a box at s = 10
+    n = 8
+    ego = [10.0 - g for g in (7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.5)]
+    feed_approach(node, [3.0] * n, [0.0] * n, [10.0] * n, ego)
+    t = node._tracks[0]
+    assert t.obs_count == n, (
+        f"counted {t.obs_count} observations from {n} detections repeated "
+        f"{REPEATS}x -- the timer repeats are being counted as evidence")
+    print(f"PASS {n} real detections at {DET_HZ:.0f} Hz republished at {PUB_HZ:.0f} Hz "
+          f"count as {t.obs_count} observations, not {n * REPEATS} hits")
+
+
+def test_the_hold_freezes_on_the_closest_pass_not_the_first_frames():
+    """The published position must be the estimate from the CLOSEST approach, and must not freeze
+    before the car has actually passed the box."""
+    node = make_node()
+    # The measured centre walks IN as the car closes and back OUT as it leaves: the lidar sees a
+    # different face of the box at every range, so the approach is not monotone and "the newest
+    # estimate" is not the best one either. Truth 3.00, best seen at the closest pass.
+    xs  = [3.40, 3.34, 3.26, 3.18, 3.08, 3.01, 3.00, 3.09, 3.20, 3.33]
+    gaps = [7.0,  6.0,  5.0,  4.0,  3.0,  2.0,  1.0, -1.0, -2.5, -4.0]
+    ego = [10.0 - g for g in gaps]
+    feed_approach(node, xs, [0.0] * len(xs), [10.0] * len(xs), ego)
+    node.frenet_cb(odom(30.0))                  # obstacle now well behind
+    node.publish_cb()
+    t = node._tracks[0]
+    assert t.pub_x is not None, "never froze after the pass"
+    truth = 3.00
+    err_hold = abs(t.pub_x - truth)
+    err_live = abs(t.x - truth)          # what freezing "now", at the end, would have kept
+    err_first = abs(xs[3] - truth)       # what the first-N-frames rule reached (~4 observations)
+    # The claim is not "the hold equals the truth" -- it cannot, because the estimate is an EMA
+    # with a = 0.3 and it lags a walking measurement by design. The claim is that freezing on the
+    # closest pass beats BOTH of the things it replaced: the first frames, and whatever the live
+    # estimate happens to be when the timer next looks.
+    assert err_hold < err_first, (
+        f"hold {t.pub_x:.3f} (err {err_hold:.3f}) is no better than the first-frames estimate "
+        f"{xs[3]:.3f} (err {err_first:.3f}) -- the freeze is still range-biased")
+    assert err_hold < err_live, (
+        f"hold {t.pub_x:.3f} (err {err_hold:.3f}) is worse than the live estimate "
+        f"{t.x:.3f} (err {err_live:.3f}) -- freezing bought nothing")
+    assert t.hold_gap is not None and t.hold_gap <= 1.5, (
+        f"hold taken from {t.hold_gap} m; the closest pass was 1.0 m")
+    print(f"PASS hold {t.pub_x:.3f} (err {err_hold:.3f}) from {t.hold_gap:.1f} m beats "
+          f"first-frames {xs[3]:.3f} (err {err_first:.3f}) and live {t.x:.3f} "
+          f"(err {err_live:.3f}); residual is EMA lag, not freeze point")
+
+
+def test_a_closer_later_estimate_beats_the_deadband():
+    """A hold taken far away must be cheap to correct; one taken close must not wobble.
+
+    Same absolute correction, two different holds: the far one republishes, the near one does not.
+    """
+    node = make_node()
+    xs = [3.40] * 6
+    ego_far = [10.0 - g for g in (7.0, 6.8, 6.6, 6.4, 6.2, 6.0)]     # never gets close
+    feed_approach(node, xs, [0.0] * 6, [10.0] * 6, ego_far)
+    node.frenet_cb(odom(30.0))
+    node.publish_cb()
+    far = node._tracks[0]
+    assert far.pub_x is not None
+    far_band = node._deadband_for(far)
+    assert far_band < node.publish_deadband_m, (
+        f"a hold taken {far.hold_gap:.1f} m away got the full {node.publish_deadband_m} m "
+        f"dead-band -- a poor estimate is being defended as hard as a good one")
+    print(f"PASS dead-band scales with the range the hold was taken at "
+          f"({far.hold_gap:.1f} m -> {far_band:.3f} m vs base {node.publish_deadband_m:.2f} m)")
 
 
 def test_window_exit_resets():
@@ -482,12 +690,18 @@ def main():
     try:
         for fn in (test_raw_detection_suppresses_the_streak_but_a_removed_box_still_unlatches,
                    test_publish_position_holds_still_under_estimate_noise,
-                   test_the_hold_seeds_only_once_the_estimate_has_settled,
+                   test_the_hold_is_not_taken_while_the_estimate_is_still_biased,
+                   test_a_repeated_detection_is_not_new_evidence,
+                   test_the_hold_freezes_on_the_closest_pass_not_the_first_frames,
+                   test_a_closer_later_estimate_beats_the_deadband,
                    test_the_live_estimate_is_published_alongside_the_held_pose,
                    test_publish_position_follows_a_real_move_at_once,
                    test_confirm_and_unlatch, test_unlatch_demotes_and_keeps_the_identity,
                    test_demoted_track_decays_at_the_lap_boundary,
                    test_line_swap_suspends_the_streak, test_ego_offline_suspends_streak,
+                   test_reopt_line_active_suspends_the_streak_even_at_d_zero,
+                   test_the_suspension_lifts_when_the_clean_line_comes_back,
+                   test_only_the_covered_box_is_suspended,
                    test_sighting_resets_streak, test_memory_detection_does_not_reset,
                    test_occlusion_suspends, test_window_exit_resets,
                    test_a_track_behind_the_car_never_accumulates_a_clear_streak,

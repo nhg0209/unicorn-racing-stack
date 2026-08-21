@@ -1,0 +1,121 @@
+detect:
+  ros__parameters:
+    rate_detect: 40
+    min_size_n: 5
+    min_size_m: 0.29999999999999999
+    max_size_m: 0.59999999999999998
+    lambda_deg: 10
+    sigma: 0.029999999999999999
+    min_2_points_dist: 0.01
+    new_cluster_threshold_m: 0.40000000000000002
+    max_viewing_distance: 15   # 15->10: 40 m track, 15 m saw obstacles half a lap away (too early).
+    boundaries_inflation: 0.15  # 0.10->0.15: reject wall points nearer the track bound as false obstacles.
+    filter_kernel_size: 7
+    measure: false
+    from_bag: false
+    save_params: false
+tracking:
+  ros__parameters:
+    save_params: false
+    rate_tracking: 40
+    P_vs: 0.2
+    P_d: 0.02
+    P_vd: 0.2
+    measurment_var_s: 0.002
+    measurment_var_d: 0.002
+    measurment_var_vs: 0.2
+    measurment_var_vd: 0.2
+    process_var_vs: 2.0
+    process_var_vd: 8.0
+    max_dist: 0.5
+    var_pub: 1.0
+    aggro_multi: 2.0
+    dist_deletion: 7.0
+    dist_infront: 14.0   # 14->11: forward interest distance; tightens how far ahead a track counts as "in front".
+    # Association diagnostics. OFF, and deliberately absent from save_yaml's key list so the rqt
+    # save button cannot leave it running -- same rule as every other debug stream here.
+    #   ros2 param set /tracking diag_assoc true
+    # Prints one line per NEW track id saying WHY it is new: either the nearest live track was
+    # further than the gate (the jump beat association) or there was no live track left (ttl had
+    # already removed it). Plus a miss-rate table by ego range, to compare against the simulated
+    # detection-loss rate (8.5% at 10 m, 22% at 12 m).
+    diag_assoc: false
+    diag_assoc_throttle_s: 1.0
+    max_std: 0.2
+    min_std: 0.16
+    min_nb_meas: 1
+    # false = keep a tracked STATIC obstacle alive across missed detection frames (memory on).
+    # With true + low ttl_static the obstacle was dropped after 3 missed frames, so /tracking/obstacles
+    # flickered empty and the spline/OVERTAKE commit flickered -> the car crawled up before avoiding.
+    noMemoryMode: true
+    debug_mode: false
+    publish_static: true
+    ratio_to_glob_path: 0.6
+    # DECREMENTED ONCE PER MISSED **DETECTION**, not per timer tick, since the measurement gate
+    # in multi_tracking.update() (2026-08-19). Before that gate the timer consumed the same
+    # detection four times, so these counts ran on the 40 Hz clock; now they run on the ~10 Hz
+    # detection clock and the same number would mean FOUR TIMES the wall-clock grace. 40 was
+    # 1.0 s and would have become 4.0 s -- long enough that a box lifted off the track stays in
+    # /tracking/obstacles for four seconds. Re-derived to keep the wall-clock behaviour that
+    # shipped: 10 missed detections at ~10 Hz = 1.0 s, unchanged.
+    ttl_dynamic: 10
+    # missed DETECTIONS a static obstacle survives (~10 Hz -> 10 = 1.0 s).
+    # raised 3 -> 15 -> 40 (on the old 40 Hz consume clock, i.e. up to 1.0 s): close-range detect gaps on wall-adjacent boxes ran ~0.5 s+, killing
+    # the track; the re-classification delay (staticFlag None -> not on /tracking/obstacles)
+    # then blanked the planner (n=0 flicker, SM never committed OVERTAKE -> car stuck trailing)
+    # AND fed the layer's unlatch streak (spurious UNLATCH -> re-CONFIRM flap). While the track
+    # memory lives, is_visible stays truthful via the observability test, so a physically
+    # removed obstacle still unlatches ~1.5 s after removal (memory decay + clear streak).
+    ttl_static: 10
+    vs_reset: 0.1
+    # position-persistence demotion guard: a CONFIRMED static obstacle reverts to dynamic only when
+    # the measured position stays > demote_disp_m from its mean (or the window speed stays above
+    # demote_speed_mps) for demote_time_s (so single-frame noise can't flip a genuinely static box).
+    # demote_disp_m MUST stay clearly below max_dist (0.5): association uses the SAME
+    # measurement-to-mean distance, so 0.5/0.5 was a DEADLOCK — a moving opponent lost
+    # association (spawning a fresh track) before the demote counter could ever fill,
+    # and the stale track stayed is_static=True forever.
+    demote_disp_m: 0.3
+    demote_time_s: 0.2
+    # window-speed classification: mean speed over the measurement window (net displacement/time).
+    # The position-std vote alone called ANY opponent slower than ~3.7 m/s "static" right after
+    # track birth (std of a mover over the young 0.15 s window is only v*T/sqrt(12)) -> the
+    # static planner splined around the moving car. A track may vote static only below
+    # static_speed_max_mps; above demote_speed_mps the static vote hard-resets / a confirmed
+    # static demotes (sustained for demote_time_s).
+    static_speed_max_mps: 0.4
+    # [m] net displacement a track may show over its measurement window and still vote static,
+    # whatever the window's DURATION. The veto above is a speed, and on a young window
+    # (min_nb_meas / rate ~ 0.15 s) speed is net/0.15 -- so a stationary box whose centroid shifts
+    # 0.06 m as its visible face changes on approach reads 0.4 m/s and is vetoed. Every recreated
+    # track then spent its first frames classified dynamic, the static planner dropped it, and the
+    # state machine fell out of the overtake into TRAILING. An opponent at 2 m/s covers 0.30 m in
+    # the same window, so the veto that keeps a static ghost off a moving car is unaffected.
+    static_net_floor_m: 0.12
+    demote_speed_mps: 0.6
+    # a track whose measurement lies within this radius of an initialized DYNAMIC track is a
+    # spare detection cluster of that car (the box detector splits the opponent into 2 clusters
+    # at times): it may not VOTE static -> no confirmed-static ghost riding the opponent.
+    # Demotion of already-confirmed statics is unaffected, so a real box the opponent passes
+    # close to keeps its static flag.
+    near_dynamic_suppress_m: 0.6
+    # Livox path (no /scan): a spot counts as observable within this range (the MID-360 sees
+    # 360 deg, so range is the limiter). Replaces the old unconditional "visible".
+    livox_max_view_dist: 15.0
+    measure: true
+    from_bag: false
+    # Per-cycle dump of every track on /tracking/diag (see publish_diag), in two arrays:
+    #   dyn   tracks with a live KF: id / dyn_id / raw x[0] / ds / vs / d / P[0][0] / matched /
+    #         staticFlag / nb_meas / ttls. The marker and /tracking/obstacles both publish
+    #         x[0] % track_length, so a state integrating past the track length is invisible in
+    #         them -- this is where to look instead.
+    #   stat  confirmed-static and not-yet-classified tracks, i.e. the ones the STATIC planner
+    #         turns into keep-outs: mean_s / mean_d (the position publishObstacles actually
+    #         publishes for them) / size / vis, so a swerve can be traced to the track that made
+    #         the box and sf+nb+m say whether it was a ghost. Cross-reference mean_d against the
+    #         `obs keep-out d=[lo,hi]` in static_avoidance's own `avoid ...` line (throttled 2 s).
+    # Instrument only:
+    # nothing downstream reads the topic. Live-togglable
+    # (ros2 param set /tracking diag_dynamic true), and deliberately NOT in save_yaml's key list,
+    # so the rqt save button can never leave a debug stream running on race day.
+    diag_dynamic: false

@@ -198,6 +198,26 @@ planner_change:
                                   # position only (pre-P1/P2 behavior), for A/B testing
 
     # --- engage gating (NOT a prediction feature: reads the tracker's measured vs) ---
+    # An overtake target must be MOVING. `is_static` is the tracker's position-persistence
+    # verdict, and it is False on every freshly created track (staticFlag stays None until
+    # min_nb_meas), so "not is_static" also means "just appeared" -- a parked box arrives here as a
+    # dynamic obstacle reading vs~0. The closing gate below cannot catch that: closing = ego - vs is
+    # LARGEST for a stationary object, so a parked box passes it maximally. In sim with no opponent
+    # at all this engaged on static boxes (v_opp=0.0 and 0.2) while the static planner was avoiding
+    # the SAME box the OTHER way; the SM adopted the dynamic path and the reference stepped 1.58 m,
+    # which saturated the steering and put the car in the wall.
+    #
+    # MIRRORS static_avoidance_params.yaml's static_demote_mps / static_demote_sec. Keep
+    # engage_min_vs_mps >= static_near_zero_mps (0.15): below that the static planner treats the
+    # obstacle as static, and if this floor dipped under it BOTH planners would claim the same
+    # obstacle -- which is the crash. The band between them (0.15-0.35 m/s sustained) is owned by
+    # neither and resolves to TRAILING, the designed fallback. check_avoidance_margins.py asserts
+    # the no-overlap direction; it cannot assert the gap away, because closing it would re-admit
+    # the 0.2 m/s reading that engaged on a stationary box.
+    engage_min_vs_mps: 0.35       # |v| (max of |vs|,|vd|) an obstacle must show to be a target
+    engage_moving_s: 0.3          # ...continuously for this long. Sustained, because a parked
+                                  # box's tracked speed brushes past any single-sample threshold.
+
     engage_min_closing_mps: -0.5  # don't ENGAGE on an opponent pulling away faster than this
                                   # (m/s, ego_vs - opp_vs). Set very negative (-3.0) to disable;
                                   # this parameter is its own off-switch.

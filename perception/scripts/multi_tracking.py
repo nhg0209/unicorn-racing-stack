@@ -37,6 +37,7 @@ class Opponent_state:
     """
     This class implements the opponent with a kalman filter
     """
+    meas_dt = 0.025   # [s] interval between CONSUMED measurements; the node re-measures it
     track_length = None
     waypoints = None
     rate = None  # hz
@@ -139,8 +140,11 @@ class Opponent_state:
                           Opponent_state.track_length)
         ds2 = normalize_s(tracked_obstacle.measurments_s[-2] - tracked_obstacle.measurments_s[-3],
                           Opponent_state.track_length)
-        vs = ((2/3 * ds1 * self.rate)
-              + (1/3 * ds2 * self.rate))
+        # /meas_dt, not *rate: rate is the TIMER cadence, and since the measurement gate in
+        # StaticDynamic.update these differences span one DETECTION period.
+        inv_dt = 1.0 / Opponent_state.meas_dt
+        vs = ((2/3 * ds1 * inv_dt)
+              + (1/3 * ds2 * inv_dt))
 
         if not (vs > -1 and vs < 8):
             self.isInitialised = False
@@ -150,7 +154,7 @@ class Opponent_state:
             tracked_obstacle.measurments_s[-1],
             vs,
             tracked_obstacle.measurments_d[-1],
-            (tracked_obstacle.measurments_d[-1] - tracked_obstacle.measurments_d[-2])*self.rate,
+            (tracked_obstacle.measurments_d[-1] - tracked_obstacle.measurments_d[-2])*inv_dt,
         ])
 
         self.dynamic_kf.update(
@@ -193,6 +197,7 @@ class ObstacleSD:
     ttl = None
     min_std = None
     max_std = None
+    static_net_floor = 0.12   # 2026-08-21 B: 순변위 정적-거부 문턱[m]
 
     def __init__(self, id, s_meas, d_meas, lap, size, isVisible):
         """
@@ -252,13 +257,31 @@ class ObstacleSD:
     def std_d(self):
         return np.std(self.measurments_d)
 
+    def _net_disp(self, track_length):
+        # 2026-08-21 B: 측정창 전반부평균 vs 후반부평균 순변위[m]. mover는 크고
+        # 정적 박스 노이즈는 평균 상쇄로 작음 -> std보다 이동 감지에 민감.
+        n = len(self.measurments_s)
+        if n < 2:
+            return 0.0
+        h = max(1, n // 2)
+        s1 = sum(self.measurments_s[:h]) / h
+        s2 = sum(self.measurments_s[-h:]) / h
+        d1 = sum(self.measurments_d[:h]) / h
+        d2 = sum(self.measurments_d[-h:]) / h
+        return math.hypot(normalize_s(s2 - s1, track_length), d2 - d1)
+
     def isStatic(self, track_length):
         # --- get a representative data set for the obstacle ---
         if self.nb_meas > ObstacleSD.min_nb_meas:
             std_s = self.std_s(track_length)
             std_d = self.std_d()
+            # 2026-08-21 B: 순변위 가드 우선 — 창 동안 net_floor 이상 움직였으면
+            # (std 작아도) 정적 투표 무효 -> mover의 static 오분류 차단.
+            net = self._net_disp(track_length)
+            if ObstacleSD.static_net_floor is not None and net > ObstacleSD.static_net_floor:
+                self.static_count = 0
             # --- create a voting system so that the outliers don't affect much the result ---
-            if (std_s < ObstacleSD.min_std and std_d < ObstacleSD.min_std):
+            elif (std_s < ObstacleSD.min_std and std_d < ObstacleSD.min_std):
                 self.static_count = self.static_count + 1
             # --- assert for sure that an obstacle is dynamic and not static ---
             elif (std_s > ObstacleSD.max_std or std_d > ObstacleSD.max_std):
@@ -311,13 +334,25 @@ class StaticDynamic(Node):
         self.scans = None
         self.current_id = 1
         self.converter = None
+        self._wx = None      # cached line geometry; see pathCallback
+        self._wy = None
         self.timer = None
         self.from_bag = self._get_param("from_bag", False)
         self.measuring = self._get_param("measure", False)
 
         # --- Subscribers ---
         self.create_subscription(ObstacleArray, '/detect/raw_obstacles', self.obstacleCallback, 10)
-        self.create_subscription(WpntArray, '/global_waypoints_scaled', self.pathCallback, 10)
+        # GEOMETRY comes from /global_waypoints, SPEEDS from /global_waypoints_scaled.
+        # static_reopt swaps /global_waypoints the instant it commits; sector_tuner only
+        # republishes /global_waypoints_scaled on its 0.5 s timer. Taking the frame from the
+        # scaled copy alone left this node up to half a second behind the planners and the
+        # state machine (which both read /global_waypoints directly), and they warned about
+        # exactly that: obstacle (s,d) arriving ~0.09 m off their frame right after a swap,
+        # which is enough to flip the SM's static GB free-check (lateral_width_static_gb_m
+        # is 0.05 m) into a phantom TRAILING. The scaled copy still owns vx_mps: it carries
+        # the sector scaling that Opponent_state.target_velocity() multiplies.
+        self.create_subscription(WpntArray, '/global_waypoints', self.pathCallback, 10)
+        self.create_subscription(WpntArray, '/global_waypoints_scaled', self.scaledPathCallback, 10)
         self.create_subscription(Odometry, '/car_state/odom_frenet', self.carStateCallback, 10)
         self.create_subscription(Odometry, '/car_state/odom', self.carStateGlobCallback, 10)
         self.create_subscription(LaserScan, '/scan', self.scansCallback, qos_profile_sensor_data)
@@ -334,6 +369,11 @@ class StaticDynamic(Node):
 
         Opponent_state.rate = self.rate
         Opponent_state.dt = 1/self.rate
+        # Interval between CONSUMED measurements. Seeded at the timer period and then measured
+        # from consecutive /detect/raw_obstacles stamps (see update()). The predict step keeps
+        # using dt = 1/rate because it still runs every timer tick; only the measurement-derived
+        # velocities use this.
+        Opponent_state.meas_dt = 1.0 / self.rate
         Opponent_state.P_vs = self._get_param("P_vs")
         Opponent_state.P_d = self._get_param("P_d")
         Opponent_state.P_vd = self._get_param("P_vd")
@@ -345,6 +385,18 @@ class StaticDynamic(Node):
         Opponent_state.process_var_vd = self._get_param("process_var_vd")
 
         self.max_dist = self._get_param("max_dist")
+        # ASSOCIATION DIAGNOSTICS. Off by default and deliberately NOT in save_yaml (same rule as
+        # every other debug stream here): a race day must never start with this printing.
+        #   ros2 param set /tracking diag_assoc true
+        # Answers ONE question, which two different faults both produce. A new track id means
+        # "this detection matched no existing track", and that is either (a) the detection jumped
+        # further than the gate, or (b) there was no track left to match because ttl had already
+        # killed it. Simulating kiss's own bbox algorithm says (a) cannot happen: the
+        # frame-to-frame centre step never reaches max_dist 0.5 even at 14 m, while detections go
+        # MISSING 8.5% of frames at 10 m and 22% at 12 m (min_cluster_cells culls the sparse
+        # cluster). One lap with this on decides it from the log instead of from another bag.
+        self.diag_assoc = bool(self._get_param("diag_assoc", False))
+        self.diag_assoc_throttle_s = float(self._get_param("diag_assoc_throttle_s", 1.0))
         self.var_pub = self._get_param("var_pub")
         self.aggro_multiplier = self._get_param("aggro_multi")
         self.dist_deletion = self._get_param("dist_deletion")
@@ -368,6 +420,7 @@ class StaticDynamic(Node):
         ObstacleSD.min_nb_meas = self.min_nb_meas
         ObstacleSD.min_std = self.min_std
         ObstacleSD.max_std = self.max_std
+        ObstacleSD.static_net_floor = self._get_param("static_net_floor_m")   # 2026-08-21 B
         self.vs_reset = self.vs_reset
 
         # save-back path (ROS1 dynamic_tracker_server wrote both detect + tracking
@@ -487,25 +540,145 @@ class StaticDynamic(Node):
 
     # --- Callbacks ---
 
+    _last_meas_stamp = None      # stamp of the last CONSUMED detection; see update()
+    _diag_seen = None            # range bin -> match OPPORTUNITIES (live track x detection msg)
+    _diag_miss = None            # range bin -> of those, the ones that found no detection
+    _diag_last_t = 0.0
+    _diag_died = ()              # (id, reason, s) removed in the current cycle
+    _diag_live_before = 0
+
     def obstacleCallback(self, data):
         self.meas_obstacles = data.obstacles
         self.current_stamp = data.header.stamp
 
     def pathCallback(self, data):
-        self.waypoints = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in data.wpnts])
-        if self.track_length is None:
-            self.get_logger().info('[Tracking] received global path')
+        """Build the FrenetConverter, and REBUILD it whenever the line's geometry changes.
+
+        The converter used to be built once (`if self.converter is None`) and kept for the whole
+        run. static_reopt swaps /global_waypoints for an obstacle-aware line at runtime, and
+        sector_tuner republishes it here as /global_waypoints_scaled, so from the first swap this
+        node held a frenet frame nobody else was using. Every measurement arriving from the bridge
+        was already expressed in the NEW frame (kiss_obstacle_bridge.path_cb rebuilds on change),
+        this node stored those (s,d) as-is, and publishObstacles reconstructed x_m,y_m from them
+        through the OLD converter -- so the published position of every static obstacle moved by
+        the difference between the two lines, while the detector had not moved at all.
+
+        Measured on bag bias_0818_2322: kiss reported box2 at (1.69,0.19) and box3 at (5.93,1.18)
+        for the whole run, and this node published them at (2.18,0.67) and (6.65,0.99) between
+        t=20 s and t=40 s -- 0.67 m and 0.73 m off, both appearing and clearing at the same
+        instant because it is one frame that moved, not two obstacles. Downstream that read as
+        seven physical boxes where there were four. The state machine's reframe_warn_m warning
+        ("Upstream tracking is not re-projecting on a static_reopt line swap") named this node.
+
+        GEOMETRY, NOT ARRIVAL: sector_tuner republishes on a 0.5 s timer, so reacting to every
+        message would re-project every track twice a second. Same cached-geometry test as
+        kiss_obstacle_bridge.path_cb.
+        """
+        if not data.wpnts:
+            return
+        wx = np.array([w.x_m for w in data.wpnts])
+        wy = np.array([w.y_m for w in data.wpnts])
+        first = self.converter is None
+        changed = (not first) and (wx.shape != self._wx.shape
+                                   or not np.allclose(wx, self._wx)
+                                   or not np.allclose(wy, self._wy))
+        if not first and not changed:
+            return                                  # unchanged geometry -> keep the converter
+        old_conv, old_len = self.converter, self.track_length
+        self.waypoints = np.column_stack((wx, wy))
+        self._wx, self._wy = wx, wy
+        self.track_length = data.wpnts[-1].s_m      # a hump changes the arc length too
+        Opponent_state.track_length = self.track_length
+        # vx_mps belongs to the SCALED copy; seed from here only until it has arrived, so a
+        # run never starts with target_velocity() indexing None.
+        if self.globalpath is None:
             self.globalpath = data.wpnts
-            self.track_length = data.wpnts[-1].s_m
-            Opponent_state.track_length = self.track_length
             Opponent_state.waypoints = self.globalpath
-        # Lazy converter init + timer start (replaces ROS1 blocking waits in
-        # __init__ / main). Done once, after the first path is available.
-        if self.converter is None:
-            self.converter = self.initialize_converter()
+        if first:
+            self.get_logger().info('[Tracking] received global path')
+        self.converter = self.initialize_converter()
+        if changed:
+            self._reproject_tracks(old_conv, old_len)
         if self.timer is None and self.converter is not None:
             self.get_logger().info('[Opponent Tracking]: Ready!')
             self.timer = self.create_timer(1.0 / self.rate, self.timer_callback)
+
+    def scaledPathCallback(self, data):
+        """Speed source only: keep vx_mps (sector-scaled) for Opponent_state.target_velocity().
+
+        The frenet FRAME is rebuilt in pathCallback off /global_waypoints, which arrives the
+        moment static_reopt swaps. This callback must not rebuild the converter or re-project:
+        sector_tuner republishes on a 0.5 s timer, and reacting to arrival rather than to a
+        geometry change would re-project every track twice a second for nothing.
+
+        track_length is taken here too, and deliberately: it is the same line, so the two
+        agree, and leaving it to the geometry callback alone would let a scaled copy from
+        BEFORE a swap sit beside a post-swap arc length.
+        """
+        if not data.wpnts:
+            return
+        self.globalpath = data.wpnts
+        Opponent_state.waypoints = self.globalpath
+        Opponent_state.track_length = data.wpnts[-1].s_m
+
+    def _reproject_tracks(self, old_conv, old_len):
+        """Carry every track's stored frenet state across a line swap, POINT BY POINT.
+
+        map (x,y) is the frame-independent quantity, so each stored (s,d) is restored to map
+        through the OLD converter and re-measured through the NEW one. That is the same shape as
+        static_obstacle_layer.glb_cb (nearest waypoint per track) and state_machine
+        ._reframe_obstacles (get_frenet per obstacle), and it is done per point rather than as one
+        offset ON PURPOSE: a re-optimized line is reshaped LOCALLY, around the obstacles, so the
+        difference between the two frames is a function of s. A single ds/dd taken at the track's
+        centre would be right there and wrong at the ends of its own measurement history.
+
+        IDEMPOTENT, and safe on the frame where this node and the bridge disagree. Re-projecting
+        an already-correct (s,d) is a round trip through map and returns it unchanged (to
+        converter precision), so the one message that may arrive in the new frame before this runs
+        costs at most that message's own position, not the track.
+
+        KF: the position components (x[0]=s, x[2]=d) are re-projected the same way. The VELOCITY
+        components are left alone -- a local hump rotates the tangent by a few degrees at most,
+        and rotating vs/vd by an angle this function does not measure would be inventing precision.
+        P is not transformed either, but its two POSITION variances are inflated by the square of
+        the distance the state just moved, so the filter treats a coordinate change it did not
+        predict as the uncertainty it is instead of as a measurement disagreement. Static tracks do
+        not publish from the KF at all, so this only affects opponents.
+        """
+        if old_conv is None or old_len is None or not self.tracked_obstacles:
+            return
+
+        def to_new(s, d):
+            x, y = old_conv.get_cartesian(s % old_len, d)
+            fr = self.converter.get_frenet(np.array([float(x)]), np.array([float(y)]))
+            return float(fr[0, 0]) % self.track_length, float(fr[1, 0])
+
+        worst = 0.0
+        for t in self.tracked_obstacles:
+            try:
+                for i in range(len(t.measurments_s)):
+                    t.measurments_s[i], t.measurments_d[i] = to_new(t.measurments_s[i],
+                                                                   t.measurments_d[i])
+                if getattr(t, "mean", None) is not None:
+                    s_new, d_new = to_new(t.mean[0], t.mean[1])
+                    worst = max(worst, math.hypot(normalize_s(s_new - t.mean[0],
+                                                              self.track_length),
+                                                  d_new - t.mean[1]))
+                    t.mean = [s_new, d_new]
+                ds = getattr(t, "dynamic_state", None)
+                if ds is not None and getattr(ds, "isInitialised", False):
+                    kf = ds.dynamic_kf
+                    s_new, d_new = to_new(kf.x[0], kf.x[2])
+                    moved = math.hypot(normalize_s(s_new - kf.x[0], self.track_length),
+                                       d_new - kf.x[2])
+                    kf.x[0], kf.x[2] = s_new, d_new
+                    kf.P[0][0] += moved ** 2
+                    kf.P[2][2] += moved ** 2
+            except Exception as e:                  # a bad track must not take the callback down
+                self.get_logger().warn(f"[Tracking] re-projection failed for one track: {e}")
+        self.get_logger().info(
+            f"[Tracking] global line changed -> re-projected {len(self.tracked_obstacles)} "
+            f"track(s) into the new frenet frame (worst move {worst:.3f} m)")
 
     def initialize_converter(self):
         """
@@ -619,9 +792,10 @@ class StaticDynamic(Node):
                          self.track_length)
         tracked_obstacle.dynamic_state.dynamic_kf.x = np.array([
             tracked_obstacle.measurments_s[-1],
-            ds*Opponent_state.rate,
+            ds/Opponent_state.meas_dt,
             tracked_obstacle.measurments_d[-1],
-            (tracked_obstacle.measurments_d[-1]-tracked_obstacle.measurments_d[-2])*Opponent_state.rate
+            (tracked_obstacle.measurments_d[-1]-tracked_obstacle.measurments_d[-2])
+            / Opponent_state.meas_dt
         ])
         tracked_obstacle.dynamic_state.isInitialised = True
         tracked_obstacle.dynamic_state.id = tracked_obstacle.id
@@ -636,6 +810,86 @@ class StaticDynamic(Node):
             self.track_length)
 
         return 0 < obj_dist_in_front < self.dist_infront
+
+    # ------------------------------------------------------------------ association diagnostics
+    _DIAG_BINS = (0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 15.0, 1e9)
+
+    def _diag_bin_of(self, gap):
+        for i in range(len(self._DIAG_BINS) - 1):
+            if self._DIAG_BINS[i] <= gap < self._DIAG_BINS[i + 1]:
+                return i
+        return len(self._DIAG_BINS) - 2
+
+    def _diag_bin(self, tracked_obstacle, car_s, matched):
+        """One match OPPORTUNITY: a live track, on a detection message, at some ego range.
+
+        miss/seen per range bin is directly comparable to the simulated detection-loss rate
+        (8.5% at 10 m, 22% at 12 m). If the real numbers land there, the new ids are missing
+        DETECTIONS and the association gate is not the fault.
+        """
+        try:
+            gap = (tracked_obstacle.measurments_s[-1] - car_s) % self.track_length
+        except Exception:
+            return
+        b = self._diag_bin_of(gap)
+        self._diag_seen[b] = self._diag_seen.get(b, 0) + 1
+        if not matched:
+            self._diag_miss[b] = self._diag_miss.get(b, 0) + 1
+
+    def _diag_new_track(self, meas_obstacle, car_s):
+        """Why did this detection start a NEW track? One line, one verdict.
+
+            "nearest track 0.62 m > gate 0.50"       -> (a) the jump beat the gate
+            "no live tracks (last died: id=N, ttl)"  -> (b) nothing left to match
+        """
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self._diag_last_t < self.diag_assoc_throttle_s:
+            return
+        self._diag_last_t = now
+        try:
+            gap = (meas_obstacle.s_center - car_s) % self.track_length
+            best_d, best_id, best_gate = None, None, None
+            for t in self.tracked_obstacles:
+                pos = ([t.dynamic_state.dynamic_kf.x[0] % self.track_length,
+                        t.dynamic_state.dynamic_kf.x[2]]
+                       if t.staticFlag is False else [t.mean[0], t.mean[1]])
+                # the SAME gate verify_position would have used: aggro_multi is a MULTIPLIER
+                gate = self.max_dist * (self.aggro_multiplier if t.staticFlag is False else 1.0)
+                dd = math.hypot(normalize_s(pos[0] - meas_obstacle.s_center, self.track_length),
+                                pos[1] - meas_obstacle.d_center)
+                if best_d is None or dd < best_d:
+                    best_d, best_id, best_gate = dd, t.id, gate
+            died = ", ".join(f"id={i}({r})" for i, r, _ in self._diag_died) or "none"
+            if best_d is None:
+                verdict = f"no live tracks (died this cycle: {died})"
+            elif best_d > best_gate:
+                verdict = f"nearest track id={best_id} {best_d:.2f} m > gate {best_gate:.2f}"
+            else:
+                verdict = (f"nearest track id={best_id} {best_d:.2f} m <= gate {best_gate:.2f} "
+                           f"(taken by another detection this cycle)")
+            miss = ""
+            b = self._diag_bin_of(gap)
+            seen_b = self._diag_seen.get(b, 0)
+            if seen_b:
+                miss = (f" | bin [{self._DIAG_BINS[b]:.0f},{self._DIAG_BINS[b+1]:.0f}) miss "
+                        f"{self._diag_miss.get(b, 0)}/{seen_b} "
+                        f"= {self._diag_miss.get(b, 0) / seen_b * 100:.0f}%")
+            self.get_logger().info(
+                f"[assoc] NEW id={self.current_id} gap={gap:.1f} m | live={self._diag_live_before}"
+                f" | {verdict} | died={died}{miss}")
+        except Exception as e:                      # a diagnostic must never break tracking
+            self.get_logger().debug(f"[assoc] diag failed: {e}")
+
+    def diag_assoc_report(self):
+        """The miss table, for comparing against the simulated detection-loss rate."""
+        if not self.diag_assoc or not self._diag_seen:
+            return
+        rows = []
+        for b in sorted(self._diag_seen):
+            seen, miss = self._diag_seen[b], self._diag_miss.get(b, 0)
+            rows.append(f"[{self._DIAG_BINS[b]:.0f},{self._DIAG_BINS[b+1]:.0f}) "
+                        f"{miss}/{seen}={miss / seen * 100:.0f}%")
+        self.get_logger().info("[assoc] miss by ego range: " + "  ".join(rows))
 
     def calc_distance_obs_car(self, tracked_obstacle, car_s):
         distance_obs_car = (tracked_obstacle.measurments_s[-1] - car_s) % self.track_length
@@ -692,7 +946,55 @@ class StaticDynamic(Node):
 
     # --- update tracked obstacles, add new obstacles and remove unecessary ---
     def update(self):
+        """Consume the measurement ONCE per detection, not once per timer tick.
+
+        obstacleCallback overwrites self.meas_obstacles at the DETECTION rate (Livox -> kiss ->
+        bridge, ~10 Hz on the car). This method ran at rate_tracking (40 Hz) and only ever emptied
+        its own local copy, so the same detection was consumed four times: four appends to
+        measurments_s, four nb_meas, four isStatic votes, four KF updates and four ttl refreshes
+        for one look at the world.
+
+        MEASURED (perception/scripts/test_meas_cadence.py): one second of a stationary box left 30
+        entries in measurments_s with ONE distinct value and nb_meas = 40 for 10 real detections.
+
+        WHAT IT BROKE. Every sample-count in this file silently meant a quarter of what it reads:
+        the 20-30 sample classification window was 0.5-0.75 s instead of 2-3 s, and min_nb_meas 3
+        was 0.075 s -- ONE real observation. Solving the static test std < min_std for speed gives
+        v < 0.554/T, so a 0.72 s window called anything under 0.77 m/s static. Combined with the
+        first verdict landing after one observation, EVERY new track was born static: measured at
+        0.3 through 2.0 m/s, the first verdict was `True` at every speed, flipping to dynamic only
+        0.2-1.0 s later. A moving opponent published as static drops out of
+        change_avoidance_node's `not o.is_static` filter and is handed to static avoidance as a
+        fixed box; when the vote flips back the SM re-enters TRAILING. That alternation is the
+        hesitate-then-accelerate-into-it this gate removes.
+
+        The timer still runs at rate_tracking: opponents_predict() (time propagation) and the
+        publishers are outside this method and are unaffected. Only measurement CONSUMPTION is
+        moved onto the measurement clock.
+        """
+        stamp_key = ((self.current_stamp.sec, self.current_stamp.nanosec)
+                     if self.current_stamp is not None else None)
+        if stamp_key is not None and stamp_key == self._last_meas_stamp:
+            return                      # no new detection since the last consume
+        if stamp_key is not None:
+            if self._last_meas_stamp is not None:
+                dt = ((stamp_key[0] - self._last_meas_stamp[0])
+                      + (stamp_key[1] - self._last_meas_stamp[1]) * 1e-9)
+                # MEASURED interval, not 1/rate_tracking. Three velocity estimates below divide a
+                # difference of consecutive measurements by it; with the duplicate consumption
+                # gone that interval is the DETECTION period (~0.1 s), and keeping 1/40 there
+                # would report every opponent at four times its speed.
+                if 1e-3 < dt < 1.0:
+                    a = 0.3
+                    Opponent_state.meas_dt = (1 - a) * Opponent_state.meas_dt + a * dt
+            self._last_meas_stamp = stamp_key
         meas_obstacles_copy = self.meas_obstacles.copy()
+        if self.diag_assoc:
+            if self._diag_seen is None:
+                self._diag_seen, self._diag_miss = {}, {}
+            self._diag_died = []
+            self._diag_live_before = len(self.tracked_obstacles)
+            self._diag_meas_before = list(self.meas_obstacles)
         car_s_copy = self.car_s
         car_position_copy = np.copy(self.car_position)
         car_orientation_copy = np.copy(self.car_orientation)
@@ -727,14 +1029,22 @@ class StaticDynamic(Node):
                     self.tracked_obstacles.insert(num_dyn_obs, tracked_obstacle)
                     num_dyn_obs += 1
 
+                if self.diag_assoc:
+                    self._diag_bin(tracked_obstacle, car_s_copy, matched=True)
                 meas_obstacles_copy.remove(meas_obstacle)
 
             else:
+                if self.diag_assoc:
+                    self._diag_bin(tracked_obstacle, car_s_copy, matched=False)
                 # --- remove obstacle with dead ttl ---
                 if tracked_obstacle.ttl <= 0:
                     if(tracked_obstacle.staticFlag == False):
                         tracked_obstacle.dynamic_state.useTargetVel = True
                     removal_list.append(tracked_obstacle)
+                    if self.diag_assoc:
+                        # kept for the creation log below: "was there anything left to match?"
+                        self._diag_died.append((tracked_obstacle.id, "ttl",
+                                                float(tracked_obstacle.measurments_s[-1])))
                 elif tracked_obstacle.staticFlag is None:
                     tracked_obstacle.ttl -= 1
                 else:
@@ -773,6 +1083,8 @@ class StaticDynamic(Node):
             self.tracked_obstacles.remove(el)
 
         for meas_obstacle in meas_obstacles_copy:
+            if self.diag_assoc:
+                self._diag_new_track(meas_obstacle, car_s_copy)
             # update the init function and append a new obstacle to the new_obstacles
             self.tracked_obstacles.append(ObstacleSD(
                 id=self.current_id,
@@ -947,6 +1259,8 @@ class StaticDynamic(Node):
             self.latency_pub.publish(msg)
         self.publishObstacles()
         self.publish_Marker()
+        if self.diag_assoc:
+            self.diag_assoc_report()
 
 
 def main(args=None):

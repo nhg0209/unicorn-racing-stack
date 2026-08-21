@@ -88,4 +88,10 @@
   <node pkg="nonlinear_mpc_acados" exec="wall_alarm" name="wall_alarm" output="screen">
     <param name="wpnt_topic" value="/centerline_waypoints"/>
   </node>
+  <arg name="frenet_grid" default="true"/>
+  <executable if="$(var frenet_grid)" output="screen"
+      cmd="python3 $(env HOME)/unicorn_ws/src/unicorn-racing-stack/stack_master/scripts/frenet_grid.py"/>
+  <arg name="obs_viz" default="true"/>
+  <executable if="$(var obs_viz)" output="screen"
+      cmd="python3 $(env HOME)/unicorn_ws/src/unicorn-racing-stack/stack_master/scripts/obs_viz.py"/>
 </launch>

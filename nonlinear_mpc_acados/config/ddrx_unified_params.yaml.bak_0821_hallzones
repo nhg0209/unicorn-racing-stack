@@ -1,0 +1,280 @@
+# ROS2 parameter file — IFAC MPC node.
+# Original ROS1 layout (`converter:`, `home_dir:`, etc.) translated to the
+# `<node_name>: ros__parameters:` structure rclpy expects. Values are the
+# F-track defaults from unicorn-racing-stack/evo_mpcc/params/ddrx_unified_params.yaml.
+
+# ═══════════════ 실제 튜닝 노브 인덱스 (2026-07-09 정리) ═══════════════
+# 이 파일의 파라미터 대부분은 레거시/미사용. 실제로 거동을 바꾸는 건 아래뿐:
+#  [속도]  progress_reward_gamma(5.0, codegen)  q_p_scale_live(6.5)  q_dv_scale_live(0.15)
+#          speed_cmd_gain(1.0=off, 가속오차증폭)  accel_preview_s(1.0)  max_speed_p / speed_target
+#  [코너]  q_v_scale_live(2.0)  dyn_mu(0.70, codegen)  brake_anticip_a(7.0=지터필터)
+#  [라인]  q_cte_scale_live  R_car_live  track_source
+#  [회피]  R_safe_live(0.40)  commit_dist_live(8)  obstacle_hold_s(0.3)
+#  [안정]  q_drate_scale_live  slew_up/down_rate  cost_spike_thr_live
+#  유령(무효): a_lat_safe_live>6.52는 clamp / (mpc_v_track·vp_project는 삭제됨)
+#  codegen 값 바꾸면: rm -rf /tmp/acados_codegen_evompcc* 후 relaunch
+# ══════════════════════════════════════════════════════════════════════
+mpc_node:
+  ros__parameters:
+    # Backend: 'acados' (SQP_RTI+HPIPM, ~1-5ms) or 'ipopt' (CasADi NLP, ~20-70ms)
+    mpc_backend: acados
+
+    # Topics — match unicorn race_stack convention
+    odom_topic_name: /car_state/odom
+    localized_pose_topic_name: /car_state/pose
+    goal_topic_name: /move_base_simple/goal
+    cmd_vel_topic_name: /vesc/high_level/ackermann_cmd   # car stack simple_mux input (matches PP controller)
+
+    # Track loader
+    track_name: f                  # → share/tracks/trackf/track f_*.csv
+    track_dir: ""                  # empty = use installed share/tracks/
+    vel_scale: 0.8   # 0821 사용자 지시: 전체 속도 0.8배 (bldg_0821 신맵 보수 시작)                  # multiply ref_v from CSV col 3
+    inflation_factor: 0.0          # 1.2→0.0 (2026-05-26): random track width 2m 에서 1.2 가 boundary 0.96m 안으로 줄여서 effective half = 0.04m → RViz 상 boundary 거의 centerline. 0.0 = raw boundary.
+    extend_part: 2                 # loop overlap (extend_part=2 → +50%)
+
+    # MPC sizing / vehicle limits
+    vehicle_L: 0.307               # F1TENTH (unicorn FIESTA1) wheelbase
+    # Conservative IFAC-demo baseline. event_stuck CSV 에서 차가 outside
+    # over-shoot 후 reverse stuck → 박히기 전에 막아야. 6 → 4 (코너 과속 ↓).
+    # 2026-07-30: 4.0 → 6.0. 7/21 브링업 때 "라인검증 후 5,6 점증" 으로 계획된 값.
+    #   검증 근거(bag 17_58_27): localization 수정 후 위치점프 10cm+ 0회(이전 175회),
+    #   라인편차 평균 0.298 m, 조향포화 1.2%(이전 15.6%), 랩 10.42~11.11s 안정.
+    #   직선(s28-36)에서 ref_v 가 4.00 = v_max 로 눌려 있었다 → 여기서만 이득이 난다.
+    #   코너는 ref_v=√(a_lat/κ)≈2.0~2.4 라 v_max 와 무관(steering-limited).
+    # ⚠ 실차 안전값이다. 이상하면 즉시 4.0 으로. 백업 /tmp/ddrx_pre_maxspeed.bak
+    max_speed: 10.0   # 0812: 3.0(미끼 캡) 복원 — 직선 흔들림 원인 의심(speed_target 7.5 가 캡 3.0 을 계속 밀어붙임). 사다리 원안 4-6-8-10
+    max_speed_p: 10.0   # 2026-07-08 B1: p_v 천장 확보 (8->10, gamma가 밀 여유)
+    actuation_latency_s: 0.08    # 0810 2차: 0.04→0.08 (코너 과회전 잔존 — 헤어핀 스윙). 0.04는 시케인 산포 0.227→0.081 개선 확인. 실측 지연 120ms. 이전 0.0
+    # R3 decouple test: hard cap=8 (above) but progress target + κ-window stay at
+    # the proven 6-regime → cap↑ should be harmless (unlike old coupled max=8).
+    speed_target: 7.5   # 0807 신맵: 심과 통일 (codegen 구움). 이전 8.0
+    progress_reward_gamma: 5.0   # 2026-07-09 2차: 1.0은 무효(이동 +0.125). 5.0=+0.6m/s 이동. 다음 8
+    lookahead_m: 2.0
+    brake_anticip_a: 5.0   # 0821: 실측 달성제동 −5.0~−5.7 정합 (6.0 은 V진입 과속 유발이었음)
+    accel_preview_s: 1.0   # 2026-07-09 가속실험: 0.7->1.0 (실측 지속가속 2.0 — VESC 더 몰아붙임. duty 3x 여유)
+    speed_cmd_gain: 1.2   # 0730 맥과 동일 (맥 검증값: 실가속 1.58->2.17, 랩 9.44)
+    # 국소 corridor 하드닝 (스텁 s≈21.6): 존 안 slack 벌금 x10 — soft 뚫림 대응 (2026-07-09)
+    corridor_hard_s0: 19.5
+    corridor_hard_s1: 25.5   # 23.0은 풍선효과(존 끝나자마자 s23-25 벽 0.000) — 코너 탈출까지 연장
+    corridor_hard_factor: 1.0   # 0731 맥 재현: 맥(ros2_ws/IFAC2026)은 존 0개로 운영 — 랩편차 0.01s, |d| 0.174
+    corridor_hard_qcte_factor: 1.0   # 0819 맥이식: 존별 q_cte 배율 신설. 1.0=이 존은 q_cte 안 건드림
+    straight_qv_factor: 2.0   # 2026-07-16 직선 전용 q_v 부스트(|κ|<thr 스테이지만 ×factor). 진단: 고속존 ref-cmd +1.79/cmd-act -0.02 → 명령이 ref 못 쫓음(코너 타협 q_v). 1.0=off
+    straight_kappa_thr: 0.06  # 직선 판정 곡률 문턱 [1/m] (코너캡 abs_kappa_lut 공유)
+    brake_anticip_d_min: 1.0  # 2026-07-16 anticip 캡 근거리(d<1m) 제외 — 직선 가속목줄 해제(plan6.9→cmd5.8 손실 복구). 0=기존
+    speed_cmd_err_max: 0.0  # 2026-07-21 NUC: off로 시작 (VESC 명령체인 실측 후 재튜닝). Mac값=2.2 → 원주석: 직선 서징 수정: cmd<=실속+1.5 (지터필터+erpm캡 슬래밍 방지, VESC 구동력은 유지). 0=off
+    brake_preview_s: 0.4   # 2026-07-16 min-guard 창만 짧게 — 직선 후반 조기제동 해소 (가속 preview 1.0 유지, 원거리 제동은 anticip 담당). 0=기존
+    slew_up_rate: 5.0   # 2026-07-16 명령 톱니 필터 (실가속 ~3 이라 무손실). 기본 8
+    corridor_hard2_s0: 20.0   # 0821 완만스윕 현긋기 방지 (실차 스샷 Max d 0.50)
+    corridor_hard2_s1: 27.5
+    corridor_hard2_factor: 2.0   # 0821 접촉 보강
+    corridor_hard2_qcte_factor: 2.5   # 0821 강화 (심 동일 처방)
+    corridor_hard3_s0: 4.3   # 0821 존C: s4.7~6.2 STUCK (심 6회→0 검증)
+    corridor_hard3_s1: 6.8
+    corridor_hard3_factor: 2.5   # 0821 존C on
+    corridor_hard3_qcte_factor: 1.0   # 0819 맥이식: 존별 q_cte 배율 신설. 1.0=이 존은 q_cte 안 건드림
+    corridor_hard4_s0: 35.5   # 0821 존B: 하단 돌출부 실벽 0.158 (심 리허설)
+    corridor_hard4_s1: 37.5   # 0821 (0820 시절 14~19.5)
+    corridor_hard4_factor: 4.0   # 0819 맥추종: 맥 bldg_0819 존4 slack 활성 (이전 1.0)   # 0731 맥 재현: 맥(ros2_ws/IFAC2026)은 존 0개로 운영 — 랩편차 0.01s, |d| 0.174
+    corridor_hard4_qcte_factor: 1.0   # 0821: bldg V용 qcte 존 해제
+    # 2026-06-11 조향 정직화: sim plant s_max=0.4189 (sim_params.yaml) 인데 0.45
+    # 로 계획 → 풀락 헤어핀에서 유령 조향 8% (계획 R 0.68m vs 실제 0.74m) = wide.
+    # plant 한계와 일치시킴. 실차는 VESC servo 매핑상 ±한계가 [-0.396, +0.428]
+    # (gain -1.2135, offset 0.52, servo 0..1) → 실차 배포 시 0.39 권장.
+    mpc_max_steering: 0.50   # 2026-07-03 실측: δ_cmd>0.40 응답 평탄(δ_eff~0.36 엔드스톱, 그립한계 이하) — 초과명령=서보 갈림(끼익)
+    # Cold-start / low-speed conditioning (2026-05-29, MPPI init_vel 기법).
+    # cold_start_vx_floor: solver 에 넘기는 x0 의 vx 하한 (dynamic 저속 ill-cond
+    #   회피 → 저속 steer chatter 제거 + 정지 출발). 0 = 비활성 (기존 PP-start 동작).
+    # startup_speed: 실측 vx 가 floor 미만일 때 출력 speed 하한 (forward push).
+    # 이 둘로 기존 3초 PP warmup ramp 대체 → t=0 부터 MPCC 조향.
+    cold_start_vx_floor: 2.0
+    startup_speed: 3.0
+    dT: 0.04                       # 0.025→0.04 (25Hz control rate). multi-dt 와 결합 — 첫 step.
+    N_horizon: 40                         # N20=18.4s best. N25/N50 시도(2026-06-08)는 N20-weight라 더 느림(22~25s)·stuck 이동 → 원복. horizon 늘리려면 N에 맞춰 재튜닝(BO) 필요.
+    # time_steps_mode: 'uniform' (모든 step dt=dT) 또는 'pyramidal' (multi-dt: 가까이 sharp + 멀리 long planning).
+    # pyramidal: dt = [dT]*20 + [dT*1.5]*30 + [dT*2.5]*30
+    #   = [0.04]*20 + [0.06]*30 + [0.10]*30 → 0.8 + 1.8 + 3.0 = 5.6s horizon
+    #   v=4: 22m, v=7: 39m — 다음 코너 + α 보임 → outside-inside-outside racing line 학습.
+    # solve_ms 영향 거의 없음 (N=80 그대로). codegen 처음 한 번 ~30s.
+    integration_mode: Euler
+
+    # MPC weights file (BO_params_LTM.json bundled in share/config/mpc/)
+    params_file: BO_params_LTM
+
+    # Reference path source for mpc:
+    #   centerline → /centerline_waypoints (트랙 한가운데, racing line 거동
+    #                위해 D_apex bias 필요. PP-like 느낌)
+    #   raceline   → /global_waypoints (IQP 사전 최적화된 racing line.
+    #                코너에서 자연스럽게 apex 통과, vx_mps 점별 가속/감속.
+    #                D_apex 는 0 권장 — raceline 자체가 이미 apex 통과)
+    track_source: raceline   # MPCC corridor reference (B-mode가 corridor 내 racing line 자유결정). raceline 모드는 구조적 wedge(미해결).
+
+    # auto_tune=true 이면 max_speed 한 변수만 사용자가 설정하고, 나머지
+    # q_lag / q_cte / max_speed_p / alpha_steer / corridor / D_apex /
+    # cost_spike_thr 는 _auto_tune_from_max_speed() 의 heuristic 매핑으로
+    # 자동 결정. 매핑 공식은 mpc_node.py 의 docstring 참고.
+    # 빠르게 튜닝하려면 true, 수동 정밀 튜닝 원하면 false.
+
+    # C: MLP weight scaler. use_ml_scale=true 면 _adaptive_weight_update()
+    # 가 B heuristic 대신 NN 추론 사용. 학습된 .pt 없으면 자동 B 폴백.
+    # 학습: python3 -m nonlinear_mpc_acados.ml.train --epochs 200
+    # ml_model_path "" → 기본 위치 (ml/saved/weight_scaler.pt) 사용.
+
+    # ── Dynamic Pacejka 모드 ──
+    # dynamic=True: 8-state, tire slip 모델링 (정확, 느림)
+    # dyn_tire_model: 'linear' / 'tanh' / 'pacejka'
+    #   linear: F_y = C_α · α (slip 작을 때만 정확)
+    #   tanh  : 2026-05-27 review #9. lat_g=24 m/s² 영역에서 linear 한계 → tanh 권장.
+    #           코너 진입 시 tire saturation 모델링.
+    use_dynamic: true
+    # nlp_solver_iters: 1 → SQP_RTI (실시간 안정, 기본). >1 → SQP(max_iter cap)+
+    # MERIT_BACKTRACKING globalization. 1-iter RTI 가 저속 dual-active-set 함정에서
+    # 못 빠져나오는 문제 탈출용. A/B: 1 vs 2 (sim 에서만 검증 후 차 적용).
+    nlp_solver_iters: 1
+    dyn_tire_model: tanh
+    # 모델 타이어 μ — sim_params.yaml mu(또는 실차 노면)와 일치시킬 것 (2026-06-10 그립 정직화)
+    # 2026-07-30 재측정 (bag 17_18_41, 수동 정상원 선회 + 스핀까지): 가속도계 기준
+    #   좌선회 μ 0.78 / 우선회 μ 0.68 / 전체 p99 0.77, 종방향 μ_x 0.82~0.84.
+    #   조건 양호 — 정지 시 |a| 9.72(중력 9.81 대비 1%), 자이로 바이어스 -0.002,
+    #   VESC/Livox 두 IMU 독립 일치, 요구 대비 실제 선회율 0.39 = 실제로 한계 초과.
+    #   (자이로 v·ω 기반 μ 1.74 는 무효 — 스핀 4.1% 구간에서 휠속도가 부풀림)
+    # ⚠ 0.70 → 0.75 는 2026-07-02 에 한 번 시도했다 되돌린 값이다. 아래 원 주석 참조:
+    #   "0.75 시도했으나 U커브 조향포화 악화(랩 +0.7s)로 0.70 확정. 코너는
+    #    grip-limited 가 아니라 steering-limited". 랩타임/조향포화를 반드시 재확인할 것.
+    dyn_mu: 0.55   # 0821 hall 끌기실측: 6lb/4.83kg → μ_s 0.563 상한, 마진 포함 0.55 (이전 0.75 bldg 실측)
+    # (원 주석) 2026-07-02 실차 friction-circle 실측: 지속 μ_y 0.65~0.75, 순간피크 0.85~0.97 (bag 14_58_38)
+    # friction ellipse headroom η (a_lim = μ·g·η). 1.0=물리한계 꽉 채움.
+    ellipse_frac: 0.95
+    # acados LM regularization for dynamic model (QP conditioning / prediction
+    # consistency). 1.0 = previous default. Higher → fewer QP_Failure/MINSTEP.
+    lm_dynamic: 3.0
+
+    # Phase D — GP residual learning (offline-trained sparse GP).
+    # use_gp_residual=true → setup_MPC 후 ResidualLearningMPC 로 wrap.
+    # gp_ckpt_path 비우면 ~/bo_results/gp_residual.pt 자동.
+    # 첫 launch 추가 codegen ~30s. import error / 파일 없으면 plain acados fallback.
+
+    # Phase D (closed-form CasADi GP) — INDEPENDENT of use_gp_residual.
+    # use_gp_casadi=true → bakes the trained GP posterior mean as a pure
+    use_gp_casadi: false   # 0819 맥추종: ckpt 의 vy/r 입력채널 붕괴(X_std=1e-6) → GP 가 상수잔차 [+0.0143,-0.0523,-0.6119] 만 출력(요가속에 -0.61 상시 편향). 맥도 launch gp:=false 로 OFF. (이전 true)   # 2026-08-10 NUC ON: nuc14 주행 4-bag(캘리브 0.568+지연0.08 이후) 12,621샘플 재학습.
+                          # 홀드아웃(20:07 bag) d_vy/d_r 설명률 93%. npz 캐시 동봉이라 torch 불필요.
+                          # (이전 OFF 사유: Mac차 학습본. 이전 주석: 2026-07-21 NUC OFF)
+    gp_casadi_ckpt: /home/nuc14/bo_results/gp_residual_nuc14_hall0813.pt   # 0813 hall 2-bag(4980) 재학습, 홀드아웃 d_vy/d_r 93%
+    gp_casadi_train_data: /home/nuc14/bo_results/res_hall_merged.pt
+    # 2026-07-02 학습 ref_v 주입 (오늘 post-fix 5-run, 74bins, grip-clamped +0.3)
+    use_learned_refv: false   # 2026-07-21 NUC OFF: Mac차 주행 학습본. NUC 라인검증+재학습 후 켤 것. Mac값=true (0716 IQP 라인 재학습)
+    learned_refv_path: ""   # 2026-07-21 NUC: /Users/mini 절대경로 무효화(비움). 재학습 후 NUC 경로로
+    # CasADi expression into the DYNAMICS only (cost/p_sym untouched), no
+    # torch/gpytorch/l4acados at runtime. Default OFF.
+
+    # B (VPMPCC simplify): override_mode 는 'off' 고정. BO 는 q_*_scale_live 만
+    # 직접 갱신. legacy modes (fixed / bucketed / polynomial) 는 mpc_node.py
+    # 에 코드 경로만 남고 yaml 키는 default 로 fallback.
+
+    # 자동 max_speed stepper — 같은 launch 안에서 lap 카운트 기반으로
+    # effective v_max 자동 증가. codegen ubu cap (yaml max_speed) 가 절대
+    # 상한 — auto_step_end 와 같게 두기. mpc.v_max (cost target) 만 변경.
+    #   start → end, +size 마다 laps 바퀴.
+    # 2026-05-28 사용자 idea: v 점진 ramp (model mismatch 적응 시간 줌)
+    # start=5 (검증 안정) → 0.5씩 step → end=6 (target). 매 2 lap 마다 step.
+    # = lap 1-2: v=5, lap 3-4: v=5.5, lap 5-6: v=6 (목표 도달).
+    # K1 (2026-05-29): autoreg_speed_bo.sh 가 stage 별로 max_speed 직접 set →
+    # 한 launch 안의 auto_step ramp 와 모순 (v=7 stage 에 end=6 이면 cap 충돌).
+    # autoreg sweep 중에는 disable. 단일 launch v ramp 필요 시 다시 true.
+
+    # Fixed-width MPC corridor (centerline/raceline ± half-width, 좌우 대칭).
+    # raceline 모드에서 장애물 회피 위해선 corridor 폭이 차폭(0.32) + 안전
+    # 마진(0.15) + lateral detour offset(0.3) 합보다 커야. 0.4 → 0.7m.
+    # raceline 자체가 안정 reference 이므로 corridor 넓혀도 oscillation 적음.
+    # 너무 키우면(>0.9) 코너에서 corridor 가 트랙 벽 밖으로 빠질 수도.
+    mpc_corridor_half_width: 0.0  # MPCC corridor half-width (centerline±, racing line 여지)
+    # 2026-06-08: 코리도어 폭-기반 속도캡 인프라 (track_loader.corridor_speed_cap).
+    # ★현재 OFF (floor=0): final 맵이 uniformly tight(post-margin 폭 mean 1.14)라
+    # 폭으로 crash지점(~0.7-1.0)을 typical(1.14)과 구분 못함 → 켜면 트랙 98% 감속
+    # → 랩타임↑·완만커브 가속 사라짐(사용자 지적). 폭 단일캡은 이 트랙엔 부적합.
+    # crash(s≈60 좁고직선) 진짜 해법 = racing-line(코너컷) / steer-hunting 잡기.
+
+    # Vehicle dynamics — only `l_wb` consumed in kinematic mode (current default)
+    vehicle.l_wb: 0.307
+    vehicle.l_f: 0.162
+    vehicle.l_r: 0.145
+    vehicle.m: 3.54
+
+    # Live-tunable weights (rqt_reconfigure 대체). Defaults mirror mpc_core.
+    # ROS1 unicorn 검증값으로 환원 (cycle-flat cost surface 의 oscillation 은
+    # corridor / D_apex 로 잡고, cost weights 는 검증된 값 유지).
+    q_cte_live: 1.0        # B 0.3 → Hybrid 1.0 (2026-05-26). 느슨한 centerline 추종 + corridor 자유 동시.
+    q_lag_live: 8.0        # B 2.0 → Hybrid 8.0. progress 어느 정도 강제 — 안정 baseline.
+    q_d_delta_live: 25.0   # base 값. 동적 조정은 MLP q_drate_scale_live (1~3×) 가 담당.
+    # 회피 거리 공식: projection ≥ R_safe + R_car. R_car 는 차 반지름,
+    # R_safe 는 장애물 자체 반지름 + 안전 margin. 둘 분리해서 튜닝.
+    # 회피 범위 좁힘: 0.35 → 0.25 (장애물 반지름 0.15 + 차 외곽 margin 0.10).
+    # 차 외곽 ↔ 장애물 외곽 빈 공간 ≈ 0.10m. 더 가까이 통과 가능.
+    R_safe_live: 0.45   # 0821: 0.6 은 side 문턱 0.87m > 최광폭 반폭 0.8 → 상시 BLOCK-STOP   # 0819 맥추종: 맥 0818 고속 회피 확대 (이전 0.30)   # 2026-07-09 keepout 0.85->0.70 (넓은 회피 완화)
+    M_slack_live: 20000.0
+    # a_lat_safe_live: 코너 측방 가속도 한계. 크면 코너에서 더 공격적 (ref_v cap = √(a_lat/κ) 증가).
+    # rand_a 의 κ_max=0.4417 (R_min=2.26m) → v_cap @ a_lat=30 = √(30/0.4417) = 8.24 m/s.
+    # 6→10→15→30 history. v=6 sweep 위해 30 까지 올림 — 그러나 30(=3g)은 그립 한계
+    # (~0.9g) 초과라 곡률 speed-cap 무력화 → 타이트 코너 과속 진입 → 박힘 (2026-05-29
+    # 진단: 남은 stall 13/13 over-speed entry). 물리적 그립으로 복원: 8 > 6 (코드 주석의
+    # 의도값, a_lat_max=8 hard 아래 headroom). ref_v cap = √(a_lat/κ) 가 코너서 실제 작동.
+    a_lat_safe_live: 6.5   # 0819 맥추종: 맥 0818 실효 코너그립 μ_y≈0.66 근거 (이전 8.0)   # D_detour_live: 회피 시 lateral offset [m]. 0.3 → 0.2 → 0.1.
+    # R_safe (hard constraint, 0.25m) 가 충돌 회피 보장하므로 D_detour 는
+    # soft target 만이라 작아도 안전. 회피 후 raceline 복귀 시 over-shoot ↓.
+    D_detour_live: 0.30
+    # D_apex_live: ACTIVE (2026-06-01 복원). e_c_ref = -D_apex·tanh(signed_κ/0.20)
+    # 로 contour reference 를 코너 안쪽(apex)으로 bias (acados_kinematic.py ~L888).
+    # 0 = off (pure centerline). ★주의: ref_v κ-cap 은 centerline-κ 기반이라 apex 가
+    # 더 빠른 ref_v 를 못 받음 → 라인만 바뀌고 속도이득 無 (구조적 한계, PIPELINE §8).
+    D_apex_live: 0.0   # 0821: 라인모드에선 0 (0.1 은 직선에서 라인 이탈=넓게돌기 조장)
+    # R_car_live: 차 반지름 (m). F1TENTH width 0.30 ÷ 2 = 0.15.
+    R_car_live: 0.27   # 0821 실측 차체 0.40×0.35 → 외접원 반경 (0.40 은 최협 0.9m 에서 코리도 소멸)
+    # commit_dist_live: 회피 시작 거리. 클수록 일찍 commit. 10 → 15 (일찍).
+    commit_dist_live: 9.0   # 0821: side 미결정 65% 해소 (검출 15m, 제동필요 5.3m)   # 2026-07-09 회피 늦게(15->8): 25m에 걸친 이른 회피가 넓은 체감의 실체
+    # cost_spike_thr_live: ringing 잡기 위해 500 → 200 으로 낮춤. fallback
+    # (ref_v·0.3 + heading hold + warm-start rebuild) 가 oscillation 초기에
+    # 트리거됨.
+    cost_spike_thr_live: 8000.0  # 1500→8000 (2026-05-28 fix). v=6/7/8 시 실측 정상 cost 500-2000. 1500 너무 빡빡해서 정상 운전도 fallback 무한 cycle → BO plateau. 8000 = 진짜 instability (10K+) 만 트리거.
+    alpha_steer_live: 1.0   # 0812b: EMA 해제 (위와 세트)
+    # 2026-05-28 BO v=6 retry best — 30 iter post-#13, Q=-47.57, lap=14.32s
+    # (PP 15.66, -8.6%; ideal 13.73, +4.3%; n_resets=2 안정; v_avg=4.99)
+    # v=4 Phase A best (q_p=4.28 dominant) 과 정반대: v=6 에서는 q_cte=4.96 strong + q_p=0.42 약.
+    # 빠른 차일수록 "centerline 단단히 추종 + anti-osc 강하게" 가 안전.
+    q_cte_scale_live: 4.9469
+    q_lag_scale_live: 0.6392
+    q_psi_scale_live: 1.7526
+    q_v_scale_live: 2.0   # 0807 신맵: 심과 동일하게 (SAFE 세트). 되돌리려면 .bak_pre_qalign — 이전 1.8 (7/9 실차 튜닝)
+    q_dd_scale_live: 1.0       # not in BO
+    q_p_scale_live: 6.5   # 0807 신맵: 심과 동일하게 (SAFE 세트). 되돌리려면 .bak_pre_qalign — 이전 7.0 (7/9 실차 튜닝)
+    q_drate_scale_live: 60.0   # 0812b: 새바닥 발진 처방(맥 0807 검증 세트). 서보 0.568 정상 상태에서의 진짜 테스트 — 월요일값 27.8138 은 구바닥 전제
+    q_dv_scale_live: 0.15   # 2026-07-09 원복(0.08->0.15): 0.08은 a_x 폭주 회귀(7/6 sim, 7/9 실차 공히). B1 gamma 단독평가 위해 검증값으로
+
+    # ─────────────────────────────────────────────────────────────────────
+    # 2026-07-30 노트북(sim) 코드 이식과 함께 추가된 키. 값은 전부 '비활성'
+    # 기본값이라 실차 거동을 바꾸지 않는다. 실차 재측정 후 조정할 것.
+    # ─────────────────────────────────────────────────────────────────────
+    zone_edit_enable: false      # RViz 존 드래그 편집. 튜닝할 때만 true (실차는 false 권장)
+    qcte_zone_factor: 1.0        # 존 안 q_cte 배수. 1.0=off
+    corridor_hard5_s0: 25.0      # 0819 맥이식: 맥 bldg_0819 존5 좌표 (맥은 q_cte 전용 존, ×2.0)
+    corridor_hard5_s1: 35.0      # 0819 맥이식 (이전 0.0 = 미사용 슬롯)
+    corridor_hard5_factor: 1.0   # 0821: bldg 상단코너용 존 해제
+    corridor_hard5_qcte_factor: 1.0   # 0820: bldg_0819 존이라 off (되돌리기 2.0)   # 0819 맥이식: off 로 시작. 맥 검증값 2.0
+    corridor_hard6_s0: 28.0   # 0821 존A: 쐐기 출구 0.18 + 심 콜드스타트 사고 s29.9
+    corridor_hard6_s1: 30.5   # 0821 (0820 시절 0~2.5)
+    corridor_hard6_factor: 4.0   # 0819 맥추종: 맥 bldg_0819 존6 시케인 slack 활성 (이전 1.0)   # 0731 맥 재현: 맥(ros2_ws/IFAC2026)은 존 0개로 운영 — 랩편차 0.01s, |d| 0.174
+    corridor_hard6_qcte_factor: 1.0   # 0821: slack 전용 (출처불명 2.0 중립화)
+    obs_pass_speed: 5.0          # 장애물 통과 시 속도 상한
+    narrow_pass_speed: 2.5       # 0819 맥이식: 좁은통로(남은 keepout<0.40) 사전 감속 캡. 라이브
+    static_only_obstacles: false # 0819 맥이식: true 면 동적 확정 무시(정적 전용 실험). 맥은 true, nuc 는 중립 false. 라이브
+    sector_refv_spec: ''         # 0819 맥이식: rqt 라이브 섹터 튜너 "start-end:factor,...". 빈 문자열=maps/<map>/speed_scaling.yaml
+    # ref_v 온라인 학습 (기본 off — 실차 검증 전 켜지 말 것)
+    use_refv_learning: false
+    refv_learn_path: ''
+    refv_scale_min: 1.0
+    refv_scale_max: 1.5
+    refv_step_delta: 0.05
+    refv_min_samples: 2
+    refv_min_margin_m: 0.35
+    refv_lt_tol: 0.02
+    refv_raise_cooldown: 2
+    alat_scale_min: 1.0
+    alat_scale_max: 1.3

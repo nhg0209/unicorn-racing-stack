@@ -146,6 +146,13 @@ def planner(obstacles, cur_s, cur_d=0.0):
     n.ramp_len, n.return_len, n.tail_m = 4.5, 4.5, 0.0
     n.ramp_len_min_m = 2.5
     n.ramp_search_enable = True
+    # THE LADDER IS A SAMPLE MECHANISM, so this file has to say so now that it is not the default.
+    # do_spline gates the ladder on `static_plan_method != "corridor_qp" or corridor_qp_ramp_ladder`
+    # -- it was measured to open exactly ZERO cells under corridor_qp over 8484 (ifac) and 9462
+    # (ifac_0807) race cells while costing the cycle p95 111 -> 45 ms, so the corridor path skips
+    # it. This fixture used to inherit "sample" from the class default and get the ladder for free;
+    # the default is corridor_qp now, and a test about the ladder must name the method that has one.
+    n.static_plan_method = "sample"
     n.ramp_search_entry_m = [3.15, 2.5, 2.0, 1.5, 1.0]
     n.ramp_search_exit_m = [4.5, 2.5, 1.5]
     n.ramp_search_max_ms = 1000.0            # offline: never cut the ladder short on time

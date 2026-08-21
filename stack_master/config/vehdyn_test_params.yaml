@@ -1,0 +1,210 @@
+/**:
+  ros__parameters:
+    # =================================================================================
+    # vehdyn_test_node / vehdyn_analyze.py -- vehicle-dynamics measurement
+    #
+    # EVERY number the tooling uses lives here. Neither script carries a tuning constant;
+    # vehdyn_analyze.py reads this same file so a bag re-analysed later is analysed with
+    # the settings it was RECORDED under (pass --params to override).
+    #
+    # THIS TOOL DRIVES THE REAL CAR AUTONOMOUSLY AT UP TO v_max_allowed. Read the safety
+    # block before changing anything. dry_run is true on purpose: the shipped config plans
+    # and prints and does not move the car.
+    #
+    # It NEVER writes veh_dyn_info/. Output goes to config/vehdyn_measured/<timestamp>/
+    # for a human to inspect and copy by hand. Copying them in requires REGENERATING THE
+    # RACELINE -- see the coupled invariant in CLAUDE.md.
+    # =================================================================================
+
+    # ---------------------------------------------------------------------------------
+    # EXECUTION
+    # ---------------------------------------------------------------------------------
+    # dry_run: plan, print the derived test conditions, publish NOTHING. The only mode in
+    # which this node cannot move the car. Leave it true until you have read the plan table.
+    dry_run: true
+
+    # circle  : washout only, left+right. Yields ggv ay_max and the resurface ratio k.
+    #           THE VENUE PATH. ~2 min. Does not touch the two machines tables.
+    # full    : circle + longitudinal + steady-state-then-step. Measures everything.
+    # current : motor current -> acceleration, for when there is no room to drive.
+    #           Extrapolated, low confidence, labelled as such in every output.
+    mode: current
+
+    # Shape of the longitudinal maneuver (mode: full only): oval | shuttle | circle_accel
+    # oval uses a box far better than a straight: on 8x4 m a lap is 20.6 m and the straights
+    # still reach ~7 m/s. shuttle needs straight_len_m. circle_accel needs area_radius_m.
+    long_mode: oval
+
+    # venue_mode: force mode to circle and skip everything else, whatever `mode` says.
+    # One switch to flip when the only question is "how much has the grip changed".
+    venue_mode: false
+
+    # How many times each maneuver is repeated (per side where the maneuver has sides).
+    # 3 is enough to see the left/right asymmetry that steering geometry causes.
+    repeats: 3
+
+    # ---------------------------------------------------------------------------------
+    # SAFETY -- everything below the maneuvers depends on this block
+    # ---------------------------------------------------------------------------------
+    # Abort box, in the frame of odom_topic (map, for /car_state/odom). Leaving it stops
+    # the car immediately. Measure it with the car at the intended centre before trusting it.
+    box_center_x: 0.0
+    box_center_y: 0.0
+    box_w: 3.5                  # [m] full width  (x extent), not half
+    box_h: 8.0                  # [m] full height (y extent)
+    # Kept clear of walls AND of the box edge when deriving test conditions.
+    safety_margin_m: 1.0
+
+    # Ceiling on every commanded speed, whatever the derivation asks for.
+    v_max_allowed: 9.0
+    # Slew limit on the published speed command [m/s^2]. A step command is never published:
+    # it is a step in the reference the controller-less path cannot shape, and it puts a
+    # transient into the very acceleration being measured.
+    v_slew_mps2: 3.0
+    # Steering slew [rad/s]. The washout run holds a FIXED steer; this bounds getting to it.
+    steer_slew_rps: 1.5
+
+    # Position source for the box test and the distance budget. Must be a map-frame odom.
+    # /car_state/odom comes from frenet_odom_republisher, i.e. it needs a loaded global line.
+    # The node FAILS CLOSED: no odom within odom_timeout_s and it will not move.
+    odom_topic: '/car_state/odom'
+    odom_timeout_s: 1.0
+
+    # Joy abort. simple_mux only hands control to the human when buttons[4] is PRESSED --
+    # moving a stick does NOT preempt autodrive -- so this node watches /joy itself and
+    # stops on ANY input. Verified against stack_master/scripts/simple_mux_node.py.
+    joy_topic: '/joy'
+    joy_abort_axis_deadzone: 0.15   # |axis| above this = operator touched it = abort
+    joy_abort_on_any_button: true
+
+    # Drive output. Goes to the mux's autodrive input.
+    drive_topic: '/vesc/high_level/ackermann_cmd'
+    control_rate_hz: 50.0
+
+    # ---------------------------------------------------------------------------------
+    # SPACE  -> the derivation turns these into test conditions (printed before the run)
+    # ---------------------------------------------------------------------------------
+    straight_len_m: 8.0         # usable straight, wall to wall (shuttle / oval straights)
+    area_radius_m: 4.0          # usable radius for a circle, centre to nearest wall
+    car_width_m: 0.30
+    wheelbase_m: 0.33           # must match CAR/vehicle_config.yaml
+
+    # ---------------------------------------------------------------------------------
+    # REFERENCE VALUES -- what the live files say today. The ratio k is measured against
+    # ggv_ay_max_ref, so this must be the value the CURRENT raceline was optimized with.
+    # ---------------------------------------------------------------------------------
+    ggv_ay_max_ref: 7.0         # veh_dyn_info/ggv.csv ay_max column
+    ggv_ax_max_ref: 7.0         # veh_dyn_info/ggv.csv ax_max column
+    # Priors used ONLY to size the maneuvers (how much straight a run needs). They are
+    # deliberately the measured 2026-08-12 values, not the conservative shipped table
+    # values, because sizing with a low prior asks for more room than the car needs.
+    a_acc_prior: 9.0
+    a_brk_prior: 13.0
+    # The shipped machines tables, copied through unchanged in `circle` mode.
+    ax_max_machines_ref: 9.5
+    b_ax_max_machines_ref: 10.0
+
+    # ---------------------------------------------------------------------------------
+    # WASHOUT DETECTION (T2)
+    # ---------------------------------------------------------------------------------
+    # With the steer held fixed, compare measured yaw rate against the kinematic
+    # prediction:  ratio = |gz| / |v * tan(delta) / wheelbase|
+    # The tyre is following while ratio ~ 1. On 2026-08-12 it held 1.00 up to a demand of 6
+    # and then collapsed to 0.53 -- the transition is sharp, so a threshold works.
+    washout_ratio_thresh: 0.90
+    washout_hold_s: 0.3         # ratio must stay below the threshold this long
+    washout_min_speed_mps: 1.5  # below this the ratio is numerically meaningless
+    # The fixed steering angle held during the washout ramp [rad], and how fast speed rises.
+    washout_steer_rad: 0.30
+    washout_ramp_mps2: 0.6      # SLOW. A fast ramp measures the ramp, not the limit.
+
+    # ---------------------------------------------------------------------------------
+    # STEP MANEUVERS (T3/T4, mode: full)
+    # ---------------------------------------------------------------------------------
+    # Stabilise at this fraction of the washout speed, HOLD, and only then step. Starting
+    # the step from a standstill raises a_x and a_lat together and measures a ramp through
+    # the envelope instead of the envelope. That is how the 2026-08-12 T3/T4 runs were lost.
+    step_speed_frac: 0.70
+    step_settle_s: 2.0          # constant-speed hold before the step is allowed
+    step_accel_target_mps: 2.0  # speed delta commanded by the throttle step (T3)
+    step_brake_target_mps: 0.0  # speed commanded by the brake step (T4)
+    step_duration_s: 1.5
+
+    # ---------------------------------------------------------------------------------
+    # BETWEEN MANEUVERS
+    # ---------------------------------------------------------------------------------
+    # Stationary settle. Bias extraction and segment splitting both depend on it. Not optional.
+    settle_still_s: 5.0
+    # PAUSE: the node stops publishing so the operator can take over and reposition. NOTE:
+    # simple_mux stays in `autodrive` until buttons[4] is pressed; it publishes zero after
+    # its 1 s freshness window. The operator must press the humandrive button to drive.
+    resume_button: 7            # /joy buttons index that resumes
+    # Resume is REFUSED unless the car is within tolerance of the planned start pose. This
+    # is the only thing standing between a mis-parked car and a high-speed run at a wall.
+    pose_tol_m: 0.5
+    pose_tol_deg: 20.0
+    # Completed maneuvers are appended here so an interrupted session resumes where it
+    # stopped. Relative paths are resolved under the output directory.
+    progress_file: 'progress.json'
+
+    # ---------------------------------------------------------------------------------
+    # CURRENT MODE
+    # ---------------------------------------------------------------------------------
+    current_topic: '/vesc/sensors/core'
+    current_max_a: 100.0        # MUST match vehicle_config.yaml vesc current_max
+    current_fit_min_a: 5.0      # ignore samples below this; the fit is dominated by noise
+    current_fit_max_speed: 3.0  # only low-speed samples, where drag is negligible
+
+    # ---------------------------------------------------------------------------------
+    # ANALYSIS  (vehdyn_analyze.py)
+    # ---------------------------------------------------------------------------------
+    analyze:
+      bag_topics:
+        imu: '/vesc/sensors/imu/raw'
+        odom: '/car_state/odom'
+        core: '/vesc/sensors/core'
+        cmd: '/vesc/high_level/ackermann_cmd'
+      # Bias: median of the stationary samples. 2026-08-12 read ax -0.407 / ay +0.474 --
+      # far too big to skip.
+      still_speed_mps: 0.1
+      # Uniform resample + Savitzky-Golay for dv/dt. The raw stamps contain duplicates and
+      # a plain difference explodes (-1816..+3188 on the 8/12 bag).
+      resample_hz: 100.0
+      savgol_window_s: 0.21
+      savgol_polyorder: 2
+      # AXIS VALIDATION -- do not assume which IMU axis is which, prove it. Below these the
+      # analysis FAILS and emits no values. This check caught controller_manager using
+      # -imu.x as longitudinal when the measurement says +imu.x.
+      axis_corr_min: 0.8
+      # The longitudinal correlation is evaluated only where the car is NOT cornering.
+      # Over the whole bag it reads 0.76 and the gate would fail a good measurement: during
+      # steady cornering dv/dt ~ 0 while roll leaks gravity into a_x, so the pair is noise
+      # against noise. Restricted to |a_lat| < this it reads 0.929 on the 8/12 bag, which
+      # is the +0.926 that bag was originally reported with.
+      axis_corr_max_alat: 2.0
+      # Longitudinal sample selection.
+      long_min_accel_mps2: 1.0      # |ax| below this is not a maneuver
+      long_speed_bin_mps: 1.0       # the machines csv curves are built per bin
+      long_min_samples_per_bin: 20
+      long_accel_pct: 95            # p95 of the accelerating samples
+      long_brake_pct: 5             # p05 of the braking samples
+      # Longitudinal samples are only accepted where the tyre is not already spending its
+      # grip sideways: |a_lat| < ggv_ay_max_ref * this.
+      long_max_alat_frac: 0.5
+      # Circle-run detection, for a bag with no maneuver log (the 8/12 bag is one).
+      circle_min_gz: 0.8
+      circle_min_speed_mps: 1.0
+      circle_min_peak_speed_mps: 3.0   # separates a washout run from slow manoeuvring
+      circle_max_gap_s: 0.6
+      circle_min_dur_s: 1.0
+      # Circle-fit trust. Residual above this = the path was not a circle, flag low
+      # confidence (8/12: 0.31-0.88, because speed was still ramping).
+      circle_max_resid_m: 0.15
+      # Arc below this = the radius is unconstrained HOWEVER SMALL THE RESIDUAL LOOKS, and a
+      # short arc produces a deceptively good residual precisely because any circle fits it.
+      # pi = half a turn. On the 8/12 bag the last right-hand run swept 2.23 rad with a
+      # residual of 0.09 -- the best-looking fit in the set -- and returned 18.3 m/s^2 against
+      # a true ~10. Excluding it brings the set to 9.05..11.95, which is the 9.8..11.5 that
+      # session reported. Do not lower this to recover a run; a short run has no radius.
+      circle_min_arc_rad: 3.14159
+      lat_imu_pct: 95

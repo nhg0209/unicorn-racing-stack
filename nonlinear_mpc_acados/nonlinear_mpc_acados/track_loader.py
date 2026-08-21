@@ -215,7 +215,7 @@ def corridor_speed_cap(width: float, v_full: float, v_floor: float = 0.0,
 #   계획-추종 오차 0.03~0.13 m.
 #   → 0.18 유지. 줄이려면 재샘플 오차부터 없애고(법선 투영으로 정확히 계산)
 #     그 다음에 단계적으로. 0 으로 한 번에 가는 건 확인된 실패다.
-_WALL_MARGIN = 0.18
+_WALL_MARGIN = 0.22   # 0820: 벽스침 대응 0.18→0.22 (협소는 α식 자동축소)
 
 # 2026-08-03 A안: 마진을 **트랙 폭에 비례**하게. 전 구간 0 은 실패했지만(위),
 # 넓은 곳은 0.18 유지 · 좁은 곳만 축소하는 건 다른 얘기다.
@@ -234,7 +234,7 @@ _WALL_MARGIN = 0.18
 #   α=0.5 → 시케인에서 0.18 → 약 0.10.
 # 0 으로 두면 기능 off (= 전 구간 _WALL_MARGIN 고정, 종전 동작).
 _WALL_MARGIN_WIDTH_ALPHA = 0.5
-_WALL_MARGIN_R_CAR = 0.30   # 코리도가 뒤에서 추가로 빼는 값 (ddrx R_car_live 와 일치시킬 것)
+_WALL_MARGIN_R_CAR = 0.27   # 0821 실측 차체 0.40×0.35 (ddrx R_car_live 와 일치)
 
 
 def _adaptive_wall_margin(d_left, d_right):
@@ -278,8 +278,11 @@ def _walls_from_centerline(ref_xy: np.ndarray, wall_wpnts) -> tuple:
     # 쐐기 STUCK 좌표(4.13,4.91)도 이 밴드. d_right 무변(여유 0.73~1.43).
     # wall_margin 배열엔 미반영 — wall_alarm 실벽 환산이 좌측에서 extra 만큼
     # 보수적이 될 뿐(안전 방향).
-    _ZA = np.array([6.182, 3.718]); _ZB = np.array([3.839, 5.033])
-    _ZEXTRA, _ZR_FULL, _ZR_ZERO = 0.0, 0.9, 1.8   # 0807 신맵 ifac_0807b: 존 앵커는 구맵 좌표 -> off
+    # 2026-08-13 hall_0813: MPCC 지름길이 s6~10 좌벽 5cm 까지 접근(32랩 전랩 d+0.31~0.37,
+    # 최협 dL0.51 에서 +0.37 랩만 접촉 = 여유 -1.5cm). 라인·튜닝 무변경, 좌벽만 +0.10.
+    # ⚠ 앵커는 hall_0813 map 좌표 — 다른 맵에서 켜지려면 재앵커 필수 (구 ifac 앵커: (6.182,3.718)-(3.839,5.033))
+    _ZA = np.array([5.713, 5.035]); _ZB = np.array([7.670, 8.612])
+    _ZEXTRA, _ZR_FULL, _ZR_ZERO = 0.10, 0.9, 1.8
     _ab = _ZB - _ZA
     _t = np.clip(((np.column_stack((cx, cy)) - _ZA) @ _ab) / (_ab @ _ab), 0.0, 1.0)
     _dseg = np.hypot(cx - (_ZA[0] + _t * _ab[0]), cy - (_ZA[1] + _t * _ab[1]))

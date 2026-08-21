@@ -280,6 +280,17 @@ class ChangeAvoidanceNode(Node):
         # --- opponent prediction (P1 temporal, P2 spatial) ---
         self.use_prediction = True           # master toggle; False = react to CURRENT opponent pos only
         self.engage_min_closing_mps = -0.5   # don't engage an opponent pulling away faster than this
+        # --- an overtake target has to be MOVING (see _track_moving) ---
+        # MIRRORS static_avoidance_node's static_demote_mps / static_demote_sec, and the mirror is
+        # the point: that planner treats a dynamic-flagged obstacle as static below
+        # static_near_zero_mps (0.15) held static_promote_sec, so as long as this floor sits at or
+        # above 0.15 the two planners can never both claim the same obstacle. Overlapping authority
+        # is what put a 1.58 m step into the reference; a GAP between them (0.15-0.35 m/s, sustained)
+        # resolves to TRAILING, which is the designed fallback. check_avoidance_margins.py asserts
+        # the no-overlap direction.
+        self.engage_min_vs_mps = 0.35        # |v| an obstacle must show to be an overtake target
+        self.engage_moving_s = 0.3           # ...continuously, for this long
+        self._moving_since = {}              # obstacle id -> time it first read clearly moving
 
         self._declare_tunables()
 
@@ -420,6 +431,10 @@ class ChangeAvoidanceNode(Node):
 
         # prediction (P1/P2)
         dbl('engage_min_closing_mps', self.engage_min_closing_mps, -3.0, 3.0, "min closing speed to engage")
+        dbl('engage_min_vs_mps', self.engage_min_vs_mps, 0.0, 3.0,
+            "min |v| an obstacle must show to be an overtake target (>= static_near_zero_mps)")
+        dbl('engage_moving_s', self.engage_moving_s, 0.0, 3.0,
+            "...continuously for this long before it may be engaged")
         self.declare_parameter('use_prediction', self.use_prediction, ParameterDescriptor(
             type=ParameterType.PARAMETER_BOOL, description="enable prediction-aware engage/offset/clearance"))
         # dbl() reads its own params back; use_prediction is declared separately, so it needs
@@ -436,7 +451,8 @@ class ChangeAvoidanceNode(Node):
             f"pass_overlap=+-{self.pass_overlap_m:.2f} "
             f"lane_slope={self.lane_max_slope:.2f}/{self.lane_max_slope_close:.2f} "
             f"use_prediction={self.use_prediction} "
-            f"engage_min_closing={self.engage_min_closing_mps:+.2f}")
+            f"engage_min_closing={self.engage_min_closing_mps:+.2f} "
+            f"engage_min_vs={self.engage_min_vs_mps:.2f} moving_for={self.engage_moving_s:.2f}s")
 
     def _apply_margins(self):
         """Derive the clearance numbers from the mirrored SM parameters.
@@ -487,7 +503,7 @@ class ChangeAvoidanceNode(Node):
                     'lane_commit', 'commit_horizon_m', 'entry_join_tol_m',
                     'commit_dev_max_m', 'commit_meet_ds_m', 'commit_obs_dd_m',
                     'lane_solve_ds', 'width_car', 'blocked_dwell_s', 'ot_gate_stale_s',
-                    'engage_min_closing_mps',
+                    'engage_min_closing_mps', 'engage_min_vs_mps', 'engage_moving_s',
                     'use_prediction'):
                 setattr(self, param.name, param.value)
         # Re-derive: live-tuning any mirror or slack must not leave sep_margin_m/_sep_monitor_m
@@ -503,6 +519,43 @@ class ChangeAvoidanceNode(Node):
     def obs_cb(self, data: ObstacleArray):
         self.obs_all = list(data.obstacles)
         self.obs_dynamic = [o for o in data.obstacles if not o.is_static]
+        self._track_moving(self.obs_dynamic)
+
+    def _track_moving(self, obstacles):
+        """How long each dynamic-flagged obstacle has read CLEARLY MOVING, continuously.
+
+        `is_static` is the tracker's position-persistence verdict and it starts out False on every
+        freshly created track (staticFlag is None until min_nb_meas, and multi_tracking publishes a
+        not-yet-classified track with is_static=False). So "not is_static" does not mean "moving" --
+        it also means "just appeared". A parked box therefore arrives on /tracking/obstacles as a
+        dynamic obstacle reading vs~0, and the engage gate below used to accept it.
+
+        Speed alone cannot separate parked from just-seen -- both read ~0 -- but TIME can, which is
+        exactly the argument static_avoidance_node._track_near_zero makes for the mirror-image test
+        (it will not treat a dynamic-flagged obstacle as static until it has read ~0 for
+        static_promote_sec). This is the same deadband read from the other side: an obstacle becomes
+        an overtake target only once it has read >= engage_min_vs_mps continuously for
+        engage_moving_s, and the reading resets the moment it drops back under.
+        """
+        now = self.now_sec()
+        seen = set()
+        for o in obstacles:
+            seen.add(o.id)
+            if max(abs(o.vs), abs(o.vd)) >= self.engage_min_vs_mps:
+                self._moving_since.setdefault(o.id, now)
+            else:
+                self._moving_since.pop(o.id, None)
+        for k in [k for k in self._moving_since if k not in seen]:
+            self._moving_since.pop(k, None)
+
+    def _moving_for(self, o) -> float:
+        """Seconds this obstacle has read clearly moving, continuously. 0.0 if it is not."""
+        t = self._moving_since.get(o.id)
+        return 0.0 if t is None else max(0.0, self.now_sec() - t)
+
+    def _is_overtakable(self, o) -> bool:
+        """May this obstacle be an OVERTAKE target at all? See _track_moving."""
+        return self._moving_for(o) >= self.engage_moving_s
 
     def state_frenet_cb(self, data: Odometry):
         self.current_s = data.pose.pose.position.x
@@ -618,6 +671,12 @@ class ChangeAvoidanceNode(Node):
             # reengage_block_s. To disable it deliberately, set engage_min_closing_mps very
             # negative (e.g. -3.0); that is its own off-switch.
             if (self.current_vs or 0.0) - o.vs < self.engage_min_closing_mps:
+                continue
+            # ...and the closing gate above CANNOT do this job: closing = ego - o.vs is at its
+            # LARGEST when the obstacle is standing still, so a parked box passes it maximally.
+            # An overtake target has to be something that is actually driving. Sustained, because a
+            # stationary box's tracked speed brushes past any single-sample threshold on noise.
+            if not self._is_overtakable(o):
                 continue
             if best is None or gap < best[0]:
                 best = (gap, o)
@@ -1397,6 +1456,9 @@ class ChangeAvoidanceNode(Node):
                 f"{'ok' if abs(best.d_center - (self.current_d or 0.0)) <= self.obs_traj_tresh else 'NO'}) "
                 f"closing={closing:+.2f}(>={self.engage_min_closing_mps:+.1f}?"
                 f"{'ok' if closing >= self.engage_min_closing_mps else 'NO'}) "
+                f"|v|={max(abs(best.vs), abs(best.vd)):.2f} moving_for={self._moving_for(best):.2f}s"
+                f"(>={self.engage_moving_s:.2f}s @>={self.engage_min_vs_mps:.2f}?"
+                f"{'ok' if self._is_overtakable(best) else 'NO'}) "
                 f"visible={best.is_visible}")
 
     def _safe_to_abort(self) -> bool:

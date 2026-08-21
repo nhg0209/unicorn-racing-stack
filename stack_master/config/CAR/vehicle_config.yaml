@@ -36,10 +36,10 @@ vesc/**:
     position_min: 0.0
     servo_max: 1.0
     servo_min: 0.0
-    speed_max: 43250.0
-    speed_min: -43250.0
+    speed_max: 46500.0
+    speed_min: -46500.0
     speed_to_erpm_gain: 4014.0
     speed_to_erpm_offset: 0.0
-    steering_angle_to_servo_gain: 0.568    # 0810 2차 미세조정: v10 bag 달성 0.806→0.832 목표 (0.55×0.832/0.806). 1차 0.55, 이전 0.5 = 7/3 임시값
-    steering_angle_to_servo_offset: 0.5705    # 0810 좌우 달성 비대칭(0.697/0.727) 보정 (이전 0.566, #0.57)
+    steering_angle_to_servo_gain: 0.568
+    steering_angle_to_servo_offset: 0.5705
     use_servo_cmd_to_calc_angular_velocity: true

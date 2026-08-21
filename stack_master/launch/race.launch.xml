@@ -126,6 +126,8 @@
     <param from="$(find-pkg-share stack_master)/config/controller.yaml"/>
     <param name="save_yaml_path" value="$(find-pkg-share stack_master)/config/controller.yaml"/>
     <param name="sim" value="$(var sim)"/>
+    <!-- picks config/<SIM|CAR>/veh_dyn_info/ggv.csv for the steering tyre limit -->
+    <param name="racecar_version" value="$(var racecar_version)"/>
   </node>
 
   <node pkg="controller" exec="pp_heading_controller" name="pp_heading_controller" output="screen"

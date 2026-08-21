@@ -56,7 +56,8 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 
 from ament_index_python.packages import get_package_share_directory
-from std_msgs.msg import String, Float32, Bool, Empty, Float32MultiArray
+from std_msgs.msg import (String, Float32, Bool, Empty, Float32MultiArray,
+                          Int32MultiArray)
 from nav_msgs.msg import Odometry
 from visualization_msgs.msg import Marker, MarkerArray
 from f110_msgs.msg import WpntArray, OTWpntArray
@@ -493,6 +494,12 @@ class StaticReoptNode(Node):
         # THE clearance definition, published for everyone who needs one. See _publish_clearance.
         self.pub_clearance = self.create_publisher(Float32MultiArray, "/static_reopt/clearance",
                                                    latched)
+        # WHICH obstacles the line that is ACTUALLY DRIVING is shaped around, as upstream marker
+        # ids. Latched, and empty whenever the clean line is active. See _publish_active_cover:
+        # the static_obstacle_layer needs this to know that the car being ON the published line
+        # is not evidence that it is not avoiding something.
+        self.pub_active_cover = self.create_publisher(Int32MultiArray,
+                                                      "/static_reopt/active_cover", latched)
 
         # Eroded occupancy map for the final wall gate (see _wall_gate_ok).
         self.map_filter = None
@@ -688,6 +695,53 @@ class StaticReoptNode(Node):
             m.text = f"id={c['id']} {c['status']} {c['clearance_m']:+.2f}m"
             arr.markers.append(m)
         self.pub_coverage.publish(arr)
+
+    def _publish_active_cover(self, bundle) -> None:
+        """/static_reopt/active_cover — the upstream marker ids the ACTIVE line is shaped around.
+
+        WHAT IT IS FOR. static_obstacle_layer suspends its unlatch streak while the car is off
+        the line, on the reasoning that a car mid-avoidance cannot judge whether a box is still
+        there. It measured "off the line" as |d| from /car_state/odom_frenet — and that d is
+        taken against /global_waypoints, which IS this node's re-optimized line whenever one is
+        active. So exactly when the avoidance is baked into the global line, the car drives it
+        at d ~ 0 while passing the box half a metre wide, the guard reads "on the line, not
+        avoiding", and the streak runs free. The obstacle is then demoted mid-avoidance, the set
+        empties, the clean line comes back, and the box is re-detected next lap: the reopt /
+        clean alternation this topic exists to stop.
+
+        The published line cannot answer "is the car avoiding this box" because the avoidance is
+        IN it. This node can: it knows which obstacles it laid a hump for. floor_by_key already
+        holds exactly that set (see _keys_for -> ("id", marker_id)), keyed by the id the layer
+        minted, so nothing new has to be tracked.
+
+        IDS, not positions, unlike /static_reopt/clearance. That topic is keyed by position
+        because its consumers include the reactive planner and the state machine, which carry
+        TRACKER ids from a different id space. This topic has one consumer, the layer, and the
+        marker id round-trips exactly: the layer mints it, publishes it on
+        /static_reopt/obstacles, and obstacles_cb echoes it into _obs_ids.
+
+        Empty is meaningful and is published: the CLEAN bundle carries no floor_by_key, so a
+        swap back to clean clears the layer's suspension in the same message that swaps the line.
+        """
+        try:
+            msg = Int32MultiArray()
+            for key in (getattr(bundle, "floor_by_key", None) or {}):
+                # _keys_for falls back to position quantization when ids are absent or
+                # duplicated; those keys carry no id and are skipped rather than guessed at.
+                if isinstance(key, tuple) and len(key) == 2 and key[0] == "id":
+                    msg.data.append(int(key[1]))
+            # getattr, and the publish inside the try: the offline harnesses build this node with
+            # __new__ and no publishers at all. Failing to publish costs the layer its suspension
+            # -- which is the behaviour that shipped before this topic existed -- and must never
+            # take the swap down with it. WARN, not debug: unlike _publish_clearance this one has
+            # a correctness consumer, so a silent loss should be visible in the log.
+            pub = getattr(self, "pub_active_cover", None)
+            if pub is not None:
+                pub.publish(msg)
+        except Exception as e:
+            self.get_logger().warn(f"[static_reopt] active_cover publish failed ({e}) -> the "
+                                   f"static_obstacle_layer will not suspend its unlatch streak "
+                                   f"for the boxes this line covers")
 
     def _publish_clearance(self) -> None:
         """/static_reopt/clearance — how far the line the car is ACTUALLY FOLLOWING passes each
@@ -2072,6 +2126,7 @@ class StaticReoptNode(Node):
         self.get_logger().info(f"[static_reopt] swapped to {kind} at s={s:.2f} m")
         self._publish_active(bundle)             # publish now, don't wait for the republish tick
         self._publish_coverage(bundle)
+        self._publish_active_cover(bundle)       # incl. the CLEAN swap, which publishes empty
         self._log_publish_margins(bundle)
         self._publish_clearance()                # the new line clears the boxes by new amounts
         self.pub_update_map.publish(Bool(data=True))   # /global_waypoints already latched above

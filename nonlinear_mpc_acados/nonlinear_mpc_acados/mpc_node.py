@@ -133,6 +133,54 @@ LIVE_PARAMS = [
 ]
 
 
+
+class _LocGuard:
+    """0820 로컬라이제이션 점프 가드 (순수 로직 — bag 리플레이 테스트 가능)."""
+    NORMAL, SUSPECT, LOST = 0, 1, 2
+
+    def __init__(self, jump_m, quiet_s, grace_s, resume_s):
+        self.jump_m, self.quiet_s = float(jump_m), float(quiet_s)
+        self.grace_s, self.resume_s = float(grace_s), float(resume_s)
+        self.state = self.NORMAL
+        self._px = self._py = self._pt = None
+        self._t0 = self._last_big = None
+        self.events = []
+
+    def update(self, t, x, y, v):
+        if self.jump_m <= 0.0:
+            return False
+        # 0821 v3: 저속(<1.0) 휴면 — 출발 전 kiss 수렴/수동 재배치의 대형 스텝은
+        # 주행 위험이 아닌데 LOST 로 출발을 막았다 ("시작 뻑"). 주행 중에만 무장.
+        # v3.1: LOST 제외 — 정지로 v<1 되면 휴면 해제→재가속→LOST 재진입 진동.
+        # LOST 해제는 오직 resume_s(조용한 시간) 로만.
+        if abs(v) < 1.0 and self.state != self.LOST:
+            if self.state != self.NORMAL:
+                self.state = self.NORMAL
+                self.events.append((t, 'disarm'))
+            self._px, self._py, self._pt = x, y, t
+            return False
+        if self._pt is not None and t > self._pt:
+            dt = t - self._pt
+            step = math.hypot(x - self._px, y - self._py)
+            thr = max(self.jump_m, 3.0 * abs(v) * dt)
+            if step > thr:
+                self._last_big = t
+                if self.state == self.NORMAL:
+                    self.state, self._t0 = self.SUSPECT, t
+                    self.events.append((t, 'suspect'))
+            elif self.state == self.SUSPECT and t - self._last_big >= self.quiet_s:
+                self.state = self.NORMAL
+                self.events.append((t, 'absorb'))
+            elif self.state == self.LOST and t - self._last_big >= self.resume_s:
+                self.state = self.NORMAL
+                self.events.append((t, 'resume'))
+            if self.state == self.SUSPECT and t - self._t0 >= self.grace_s:
+                self.state = self.LOST
+                self.events.append((t, 'lost'))
+        self._px, self._py, self._pt = x, y, t
+        return self.state == self.LOST
+
+
 class MPCNode(Node):
     CONTROLLER_FREQ = 40.0  # Hz — matches ROS1 default
 
@@ -240,6 +288,17 @@ class MPCNode(Node):
         self.declare_parameter('brake_anticip_d_min', 0.0)  # 2026-07-16 anticip 캡 근거리 제외 [m]: d_i<d_min 스테이지는 캡 후보서 제외. 0=기존(직선서 캡≈v_next=가속목줄, bag 재계산으로 확정). 코너 정직성은 brake min-guard+원거리 캡이 유지.
         self.declare_parameter('speed_cmd_err_max', 0.0)  # 2026-07-16 발행 v_cmd <= v_now+err_max [m/s]. d_min 해방 후 cmd 7.8>erpm캡 6.74 슬래밍+plan지터 증폭(톱니 0.2/실속출렁 0.6) → 캡이 물리면 cmd=실속+상수(매끈)+VESC 최대구동 유지. 0=off
         self.declare_parameter('speed_cmd_gain', 1.0)  # 2026-07-09 가속 오차증폭 G: v_cmd=v_now+G*(v_plan-v_now), 가속국면만. VESC 약한 속도PID의 소프트웨어 보상. 1.0=off
+        # ── 0821 sight-limited speed (갑작스러운 장애물) ──
+        self.declare_parameter('sight_brake_a', 4.0)   # [m/s²] 안전속도 계산용 제동. 0=off
+        self.declare_parameter('sight_v_floor', 1.2)   # [m/s] 하한 — 완전정지 방지
+        # ── 0820 loc-guard: 로컬라이제이션 점프 가드 (kiss 종방향 톱니 사고 대응) ──
+        self.declare_parameter('loc_guard_jump_m', 0.35)   # 스텝 문턱 [m], 0=off
+        self.declare_parameter('loc_guard_quiet_s', 0.4)   # 이 시간 재점프 없으면 흡수
+        self.declare_parameter('loc_guard_grace_s', 0.6)   # 소강 실패 → 정지
+        self.declare_parameter('loc_guard_resume_s', 0.8)
+        # ── 0821 solver-guard: 해 소실(infeasible) 지속 시 정지, 복구 시 재주행 ──
+        self.declare_parameter('solver_guard_bad_n', 8)    # 연속 infeasible → 정지 (40Hz 0.2s). 0=off
+        self.declare_parameter('solver_guard_ok_n', 12)    # 연속 정상 해 → 재주행 (0.3s)  # 정지 후 조용 → 재주행
         # 2026-07-09 국소 corridor 하드닝: s∈[s0,s1] 예측 스테이지의 corridor slack
         # 벌금을 factor배 (스텁 s≈21.6 soft-corridor 뚫림 대응). factor<=1 = off. live.
         self.declare_parameter('corridor_hard_s0', 20.8)
@@ -265,7 +324,18 @@ class MPCNode(Node):
         self.declare_parameter('corridor_hard6_factor', 1.0)
         # 2026-07-21 헤어핀 q_cte 존 부스트: corridor_hard 존 안 스테이지의
         # q_cte_scale ×factor (라인추종 타이트닝). 1.0=off. live.
+        # 2026-08-19: 전역 스칼라 1개라 "존A는 조이고 존B는 푸는" 조합이 불가능했다.
+        # 아래 존별 qcte factor 를 신설하고, 이 전역값은 존별 값이 1.0(미설정)일 때의
+        # 폴백으로만 남긴다 — 기존 yaml 이 무수정으로 같은 거동을 내야 하므로.
         self.declare_parameter('qcte_zone_factor', 1.0)
+        # 2026-08-19 존별 q_cte 배율. 1.0 = 이 존은 q_cte 를 건드리지 않음.
+        # slack factor 와 독립이라 "코리도는 그대로 두고 q_cte 만" 이 가능하다.
+        self.declare_parameter('corridor_hard_qcte_factor', 1.0)
+        self.declare_parameter('corridor_hard2_qcte_factor', 1.0)
+        self.declare_parameter('corridor_hard3_qcte_factor', 1.0)
+        self.declare_parameter('corridor_hard4_qcte_factor', 1.0)
+        self.declare_parameter('corridor_hard5_qcte_factor', 1.0)
+        self.declare_parameter('corridor_hard6_qcte_factor', 1.0)
         # 2026-07-28: corridor_hard 존/ s 눈금자를 /mpc/zone_markers 로 발행.
         # 발행 전용(제어 무영향). 존 구성이 바뀐 사이클에만 다시 그린다.
         self.declare_parameter('publish_zone_markers', True)
@@ -282,6 +352,11 @@ class MPCNode(Node):
         # 0722n 2.5→3.3: 2.5 플로어가 "회피가 너무 느림" 체감의 정체 (순항 4.5 대비).
         # slack×10으로 계획이 keepout을 지키게 된 뒤라 감속 의존도 낮아짐.
         self.declare_parameter('obs_pass_speed', 3.3)
+        # 0818 좁은통로(정중앙 장애물, side-decide shift>0) 사전 감속 캡. 라이브.
+        self.declare_parameter('narrow_pass_speed', 2.5)
+        # 0818 정적 전용 스위치: true 면 동적 확정 무시(전 검출 정적 경로). 정적 장애물 실험용.
+        # 트레일링/추월 땐 false. 라이브.
+        self.declare_parameter('static_only_obstacles', False)
         # 0723z: 동적 상대 추월 허용 스위치 — 기본 False(트레일링만). 추후 GP
         # 예측 신뢰도가 충분할 때 True로 (사용자 로드맵: 학습되면 오버테이킹).
         self.declare_parameter('overtake_enabled', False)
@@ -430,6 +505,15 @@ class MPCNode(Node):
         self.declare_parameter('save_params', False)
         self._save_params_req = False
         self._housekeep_timer = self.create_timer(0.5, self._housekeep_cb)
+        # 0812 rqt 라이브 섹터 튜너 — "start-end:factor,..." (wpnt id 구간별 ref_v 배율).
+        # 빈 문자열 = maps/<map>/speed_scaling.yaml 사용. rqt 로 바꾸면 하우스키핑
+        # 타이머가 트랙 ref_v 를 재구축한다(제어루프 1~3s 유휴 — 저속/정지 중 변경 권장).
+        self.declare_parameter('sector_refv_spec', '')
+        self._sector_respec_req = False
+        self._ref_vx_orig = None      # 스케일 전 원본 vx (재적용 기준점)
+        # ⚠함수내 from-import 금지: 위쪽 QoSProfile 사용(141행)을 지역변수화해 죽인다
+        self._refv_marker_pub = self.create_publisher(
+            MarkerArray, '/mpc/refv_markers', self._latched_qos)
         self.prediction_pub = self.create_publisher(MPCTrajectory, '/mpc/prediction', 1)
         self.cost_pub = self.create_publisher(Float64, '/mpc/cost', 10)
         self.solve_time_pub = self.create_publisher(Float64, '/mpc/solve_time', 10)
@@ -611,6 +695,8 @@ class MPCNode(Node):
         if self._track_init_done:
             return
         self._ref_wpnts = msg.wpnts
+        # 섹터 배율은 in-place 곱이라 라이브 재적용의 기준점을 남겨둔다
+        self._ref_vx_orig = [float(w.vx_mps) for w in msg.wpnts]
         self._try_build_track()
 
     def _on_wall_wpnts(self, msg: WpntArray) -> None:
@@ -719,37 +805,44 @@ class MPCNode(Node):
                             f"[learned_refv] {_p} 로드 실패({_e}) — 해석적 ref_V 사용")
                 else:
                     self.get_logger().warn(f"[learned_refv] 파일 없음: {_p} — 해석적 ref_V 사용")
-            # 0810 섹터별 ref_v 배율 — maps/<track>/speed_scaling.yaml (speed_sector_tuner
-            # 포맷: SectorN{start,end,scaling}+global_limit)를 MPCC 경로에서도 읽는다.
-            # 이전엔 sector_tuner(클래식 스택) 전용이라 MPCC에선 죽은 파일이었음.
-            # wpnt.vx_mps 를 인덱스 구간별로 곱하며, 이후 build_track_from_wpnts 의
-            # κ/a_lat/clip 캡이 그대로 적용되므로 과한 상향은 물리 캡에서 잘린다(안전).
+            # ── 0812 섹터별 ref_v 배율 (nuc [sector_refv] 이식 + 라이브 spec 우선) ──
+            # spec 파라미터("s-e:f,...") 가 있으면 그걸, 없으면 maps/<map>/speed_scaling.yaml.
+            # wpnt.vx_mps 에 곱한 뒤 build_track_from_wpnts 의 κ/a_lat 캡이 물리로 자른다(과상향 안전).
             try:
-                from ament_index_python.packages import get_package_share_directory as _gpsd
-                _ssp = os.path.join(_gpsd('stack_master'), 'maps',
-                                    str(self.get_parameter('track_name').value),
-                                    'speed_scaling.yaml')
-                if os.path.isfile(_ssp):
+                _secs = []
+                _spec = str(self.get_parameter('sector_refv_spec').value).strip()
+                if _spec:
+                    for _tok in _spec.split(','):
+                        _rng, _f = _tok.split(':')
+                        _a, _b = _rng.split('-')
+                        _secs.append((int(_a), int(_b), float(_f)))
+                else:
+                    from ament_index_python.packages import get_package_share_directory as _gpsd
                     import yaml as _yaml
-                    _sp = _yaml.safe_load(open(_ssp))['speed_sector_tuner']['ros__parameters']
-                    _glim = float(_sp.get('global_limit', 1.0))
-                    _nsec = int(_sp.get('n_sectors', 0))
-                    _applied = []
-                    for _si in range(_nsec):
-                        _sec = _sp.get(f'Sector{_si}', {})
-                        _a, _b = int(_sec.get('start', 0)), int(_sec.get('end', -1))
-                        _sc = float(_sec.get('scaling', 1.0)) * _glim
-                        if abs(_sc - 1.0) < 1e-6:
-                            continue
-                        for _w in wpnts:
-                            if _a <= int(_w.id) <= _b:
-                                _w.vx_mps = float(_w.vx_mps) * _sc
-                        _applied.append(f'S{_si}[{_a}-{_b}]x{_sc:.2f}')
-                    if _applied:
-                        self.get_logger().warn(
-                            f"[sector_refv] {_ssp}: " + ' '.join(_applied))
+                    _ssp = os.path.join(_gpsd('stack_master'), 'maps',
+                                        str(self.get_parameter('track_name').value),
+                                        'speed_scaling.yaml')
+                    if os.path.isfile(_ssp):
+                        _sp = _yaml.safe_load(open(_ssp))['speed_sector_tuner']['ros__parameters']
+                        _gl = float(_sp.get('global_limit', 1.0))
+                        for _si in range(int(_sp.get('n_sectors', 0))):
+                            _sec = _sp.get(f'Sector{_si}', {})
+                            _secs.append((int(_sec.get('start', 0)),
+                                          int(_sec.get('end', -1)),
+                                          float(_sec.get('scaling', 1.0)) * _gl))
+                _applied = []
+                for _a, _b, _f in _secs:
+                    if abs(_f - 1.0) < 1e-6:
+                        continue
+                    for _w in wpnts:
+                        if _a <= int(_w.id) <= _b:
+                            _w.vx_mps = float(_w.vx_mps) * _f
+                    _applied.append(f'[{_a}-{_b}]x{_f:.2f}')
+                if _applied:
+                    self.get_logger().warn('[sector_refv] ' + ' '.join(_applied))
+                self._publish_refv_markers(wpnts)
             except Exception as _e:
-                self.get_logger().warn(f"[sector_refv] 적용 실패({_e}) — 프로파일 원본 사용")
+                self.get_logger().warn(f'[sector_refv] 적용 실패({_e}) — 프로파일 원본 사용')
             self._track = build_track_from_wpnts(
                 wpnts, wall_wpnts=wall_wpnts, vel_scale=vel_scale,
                 inflation_factor=inflation, extend_part=extend_part,
@@ -1043,6 +1136,8 @@ class MPCNode(Node):
             # 생긴다. 플래그만 세우고 실제 저장은 하우스키핑 타이머가 한다.
             if p.name == 'save_params' and bool(p.value):
                 self._save_params_req = True
+            if p.name == 'sector_refv_spec':
+                self._sector_respec_req = True
             if p.name in live_names:
                 try:
                     setattr(self.mpc, p.name, float(p.value))
@@ -1054,6 +1149,28 @@ class MPCNode(Node):
     # Sub callbacks — cache only; heavy work runs on the control timer
     # ─────────────────────────────────────────────────────────────────
     def _odom_cb(self, msg: Odometry):
+        # ── 0820 stale 필터: 스탬프 과거 odom 드랍 (실측 4.8% 역순 도착 = 톱니 원인) ──
+        _st = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        _mx = getattr(self, '_odom_stamp_max', -1.0)
+        if _st <= _mx:
+            # v2: 클럭 불연속 escape — 1s+ 후퇴/연속드랍 400+ 는 소스 재시작. 래치 리셋.
+            self._odom_stale_run = getattr(self, '_odom_stale_run', 0) + 1
+            if _mx - _st > 1.0 or self._odom_stale_run > 400:
+                self.get_logger().warn(
+                    f'[stale-filter] 클럭 불연속(뒤로 {_mx - _st:.2f}s, '
+                    f'연속드랍 {self._odom_stale_run}) — 래치 리셋 후 수용')
+                self._odom_stamp_max = _st
+                self._odom_stale_run = 0
+            else:
+                self._odom_stale_n = getattr(self, '_odom_stale_n', 0) + 1
+                if self._odom_stale_n % 1000 == 1:
+                    self.get_logger().warn(
+                        f'[stale-filter] 역순 odom 드랍 누계 {self._odom_stale_n}')
+                return
+        else:
+            self._odom_stamp_max = _st
+            self._odom_stale_run = 0
+        self._odom_rx_mono = time.monotonic()   # v2 워치독용 (수용 시각)
         # Teleport detection — RViz /initialpose 로 차 이동 시 odom 위치가 점프.
         # 이전 위치와 1m 이상 차이 나면 MPC warm-start reset (옛 traj 의 풀-스티어
         # spin 방지). 정상 주행 dx 는 보통 v·dt = 5·0.025 = 0.125m 라 1m threshold
@@ -1064,6 +1181,25 @@ class MPCNode(Node):
             jump = ((p1.x - p0.x) ** 2 + (p1.y - p0.y) ** 2) ** 0.5
             if jump > 1.0:
                 self._reset_mpc_latches(f'teleport 감지 ({jump:.2f}m jump)')
+        # ── 0820 loc-guard: kiss 점프 지속 시 정지, 소강 시 재주행 ──
+        if not hasattr(self, '_loc_guard'):
+            self._loc_guard = _LocGuard(
+                self.get_parameter('loc_guard_jump_m').value,
+                self.get_parameter('loc_guard_quiet_s').value,
+                self.get_parameter('loc_guard_grace_s').value,
+                self.get_parameter('loc_guard_resume_s').value)
+        _p = msg.pose.pose.position
+        _t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        _was = self._loc_guard.state
+        self._loc_lost = self._loc_guard.update(
+            _t, _p.x, _p.y, msg.twist.twist.linear.x)
+        if self._loc_guard.state != _was and self._loc_guard.events:
+            _ev = self._loc_guard.events[-1][1]
+            if _ev == 'lost':
+                self.get_logger().warn('[loc-guard] 점프 지속 — 정지 (speed 0)')
+            elif _ev == 'resume':
+                self.get_logger().warn('[loc-guard] 소강 — 재주행')
+                self._reset_mpc_latches('loc-guard 복귀')
         self._last_odom = msg
 
     def _reset_mpc_latches(self, reason: str) -> None:
@@ -1120,6 +1256,28 @@ class MPCNode(Node):
         # 와서 mpc 가 commit release -> warm-start 리셋 -> 재commit 진동 (실측: 장애물
         # 가시중 steer 지터 p90 +25%). 빈 수신은 아래 TTL 3s 동안 이전 목록 유지.
         new = [(p.position.x, p.position.y) for p in msg.poses]
+        # 0813 kiss 정적/동적 플래그 수신 (orientation.z: <0.25 정적확정 / 0.5 미확정 / ≥0.75 동적).
+        # 정적확정만 위치안정 게이트 우회. 미확정·동적은 기존 MPCC 경로 그대로.
+        # 구 kiss 가드: 송신 패치 전 kiss 는 orientation 정확히 0 → 정적확정과 구분 불가.
+        # 세션 중 z∉{0}(0.5/1.0) 이 한 번이라도 보이면 신 kiss 로 래치. 그 전엔 불신(안전).
+        if not getattr(self, '_kiss_flag_ok', False):
+            self._kiss_flag_ok = any(p.orientation.z > 0.1 for p in msg.poses)
+        self._kiss_static_xy = ([(p.position.x, p.position.y) for p in msg.poses
+                                 if p.orientation.z < 0.25]
+                                if getattr(self, '_kiss_flag_ok', False) else [])
+        self._kiss_dyn_v = {(p.position.x, p.position.y): (p.orientation.x, p.orientation.y)
+                            for p in msg.poses if p.orientation.z >= 0.75}
+        # ── 0807 실차: 트랙 밖 클러스터 게이트 (노트북 8f1c90a 동일) ──
+        # kiss 클러스터 raw 입력이라 트랙 밖 6.5~7.5 m 피트/구조물이
+        # side-decide 스팸 + 유령 동적 래치(vs=-0.73)를 만들던 것 차단.
+        try:
+            _rlf = self._rl_arrays()
+            if _rlf is not None:
+                _, rxF, ryF = _rlf
+                new = [(x, y) for x, y in new
+                       if float(np.min((rxF - x) ** 2 + (ryF - y) ** 2)) <= 6.25]
+        except Exception:
+            pass
         now = time.monotonic()
         # ── P2 Stage-A' (0722j): 장애물 단기기억 TTL 3s ──────────────────
         # 라이다 가림: detour길 위 #2가 #1 뒤에 가려져 커밋 순간 리스트에 없음
@@ -1130,20 +1288,87 @@ class MPCNode(Node):
         # 0723x 정적/동적 셀 구분: 같은 셀에서 0.25s 이상 재관측 = 정적 확정(0723y 반응성 단축)(TTL 3s
         # 가림 지속성 유지). 미확정 셀은 "지금 보이는 것"만 유효 — 이동 상대가
         # 남기던 최대 6m 잔상 열(breadcrumb, 유령 커밋·obs2/3 오염의 원인) 즉시 소멸.
-        if not hasattr(self, '_obs_seen'):
-            self._obs_seen = {}   # (x,y grid 0.3m) -> (x, y, t_first, t_last)
+        if not hasattr(self, '_obs_trk'):
+            self._obs_trk = []   # [{x,y,P,t0,t,hits,inn,miss}]
+        _R = 0.15 ** 2           # 측정분산 (kiss BEV 지터 ~0.15 m)
+        for tr in self._obs_trk:
+            tr['upd'] = False
         for x, y in new:
-            k = (round(x / 0.3), round(y / 0.3))
-            old = self._obs_seen.get(k)
-            t_first = old[2] if old is not None else now
-            self._obs_seen[k] = (x, y, t_first, now)
-        ttl = 3.0
-        self._obs_seen = {k: v for k, v in self._obs_seen.items()
-                          if now - v[3] <= ttl}
-        _static = [(v[0], v[1]) for v in self._obs_seen.values()
-                   if v[3] - v[2] >= 0.25]
-        _fresh_dyn = [(v[0], v[1]) for v in self._obs_seen.values()
-                      if v[3] - v[2] < 0.25 and now - v[3] < 0.15]
+            best = None
+            bd = None
+            for tr in self._obs_trk:
+                d2 = (tr['x'] - x) ** 2 + (tr['y'] - y) ** 2
+                gate = max(0.45, 3.0 * math.sqrt(tr['P'] + _R))
+                if d2 < gate * gate and (bd is None or d2 < bd):
+                    best, bd = tr, d2
+            if best is None:
+                self._obs_trk.append({'x': x, 'y': y, 'P': 0.35 ** 2,
+                                      't0': now, 't': now, 'hits': 1,
+                                      'inn': 0.0, 'miss': 0, 'upd': True})
+            else:
+                inn = math.sqrt(bd)
+                best['inn'] = 0.7 * best['inn'] + 0.3 * inn
+                K = best['P'] / (best['P'] + _R)
+                best['x'] += K * (x - best['x'])
+                best['y'] += K * (y - best['y'])
+                best['P'] = max(0.03 ** 2, (1.0 - K) * best['P'])
+                best['t'] = now
+                best['hits'] += 1
+                best['miss'] = 0
+                best['upd'] = True
+        # ── 0813 D6 랩 지속 기억 + 부정증거 퇴출 ─────────────────────
+        # 정적확정 트랙은 TTL 없이 랩을 넘겨 기억한다 (안 보여도 제약 유지 —
+        # 가림·사거리 밖·검출 게이트 지연 전부 무시하고 다음 랩 즉시 커밋).
+        # 삭제는 "봤어야 하는데 안 보임" 누적으로만: 전방 ±80°·6 m 내이고
+        # 더 가까운 다른 확정 트랙이 시선을 막지 않는 사이클에 무검출이면
+        # miss+1, 10회(≈0.4 s) 연속이면 치워진 것으로 보고 삭제.
+        _pose = getattr(self, '_last_pose_xy', None)
+        _conf = [tr for tr in self._obs_trk
+                 if tr['t'] - tr['t0'] >= 0.25 and tr['hits'] >= 4
+                 and tr['inn'] < 0.25]
+        if _pose is not None:
+            px, py, pyaw = _pose
+            for tr in _conf:
+                if tr['upd']:
+                    continue
+                dx, dy = tr['x'] - px, tr['y'] - py
+                dist = math.hypot(dx, dy)
+                brg = math.atan2(dy, dx) - pyaw
+                brg = (brg + math.pi) % (2 * math.pi) - math.pi
+                if dist > 6.0 or abs(brg) > 1.4:
+                    continue          # 시야 밖 — 부정증거 아님
+                _occl = False
+                for o in _conf:
+                    if o is tr:
+                        continue
+                    od = math.hypot(o['x'] - px, o['y'] - py)
+                    ob = math.atan2(o['y'] - py, o['x'] - px) - pyaw
+                    ob = (ob + math.pi) % (2 * math.pi) - math.pi
+                    if od < dist - 0.2 and abs(ob - brg) < 0.18:
+                        _occl = True  # 다른 장애물이 가림
+                        break
+                if not _occl:
+                    tr['miss'] += 1
+        _confset = set(id(tr) for tr in _conf)
+        self._obs_trk = [tr for tr in self._obs_trk
+                         if (id(tr) in _confset and tr['miss'] < 10)
+                         or (id(tr) not in _confset and now - tr['t'] <= 3.0)]
+        # σ 힌트 수출 → acados keepout 이 불확실성 비례로 넓힘
+        try:
+            if getattr(self, 'mpc', None) is not None:
+                self.mpc.obs_sigma_hints = [
+                    (tr['x'], tr['y'], math.sqrt(tr['P']))
+                    for tr in self._obs_trk if id(tr) in _confset]
+        except Exception:
+            pass
+        # 정적 확정: 0.25 s + 4히트 + 혁신 EMA<0.25 (이동체 배제)
+        _static = [(tr['x'], tr['y']) for tr in self._obs_trk
+                   if tr['t'] - tr['t0'] >= 0.25 and tr['hits'] >= 4
+                   and tr['inn'] < 0.25]
+        _fresh_dyn = [(tr['x'], tr['y']) for tr in self._obs_trk
+                      if not (tr['t'] - tr['t0'] >= 0.25 and tr['hits'] >= 4
+                              and tr['inn'] < 0.25)
+                      and now - tr['t'] < 0.15]
         self._obstacles = _static + _fresh_dyn
         self._obstacles_stamp = now
         # ── 0723E OppTracker: 정적 확정 셀을 제외한 감지를 Frenet으로 투영해
@@ -1424,7 +1649,7 @@ class MPCNode(Node):
         # 블록 담장이 됐고, 높이 0.9 m 가 궤적을 가렸다. 이음매 없는 커튼으로
         # 바꾸고 높이를 0.5 m 로 낮춘다 — 존은 보이되 궤적을 안 가리게.
         ZW = 0.5        # 커튼 높이 [m]
-        for zi, (pfx, s0, s1, fac) in enumerate(zone_specs):
+        for zi, (pfx, s0, s1, fac, qfac) in enumerate(zone_specs):
             span = (s1 - s0) if s1 >= s0 else (s1 + L - s0)
             t = min(max((float(fac) - 1.0) / 5.0, 0.0), 1.0)   # 1.0~6.0 → 0~1
 
@@ -1467,7 +1692,9 @@ class MPCNode(Node):
             lab.pose.position.x, lab.pose.position.y, lab.pose.position.z = lx, ly, ZW + 0.45
             lab.scale.z = 0.40
             lab.color.r, lab.color.g, lab.color.b, lab.color.a = 1.0, 1.0, 1.0, 1.0
-            lab.text = f"{pfx}  s{s0:.1f}~{s1:.1f}  x{fac:.1f}"
+            # 2026-08-19: slack 배율(x)과 q_cte 배율(q) 을 같이 찍는다.
+            lab.text = (f"{pfx}  s{s0:.1f}~{s1:.1f}  x{fac:.1f}"
+                        + (f"  q{qfac:.2f}" if qfac != 1.0 else ""))
             arr.markers.append(lab)
 
         self.zone_markers_pub.publish(arr)
@@ -1570,7 +1797,7 @@ class MPCNode(Node):
         self._imk_server.clear()
         self._imk_map = {}
         L = float(self._track.element_arc_lengths_orig[-1])
-        for pfx, s0, s1, _fac in zone_specs:
+        for pfx, s0, s1, _fac, _qfac in zone_specs:
             for which, s_val, (cr, cg, cb) in (('s0', s0, (0.1, 1.0, 0.2)),
                                                ('s1', s1, (0.2, 0.5, 1.0))):
                 name = f"{pfx}_{which}"
@@ -1634,6 +1861,52 @@ class MPCNode(Node):
         except Exception as e:  # noqa: BLE001
             self.get_logger().warn(f"[zone-edit] feedback 처리 실패: {e}")
 
+    def _publish_refv_markers(self, wpnts) -> None:
+        """섹터 배율 적용된 ref_v 를 RViz 로. 구슬 색 = 속도(파랑 느림→빨강 빠름),
+        16점마다 'id:속도' 텍스트. TRANSIENT_LOCAL 이라 RViz 늦게 켜도 보인다.
+        RViz: MarkerArray 디스플레이 → topic /mpc/refv_markers."""
+        try:
+            ma = MarkerArray()
+            _wipe = Marker()
+            _wipe.action = Marker.DELETEALL
+            ma.markers.append(_wipe)
+            vals = [float(w.vx_mps) for w in wpnts]
+            vmin, vrng = min(vals), max(max(vals) - min(vals), 1e-3)
+            now = self.get_clock().now().to_msg()
+            for i, w in enumerate(wpnts):
+                if i % 4:
+                    continue
+                m = Marker()
+                m.header.frame_id = 'map'
+                m.header.stamp = now
+                m.ns, m.id, m.type = 'refv', i, Marker.SPHERE
+                m.pose.position.x = float(w.x_m)
+                m.pose.position.y = float(w.y_m)
+                m.pose.position.z = 0.05
+                m.pose.orientation.w = 1.0
+                m.scale.x = m.scale.y = m.scale.z = 0.08
+                t = (float(w.vx_mps) - vmin) / vrng
+                m.color.r, m.color.g, m.color.b, m.color.a = t, 0.2, 1.0 - t, 1.0
+                ma.markers.append(m)
+                if i % 16 == 0:
+                    tm = Marker()
+                    tm.header.frame_id = 'map'
+                    tm.header.stamp = now
+                    tm.ns, tm.id, tm.type = 'refv_txt', i, Marker.TEXT_VIEW_FACING
+                    tm.pose.position.x = float(w.x_m)
+                    tm.pose.position.y = float(w.y_m)
+                    tm.pose.position.z = 0.25
+                    tm.pose.orientation.w = 1.0
+                    tm.scale.z = 0.15
+                    tm.color.r = tm.color.g = tm.color.b = 1.0
+                    tm.color.a = 0.9
+                    tm.text = f'{int(w.id)}:{float(w.vx_mps):.1f}'
+                    ma.markers.append(tm)
+            self._refv_marker_pub.publish(ma)
+            self._last_refv_ma = ma   # RViz 늦참여(volatile 구독) 대비 주기 재발행용
+        except Exception as e:
+            self.get_logger().warn(f'[refv-viz] 발행 실패: {e}')
+
     def _housekeep_cb(self):
         """제어 루프 밖에서 도는 저속(2 Hz) 잡무 — 현재는 존 저장 요청 처리.
 
@@ -1662,6 +1935,27 @@ class MPCNode(Node):
             self.get_logger().warn(f"[zone-edit] 토글 처리 실패: {e}",
                                    throttle_duration_sec=5.0)
 
+        # RViz 가 volatile 로 구독해도 보이도록 마커 주기 재발행 (0.5Hz 타이머 2틱=1s)
+        _ma = getattr(self, '_last_refv_ma', None)
+        if _ma is not None:
+            self._refv_tick = getattr(self, '_refv_tick', 0) + 1
+            if self._refv_tick % 2 == 0:
+                self._refv_marker_pub.publish(_ma)
+        # 0812 섹터 spec 변경 → 원본 vx 복원 후 트랙 재구축 (제어루프 잠깐 유휴)
+        if self._sector_respec_req:
+            self._sector_respec_req = False
+            try:
+                if self._ref_wpnts is not None and self._ref_vx_orig is not None:
+                    for _w, _v in zip(self._ref_wpnts, self._ref_vx_orig):
+                        _w.vx_mps = _v
+                    self._initialize_mpc(wpnts=self._ref_wpnts,
+                                         wall_wpnts=self._wall_wpnts)
+                    self.get_logger().info('[sector_refv] 라이브 재적용 완료')
+                else:
+                    self.get_logger().warn(
+                        '[sector_refv] wpnts 원본 미보유 — 재적용 불가 (CSV 트랙 경로?)')
+            except Exception as e:
+                self.get_logger().error(f'[sector_refv] 라이브 재적용 실패: {e}')
         if not self._save_params_req:
             return
         self._save_params_req = False
@@ -1736,7 +2030,9 @@ class MPCNode(Node):
         # 존 키는 yaml 에 없더라도 반드시 기록(없으면 재시작 시 유실)
         for pfx in ('corridor_hard', 'corridor_hard2', 'corridor_hard3',
                     'corridor_hard4', 'corridor_hard5', 'corridor_hard6'):
-            for suf in ('_s0', '_s1', '_factor'):
+            # 2026-08-19: _qcte_factor 추가 — 빠뜨리면 존별 q_cte 배율이
+            # zone-save 후 재시작 때 통째로 사라진다 (yaml 에 안 써지므로).
+            for suf in ('_s0', '_s1', '_factor', '_qcte_factor'):
                 try:
                     keys[pfx + suf] = float(self.get_parameter(pfx + suf).value)
                 except Exception:  # noqa: BLE001
@@ -1791,8 +2087,8 @@ class MPCNode(Node):
             return
         # unified 7-dim state [x,y,ψ,vx,vy,r,s] (both modes) → s = x0[6].
         s_now = float(x0[6])
-        # 국소 corridor 하드닝 존 전달 (live 튜닝 가능)
-        _chf = float(self.get_parameter('corridor_hard_factor').value)
+        # 국소 corridor 하드닝 존 전달 (live 튜닝 가능) — 존 1 도 아래 _zone_of()
+        # 루프에서 나머지와 같이 처리한다 (2026-08-19 이전에는 존 1 만 별도 분기였다).
         self.mpc.straight_qv_factor = float(self.get_parameter('straight_qv_factor').value)
         self.mpc.straight_kappa_thr = float(self.get_parameter('straight_kappa_thr').value)
         # _zone_specs 는 (파라미터 접두어, s0, s1, factor) — 시각화/드래그 편집이
@@ -1802,19 +2098,26 @@ class MPCNode(Node):
         # 좁은 시케인(s21-24, 폭 ±0.13-0.23)은 강한 corridor push 가 반대편
         # 클립을 유발해(0602 재현) 오히려 벌점을 낮춰야 통과한다 (아침 bag:
         # 실효 60/45 로 통과, 200/120+ 로 매랩 충돌). 1.0 만 '비활성'.
+        # 2026-08-19: 등록 게이트가 slack factor 만 보던 탓에 q_cte 존을 켜려면
+        # slack factor 를 1.05 같은 근중립값으로 두는 해킹이 필요했다. 둘 중
+        # 하나라도 활성이면 등록한다 — slack 은 그대로 두고 q_cte 만 조절 가능.
+        def _zone_of(_zn):
+            _sf = float(self.get_parameter(_zn + '_factor').value)
+            _qf = float(self.get_parameter(_zn + '_qcte_factor').value)
+            if not ((_sf != 1.0 and _sf > 0.0) or (_qf != 1.0 and _qf > 0.0)):
+                return None
+            return (_zn,
+                    float(self.get_parameter(_zn + '_s0').value),
+                    float(self.get_parameter(_zn + '_s1').value),
+                    _sf, _qf)
+
         _zone_specs = []
-        if _chf != 1.0 and _chf > 0.0:
-            _zone_specs.append(('corridor_hard',
-                                float(self.get_parameter('corridor_hard_s0').value),
-                                float(self.get_parameter('corridor_hard_s1').value), _chf))
-        for _zn in ('corridor_hard2', 'corridor_hard3', 'corridor_hard4',
-                    'corridor_hard5', 'corridor_hard6'):
-            _zf = float(self.get_parameter(_zn + '_factor').value)
-            if _zf != 1.0 and _zf > 0.0:
-                _zone_specs.append((_zn,
-                                    float(self.get_parameter(_zn + '_s0').value),
-                                    float(self.get_parameter(_zn + '_s1').value), _zf))
-        _zones = [(a, b, c) for _, a, b, c in _zone_specs]
+        for _zn in ('corridor_hard', 'corridor_hard2', 'corridor_hard3',
+                    'corridor_hard4', 'corridor_hard5', 'corridor_hard6'):
+            _z = _zone_of(_zn)
+            if _z is not None:
+                _zone_specs.append(_z)
+        _zones = [(a, b, c, d) for _, a, b, c, d in _zone_specs]
         self.mpc.corridor_hard_zones = _zones
         if bool(self.get_parameter('publish_zone_markers').value):
             try:
@@ -1877,6 +2180,10 @@ class MPCNode(Node):
             if _trk is not None:
                 _trk.predict(_now_dyn)
             _dyn = _trk is not None and _trk.confirmed_dynamic(_now_dyn)
+            # 0818 정적 전용 스위치 — 고속 검출 밀림이 정적 물체를 동적으로 오판해
+            # 원형 keepout/추종 모드로 빠지는 것을 차단 (정적 장애물 실험 중).
+            if bool(self.get_parameter('static_only_obstacles').value):
+                _dyn = False
             if _dyn != _dyn_prev:
                 self.get_logger().info(
                     "[P3] dynamic opp %s (vs=%.2f)" % (
@@ -1953,13 +2260,36 @@ class MPCNode(Node):
             # _opp_v 추정(수백 ms 워밍업)과 커밋(즉시) 사이의 경쟁 제거 (bag 15_39:
             # 감지 재출현 순간마다 분류 전에 커밋이 먼저 물던 것).
             _young = False
+            _memorized = False
             if self._obstacles:
                 _now_cls = time.monotonic()
+                # 0813 D6: 트래커 퇴출 판정용 최신 pose 스탬프
+                self._last_pose_xy = (float(x0[0]), float(x0[1]), float(x0[2]))
                 _seen = getattr(self, '_commit_seen', {})
+                # 0813 kiss 가 정적으로 확정한 검출은 위치안정 게이트를 즉시 통과 —
+                # 등록시각을 1s 전으로 박아 _young=False. kiss 판정이 MPCC 재판단(0.25s+
+                # 고속 반경붕괴)보다 빠르고 정확. 없으면(구 kiss) 기존 경로 그대로.
+                for _kx, _ky in getattr(self, '_kiss_static_xy', []):
+                    if not any(math.hypot(_k2[0]-_kx, _k2[1]-_ky) < 0.35 for _k2 in _seen):
+                        _seen[(float(_kx), float(_ky))] = _now_cls - 1.0
                 _nx, _ny = min(self._obstacles,
                                key=lambda o: (float(o[0]) - float(x0[0])) ** 2
                                + (float(o[1]) - float(x0[1])) ** 2)[:2]
-                _best = None; _bd = 0.35
+                # 0813 D6: 확정 트랙(기억 1s+)이면 위치안정 게이트 우회 플래그 —
+                # 이미 오래 본 물체라 0.25s 재관찰이 불필요 (랩당 커밋지연 제거).
+                # 아래 최종 대입에서 (_young and not _memorized) 로 반영.
+                # 0813 속도비례 반경: 고속에선 정지 장애물 검출이 진행방향으로 v·지연 만큼
+                # 밀려(0.3s 에 ~1m) 고정 0.35/0.5m 안에 안 머문다 → 게이트가 영원히 안 열림.
+                # +0.2·v 여유 (7m/s → +1.4m). 움직이는 상대 차단 목적은 유지(초당 수 m 이동).
+                _gate_r_v = 0.20 * abs(float(x0[3]))
+                _mem_r2 = (0.5 + _gate_r_v) ** 2
+                _memorized = any(
+                    (_tr['t'] - _tr['t0'] >= 1.0 and _tr['hits'] >= 4
+                     and _tr['inn'] < 0.25
+                     and (_tr['x'] - float(_nx)) ** 2
+                     + (_tr['y'] - float(_ny)) ** 2 < _mem_r2)
+                    for _tr in getattr(self, '_obs_trk', []))
+                _best = None; _bd = 0.35 + _gate_r_v
                 for _k2 in _seen:
                     _d2k = math.hypot(_k2[0] - float(_nx), _k2[1] - float(_ny))
                     if _d2k < _bd:
@@ -1972,7 +2302,7 @@ class MPCNode(Node):
                 if len(_seen) > 64:
                     _seen = {k: v for k, v in _seen.items() if _now_cls - v < 5.0}
                 self._commit_seen = _seen
-            self.mpc.suppress_commit = _dyn or _young
+            self.mpc.suppress_commit = _dyn or (_young and not _memorized)
             # 2026-08-07 정지 상대 핸드오프 (bag 12_14_53/12_19_35 추돌 0.57/0.40 m ×2):
             # 저속 0.7 s 로 동적 확정이 풀려도 트래커가 위치를 아는 동안(active)
             # 상대가 전방 근접(<8 m)이면 원형 keepout 을 유지한다 — 정적 검출
@@ -2500,9 +2830,26 @@ class MPCNode(Node):
                                                  traj[:, 1] - float(_oy)).min())
                         except Exception:
                             _pd = 0.0
-                        if _pd > 0.5:
+                        # 0818 좁은통로 판정: side-decide 가 이 장애물에 shift>0 을 기록했으면
+                        # (keepout 이 통로보다 넓어 제약선을 밀어야 함 = 정중앙 배치) 계획-간극
+                        # 게이트를 우회하고 narrow_pass_speed 로 미리 감속. bag 21_47: 이 배치에서
+                        # 커밋 왕복 중 저속 정지→QP 10건 + 스침 0.25m. 넓은 통로는 영향 없음.
+                        _nsd = getattr(self.mpc, '_narrow_shift', None) or {}
+                        _nit = _nsd.get((round(float(_ox) * 2.0) / 2.0,
+                                         round(float(_oy) * 2.0) / 2.0))
+                        # 0818b 티어: 남은 keepout 절대폭(keep_eff)으로 판단. shift 유무는 거의 모든
+                        # 장애물에서 참이라(사용자 실측: 전 회피 감속) 기준으로 부적합.
+                        #   keep_eff ≥0.55 → 감속 없음(기존 게이트) / 0.40~0.55 → 4.0 / <0.40 → narrow_pass_speed
+                        _keep_left = (float(_nit[2]) if (_nit is not None and len(_nit) > 2
+                                      and time.monotonic() - float(_nit[1]) < 10.0) else 9.9)
+                        _narrow = _keep_left < 0.55
+                        if _pd > 0.5 and not _narrow:
                             continue
                         _vp = float(self.get_parameter('obs_pass_speed').value)
+                        if _keep_left < 0.40:
+                            _vp = min(_vp, float(self.get_parameter('narrow_pass_speed').value))
+                        elif _keep_left < 0.55:
+                            _vp = min(_vp, 4.0)
                         # 0723c narrow-pass 감속: 계획 간극이 좁을수록 통과속도를
                         # 비례 축소 (0.5m→vp 그대로, 0.3m→~2.2, 바닥 2.0).
                         # keepout 공간맞춤으로 좁은 통로를 "지나가게" 된 대신
@@ -2536,7 +2883,11 @@ class MPCNode(Node):
         # stuck-release(후진) 중이면 floor 적용 안 함. unified: 양 모드.
         startup_speed = float(self.get_parameter('startup_speed').value) \
             if self.has_parameter('startup_speed') else 0.0
+        # 0812: _has_moved 게이트 추가 — 솔버측 플로어(위쪽)엔 있는데 여기만 없어서
+        # BLOCK-STOP 제동으로 2.0 밑에 내려가는 순간 3.0 으로 되밀어 장애물에 박았다
+        # (BLOCKED→STUCK→후진 루프의 직접 원인). 출발 1회만 플로어가 맞는 설계.
         if (vx_floor > 0.0 and raw_vx < vx_floor
+                and not getattr(self.mpc, '_has_moved', False)
                 and not getattr(self.mpc, '_stuck_release_active', False)):
             cmd.drive.speed = max(float(cmd.drive.speed), startup_speed)
 
@@ -2605,6 +2956,63 @@ class MPCNode(Node):
         self._last_steer_pub = float(cmd.drive.steering_angle)
         self._last_steer_t = _now_t
 
+        # ── 0820 loc-guard v2: LOST/odom두절 시 램프 정지 (즉시 0 = 휠락이라 금지) ──
+        _lg_stop = getattr(self, '_loc_lost', False) or getattr(self, '_solver_lost', False)
+        _rx = getattr(self, '_odom_rx_mono', None)
+        if _rx is not None and time.monotonic() - _rx > 0.4:
+            _lg_stop = True   # 수용 odom 0.4s 두절 — 블라인드 주행 차단 (워치독)
+            if time.monotonic() - getattr(self, '_lg_wd_warn_t', 0.0) > 2.0:
+                self.get_logger().warn('[loc-guard] odom 두절 0.4s+ — 램프 정지')
+                self._lg_wd_warn_t = time.monotonic()
+        if _lg_stop:
+            _prev_v = getattr(self, '_lg_ramp_v', None)
+            if _prev_v is None:
+                _prev_v = float(self._last_speed_pub or 0.0)
+            _dt_rv = min(0.1, _now_t - getattr(self, '_lg_ramp_t', _now_t))
+            _v_new = max(0.0, _prev_v - 5.0 * _dt_rv)   # 5 m/s² 제어 제동
+            cmd.drive.speed = _v_new
+            self._last_speed_pub = _v_new
+            self._lg_ramp_v = _v_new
+        else:
+            self._lg_ramp_v = None
+        self._lg_ramp_t = _now_t
+        # v2 (0821): 유클리드 거리는 방향을 모른다 — 옆을 지나가는 중/이미 지나친/
+        # 횡으로 충분히 벗어난 장애물에도 감속이 걸려 레이스 페이스를 깎았다(실측).
+        # 충돌 코스일 때만 건다: ①전방(Δs>0) ②횡으로 겹침 ③회피 커밋 전.
+        _sl_a = float(self.get_parameter('sight_brake_a').value)
+        if _sl_a > 0.0 and getattr(self.mpc, 'path_length', None):
+            try:
+                _sx = float(getattr(self.mpc, 'dbg_sel_x', 0.0))
+                _sy = float(getattr(self.mpc, 'dbg_sel_y', 0.0))
+                _dsel = float(getattr(self.mpc, 'dbg_sel_dmin', float('inf')))
+                _od = self._last_odom
+                if _dsel < 1e5 and _od is not None and (abs(_sx) + abs(_sy)) > 1e-6:
+                    _L = float(self.mpc.path_length)
+                    _s_o, _e_o = self.mpc._obstacle_frenet(_sx, _sy)
+                    _s_c, _e_c = self.mpc._obstacle_frenet(
+                        _od.pose.pose.position.x, _od.pose.pose.position.y)
+                    _ds = (_s_o - _s_c + 0.5 * _L) % _L - 0.5 * _L   # 전방 양수
+                    _keep = (float(getattr(self.mpc, 'R_safe_live', 0.45))
+                             + float(getattr(self.mpc, 'R_car_live', 0.27)))
+                    # ③ 이미 side 커밋 = 회피가 처리 중 → 감속 불필요
+                    _committed = getattr(self.mpc, '_committed_obs', None) is not None
+                    # ② 횡 겹침: 안 비켜도 지나갈 만큼 벗어나 있으면 위협 아님
+                    _lat_free = abs(_e_o - _e_c) > (_keep + 0.10)
+                    # Δs 하한 0.6m: 이미 옆을 지나는 중이면 감속해도 무의미, 페이스만 손해
+                    if (not _committed) and (not _lat_free) and 0.6 < _ds < 12.0:
+                        _free = max(0.0, _ds - _keep)
+                        _v_lim = max(float(self.get_parameter('sight_v_floor').value),
+                                     math.sqrt(2.0 * _sl_a * _free))
+                        if _v_lim < float(cmd.drive.speed):
+                            self.get_logger().warn(
+                                f'[sight] 전방 {_ds:.2f}m 횡{abs(_e_o-_e_c):.2f} → '
+                                f'상한 {_v_lim:.2f} (요청 {float(cmd.drive.speed):.2f})',
+                                throttle_duration_sec=1.0)
+                            cmd.drive.speed = _v_lim
+                            self._last_speed_pub = _v_lim
+            except Exception:
+                pass   # 안전속도 실패가 제어를 죽이지 않는다
+
         self.ackermann_pub.publish(cmd)
 
         # Diagnostics
@@ -2612,7 +3020,26 @@ class MPCNode(Node):
         # ROS1 호환: ms 단위 (Nonlinear_MPC_node.py:328). logger [dbg] 출력
         # 도 "ms" 표기라 seconds 그대로 publish 하면 0 으로 보임.
         self.solve_time_pub.publish(Float64(data=float(solve_dt * 1000.0)))
-        self.feasible_pub.publish(Bool(data=bool(opti_value < 1e8)))
+        _feas = bool(opti_value < 1e8)
+        self.feasible_pub.publish(Bool(data=_feas))
+        # ── 0821 solver-guard ──
+        _sg_bad = int(self.get_parameter('solver_guard_bad_n').value)
+        _sg_ok = int(self.get_parameter('solver_guard_ok_n').value)
+        if _sg_bad > 0:
+            if _feas:
+                self._sg_ok_run = getattr(self, '_sg_ok_run', 0) + 1
+                self._sg_bad_run = 0
+                if getattr(self, '_solver_lost', False) and self._sg_ok_run >= _sg_ok:
+                    self._solver_lost = False
+                    self.get_logger().warn('[solver-guard] 해 복구 — 재주행')
+                    self._reset_mpc_latches('solver-guard 복귀')
+            else:
+                self._sg_bad_run = getattr(self, '_sg_bad_run', 0) + 1
+                self._sg_ok_run = 0
+                if not getattr(self, '_solver_lost', False) and self._sg_bad_run >= _sg_bad:
+                    self._solver_lost = True
+                    self.get_logger().warn(
+                        f'[solver-guard] 해 소실 {self._sg_bad_run}사이클 연속 — 정지')
 
         # MPC trajectory as nav_msgs/Path
         path = Path()

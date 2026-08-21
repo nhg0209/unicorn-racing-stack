@@ -451,13 +451,18 @@ class GlobalPlanner(Node):
         # get morphological skeleton of the map
         skeleton = skeletonize(opening, method='lee')
 
-        # ! For debugging
-        # origin='lower' flips the display about the x-axis so the map shows
-        # right-side-up (viz only; the underlying arrays / waypoints are unchanged).
-        f, (ax0, ax1) = plt.subplots(2, 1)
-        ax0.imshow(opening, cmap='gray', origin='lower')
-        ax1.imshow(skeleton, cmap='gray', origin='lower')
-        plt.show()
+        # Debug view of the filtered map and the skeleton extracted from it.
+        # Gated on show_plots like every other plot in this file: plt.show()
+        # blocks until the window is closed, so leaving it unconditional hangs
+        # the one-shot raceline run (raceline_generator.launch.xml) forever when
+        # there is no display to close it on -- headless, or over SSH.
+        if self.show_plots:
+            # origin='lower' flips the display about the x-axis so the map shows
+            # right-side-up (viz only; the underlying arrays / waypoints are unchanged).
+            f, (ax0, ax1) = plt.subplots(2, 1)
+            ax0.imshow(opening, cmap='gray', origin='lower')
+            ax1.imshow(skeleton, cmap='gray', origin='lower')
+            plt.show()
 
         ################################################################################################################
         # Extract centerline from filtered occupancy grid map
