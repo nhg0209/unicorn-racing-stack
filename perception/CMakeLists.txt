@@ -73,4 +73,15 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
 )
 
+# race.launch.xml launches this as `exec="kiss_obstacle_bridge"`, so drop the .py.
+# NOTE: RENAME is not part of ament's symlink-install reimplementation of install(PROGRAMS)
+# (its parser knows only OPTIONAL/DESTINATION/PROGRAMS), so a renamed program falls through to
+# native CMake install and is COPIED, not symlinked -- edits to the source need a rebuild to take
+# effect, unlike the un-renamed adapter above. Same as tracking_node.
+install(PROGRAMS
+  scripts/kiss_obstacle_bridge.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME kiss_obstacle_bridge
+)
+
 ament_package()
