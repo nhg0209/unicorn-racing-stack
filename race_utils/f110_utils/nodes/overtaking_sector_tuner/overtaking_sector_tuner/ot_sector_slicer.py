@@ -43,6 +43,7 @@ class OvertakingSectorSlicer(Node):
                          automatically_declare_parameters_from_overrides=False)
         # rosparam to define yaml dir but filename will always be ot_sectors.yaml
         self.declare_parameter('save_dir', '')
+        self.declare_parameter('use_gui', True)
         self.future = future
 
         self.glb_wpnts = None
@@ -51,6 +52,7 @@ class OvertakingSectorSlicer(Node):
 
         self.glob_slider_s = 0
         self.sector_pnts = [0]  # Sector always has to start at 0
+        self.use_gui = bool(self.get_parameter('use_gui').value)
 
         self.wpnt_sub = self.create_subscription(WpntArray, '/global_waypoints', self.glb_wpnts_cb, 10)
         self.wpnt_sub_sp = self.create_subscription(WpntArray, '/global_waypoints/shortest_path', self.glb_sp_wpnts_cb, 10)
@@ -79,8 +81,15 @@ class OvertakingSectorSlicer(Node):
         if (self.glb_sp_wpnts is None):
             return
 
-        # Select Sectors via the GUI
-        self.sector_gui()
+        # Select Sectors via the GUI. Headless (use_gui:=false) skips it and lets
+        # sectors_to_yaml() take its own single-sector fallback (sector_pnts stays [0],
+        # so it appends the last index and the whole track becomes one sector). The GUI
+        # is matplotlib and blocks forever with no display, which is every SSH session.
+        if self.use_gui:
+            self.sector_gui()
+        else:
+            self.get_logger().warn('use_gui:=false -> skipping the slicing GUI; '
+                                   'writing ONE overtaking sector over the whole track.')
         self.get_logger().info('Selected Overtaking Sector IDXs: ' + str(self.sector_pnts))
 
         # Write sectors to yaml

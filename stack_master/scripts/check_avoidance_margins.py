@@ -6,7 +6,7 @@ keep-out, or the re-opt line sits inside the reactive keep-out and the reactive 
 re-avoids the already-handled obstacle every lap (hump on top of hump, OVERTAKE flip-flop).
 
     reactive keep-out  = width_car/2 + safety_margin   (static_avoidance_params.yaml)
-    re-opt clearance   = reopt_obs_margin              (base_system.launch.xml -> static_reopt_node)
+    re-opt clearance   = obs_margin                    (static_reopt_params.yaml -> static_reopt_node)
 
 THIRD chain member — the state machine's GB free-check: for the swapped line to read FREE
 (GB_TRACK holds, no phantom TRAILING), the line's actual box-edge clearance (keep-out +
@@ -42,57 +42,43 @@ def load_reactive_params():
     return p, cfg
 
 
-def load_launch_args():
-    p = STACK_MASTER / "launch" / "base_system.launch.xml"
-    root = ET.parse(p).getroot()
-    args = {a.get("name"): a.get("default") for a in root.iter("arg")}
-    return p, args
+def load_reopt_params():
+    p = STACK_MASTER / "config" / "static_reopt_params.yaml"
+    cfg = yaml.safe_load(p.read_text())["static_reopt_node"]["ros__parameters"]
+    return p, cfg
 
 
 def check_launch_agreement() -> bool:
-    """race.launch.xml and base_system.launch.xml must agree on every reopt_* default.
+    """No reopt_* tuning argument may reappear in the launch files.
 
-    This exists because of a real miss: reopt_wall_margin was 0.05 in base_system.launch.xml (and
-    in the node) but 0.12 in race.launch.xml, which is the entry point the runbook and every sim
-    run actually use. The rest of this script only reads base_system, so it reported the safe 0.05
-    and everyone believed it. Measured cost of that 7 cm on ifac: the corridor fit shrank the
+    The bug this used to guard against was two sources of truth: reopt_wall_margin was 0.05 in
+    base_system.launch.xml (and in the node) but 0.12 in race.launch.xml, which is the entry
+    point the runbook and every sim run actually use, so this script read the safe 0.05 and
+    everyone believed it. Measured cost of that 7 cm on ifac: the corridor fit shrank the
     avoidance hump, worst-case lap loss went +0.49 -> +1.47 s and the laid line exceeded curvlim.
 
-    Also flags reopt_* args base_system declares but race.launch.xml never forwards — those are
-    silently un-tunable from the documented entry point (reopt_obs_margin was one).
+    static_reopt_params.yaml is now the only source and the node loads it directly, so that class
+    of drift is gone by construction. What remains is the way BACK to it: a `<param name="..."
+    value="$(var reopt_...)"/>` added after the `<param from=...>` silently overrides the file for
+    every run, and nothing else would notice. `reopt` itself is exempt: it enables the node, it
+    does not tune it.
     """
-    base_p = STACK_MASTER / "launch" / "base_system.launch.xml"
-    race_p = STACK_MASTER / "launch" / "race.launch.xml"
-    if not race_p.is_file():
-        return True
-    base_root, race_root = ET.parse(base_p).getroot(), ET.parse(race_p).getroot()
-    base_args = {a.get("name"): a.get("default") for a in base_root.iter("arg")
-                 if (a.get("name") or "").startswith("reopt")}
-    # <arg name=.. default=..> declarations vs <arg name=.. value=..> forwards inside <include>
-    race_args = {a.get("name"): a.get("default") for a in race_root.iter("arg")
-                 if (a.get("name") or "").startswith("reopt") and a.get("default") is not None}
-    race_fwd = {a.get("name") for a in race_root.iter("arg")
-                if (a.get("name") or "").startswith("reopt") and a.get("value") is not None}
-
-    print(f"\n--- launch agreement ({race_p.name} <-> {base_p.name}) ---")
     ok = True
-    for name in sorted(set(base_args) & set(race_args)):
-        b, r = base_args[name], race_args[name]
-        try:
-            same = abs(float(b) - float(r)) < 1e-9
-        except (TypeError, ValueError):
-            same = str(b) == str(r)
-        if not same:
+    print("\n--- launch/yaml separation ---")
+    for name in ("base_system.launch.xml", "race.launch.xml"):
+        path = STACK_MASTER / "launch" / name
+        if not path.is_file():
+            continue
+        root = ET.parse(path).getroot()
+        stray = sorted({a.get("name") for a in root.iter("arg")
+                        if (a.get("name") or "").startswith("reopt_")})
+        if stray:
             ok = False
-            print(f"FAIL: {name} default is {r} in {race_p.name} but {b} in {base_p.name}. "
-                  f"{race_p.name} wins for every documented run, so {b} is a fiction.")
-    missing = sorted(n for n in base_args if n not in race_fwd)
-    if missing:
-        ok = False
-        print(f"FAIL: {race_p.name} never forwards {', '.join(missing)} — un-tunable from the "
-              f"entry point the runbook uses. Add <arg name=.. value=..> to the include.")
+            print(f"FAIL: {name} declares tuning args {', '.join(stray)}. Tuning lives in "
+                  f"static_reopt_params.yaml; a launch arg shadows it for every run.")
     if ok:
-        print(f"OK: all {len(base_args)} reopt_* defaults agree and are forwarded.")
+        yaml_path, _ = load_reopt_params()
+        print(f"OK: no reopt_* tuning args in the launch files; {yaml_path.name} is the only source.")
     return ok
 
 
@@ -196,7 +182,7 @@ def check_dynamic_chain(sm_path, sm) -> bool:
 
 def main() -> int:
     yaml_path, cfg = load_reactive_params()
-    launch_path, args = load_launch_args()
+    reopt_path, reopt = load_reopt_params()
 
     width_car = float(cfg["width_car"])
     safety_margin = float(cfg["safety_margin"])
@@ -204,27 +190,27 @@ def main() -> int:
     reactive_wall = float(cfg.get("wall_margin", 0.0))
     keepout = width_car / 2.0 + safety_margin
 
-    obs_margin = float(args["reopt_obs_margin"])
-    reopt_wall = float(args.get("reopt_wall_margin", 0.0))
-    qp_veh_width = float(args.get("reopt_qp_veh_width", 0.0))
-    reopt_safety_width = float(args.get("reopt_safety_width", 0.0))
+    obs_margin = float(reopt["obs_margin"])
+    reopt_wall = float(reopt.get("wall_margin", 0.0))
+    qp_veh_width = float(reopt.get("qp_veh_width", 0.0))
+    reopt_safety_width = float(reopt.get("safety_width", 0.0))
 
     print(f"reactive ({yaml_path.name}):")
     print(f"  width_car/2 + safety_margin = {width_car/2:.3f} + {safety_margin:.3f} = {keepout:.3f} m (keep-out)")
     print(f"  apex_bulge = {apex_bulge:.3f} m, wall_margin = {reactive_wall:.3f} m")
-    print(f"re-opt ({launch_path.name} defaults; node defaults apply only if launched without these args):")
-    print(f"  reopt_obs_margin = {obs_margin:.3f} m, reopt_wall_margin = {reopt_wall:.3f} m")
-    print(f"  reopt_qp_veh_width = {qp_veh_width:.3f} m, reopt_safety_width = {reopt_safety_width:.3f} m")
+    print(f"re-opt ({reopt_path.name}; the node loads this file, so these are the live values):")
+    print(f"  obs_margin = {obs_margin:.3f} m, wall_margin = {reopt_wall:.3f} m")
+    print(f"  qp_veh_width = {qp_veh_width:.3f} m, safety_width = {reopt_safety_width:.3f} m")
 
     ok = True
     if obs_margin < keepout + SLACK:
         ok = False
-        print(f"\nFAIL: reopt_obs_margin ({obs_margin:.3f}) < reactive keep-out + slack "
+        print(f"\nFAIL: obs_margin ({obs_margin:.3f}) < reactive keep-out + slack "
               f"({keepout:.3f} + {SLACK:.2f} = {keepout + SLACK:.3f}).")
         print("      The re-optimized line will be re-avoided by the reactive planner every lap.")
-        print(f"      Raise reopt_obs_margin in {launch_path.name} or lower the reactive keep-out.")
+        print(f"      Raise obs_margin in {reopt_path.name} or lower the reactive keep-out.")
     else:
-        print(f"\nOK: reopt_obs_margin ({obs_margin:.3f}) >= reactive keep-out + slack ({keepout + SLACK:.3f}).")
+        print(f"\nOK: obs_margin ({obs_margin:.3f}) >= reactive keep-out + slack ({keepout + SLACK:.3f}).")
 
     # Wall reserves compared like-for-like: reopt reserve = qp_veh_width/2 + wall_margin vs the
     # reactive planner's corridor reserve = width_car/2 (its bound_ok check). The reopt reserve
@@ -240,27 +226,27 @@ def main() -> int:
         ok = False
         print(f"FAIL: reopt wall reserve ({reopt_reserve:.3f}) > reactive terminal reserve + slack "
               f"({react_reserve:.3f} + {SLACK:.2f}) — reactive-proven apexes will be corridor-"
-              f"rejected; lower reopt_wall_margin in {launch_path.name}.")
+              f"rejected; lower wall_margin in {reopt_path.name}.")
     else:
         print(f"OK: reopt wall reserve ({reopt_reserve:.3f}) <= reactive terminal reserve + slack "
               f"({react_reserve + SLACK:.3f}).")
 
-    # reopt_fit_tol is spent OUT OF reopt_wall_margin: the corridor fit is allowed to overshoot the
+    # fit_tol is spent OUT OF reopt_wall_margin: the corridor fit is allowed to overshoot the
     # bound by fit_tol, so the effective wall reserve is reopt_wall_margin - fit_tol. Without a
     # tolerance the fit collapses the hump over sub-mm ripples in the smoothed bound (that was the
     # bug); with too much, it eats the wall reserve it is measured against.
-    fit_tol = float(args.get("reopt_fit_tol", 0.0))
-    print(f"  reopt_fit_tol = {fit_tol:.4f} m -> effective wall reserve "
+    fit_tol = float(reopt.get("fit_tol", 0.0))
+    print(f"  fit_tol = {fit_tol:.4f} m -> effective wall reserve "
           f"{reopt_reserve - fit_tol:.3f} m")
     if fit_tol <= 0.0:
         ok = False
-        print(f"FAIL: reopt_fit_tol is {fit_tol:.4f}. A zero-tolerance corridor fit rejects every "
+        print(f"FAIL: fit_tol is {fit_tol:.4f}. A zero-tolerance corridor fit rejects every "
               f"wide reach over a sub-millimetre violation and collapses the avoidance hump "
               f"(ifac: reach 5.00 -> 1.24 m, +1.62 s/lap, curvlim exceeded). Use ~0.005.")
     elif fit_tol > 0.5 * max(reopt_wall, 1e-9):
         ok = False
-        print(f"FAIL: reopt_fit_tol ({fit_tol:.4f}) > half of reopt_wall_margin ({reopt_wall:.3f}); "
-              f"the fit may spend most of the wall reserve. Lower it or raise reopt_wall_margin.")
+        print(f"FAIL: fit_tol ({fit_tol:.4f}) > half of reopt_wall_margin ({reopt_wall:.3f}); "
+              f"the fit may spend most of the wall reserve. Lower it or raise wall_margin.")
 
     # --- the raceline-CLEAR gate vs the line static_reopt actually builds -------------------
     # The gate decides whether the current global line already avoids everything ahead. Its
@@ -282,7 +268,7 @@ def main() -> int:
         print(f"FAIL: clear-gate need ({clear_need:.3f}) is not at least {SLACK:.2f} m below the "
               f"re-opt build ({obs_margin:.3f}). The obstacle-aware line will re-trigger the "
               f"reactive planner on obstacles it already clears -> all candidates rejected -> "
-              f"TRAILING. Lower clear_margin_m or raise reopt_obs_margin.")
+              f"TRAILING. Lower clear_margin_m or raise obs_margin.")
     elif clear_need < width_car / 2.0:
         ok = False
         print(f"FAIL: clear-gate need ({clear_need:.3f}) is below half the car ({width_car/2:.3f}); "
