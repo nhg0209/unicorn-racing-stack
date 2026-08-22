@@ -48,6 +48,7 @@ class StateMachineParams:
         "local_window_a_long_mps2",
         "min_dwell_sec",
         "ot_free_lost_sec",
+        "overtaking_ttl_sec",
         "free_check_predict_dynamic",
         "free_check_pass_speed",
         "free_check_dynamic_ot_slow",
@@ -496,14 +497,9 @@ class StateMachineParams:
             elif name == "splini_ttl":
                 if self.node.ot_planner == "spliner":
                     self.splini_ttl = value
-                    self.node.splini_ttl_counter = int(self.splini_ttl * self.rate_hz)
             elif name == "pred_splini_ttl":
                 if self.node.ot_planner != "spliner":
                     self.splini_ttl = value
-                    self.node.splini_ttl_counter = int(self.splini_ttl * self.rate_hz)
-            elif name == "overtaking_ttl_sec":
-                self.overtaking_ttl_sec = value
-                self.node.overtaking_ttl_count_threshold = int(value * self.rate_hz)
             elif name == "ftg_active":
                 self.ftg_active = value
                 self.node.ftg_disabled = not value

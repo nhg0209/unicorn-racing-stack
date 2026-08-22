@@ -24,11 +24,36 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}/
 )
 
-# Install maps directory
-install(DIRECTORY
-  maps
-  DESTINATION share/${PROJECT_NAME}/
-)
+# Install maps directory, minus the point clouds.
+#
+# *.pcd is the one map file .gitignore never carries (stack_master/maps/**/*.pcd),
+# so it is always moved between machines by hand -- and a hand-moved pcd that ends
+# up a dangling/self-referencing symlink kills the whole build: ament's
+# --symlink-install links the file and then validates with `if(NOT EXISTS ...)`,
+# which resolves symlinks, so an unresolvable source is fatal (a *missing* file is
+# harmless -- it is simply not globbed). Keeping the clouds out of the install tree
+# makes the build immune to that. Runtime still finds them: the launch files read
+# $(env STACK_MASTER_MAPS_ROOT ...), which unicorn.sh defaults to the source tree.
+#
+# The two branches are NOT interchangeable. ament's symlink-install replaces
+# install() with a function parsed as
+#   cmake_parse_arguments(ARG "OPTIONAL" "DESTINATION" "DIRECTORY;PATTERN;PATTERN_EXCLUDE")
+# which has no EXCLUDE keyword, so CMake's own `PATTERN "*.pcd" EXCLUDE` is swallowed
+# into the *include* list (ARG_PATTERN = "*.pcd;EXCLUDE") and would install the pcds
+# and nothing else -- silently, with no unparsed-argument warning.
+if(AMENT_CMAKE_SYMLINK_INSTALL)
+  install(DIRECTORY
+    maps
+    DESTINATION share/${PROJECT_NAME}/
+    PATTERN_EXCLUDE "*.pcd"
+  )
+else()
+  install(DIRECTORY
+    maps
+    DESTINATION share/${PROJECT_NAME}/
+    PATTERN "*.pcd" EXCLUDE
+  )
+endif()
 
 # Install Python scripts
 install(PROGRAMS
@@ -42,6 +67,7 @@ install(PROGRAMS
   scripts/static_tf_publisher.py
   scripts/vesc_calibration_node.py
   scripts/opponent_bridge_node.py
+  scripts/vehdyn_test_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -42,7 +42,7 @@ mpc_node:
     #   직선(s28-36)에서 ref_v 가 4.00 = v_max 로 눌려 있었다 → 여기서만 이득이 난다.
     #   코너는 ref_v=√(a_lat/κ)≈2.0~2.4 라 v_max 와 무관(steering-limited).
     # ⚠ 실차 안전값이다. 이상하면 즉시 4.0 으로. 백업 /tmp/ddrx_pre_maxspeed.bak
-    max_speed: 10.0   # 0810 사용자 지시로 4→10 (조향 캘리브 0.55 반영 후). ⚠캐시 미스탬프 → ~/.acados_codegen 치움(_stale_0810). 사다리 원안은 4-6-8-10
+    max_speed: 10.0   # 0812: 3.0(미끼 캡) 복원 — 직선 흔들림 원인 의심(speed_target 7.5 가 캡 3.0 을 계속 밀어붙임). 사다리 원안 4-6-8-10
     max_speed_p: 10.0   # 2026-07-08 B1: p_v 천장 확보 (8->10, gamma가 밀 여유)
     actuation_latency_s: 0.08    # 0810 2차: 0.04→0.08 (코너 과회전 잔존 — 헤어핀 스윙). 0.04는 시케인 산포 0.227→0.081 개선 확인. 실측 지연 120ms. 이전 0.0
     # R3 decouple test: hard cap=8 (above) but progress target + κ-window stay at
@@ -154,8 +154,8 @@ mpc_node:
     use_gp_casadi: true   # 2026-08-10 NUC ON: nuc14 주행 4-bag(캘리브 0.568+지연0.08 이후) 12,621샘플 재학습.
                           # 홀드아웃(20:07 bag) d_vy/d_r 설명률 93%. npz 캐시 동봉이라 torch 불필요.
                           # (이전 OFF 사유: Mac차 학습본. 이전 주석: 2026-07-21 NUC OFF)
-    gp_casadi_ckpt: /home/nuc14/bo_results/gp_residual_nuc14.pt   # 0810 nuc14 재학습 (laptop 학습, inducing 200, ARD)
-    gp_casadi_train_data: /home/nuc14/bo_results/gp_train_data_nuc14.pt
+    gp_casadi_ckpt: /home/nuc14/bo_results/gp_residual_nuc14_hall0813.pt   # 0813 hall 2-bag(4980) 재학습, 홀드아웃 d_vy/d_r 93%
+    gp_casadi_train_data: /home/nuc14/bo_results/res_hall_merged.pt
     # 2026-07-02 학습 ref_v 주입 (오늘 post-fix 5-run, 74bins, grip-clamped +0.3)
     use_learned_refv: false   # 2026-07-21 NUC OFF: Mac차 주행 학습본. NUC 라인검증+재학습 후 켤 것. Mac값=true (0716 IQP 라인 재학습)
     learned_refv_path: ""   # 2026-07-21 NUC: /Users/mini 절대경로 무효화(비움). 재학습 후 NUC 경로로
@@ -231,7 +231,7 @@ mpc_node:
     # (ref_v·0.3 + heading hold + warm-start rebuild) 가 oscillation 초기에
     # 트리거됨.
     cost_spike_thr_live: 8000.0  # 1500→8000 (2026-05-28 fix). v=6/7/8 시 실측 정상 cost 500-2000. 1500 너무 빡빡해서 정상 운전도 fallback 무한 cycle → BO plateau. 8000 = 진짜 instability (10K+) 만 트리거.
-    alpha_steer_live: 0.85   # base. auto_tune 매핑이 max_speed 따라 갱신.
+    alpha_steer_live: 1.0   # 0812b: EMA 해제 (위와 세트)
     # 2026-05-28 BO v=6 retry best — 30 iter post-#13, Q=-47.57, lap=14.32s
     # (PP 15.66, -8.6%; ideal 13.73, +4.3%; n_resets=2 안정; v_avg=4.99)
     # v=4 Phase A best (q_p=4.28 dominant) 과 정반대: v=6 에서는 q_cte=4.96 strong + q_p=0.42 약.
@@ -242,7 +242,7 @@ mpc_node:
     q_v_scale_live: 2.0   # 0807 신맵: 심과 동일하게 (SAFE 세트). 되돌리려면 .bak_pre_qalign — 이전 1.8 (7/9 실차 튜닝)
     q_dd_scale_live: 1.0       # not in BO
     q_p_scale_live: 6.5   # 0807 신맵: 심과 동일하게 (SAFE 세트). 되돌리려면 .bak_pre_qalign — 이전 7.0 (7/9 실차 튜닝)
-    q_drate_scale_live: 27.8138
+    q_drate_scale_live: 60.0   # 0812b: 새바닥 발진 처방(맥 0807 검증 세트). 서보 0.568 정상 상태에서의 진짜 테스트 — 월요일값 27.8138 은 구바닥 전제
     q_dv_scale_live: 0.15   # 2026-07-09 원복(0.08->0.15): 0.08은 a_x 폭주 회귀(7/6 sim, 7/9 실차 공히). B1 gamma 단독평가 위해 검증값으로
 
     # ─────────────────────────────────────────────────────────────────────

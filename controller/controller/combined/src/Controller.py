@@ -1,10 +1,92 @@
 #!/usr/bin/env python3
 
 import logging
+import os
 
 import numpy as np
 
 from visualization_msgs.msg import Marker, MarkerArray
+
+
+def load_ggv_ay(path):
+    """Read a veh_dyn_info/ggv.csv into the [v_mps, ay_max_mps2] table this module needs.
+
+    A five-line numpy read rather than a dependency, on purpose. The two other ggv readers in
+    the stack (state_machine_node, stack_master/scripts/global_velocity_planner.py) both go
+    through `tph.import_veh_dyn_info`, and trajectory_planning_helpers is NOT importable from
+    the interpreter this control node runs under -- reusing them would buy consistency at the
+    price of a new way for the controller to fail at startup. Folding all three onto one
+    veh_dyn library is real work that is DEFERRED UNTIL AFTER THE RACE; when it happens, this
+    function is the caller to delete.
+
+    THERE IS NOW A SECOND COPY: planner/spliner/spliner/static_avoidance_node.py grew
+    load_veh_dyn_tables / resolve_veh_dyn_limits reading the same files, for the same reason
+    (one k in ggv.csv has to reach every consumer on race day). They are deliberately not shared
+    -- a control node and a planner in different ROS packages should not depend on each other to
+    read config -- and both are on the same deferred list.
+
+    The full table is kept (not min/mean-folded to a scalar): every row reads the same 5.7
+    today, so any reduction looks right, and would go on looking right the day the table
+    becomes speed-dependent while being silently wrong.
+    """
+    return _ggv(path)[:, [0, 2]]
+
+
+def _ggv(path):
+    tbl = np.atleast_2d(np.loadtxt(path, delimiter=",", comments="#"))
+    if tbl.shape[1] < 3:
+        raise ValueError(f"{path}: expected 3 columns (v_mps, ax_max, ay_max), got {tbl.shape[1]}")
+    return tbl
+
+
+def load_veh_dyn(cfg_dir):
+    """Everything the friction circle needs, from a config/<SIM|CAR> directory.
+
+    Returns (ggv_ay, ggv_ax, ax_machines, b_ax_machines, dyn_model_exp): four [v_mps, value]
+    tables to be INTERPOLATED at the current speed, and the exponent p of the combined-
+    acceleration model. Nothing here is a constant in the controller -- ay_max and ax_max come
+    from veh_dyn_info/ggv.csv, the drivetrain cap from veh_dyn_info/ax_max_machines.csv (which is
+    genuinely speed-dependent: 9.5 at rest, 4.62 at 15 m/s), the BRAKE cap from
+    veh_dyn_info/b_ax_max_machines.csv, and p from racecar_f110.ini's vel_calc_opts. They are the
+    SAME inputs the offline velocity profile was solved against, which is the only reason the
+    online check and the plan can agree.
+
+    b_ax_max_machines joined this loader on 2026-08-12, when the slew limit stopped being a
+    hand-copied 5.0 in controller.yaml and started being derived -- see _slew_limits.
+
+    The .ini is read by per-key regex rather than parsed as a dict literal, because those
+    blocks carry inline '#' comments that break literal_eval. That technique is lifted from
+    planner/gb_optimizer/.../static_reopt_core.py::_load_veh_dyn, which reads the same files
+    for the offline path; the code is not imported because it lives in a planner package and
+    the control node has no business depending on one to read its own config. Two readers of
+    one set of files is a duplication that belongs in the veh_dyn library deferred until after
+    the race -- see load_ggv_ay.
+
+    Raises if anything is missing; the caller reports that and leaves the limit inert.
+    """
+    import re
+
+    vdi = os.path.join(cfg_dir, "veh_dyn_info")
+    ggv = _ggv(os.path.join(vdi, "ggv.csv"))
+
+    def _two_col(name):
+        t = np.atleast_2d(np.loadtxt(os.path.join(vdi, name), delimiter=",", comments="#"))
+        if t.shape[1] < 2:
+            raise ValueError(f"{name}: expected 2 columns, got {t.shape[1]}")
+        return t[:, [0, 1]]
+
+    axm = _two_col("ax_max_machines.csv")
+    bax = _two_col("b_ax_max_machines.csv")
+    ini = os.path.join(cfg_dir, "racecar_f110.ini")
+    with open(ini) as f:
+        txt = f.read()
+    m = re.search(r'"dyn_model_exp"\s*:\s*([-+0-9.eE]+)', txt)
+    if not m:
+        raise ValueError(f"{ini}: no dyn_model_exp in vel_calc_opts")
+    p = float(m.group(1))
+    if not 1.0 <= p <= 2.0:
+        raise ValueError(f"{ini}: dyn_model_exp {p} outside the model's range [1.0, 2.0]")
+    return ggv[:, [0, 2]], ggv[:, [0, 1]], axm, bax, p
 
 
 class Controller:
@@ -121,15 +203,44 @@ class Controller:
         self._aeb_cycles = 0                  # cycles the clamp has been held (this loop is fixed-rate)
         self.l1_lat_err_cap = t_clip_max      # manager overrides from yaml (uncapped by default)
         self.converter = converter
-        # Longitudinal limits of the PUBLISHED speed command. Defaults mirror the ggv the global
-        # trajectory is planned against (veh_dyn_info/ggv.csv ax_max = 5.0, ax_max_machines = 5.0);
-        # the manager overrides both from controller.yaml. Asking for more than this is asking for
-        # something the car cannot do — see _slew_limit_speed.
+        # Longitudinal limits of the PUBLISHED speed command. FALLBACKS ONLY: _slew_limits derives
+        # the real pair from config/<SIM|CAR>/veh_dyn_info at the current speed, and these are what
+        # it uses when those files cannot be read (warned once). The manager still overrides them
+        # from controller.yaml, so the yaml value is the fallback that ships.
+        # They were the live values until 2026-08-12, hardcoded 5.0 here and in the yaml with a
+        # comment claiming they mirrored ggv ax_max and ax_max_machines. That claim went stale on
+        # 2026-08-11 (ggv ax_max 5.0 -> 7.0) and nothing noticed, which is why it is derived now.
         self.max_accel_mps2 = 5.0
         self.max_decel_mps2 = 5.0
+        self._slew_warned = False
         self._speed_cmd_prev = None           # last PUBLISHED command, for the slew limit
         self._trailing_handoff = None         # ramp state while merging out of TRAILING
         self._trailing_entry = None           # ...and while merging INTO it (see calc_speed_command)
+        # TYRE LIMIT on the steering command -- see _clip_to_tyre_limit. ggv_table is the
+        # [v_mps, ay_max] table from config/<SIM|CAR>/veh_dyn_info/ggv.csv, delivered by the
+        # manager (load_ggv_ay); without it the clip is inert and says so once. The three
+        # parameters are overridden from controller.yaml and are live-togglable.
+        # a_lat_margin is NOT 1.0, and that is the whole point -- see _clip_to_tyre_limit.
+        self.a_lat_limit_enable = True
+        self.a_lat_margin = 1.35              # [-] multiplies the ggv's ay_max
+        self.a_lat_v_floor = 0.5              # [m/s] floor in the v^2 denominator
+        self.ggv_table = None
+        self._ggv_warned = False
+        # FRICTION CIRCLE on the speed command -- see _ax_avail. Same delivery convention as the
+        # tyre limit above: the manager reads the three tables (load_veh_dyn) and assigns them,
+        # the two parameters come from controller.yaml and are live-togglable.
+        self.a_comb_limit_enable = True
+        self.a_comb_margin = 1.0              # [-] multiplies ay_max in the circle -- see _ax_avail
+        # Fusion weights in calc_future_position. 1.0 = PURE KINEMATIC MODEL, 0.0 = pure IMU.
+        # Both were hardcoded 1.0, i.e. the measured yaw rate reached the controller and was
+        # then multiplied by zero. Overridden from controller.yaml, live-togglable.
+        self.lambda_weight = 1.0              # slip angle: model vs IMU-derived
+        self.gamma_weight = 1.0               # future heading: model vs measured yaw rate
+        self.ggv_ax_table = None              # [v, ax_max] from ggv.csv
+        self.ax_machines_table = None         # [v, ax_max_machines] from ax_max_machines.csv
+        self.b_ax_table = None                # [v, b_ax_max_machines] from b_ax_max_machines.csv
+        self.dyn_model_exp = None             # p, from racecar_f110.ini vel_calc_opts
+        self._comb_warned = False
 
         # Parameters in the controller
         self.curr_steering_angle = 0
@@ -273,10 +384,71 @@ class Controller:
             self._speed_cmd_prev = speed
             return speed
         dt = 1.0 / max(self.loop_rate, 1.0)
-        up, dn = self.max_accel_mps2 * dt, self.max_decel_mps2 * dt
+        # FRICTION CIRCLE: the UP allowance is whatever longitudinal acceleration the tyre has
+        # left after the corner has taken its share (_ax_avail). Outside the circle that is 0
+        # and the command simply may not rise. The DOWN allowance is untouched on purpose --
+        # this refuses acceleration, it does not command braking.
+        accel, decel = self._slew_limits()
+        if self.a_comb_limit_enable:
+            avail = self._ax_avail()
+            if avail is None:
+                if not self._comb_warned:
+                    self._comb_warned = True
+                    self.logger_warn("[Controller] a_comb_limit_enable is set but the veh_dyn "
+                                     "tables are incomplete -> the friction circle is INERT")
+            else:
+                accel = min(accel, avail)
+        up, dn = accel * dt, decel * dt
         limited = min(max(speed, prev - dn), prev + up)
         self._speed_cmd_prev = limited
         return limited
+
+    def _slew_limits(self):
+        """(accel, decel) allowance on the PUBLISHED speed command [m/s^2], at the current speed.
+
+        Read from config/<SIM|CAR>/veh_dyn_info -- the same pair the offline velocity profile
+        bounds itself with:
+            accel = min(ggv ax_max, ax_max_machines)      friction bound AND drive bound
+            decel = min(ggv ax_max, b_ax_max_machines)    friction bound AND brake bound
+        interpolated at speed_now, because ax_max_machines is the one table that is genuinely
+        speed-dependent (9.5 at rest, 4.62 at 15 m/s) and a scalar would hide that.
+
+        WHY NOT controller.yaml. Those two keys shipped at 5.0 with a comment stating they
+        mirrored ggv ax_max and ax_max_machines -- true when written, false from 2026-08-11
+        (ggv ax_max 5.0 -> 7.0) and more so from 2026-08-12 (b_ax 5.0 -> 10.0). A number that has
+        to be hand-updated in step with a csv is a number that will be stale, and the cost of
+        this one being stale is the slew limit clipping a plan the car could actually follow.
+        Same reason and same shape as static_avoidance_node's _a_limits.
+
+        THE ACCEL SIDE IS NOT THE BINDING ONE while a_comb_limit_enable is set: _ax_avail returns
+        min(ax_machines, ax_max*(1-used^p)^(1/p)), which is <= this accel everywhere, so the
+        caller's min() picks the friction circle. Deriving it still matters -- it stops the yaml
+        scalar being a second, cruder cap underneath the circle, which is exactly what 5.0 was.
+        The DECEL side has no circle by design (refusing acceleration is not commanding braking),
+        so it is governed here alone.
+
+        The yaml keys REMAIN as the fallback used when the tables are absent, warned once and
+        naming what is in force. That makes `ros2 param set max_accel_mps2 ...` inert on a car
+        whose config IS readable -- deliberate, and free: a re-grip restarts the stack anyway.
+        Built without the tables (the offline gates stub this class) it answers from them too.
+        """
+        ax_t = getattr(self, "ggv_ax_table", None)
+        axm_t = getattr(self, "ax_machines_table", None)
+        bax_t = getattr(self, "b_ax_table", None)
+        if ax_t is None or axm_t is None or bax_t is None:
+            if not getattr(self, "_slew_warned", False):
+                self._slew_warned = True
+                warn = getattr(self, "logger_warn", None)
+                if warn is not None:
+                    warn(f"[Controller] veh_dyn tables unavailable -> the slew limit falls back "
+                         f"to controller.yaml (accel {self.max_accel_mps2}, decel "
+                         f"{self.max_decel_mps2} m/s^2). A change to ggv.csv, ax_max_machines.csv "
+                         f"or b_ax_max_machines.csv will NOT reach the published speed command.")
+            return float(self.max_accel_mps2), float(self.max_decel_mps2)
+        v = float(getattr(self, "speed_now", 0.0) or 0.0)
+        ax = self._interp(ax_t, v)
+        return (float(min(ax, self._interp(axm_t, v))),
+                float(min(ax, self._interp(bax_t, v))))
 
     def AEB_for_weird_local_wpnt(self, speed):
         nearest_local_wpnt = self.waypoint_array_in_map[self.idx_nearest_waypoint, :2]
@@ -411,6 +583,25 @@ class Controller:
 
         #-------------------------Steering Scaling-----------------------------
 
+        # TYRE LIMIT. Every modifier above is a tracking DEMAND; none of them knows what the
+        # tyres can deliver. Measured on ~/ggv_0812_1645 (5 clean laps, offline replay through
+        # this very class, full coverage): this loop commands a lateral acceleration of p90
+        # 14.36 and max 22.37 m/s^2, against a car that never once achieved more than 11.71.
+        # A saturated tyre has lost cornering force AND steering authority, so the unachievable
+        # part of that demand does not merely fail to help, it slows the line recovery it was
+        # asked for. The ceiling sits ABOVE the raceline's own worst demand of 5.70 and at the
+        # p90 of what the car demonstrably delivers -- see _clip_to_tyre_limit for why equality
+        # with 5.70 was a regression and why a "6.0-6.5 knee" was an artefact of a short window.
+        # Placed BEFORE the rate limit and the +-0.53 saturation so both still act on a
+        # physically meaningful command, and the assignment at the end of this function carries
+        # the clipped value into curr_steering_angle -- which is the rate limiter's reference
+        # next cycle, so skipping that would walk the reference away from what was published.
+        # WHAT THIS DOES NOT PROVE: the replay is OPEN LOOP (recorded positions), so it shows
+        # the command falling and cannot show the car returning to the line under the new
+        # ceiling. That is a sim/real question. See analysis/replay_steering.py.
+        if self.a_lat_limit_enable:
+            steering_angle = self._clip_to_tyre_limit(steering_angle)
+
         # limit change of steering angle
         threshold = 0.4
         if abs(steering_angle - self.curr_steering_angle) > threshold:
@@ -421,6 +612,129 @@ class Controller:
         self.curr_steering_angle = steering_angle
 
         return steering_angle
+
+    def a_lat_now(self):
+        """Lateral acceleration the car is using right now: v^2 * |kappa| of the PLAN.
+
+        The raceline's curvature at the nearest waypoint, not the gyro. Both were measured on
+        bag ggv_0812_1645 and the plan's kappa is the one to use: the gyro reports the
+        curvature the car ACHIEVED, which in exactly the situation this limit exists for is
+        LOWER than what the path is asking of the tyre (the car is understeering wide -- that
+        is what the growing d IS), so a gyro-fed circle opens up precisely when it should be
+        closing. The plan's kappa also has no noise and no 90-degree mounting convention.
+        """
+        try:
+            kappa = abs(float(self.waypoint_array_in_map[self.idx_nearest_waypoint, 5]))
+        except (TypeError, IndexError):
+            return None
+        return float(self.speed_now) ** 2 * kappa
+
+    def _ax_avail(self):
+        """Longitudinal acceleration still available at the current lateral usage [m/s^2].
+
+            ax_avail = min( ax_machines(v),
+                            ax_max(v) * (1 - (a_lat / (ay_max(v)*margin))^p)^(1/p) )
+
+        p = dyn_model_exp from racecar_f110.ini (2.0 today = an ellipse). This is the SAME
+        combined-acceleration model the offline velocity profile is solved with, read from the
+        same three files, which is what makes "the plan says 4.51 here" and "you may not
+        accelerate here" the same statement instead of two opinions.
+
+        WHY THIS EXISTS. Measured on ifac_0807's right-hand slalom (s 2.8-10.0, real bag, laps
+        2 and 3 alike): at the apex s=5.2 the raceline asks for kappa -0.27 at 4.51 m/s, the car
+        is doing 5.13, and 5.13^2*0.27 = 7.1 m/s^2 of lateral demand against a ggv ay_max of
+        5.7. The car is already OUTSIDE the friction circle -- and it goes on accelerating,
+        4.90 -> 5.13 -> 5.51, because speed_lookahead 0.25 s at 4.85 m/s reads the profile
+        1.21 m ahead, which is the corner EXIT. Every m/s^2 spent going faster there is lateral
+        force the tyre no longer has, so d climbs monotonically (-0.04 -> +0.41) and the car
+        enters the following straight wide and slow (-0.76 m/s under target at s=8.2).
+
+        a_lat past the circle clamps the used fraction at 1, so ax_avail is 0 and the speed
+        command may not RISE. It is deliberately not allowed to force a decrease: braking is a
+        different intervention that would move every other section of the lap, and the measured
+        fault here is the acceleration.
+
+        Returns None if any of the three inputs is missing; the caller reports that once.
+        """
+        if (self.ggv_table is None or self.ggv_ax_table is None
+                or self.ax_machines_table is None or self.dyn_model_exp is None):
+            return None
+        a_lat = self.a_lat_now()
+        if a_lat is None:
+            return None
+        v = float(self.speed_now)
+        ay = self._interp(self.ggv_table, v) * float(self.a_comb_margin)
+        ax = self._interp(self.ggv_ax_table, v)
+        axm = self._interp(self.ax_machines_table, v)
+        if ay <= 0.0:
+            return 0.0
+        used = min(a_lat / ay, 1.0)
+        p = float(self.dyn_model_exp)
+        return float(min(axm, ax * (1.0 - used ** p) ** (1.0 / p)))
+
+    @staticmethod
+    def _interp(table, v):
+        t = np.atleast_2d(table)
+        return float(np.interp(v, t[:, 0], t[:, 1]))
+
+    def a_lat_max_now(self, speed):
+        """The controller's lateral-acceleration ceiling [m/s^2] at this speed.
+
+        ggv ay_max INTERPOLATED at the current speed, times a_lat_margin. Interpolated and not
+        reduced to a scalar: ggv.csv is a (v_mps, ax_max, ay_max) table, and that it is flat at
+        5.7 over the whole range today is this table's value, not a property of the format.
+
+        Returns None when no table was delivered, which the caller reports rather than guessing.
+        """
+        if self.ggv_table is None:
+            return None
+        t = np.atleast_2d(self.ggv_table)
+        return float(np.interp(speed, t[:, 0], t[:, 1])) * self.a_lat_margin
+
+    def _clip_to_tyre_limit(self, steering_angle):
+        """Bound the steering command by the lateral acceleration the tyres can actually make.
+
+        Bicycle model: a_lat = v^2 * tan(delta) / L, so the steering angle that asks for exactly
+        the ceiling is delta_max = atan(L * a_lat_ctrl(v) / v^2).
+
+        WHY THE CEILING IS NOT THE ggv's 5.7. That number is the PLANNER's limit, and the
+        raceline spends all of it: the published line's own worst demand is vx^2*|kappa| = 5.70.
+        Clipping the total to 5.70 therefore leaves EXACTLY ZERO budget for returning to the
+        line at a corner apex, and that is not a theory -- it shipped once, at margin 1.0, and
+        came back as "path tracking is far too sluggish" on the real car. The prediction that
+        goes with the diagnosis is that the sluggishness is CONCENTRATED IN CORNERS, because on
+        a straight the line asks for ~0 and the whole budget is free.
+        So the controller's ceiling must sit ABOVE the planner's, and the gap IS the recovery
+        budget.
+
+        WHERE THE ROOF IS. The first correction to this reasoning put the roof at a "tyre knee"
+        of 6.0-6.5, from an achieved/demanded ratio that held at 1.00 up to a demand of 6 and
+        collapsed to 0.53 above it. That was measured over 8.2 s of a 50.4 s bag -- the replay
+        was silently dying at the first lap boundary. Over the WHOLE bag there is NO CLIFF: the
+        ratio falls but the achieved value keeps climbing (demand 6-8 -> achieved 5.55, 8-10 ->
+        5.53, 10-14 -> 6.26, 14-25 -> 7.39), and the car demonstrably made p50 4.96, p90 7.62,
+        max 11.71 m/s^2 of real lateral acceleration. A ceiling below that band does not stop
+        the car asking for the impossible, it stops the car doing what it can: 5.70 removes
+        capability the record shows for 41.4% of the run, 6.27 for 29.9%.
+        So the roof is what the tyre DEMONSTRABLY DELIVERS, and the ceiling is anchored at the
+        p90 of that: 7.62, i.e. a_lat_margin 1.35 -> 7.70. It gives up 9.5% of the run, leaves
+        the MEDIAN command untouched (demand p50 6.69, same as with no clip at all) and still
+        removes the unachievable tail (demand p90 14.36 -> 7.70, max 22.37 -> 7.70, against an
+        achieved max of 11.71 the car never once exceeded).
+
+        v is floored at a_lat_v_floor: as v -> 0, delta_max -> pi/2 and the expression stops
+        meaning anything. The +-0.53 saturation downstream does catch it, but by accident.
+        """
+        a_lat_max = self.a_lat_max_now(self.speed_now)
+        if a_lat_max is None or a_lat_max <= 0.0:
+            if not self._ggv_warned:
+                self._ggv_warned = True
+                self.logger_warn("[Controller] a_lat_limit_enable is set but no usable ggv table "
+                                 "was delivered -> the steering tyre limit is INERT")
+            return steering_angle
+        v = max(float(self.speed_now), float(self.a_lat_v_floor))
+        delta_max = float(np.arctan(self.wheelbase * a_lat_max / (v * v)))
+        return float(np.clip(steering_angle, -delta_max, delta_max))
 
     def calc_future_L1_point(self, future_lateral_error):
 
@@ -755,14 +1069,27 @@ class Controller:
         beta_model = np.arctan((L_r / (L_f + L_r)) * np.tan(delta))
 
         # 2. Estimate slip angle indirectly using IMU yaw rate data
+        # THIS IS NOT A SLIP ANGLE. Substituting the bicycle relation yaw_rate = v*tan(delta)/L
+        # gives arcsin(tan(delta)) ~= delta -- the STEERING angle. The slip angle is
+        # arctan((L_r/L)*tan(delta)), which is what beta_model above computes, so this term is
+        # too large by L/L_r = 1/0.48 = 2.08x. Measured consequence (replay_steering.py --gamma,
+        # full bag): mixing it in makes the future-position prediction monotonically WORSE --
+        # p50 error 0.0455 m at lambda 1.0, 0.0484 at 0.7, 0.0502 at 0.5, 0.0555 at 0.0 -- which
+        # is why lambda_weight stays at 1.0. Correcting the formula is a model change that needs
+        # its own sweep and is deliberately NOT bundled with the IMU sign fix.
         if abs(v) > 2.0:
             # If speed is sufficient, estimate slip angle from IMU yaw rate
             beta_imu = np.arcsin(np.clip(((L_f + L_r) * self.yaw_rate / v), -1.0, 1.0))
         else:
             beta_imu = beta_model  # Maintain basic model when speed is very low
 
-        # 3. Fuse the geometric and IMU-based slip angles using weighted average
-        lambda_weight = 1.0
+        # 3. Fuse the geometric and IMU-based slip angles using weighted average.
+        # WEIGHT 1.0 MEANS PURE KINEMATIC MODEL -- the IMU term is multiplied by zero. Both this
+        # and gamma_weight below shipped hardcoded at 1.0, which is why the controller had no
+        # dynamic feedback at all: it could not tell that a demand of 20 m/s^2 was producing 7.
+        # They are instance attributes so controller.yaml can set them; see the note there for
+        # why lambda stays at 1.0 while gamma does not.
+        lambda_weight = self.lambda_weight
         beta_fused = lambda_weight * beta_model + (1 - lambda_weight) * beta_imu
 
         # 4. Predict future position using the fused slip angle
@@ -775,7 +1102,7 @@ class Controller:
         # Option B: IMU-based prediction
         future_psi_imu = psi_current + self.yaw_rate * T
         # Fuse the two heading predictions using a weighted average
-        gamma_weight = 1.0
+        gamma_weight = self.gamma_weight
         future_psi = gamma_weight * future_psi_model + (1 - gamma_weight) * future_psi_imu
         # Normalize heading to the range [-pi, pi]
         future_psi = np.arctan2(np.sin(future_psi), np.cos(future_psi))

@@ -31,7 +31,7 @@
   <arg name="opponent_port"   default="47600"          description="UDP port (same on both cars)"/>
   <arg name="opponent_rate"   default="50.0"           description="Send-rate cap [Hz]"/>
 
-  <let name="maps_dir"                value="$(find-pkg-share stack_master)/maps"/>
+  <let name="maps_dir"                value="$(env STACK_MASTER_MAPS_ROOT $(find-pkg-share stack_master)/maps)"/>
   <let name="map_path"                value="$(var maps_dir)/$(var map)/$(var map)"/>
   <let name="cartographer_config_dir" value="$(find-pkg-share stack_master)/config"/>
 
@@ -132,7 +132,7 @@
            오발동으로 콘 회피 선점). 모든 맵 폴더에 <map>_track.yaml 필요.
            The ground-band crop (crop_*) is set in kiss.yaml. -->
       <param name="map_pcd_3d"      value="$(var map_path).pcd"/>
-      <param name="track_map_yaml"  value="$(var map_path)_track.yaml"/>
+      <param name="track_map_yaml"  value="$(var map_path).yaml"/>
     </node>
   </group>
 

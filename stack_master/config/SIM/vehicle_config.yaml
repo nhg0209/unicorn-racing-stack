@@ -36,8 +36,8 @@ vesc/**:
     position_min: 0.0
     servo_max: 1.0
     servo_min: 0.0
-    speed_max: 23250.0
-    speed_min: -23250.0
+    speed_max: 46500.0
+    speed_min: -46500.0
     speed_to_erpm_gain: 4614.0
     speed_to_erpm_offset: 0.0
     steering_angle_to_servo_gain: -1.2135

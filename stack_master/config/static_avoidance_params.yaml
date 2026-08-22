@@ -39,6 +39,14 @@ static_avoidance_planner:
     # but a genuinely parked obstacle keeps reading 0.00 for as long as you look at it.
     # Raise if the car still twitches out of corners; lower if a real static box is picked up
     # too late. 0.0 restores the old behaviour (promote immediately).
+    # Throttle [s] on the per-cycle `avoid ... | corridor d=[..] obs keep-out d=[..]` line -- the
+    # only record of which side this planner chose and why. At 2.0 s / 20 Hz that is 1 line per 40
+    # cycles, and the sequence it has to order (a lane-change engage, an SM planner swap, 15
+    # saturated steering cycles, a wall) fits inside 1 s, so 2.0 loses exactly the ordering. Left at
+    # 2.0 so race-day log volume is unchanged; set 0.0 for a reproduction run:
+    #   ros2 param set /static_avoidance_planner avoid_log_throttle_s 0.0
+    # There is no save_params in this node, so nothing can persist a debug value by accident.
+    avoid_log_throttle_s: 2.0
     static_near_zero_mps: 0.15
     static_promote_sec: 0.5
     # Hysteresis: once promoted it stays static until it reads clearly moving (above
@@ -46,7 +54,7 @@ static_avoidance_planner:
     # blink whenever the tracked speed brushes the band.
     static_demote_mps: 0.35
     static_demote_sec: 0.3
-    safety_margin: 0.2     # [m]  extra clearance around the obstacle box. obs_margin = half_car(0.15)+
+    safety_margin: 0.15     # [m]  extra clearance around the obstacle box. obs_margin = half_car(0.15)+
                             #      safety must cover the SIM ego collision radius (0.29 m = half car
                             #      LENGTH in gym_bridge); 0.16 -> 0.31 clears it so the car no longer
                             #      grazes-then-teleports. Raise if the car still clips the box. Lowering
@@ -62,7 +70,7 @@ static_avoidance_planner:
     # tracker's own position error.
     # Equal to safety_margin here on purpose -- the split shipped as a pure refactor, verified
     # bit-identical over 1656 planning cases. Move it, not safety_margin, to narrow the avoidance.
-    safety_margin_d: 0.2
+    safety_margin_d: 0.15
     wall_margin: 0.15        # [m]  how close to the wall a candidate may reach (corridor room).
                             #   NOT a feasibility knob either, despite what the safety_margin note above
                             #   implies about tight sections: measured over the same grid, feasible
@@ -243,6 +251,23 @@ static_avoidance_planner:
     # no avoidance. kappa_max is kept only as a DEPRECATED alias of kappa_abs_max.
     kappa_add_max: 5.0      # [1/m] max curvature the maneuver may ADD over the raceline
     kappa_abs_max: 5.5      # [1/m] absolute curvature ceiling (physical min turn radius)
+    # THE NEXT THREE ARE FALLBACKS, NOT THE SOURCE OF TRUTH. At startup the node replaces them
+    # from config/<SIM|CAR>/veh_dyn_info (static_avoidance_node.load_veh_dyn_tables):
+    #     a_lat_max    <- ggv.csv ay_max                              6.0 -> 5.70
+    #     a_long_max   <- min(ggv ax_max, b_ax_max_machines.csv)      4.0 -> 7.00
+    #     a_long_accel <- min(ggv ax_max, ax_max_machines.csv)        3.0 -> 7.00
+    # a_long_max read 5.00 until 2026-08-12: b_ax_max_machines.csv was 5.0 and BOUND the pair.
+    # Measured braking is -12.6..-14.1 m/s^2, so that table was ~2.6x low; it is now 10.0 and the
+    # binding term on BOTH longitudinal limits is ggv ax_max (7.0). This is a LIVE change -- the
+    # node re-reads these at startup, so it does not wait for a raceline regeneration.
+    # WHY: race day resurfaces the grip, and the procedure is to multiply a factor k into
+    # ggv.csv and regenerate the raceline (seconds). That only works if k lands in ONE file.
+    # These three sat outside that path, so a re-grip would have left avoidance planning
+    # against the old surface -- and nobody would have seen it until the car pushed wide.
+    # The values below are still used, and warned about once, if veh_dyn_info cannot be read.
+    # Because the node re-reads them at startup, `ros2 param set a_lat_max ...` no longer
+    # changes anything on a car whose config IS readable. That is deliberate and costs nothing
+    # here: the re-grip workflow restarts the stack anyway.
     a_lat_max: 6.0          # [m/s^2] lateral-accel cap used for v = min(v_gb, sqrt(a_lat_max/kappa))
     a_long_max: 4.0         # [m/s^2] longitudinal DECEL; backward pass brakes EARLY into the apex (slow-in)
     a_long_accel: 3.0       # [m/s^2] longitudinal ACCEL; forward pass ramps speed up GRADUALLY out of the
@@ -307,7 +332,7 @@ static_avoidance_planner:
     # re-recording (which walked the re-opt line outward every lap), SM stays GB_TRACK.
     clear_gate_enable: true
     clear_hyst_m: 0.03      # [m] EXTRA clearance required to enter idle (leave only on a real violation)
-    clear_max_cur_d: 0.2   # [m] above this |cur_d| a stand-down CANCELS an excursion, so it must be
+    clear_max_cur_d: 0.15   # [m] above this |cur_d| a stand-down CANCELS an excursion, so it must be
                             #      earned at the full entry margin and may never ride on a latch. It no
                             #      longer gates whether the clearance is EVALUATED: the steady-state
                             #      tracking error is ~0.5 m, so gating evaluation on 0.15 meant the gate
@@ -318,7 +343,7 @@ static_avoidance_planner:
                             #      OUTLIVES the lookahead -- a box leaves the horizon on every approach,
                             #      and resetting there made it re-earn idle at the entry margin each lap
                             #      (one re-triggered maneuver per pass). The TTL only bounds the dict.
-    clear_margin_m: 0.15    # [m] extra beyond half_car(0.15) for the CLEAR trigger -> need = 0.25 m from
+    clear_margin_m: 0.10    # [m] extra beyond half_car(0.15) for the CLEAR trigger -> need = 0.25 m from
                             #      the box edge (+clear_hyst_m when entering idle). This is "does the car
                             #      fit past the box", NOT the clearance a new path is designed to
                             #      (obs_margin = half_car + safety_margin = 0.30). The gate used
@@ -373,6 +398,65 @@ static_avoidance_planner:
     # clamp is the safety argument: the shaped set contains every box inside the lookahead, so the
     # re-plan this trigger causes records the box as shaped and it cannot fire twice.
     commit_replan_gap_m: 7.0
+
+    # --- which shape carries the sampled terminal offset -----------------------------------
+    # sample      the quintic hump: raceline -> apex -> raceline, with the corridor consulted at the
+    #             obstacle's own station and along the two outer ramps. This is what ships.
+    # corridor_qp minimum bending inside the measured corridor, solved once per candidate over the
+    #             WHOLE span the maneuver owns -- entry ramp, every apex, the inter-apex weave and
+    #             the return -- with the keep-out of each shaped box and the terminal d = 0 folded
+    #             into the bounds. Knots, sides, apex offsets, lookahead and every gate afterwards
+    #             are the sampled path's, unchanged; only d(s) is re-decided.
+    #
+    # WHY THE OPTION EXISTS, in one line each (planner/spliner/RAMP_CEILING_NOTE.md):
+    #   67 % of the rejections that a corridor could fix sit in the inter-apex weave -- the one
+    #   segment nothing scans; the two ramps together are 11 %. The ceiling for re-deciding the
+    #   whole span, answering every gate the node runs, is 25.6 % / 35.1 % of ALL refusals.
+    # WHAT IT COSTS: the corridor-decided shape is more curved than a quintic through the same
+    #   apex, so its curvature-limited speed is lower. A slower real path where there was no path
+    #   is the trade; a refusal is a TRAILING standstill behind a stationary box.
+    # DEFAULT corridor_qp AS OF SIM. It was 'sample' while every corridor_qp number was offline;
+    # sim now reports paths generated early and tracked well, and the offline gates agree -- the
+    # stability sweep passes on both methods once G2 measures the step the car did NOT drive to
+    # (see the G2 note in sweep_avoidance_stability.py), and corridor_qp publishes on 415 of 585
+    # cycles there against sample's 139.
+    # THE SWITCH STAYS. The sampled path is still present and still the fallback: this is a
+    # default, not a deletion, and 'sample' remains selectable at runtime.
+    static_plan_method: "corridor_qp"     # sample | corridor_qp
+    # corridor_qp: weight on ||d||^2 against ||d''||^2 in the objective. NOT a fraction -- the
+    # bending block carries 1/ds^4, which is 1e4 at the 0.1 m publishing grid, so this is only felt
+    # in the hundreds. 0 = pure minimum bending, which the terminal pins already keep bounded.
+    corridor_qp_w_dev: 0.0
+    # corridor_qp: hold the apex bands at the quintic's own values instead of letting the keep-out
+    # bounds decide them. Side selection and keep-out are ALREADY in the bounds, so the corridor
+    # forces the apex offset on its own and pinning the value as well over-constrains a run whose
+    # two ends are pinned already. Kept so the two formulations can be measured against each other
+    # (sweep_static_race.py --method corridor_qp --pin-apex).
+    corridor_qp_pin_apex: false
+    # corridor_qp: control points per solve. The BOUNDS are enforced at every published station
+    # whatever this is, so lowering it costs expressiveness and never costs feasibility. A three-box
+    # maneuver is 200+ stations at 0.1 m and the solve runs once per candidate inside a 20 Hz cycle;
+    # 60 keeps that at ~0.6 ms.
+    corridor_qp_max_vars: 60
+    # corridor_qp: run the ramp ladder as well. OFF, and measured rather than assumed.
+    # The ladder re-throws the candidate grid over a different ramp pair. What that buys the SAMPLE
+    # path is not a ramp length: on the 90 (ifac) / 65 (ifac_0807) cells it opens, every one died at
+    # rung 0 on obs_box+grid+body and every winning rung has a SHORTER ENTRY -- which moves
+    # s_entry0, and with it cand_entry_i, the station from which the grid and body gates hold a
+    # candidate responsible. The quintic's only way past an early pinch is to hand those stations
+    # back to the pre-ramp and the d = 0 tail. The QP can already sit on the raceline there inside
+    # the long window, so over 8484 / 9462 race cells the ladder opens exactly ZERO for it --
+    # identical refusal rate (32.0 % / 24.4 %) and identical published-path counts, at 2.4x the
+    # cell time. Set true to re-test the claim on a new map.
+    corridor_qp_ramp_ladder: false
+    # One PLAN line per cycle, for SIM runs. OFF: it costs a whole extra planning pass.
+    #   PLAN method=corridor_qp ms=11.4 pts=151 obs=3 squeeze=0 vcap=2.44 vs_sample=OPENED
+    # vs_sample re-runs the REAL pipeline with the other d(s) generator and probe=true, so it
+    # answers to the same knots, gates and margins. OPENED = this shape found a path the other one
+    # would not have; LOST = the reverse, never seen offline and worth investigating if a bag shows
+    # it. A refusal rate is a sweep statistic; this is the only way to see, from a bag, what
+    # changing the shape actually changed on a car.
+    static_plan_log: false
 
     # --- cost weights  J = w_d*Σ|d| + w_k*Σκ² + w_c*|d_end-d_end_prev| + w_obs*Σexp(-dist/σ) ---
     w_d: 1.0                # raceline deviation

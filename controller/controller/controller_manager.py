@@ -20,7 +20,7 @@ from std_msgs.msg import Float32, Bool
 from tf_transformations import euler_from_quaternion, quaternion_from_euler
 from visualization_msgs.msg import Marker, MarkerArray
 
-from controller.combined.src.Controller import Controller
+from controller.combined.src.Controller import Controller, load_veh_dyn
 from controller.ftg.ftg import FTG
 
 
@@ -37,7 +37,23 @@ L1_PARAMS = [
     'AEB_thres_overtake', 'AEB_offline_d_thres', 'AEB_release_hyst_m', 'AEB_min_hold_s',
     'speed_diff_thres', 'start_speed', 'start_curvature_factor',
     'l1_lat_err_cap', 'max_accel_mps2', 'max_decel_mps2',
+    'a_lat_limit_enable', 'a_lat_margin', 'a_lat_v_floor',
+    'a_comb_limit_enable', 'a_comb_margin',
+    'lambda_weight', 'gamma_weight',
 ]
+
+# Fallbacks for L1_PARAMS a yaml predating them does not carry. Everything else is required
+# from controller.yaml (a missing key logs an error and lands as None); the steering tyre
+# limit must default ON, and at its chosen margin, even against an old yaml.
+L1_PARAM_DEFAULTS = {
+    'a_lat_limit_enable': True,
+    'a_lat_margin': 1.35,
+    'a_lat_v_floor': 0.5,
+    'a_comb_limit_enable': True,
+    'a_comb_margin': 1.0,
+    'lambda_weight': 1.0,
+    'gamma_weight': 0.0,
+}
 
 
 class ControllerManager(Node):
@@ -99,7 +115,48 @@ class ControllerManager(Node):
 
         # load all L1 params into members (startup-apply; mirror ROS1 init)
         for p in L1_PARAMS:
-            setattr(self, p, self._get_param(p))
+            setattr(self, p, self._get_param(p, L1_PARAM_DEFAULTS.get(p)))
+
+        # Vehicle dynamics for the steering tyre limit (Controller._clip_to_tyre_limit) and the
+        # friction circle (Controller._ax_avail): ggv.csv + ax_max_machines.csv +
+        # racecar_f110.ini, the same three the offline velocity profile is solved against.
+        # SIM and CAR carry the same ay_max today, but that is a decision and not an identity,
+        # so read the set that belongs to this run: race.launch.xml already computes
+        # racecar_version from `sim` and passes it; the default here mirrors that rule for a
+        # bare `ros2 run`.
+        self.racecar_version = self._get_param('racecar_version', 'SIM' if self.use_sim else 'CAR')
+        self.ggv_table = self.ggv_ax_table = self.ax_machines_table = None
+        self.b_ax_table = self.dyn_model_exp = None
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            cfg_dir = os.path.join(get_package_share_directory('stack_master'), 'config',
+                                   self.racecar_version)
+            (self.ggv_table, self.ggv_ax_table, self.ax_machines_table,
+             self.b_ax_table, self.dyn_model_exp) = load_veh_dyn(cfg_dir)
+            self.get_logger().info(
+                f"[{self.name}] veh_dyn {self.racecar_version}: ay_max "
+                f"{self.ggv_table[:, 1].min():.2f}-{self.ggv_table[:, 1].max():.2f}, ax_max "
+                f"{self.ggv_ax_table[:, 1].min():.2f}-{self.ggv_ax_table[:, 1].max():.2f}, "
+                f"ax_machines {self.ax_machines_table[:, 1].min():.2f}-"
+                f"{self.ax_machines_table[:, 1].max():.2f}, b_ax_machines "
+                f"{self.b_ax_table[:, 1].min():.2f}-{self.b_ax_table[:, 1].max():.2f} m/s^2, "
+                f"p {self.dyn_model_exp} ({cfg_dir})")
+            # The slew limit is DERIVED from these now (Controller._slew_limits), so say what it
+            # resolves to at rest next to the controller.yaml values it replaces -- otherwise the
+            # only record of the published command's real bound is a csv nobody opened.
+            v0 = 0.0
+            _ax = float(np.interp(v0, self.ggv_ax_table[:, 0], self.ggv_ax_table[:, 1]))
+            _axm = float(np.interp(v0, self.ax_machines_table[:, 0], self.ax_machines_table[:, 1]))
+            _bax = float(np.interp(v0, self.b_ax_table[:, 0], self.b_ax_table[:, 1]))
+            self.get_logger().info(
+                f"[{self.name}] slew limit at v=0 -> accel {min(_ax, _axm):.2f}, decel "
+                f"{min(_ax, _bax):.2f} m/s^2 (controller.yaml {self.max_accel_mps2}/"
+                f"{self.max_decel_mps2} are now the unreadable-config fallback only)")
+        except Exception as e:
+            self.get_logger().error(
+                f"[{self.name}] could not read veh_dyn ({e}) -> the steering tyre limit AND "
+                f"the friction circle are both INERT, and the slew limit falls back to "
+                f"controller.yaml ({self.max_accel_mps2}/{self.max_decel_mps2} m/s^2)")
 
         # Publishers (ROS1 topic names kept)
         self.lookahead_pub = self.create_publisher(Marker, 'lookahead_point', 10)
@@ -213,6 +270,19 @@ class ControllerManager(Node):
         self.controller.l1_lat_err_cap = self.l1_lat_err_cap
         self.controller.max_accel_mps2 = self.max_accel_mps2
         self.controller.max_decel_mps2 = self.max_decel_mps2
+        self.controller.a_lat_limit_enable = self.a_lat_limit_enable
+        self.controller.a_lat_margin = self.a_lat_margin
+        self.controller.a_lat_v_floor = self.a_lat_v_floor
+        self.controller.a_comb_limit_enable = self.a_comb_limit_enable
+        self.controller.a_comb_margin = self.a_comb_margin
+        # not params: read once from the config dir
+        self.controller.ggv_table = self.ggv_table
+        self.controller.ggv_ax_table = self.ggv_ax_table
+        self.controller.ax_machines_table = self.ax_machines_table
+        self.controller.b_ax_table = self.b_ax_table
+        self.controller.dyn_model_exp = self.dyn_model_exp
+        self.controller.lambda_weight = self.lambda_weight
+        self.controller.gamma_weight = self.gamma_weight
         self.get_logger().info(f"[{self.name}] initialized FrenetConverter + Controller. Ready!")
 
     ############################################ CALLBACKS ############################################
@@ -248,7 +318,14 @@ class ControllerManager(Node):
             if os.path.exists(self.save_yaml_path):
                 with open(self.save_yaml_path, "r") as f:
                     data = yaml.safe_load(f) or {}
-            params = {p: float(getattr(self, p)) for p in L1_PARAMS}
+            # bools stay bools. float(True) writes 1.0, the next launch declares that parameter
+            # as a double, and `ros2 param set <it> false` then fails on a type mismatch -- i.e.
+            # pressing save would quietly kill the live escape hatch it had just saved. The
+            # steering tyre limit's off-switch depends on this.
+            params = {}
+            for p in L1_PARAMS:
+                v = getattr(self, p)
+                params[p] = bool(v) if isinstance(v, bool) else float(v)
             params['save_params'] = False
             data.setdefault('controller_manager', {})['ros__parameters'] = params
             with open(self.save_yaml_path, "w") as f:
@@ -314,10 +391,29 @@ class ControllerManager(Node):
         self.state = data.state
 
     def imu_cb(self, data):
+        # THE IMU IS NOT ROTATED 90 DEGREES. Both lines here used to negate their input, on the
+        # authority of a comment ("vesc is rotated 90 deg, so (-acc_y) == (long_acc)") that did
+        # not even match the code beneath it -- it names acc_y and the code read acc_x.
+        # Measured on bag ggv_0812_1645 (v > 2 m/s, speed smoothed before differentiating):
+        #   corr(imu.x, dv/dt)   = +0.956, fit imu.x = +1.035*dv/dt   -> x IS longitudinal,
+        #     and sustained events agree in sign, not just in correlation: braking dv/dt -3.97
+        #     with imu.x -4.45, acceleration +3.54 with imu.x +3.46.
+        #   corr(imu.y, v*gz)    = +0.945                             -> y is lateral
+        #   corr(gz, dyaw/dt)    = +0.986, fit gz = +0.957*dyaw/dt    -> gz needs NO negation
+        #     (dyaw/dt from the localizer's own pose; feeding -gz gives corr -0.986). A steering
+        #     cross-check agrees: corr(steer_cmd, dyaw/dt) = +0.915 and corr(steer_cmd, gz) =
+        #     +0.912, so the whole chain is one consistent right-handed frame.
+        # The same wrong premise is in low_level.launch.xml's base_link->vesc_imu TF (yaw +90)
+        # and the vesc_imu->vesc_imu_rot TF that undoes it. Its ONLY consumer is cartographer's
+        # mapping_2d.lua (tracking_frame = "vesc_imu_rot"); localization_2d.lua tracks base_link
+        # and the kiss path treats the mount as identity (kiss_scan.yaml:31). The mislabel has
+        # stayed invisible there because a pure yaw rotation changes neither gz nor the gravity
+        # vector, which is all 2D cartographer uses. Mapping config is out of scope here by
+        # standing instruction -- this is recorded, not fixed.
         self.acc_now[1:] = self.acc_now[:-1]
-        self.acc_now[0] = -data.linear_acceleration.x  # vesc is rotated 90 deg, so (-acc_y) == (long_acc)
+        self.acc_now[0] = data.linear_acceleration.x   # longitudinal, sign already correct
 
-        self.yaw_rate = -data.angular_velocity.z  # vesc is rotated 90 deg, so (-acc_y) == (long_acc)
+        self.yaw_rate = data.angular_velocity.z        # +z = CCW = left, same as the pose
         if self.controller is not None:
             self.controller.yaw_rate = self.yaw_rate
 

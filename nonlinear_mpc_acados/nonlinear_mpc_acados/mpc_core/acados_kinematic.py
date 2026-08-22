@@ -834,6 +834,13 @@ class MPC:
                 gp_z = ca.vertcat(dyn['vx'], dyn['vy'], dyn['r'],
                                   dyn['delta'], dyn['a_x'])
                 mu = build_casadi_residual(gp_z, gp_p)
+                # 0812 GP 저속 게이트 — GP 는 vx>1.5 데이터로만 학습돼 정지·저속에서
+                # 평균회귀(요가속 편향 주입 → 출발 조향 스윙, 0811 아젠다 ⑤①).
+                # 게이트: vx 1.0 중심 시그모이드 — 정지 0, 1.5 에서 ~0.95, 학습영역 1.0.
+                # 후진(vx<0)도 자연히 0 (GP 학습영역 밖).
+                # (0813: nuc14 트리에서 역이식 — 두 트리 통합)
+                _gp_gate = 0.5 * (1 + ca.tanh((dyn["vx"] - 1.0) / 0.3))
+                mu = _gp_gate * mu
                 # B_d: 3 GP outputs -> state rows vx(3), vy(4), r(5).
                 # Pad residual to f_expl width: 8 (plain) or 18 (joint-α
                 # LMPC appends 10 α-states AFTER the 8 physical, so rows
@@ -1838,8 +1845,28 @@ class MPC:
                 # 요구 room 가산 (병합 장애물의 실질 반폭 확장)
                 ok_up = (r_up - float(extra_up) >= w_car_safe) and (+1 not in _stuck)
                 ok_dn = (r_dn - float(extra_dn) >= w_car_safe) and (-1 not in _stuck)
+                # ── 2026-08-13 달성가능 keepout 기반 side 선택 (hall bag2 실측) ──
+                # raw room 비교는 두 문제를 낳는다: ①센터 장애물(e_c≈0)에선 검출
+                # 노이즈 ±5cm 가 side 를 결정(랩마다 반전), ②좁은 쪽이 낙점되면
+                # 아래 _keep_eff 의 max(0.40,…) 플로어가 코리도 한계(_cor_reach)를
+                # 넘어 "장애물 vs 코리도 soft 모순"이 부활 → 실통과 간격 0.26~0.29
+                # (요구 0.30 미달 = 스침, hall_0813 bag2 7/15회). 선택 단계에서
+                # 코리도 한계까지 반영한 달성가능 keepout 을 양쪽 계산해 큰 쪽을
+                # 고른다 — 좁은 쪽은 아예 선택되지 않는다.
+                _kb_o = min(0.15, 0.25 * _ko)
+                _full_keep = float(self.R_safe_live) + _kb_o + float(self.R_car_live)
+                _wlx = float(self.left_lut_x(sk0)); _wly = float(self.left_lut_y(sk0))
+                _wrx = float(self.right_lut_x(sk0)); _wry = float(self.right_lut_y(sk0))
+                _cx = float(self.center_lut_x(sk0)); _cy = float(self.center_lut_y(sk0))
+                _wl = sin_t * (_wlx - _cx) - cos_t * (_wly - _cy)
+                _wr = sin_t * (_wrx - _cx) - cos_t * (_wry - _cy)
+                _hi = max(_wl, _wr); _lo = min(_wl, _wr)
+                _cr_up = (_hi - float(self.R_car_live)) - float(e_c_obs)
+                _cr_dn = float(e_c_obs) - (_lo + float(self.R_car_live))
+                _ach_up = min(_full_keep, (r_up - float(extra_up)) - 0.32, _cr_up - 0.12)
+                _ach_dn = min(_full_keep, (r_dn - float(extra_dn)) - 0.32, _cr_dn - 0.12)
                 if ok_up and ok_dn:
-                    _side = +1 if (r_up - extra_up) >= (r_dn - extra_dn) else -1
+                    _side = +1 if _ach_up >= _ach_dn else -1
                 elif ok_up:
                     _side = +1
                 elif ok_dn:
@@ -1917,8 +1944,10 @@ class MPC:
                     _shift_log = float(_shift)
                 self._log.info(
                     "[MPC] side-decide(MAP) s_obs=%.1f e_c=%+.2f room_up=%.2f "
-                    "room_dn=%.2f keepout=%.2f -> side=%+d shift=%.2f | LUT벽 e_c: wl=%+.2f wr=%+.2f",
-                    s_obs, e_c_obs, r_up, r_dn, w_car_safe, _side, _shift_log, _wl, _wr)
+                    "room_dn=%.2f keepout=%.2f -> side=%+d shift=%.2f | LUT벽 e_c: wl=%+.2f wr=%+.2f"
+                    " | ach u/d=%.2f/%.2f",
+                    s_obs, e_c_obs, r_up, r_dn, w_car_safe, _side, _shift_log, _wl, _wr,
+                    _ach_up, _ach_dn)
                 return _side
         # 2026-07-21e 라벨 완전 배제 — e_c 축 직접 판정 (첫 시도 정답이 목표).
         # 좌/우 "라벨"(w_l/w_r)은 트랙 방향·경계추출 이음새에 따라 뒤집혀 어떤

@@ -25,7 +25,128 @@ from f110_msgs.msg import Obstacle, ObstacleArray, OTWpntArray, Wpnt, WpntArray,
 from frenet_conversion.frenet_converter import FrenetConverter
 from transforms3d.euler import quat2euler
 from grid_filter.grid_filter import GridFilter
+
+# OPTIONAL BY DESIGN. rate_check only ever prints a warning, so a workspace where it has not been
+# built yet loses the warning and nothing else -- which is exactly the state every node was in
+# before it existed. Hard-failing three live nodes on a missing diagnostic would be a worse trade.
+try:
+    from rate_check.rate_check import RateCheck
+except ImportError:                          # pragma: no cover - deployment shape, not logic
+    RateCheck = None
 import trajectory_planning_helpers as tph
+
+# The corridor QP, loaded AS A SIBLING FILE rather than as `spliner.corridor_path`.
+# Every offline gate in this repo runs this node by exec'ing its source with no build (CLAUDE.md:
+# the user builds manually), and a package import there resolves against the INSTALL space -- so it
+# either fails outright, or, worse, succeeds and pairs source planner code with a stale solver. The
+# file beside this one is the matching one by construction, in the source tree and in the install
+# space alike. A plain `from spliner.corridor_path import ...` is what belongs here and is exactly
+# what cannot be trusted.
+def _load_corridor_path():
+    import importlib.util
+    import os
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "corridor_path.py")
+    spec = importlib.util.spec_from_file_location("spliner_corridor_path", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_corridor_path = _load_corridor_path()
+
+
+cut_keepout, solve_corridor_path = _corridor_path.cut_keepout, _corridor_path.solve_corridor_path
+
+
+def _two_col(path):
+    import numpy as _np
+    t = _np.atleast_2d(_np.loadtxt(path, delimiter=",", comments="#"))
+    if t.shape[1] < 2:
+        raise ValueError(f"{path}: expected 2 columns (v_mps, value), got {t.shape[1]}")
+    return t[:, [0, 1]]
+
+
+def load_veh_dyn_tables(cfg_dir):
+    """The acceleration envelope, from a config/<SIM|CAR> directory.
+
+    Returns four [v_mps, value] tables to be INTERPOLATED at the speed of interest:
+    (ay_max, ax_max, ax_machines, b_ax_machines) -- ggv.csv columns 3 and 2, then
+    ax_max_machines.csv and b_ax_max_machines.csv.
+
+    WHY THIS EXISTS. Race day resurfaces the grip: the intended procedure is to measure a
+    washout, multiply a factor k into ggv.csv, and regenerate the raceline (seconds). That only
+    works if k lands in ONE file. This planner used to hold its own a_lat_max 6.0 / a_long_max
+    4.0 / a_long_accel 3.0 outside that path, so a re-grip would have silently left avoidance
+    planning against the old surface.
+
+    SECOND COPY, ON PURPOSE. controller/controller/combined/src/Controller.py::load_veh_dyn
+    reads the same files for the control node. Neither imports the other: they live in different
+    ROS packages, and making a planner depend on the controller (or the reverse) to read config
+    is worse than the duplication. The stack's third reader, tph.import_veh_dyn_info, is not
+    available here either -- `import trajectory_planning_helpers` fails in the system python
+    these nodes run under, which is checked, not assumed. Folding all of them onto one veh_dyn
+    library is DEFERRED UNTIL AFTER THE RACE; when it happens, both copies go.
+    """
+    import os
+    import numpy as _np
+    vdi = os.path.join(cfg_dir, "veh_dyn_info")
+    ggv = _np.atleast_2d(_np.loadtxt(os.path.join(vdi, "ggv.csv"), delimiter=",", comments="#"))
+    if ggv.shape[1] < 3:
+        raise ValueError(f"ggv.csv: expected 3 columns (v, ax_max, ay_max), got {ggv.shape[1]}")
+    return (ggv[:, [0, 2]], ggv[:, [0, 1]],
+            _two_col(os.path.join(vdi, "ax_max_machines.csv")),
+            _two_col(os.path.join(vdi, "b_ax_max_machines.csv")))
+
+
+def load_dyn_model_exp(cfg_dir, default=2.0):
+    """The combined-acceleration exponent p, from config/<SIM|CAR>/racecar_f110.ini.
+
+    READ, not hardcoded, for the same reason ggv is: the race-day procedure is to put the change
+    in ONE file and regenerate. p is the shape of the g-g envelope (1 = diamond, 2 = ellipse) and
+    it is the exponent the OFFLINE velocity profile is solved with, so a planner that assumes a
+    different one is planning against a different car than the raceline was.
+
+    Read by regex rather than parsed: those .ini blocks are python-dict literals carrying inline
+    '#' comments, which breaks literal_eval. Same technique as Controller.load_veh_dyn and
+    static_reopt_core._load_veh_dyn -- a third reader of the same file, and the same deferred
+    consolidation those two already name.
+    """
+    import os
+    import re
+    ini = os.path.join(cfg_dir, "racecar_f110.ini")
+    with open(ini) as f:
+        m = re.search(r'"dyn_model_exp"\s*:\s*([-+0-9.eE]+)', f.read())
+    if not m:
+        raise ValueError(f"{ini}: no dyn_model_exp in vel_calc_opts")
+    p = float(m.group(1))
+    if not 1.0 <= p <= 2.0:
+        raise ValueError(f"{ini}: dyn_model_exp {p} outside the model's range [1.0, 2.0]")
+    return p
+
+
+def resolve_veh_dyn_limits(tables, speed):
+    """The three limits the avoidance velocity profile needs, interpolated at `speed`.
+
+    Which file feeds which, from what the numbers are USED for in _speed_profile:
+      a_lat_max     the curvature cap v = sqrt(a_lat_max/|kappa|)  -> ggv ay_max. Same lateral
+                    budget the raceline is planned against, which is the whole point.
+      a_long_max    the BACKWARD pass, braking into the apex       -> min(ggv ax_max,
+                    b_ax_max_machines). Friction bound AND brake bound, the pair the offline
+                    velocity profile uses.
+      a_long_accel  the FORWARD pass, accelerating out             -> min(ggv ax_max,
+                    ax_max_machines). Same pair, drive side. ax_max_machines is the only one of
+                    the four that is genuinely speed-dependent (9.5 at rest, 4.62 at 15 m/s),
+                    so the interpolation is not decoration -- it just does not bite yet, because
+                    below ~11 m/s the 7.0 friction bound is the smaller of the two.
+    """
+    import numpy as _np
+    ay, ax, axm, bax = tables
+    it = lambda t: float(_np.interp(speed, t[:, 0], t[:, 1]))   # noqa: E731
+    ax_f = it(ax)
+    return {"a_lat_max": it(ay),
+            "a_long_max": min(ax_f, it(bax)),
+            "a_long_accel": min(ax_f, it(axm))}
+
 
 # --- Evasion path kappa smoothing ---
 # [s] how old the last published path may be and still be blended onto. Not a tuning knob: the
@@ -88,6 +209,24 @@ class ObstacleSpliner(Node):
         - ``/planner/avoidance/markers``    (MarkerArray)      grey=all, red=rejected, green=selected
         - ``/planner/avoidance/latency``    (Float32)          loop time (only if ``measure``)
     """
+
+    # CLASS-LEVEL, and only for the d(s) branch. Every other planning value reaches the node
+    # through dyn_param_cb and would be a second source of truth here. These four are the
+    # exception because the branch they select is the difference between the shape that ships and
+    # one that does not: an unset attribute would be an AttributeError inside do_spline, and the
+    # value to fall back on when the parameter machinery has not run is the shipped shape, not a
+    # crash. The yaml still overrides all four through the ordinary declare/branch/sync chain
+    # (planner/spliner/test/test_param_wiring.py enforces it).
+    static_plan_method = "corridor_qp"
+    corridor_qp_w_dev = 0.0
+    corridor_qp_pin_apex = False
+    corridor_qp_max_vars = 60
+    corridor_qp_ramp_ladder = False
+    static_plan_log = False
+    # Same reason as the five above: every offline harness builds this node with __new__ and a
+    # hand-set attribute list, so a NEW attribute the hot path reads is an AttributeError in 31
+    # tests before it is ever a feature. A diagnostic throttle must not be able to break planning.
+    avoid_log_throttle_s = 2.0
 
     def __init__(self):
         self.name = "static_avoidance_planner"
@@ -156,10 +295,16 @@ class ObstacleSpliner(Node):
         # raceline curvature alone already ate the budget -> flat spline, no avoidance.
         self.kappa_add_max = 2.0     # [1/m] max curvature the maneuver may ADD over the raceline
         self.kappa_abs_max = 3.5     # [1/m] absolute curvature ceiling (min turn radius)
+        # THESE THREE ARE FALLBACKS, NOT THE SOURCE. At startup they are replaced by
+        # config/<SIM|CAR>/veh_dyn_info (see load_veh_dyn_tables / _a_limits) so that a race-day
+        # re-grip -- multiply k into ggv.csv, regenerate the raceline -- reaches the avoidance
+        # planner too instead of leaving it planning against the old surface. They are still the
+        # values used if those files cannot be read, which is why they stay here and in the yaml.
         self.a_lat_max = 6.0         # [m/s^2] lateral-accel cap for the velocity profile
         self.a_long_max = 4.0        # [m/s^2] longitudinal DECEL for the backward pass (brake into the apex)
         self.a_long_accel = 3.0      # [m/s^2] longitudinal ACCEL for the forward pass (gentle exit ramp-up;
                                      # lower = more gradual "fast-out" acceleration off the apex)
+        self._veh_dyn = None         # (ay, ax, ax_machines, b_ax_machines) tables, or None
         self.safety_margin = 0.16    # [m] extra clearance around the obstacle box (beyond half car).
         # LATERAL half of the keep-out. Split from safety_margin so the two axes obs_margin
         # conflates can move independently: the longitudinal one is bounded by half the car's
@@ -167,6 +312,15 @@ class ObstacleSpliner(Node):
         # tracker's position error. Equal to safety_margin here, which makes the split a pure
         # refactor -- every published path is bit-identical to before it.
         self.safety_margin_d = 0.16
+        # How often the per-cycle `avoid ...` selection line may print. It is the ONE record of
+        # which side this planner chose, at what d_end, inside which corridor and against which
+        # keep-out -- i.e. the only way to line this planner up against the other one after a
+        # crash. At 2.0 s and a 20 Hz loop that is one line per 40 cycles, and the events it has to
+        # order (an engage, a planner swap, 15 saturated steering cycles, a wall) happen inside
+        # 1 s: the ordering is exactly what gets lost. Kept at 2.0 as the DEFAULT so race-day log
+        # volume does not change, and made settable so a reproduction run can turn it down:
+        #   ros2 param set /static_avoidance_planner avoid_log_throttle_s 0.0
+        self.avoid_log_throttle_s = 2.0
         self.static_near_zero_mps = 0.15  # speed band for the near-stationary fallback
         self.static_promote_sec = 0.5     # how long it must hold before the fallback is believed
         self.static_demote_mps = 0.35     # clearly-moving band that ends the belief
@@ -354,7 +508,8 @@ class ObstacleSpliner(Node):
             'kernel_size', 'body_kernel_size',
             'lookahead_min', 'lookahead_k', 'n_d_samples', 'sample_gaps', 'kappa_max',
             'kappa_add_max', 'kappa_abs_max', 'a_lat_max', 'a_long_max', 'a_long_accel',
-            'safety_margin', 'safety_margin_d', 'static_near_zero_mps', 'static_promote_sec',
+            'safety_margin', 'safety_margin_d', 'avoid_log_throttle_s',
+            'static_near_zero_mps', 'static_promote_sec',
             'static_demote_mps', 'static_demote_sec',
             'wall_margin', 'knot_merge_s_m', 'shift_min', 'shift_buffer', 'ramp_len', 'hold_after',
             'return_len', 'ramp_len_min_m',
@@ -368,7 +523,10 @@ class ObstacleSpliner(Node):
             'commit_enable', 'commit_dev_max', 'commit_obs_ds', 'commit_obs_dd',
             'commit_drop_on_new_obstacle', 'commit_replan_gap_m',
             'commit_reanchor_len_m', 'commit_reanchor_max_m', 'preramp_len_m',
+            'static_plan_method', 'corridor_qp_w_dev', 'corridor_qp_pin_apex',
+            'corridor_qp_max_vars', 'corridor_qp_ramp_ladder', 'static_plan_log',
         ]))
+        self._load_veh_dyn()
         self.add_on_set_parameters_callback(self.dyn_param_cb)
 
         # Subscribers
@@ -397,10 +555,81 @@ class ObstacleSpliner(Node):
         self.wait_for_messages()
         self.converter = self.initialize_converter()
         self.create_timer(1.0 / 20.0, self.loop)   # 20 Hz
+        self._rate_check = (RateCheck(
+            self, nominal_hz=20.0, name=self.name,
+            consequence="the planner's own 50 ms period, which the state machine's "
+                        "staleness gate is set against") if RateCheck else None)
 
     #####################
     # DYNAMIC PARAMETERS #
     #####################
+    def _load_veh_dyn(self):
+        """Take the acceleration envelope from veh_dyn_info, or keep the fallbacks and say so.
+
+        FAIL SOFT, by instruction: this is a planner that is already driving. A missing or
+        unreadable file leaves a_lat_max / a_long_max / a_long_accel at their yaml values and
+        warns ONCE -- it does not add a new way for the stack to fail at startup.
+        """
+        import os
+        self.racecar_version = self.declare_parameter(
+            'racecar_version', 'CAR',
+            ParameterDescriptor(description="config/<SIM|CAR> the veh_dyn_info tables come from"),
+        ).value
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            cfg = os.path.join(get_package_share_directory('stack_master'), 'config',
+                               self.racecar_version)
+            self._veh_dyn = load_veh_dyn_tables(cfg)
+            self._dyn_model_exp = load_dyn_model_exp(cfg)
+            lim = resolve_veh_dyn_limits(self._veh_dyn, 0.0)
+            self.get_logger().info(
+                f"[{self.name}] veh_dyn {self.racecar_version}: a_lat_max "
+                f"{self.a_lat_max:.2f}->{lim['a_lat_max']:.2f}, a_long_max "
+                f"{self.a_long_max:.2f}->{lim['a_long_max']:.2f}, a_long_accel "
+                f"{self.a_long_accel:.2f}->{lim['a_long_accel']:.2f} m/s^2 (at v=0; "
+                f"interpolated per solve). yaml values are now fallbacks only. ({cfg})")
+        except Exception as e:
+            self._veh_dyn = None
+            self._dyn_model_exp = None
+            self.get_logger().warn(
+                f"[{self.name}] could not read veh_dyn_info ({e}) -> keeping the yaml limits "
+                f"a_lat_max {self.a_lat_max}, a_long_max {self.a_long_max}, a_long_accel "
+                f"{self.a_long_accel}. A re-grip of ggv.csv will NOT reach this planner.")
+
+    def _dyn_exp(self):
+        """Combined-acceleration exponent for this solve.
+
+        getattr, like _a_limits: the offline sweeps build this class with __new__ and never run
+        __init__, so the attribute may not exist at all. Falls back to 2.0 (the ellipse, and what
+        both shipped .ini files carry) rather than to 1.0, because 1.0 is the DIAMOND -- the more
+        conservative shape -- and silently planning to it would slow every avoidance whenever the
+        ini could not be read, which is the opposite of failing soft.
+        """
+        p = getattr(self, "_dyn_model_exp", None)
+        return 2.0 if not p else float(p)
+
+    def _a_limits(self):
+        """(a_lat_max, a_long_max, a_long_accel) for this solve, interpolated at the ego speed.
+
+        Interpolated rather than folded to a scalar: three of the four source columns are flat
+        today, so every reduction agrees and would go on agreeing while being wrong the day one
+        of them becomes speed-dependent -- ax_max_machines already is. `cur_vs` is the ego speed
+        the solve is being planned from, which is the one speed available before the profile
+        exists; the offline sweeps resolve at their own cur_vs the same way.
+
+        Falls back to the parameter values when no tables were loaded, which is also what makes
+        `ros2 param set a_lat_max ...` still mean something on a car with unreadable config.
+        """
+        # getattr, not self._veh_dyn: the offline sweeps build this class with __new__ and never
+        # run __init__, so the attribute does not exist there at all. Without the default that
+        # is an AttributeError inside the solve, which Harness.cell() swallows -- the sweep then
+        # reports every cell as a malformed result instead of a refusal. Measured the hard way.
+        tables = getattr(self, "_veh_dyn", None)
+        if tables is None:
+            return self.a_lat_max, self.a_long_max, self.a_long_accel
+        lim = resolve_veh_dyn_limits(tables, float(getattr(self, "cur_vs", 0.0) or 0.0))
+        return lim["a_lat_max"], lim["a_long_max"], lim["a_long_accel"]
+
     def declare_all_parameters(self):
         def dbl(min_v, max_v, desc=""):
             return ParameterDescriptor(
@@ -431,6 +660,10 @@ class ObstacleSpliner(Node):
         self.declare_parameter('a_long_accel', 3.0, dbl(0.5, 20.0, "longitudinal accel for forward pass (gentle exit) [m/s^2]"))
         self.declare_parameter('safety_margin', 0.16, dbl(0.0, 1.0, "clearance around obstacle box [m]"))
         self.declare_parameter('safety_margin_d', 0.16, dbl(0.0, 1.0, "LATERAL clearance around the obstacle box [m]"))
+        self.declare_parameter('avoid_log_throttle_s', 2.0,
+                               ParameterDescriptor(
+                                   description="throttle [s] on the `avoid ...` selection line; "
+                                               "0 = every cycle (reproduction runs)"))
         self.declare_parameter('static_near_zero_mps', 0.15,
                                dbl(0.0, 1.0, "speed band for the near-stationary fallback [m/s]"))
         self.declare_parameter('static_promote_sec', 0.5,
@@ -523,6 +756,26 @@ class ObstacleSpliner(Node):
         self.declare_parameter('preramp_len_m', 3.0, dbl(0.0, 15.0, "decay the car's current d to the raceline within this much of the path before the hump [m]"))
         self.declare_parameter('commit_obs_ds', 0.75, dbl(0.05, 5.0, "drop the commit if the triggering obstacle s drifts this far [m]"))
         self.declare_parameter('commit_obs_dd', 0.40, dbl(0.05, 2.0, "drop the commit if the triggering obstacle d drifts this far [m]"))
+        # --- which shape carries the sampled terminal offset (see the branch in do_spline) ---
+        self.declare_parameter('static_plan_method', 'corridor_qp',
+                               ParameterDescriptor(type=ParameterType.PARAMETER_STRING,
+                                                   description="d(s) generator: 'sample' (the quintic hump) or 'corridor_qp' (minimum bending inside the measured corridor)"))
+        self.declare_parameter('corridor_qp_w_dev', 0.0,
+                               dbl(0.0, 1e5, "corridor_qp: weight on ||d||^2 against ||d''||^2. "
+                                             "The bending block carries 1/ds^4 (1e4 at 0.1 m "
+                                             "spacing), so this is only felt in the hundreds"))
+        self.declare_parameter('corridor_qp_pin_apex', False,
+                               ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
+                                                   description="corridor_qp: hold the apex bands at the quintic's own values instead of letting the keep-out bounds decide them"))
+        self.declare_parameter('corridor_qp_max_vars', 60,
+                               intd(8, 400, "corridor_qp: control points per solve. The BOUNDS are "
+                                            "still enforced at every published station"))
+        self.declare_parameter('corridor_qp_ramp_ladder', False,
+                               ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
+                                                   description="corridor_qp: run the ramp ladder too. Measured to open ZERO cells on both maps and to cost the cycle 2.4x, so it is off"))
+        self.declare_parameter('static_plan_log', False,
+                               ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
+                                                   description="one PLAN line per cycle: method, cost, points, curvature-limited speed, and whether the OTHER d(s) generator would have found a path. Costs an extra planning pass; for sim runs"))
 
     def dyn_param_cb(self, params: List[Parameter]):
         for p in params:
@@ -565,6 +818,8 @@ class ObstacleSpliner(Node):
                 self.safety_margin = float(p.value)
             elif n == 'safety_margin_d':
                 self.safety_margin_d = float(p.value)
+            elif n == 'avoid_log_throttle_s':
+                self.avoid_log_throttle_s = max(0.0, float(p.value))
             elif n == 'static_near_zero_mps':
                 self.static_near_zero_mps = float(p.value)
             elif n == 'static_promote_sec':
@@ -675,6 +930,25 @@ class ObstacleSpliner(Node):
                 self.commit_obs_ds = float(p.value)
             elif n == 'commit_obs_dd':
                 self.commit_obs_dd = float(p.value)
+            elif n == 'static_plan_method':
+                v = str(p.value)
+                if v not in ("sample", "corridor_qp"):
+                    self.get_logger().error(
+                        f"[{self.name}] static_plan_method='{v}' is not a method; keeping "
+                        f"'{getattr(self, 'static_plan_method', 'corridor_qp')}'. A fallthrough branch "
+                        f"here would silently plan with something nobody asked for.")
+                else:
+                    self.static_plan_method = v
+            elif n == 'corridor_qp_w_dev':
+                self.corridor_qp_w_dev = float(p.value)
+            elif n == 'corridor_qp_pin_apex':
+                self.corridor_qp_pin_apex = bool(p.value)
+            elif n == 'corridor_qp_max_vars':
+                self.corridor_qp_max_vars = int(p.value)
+            elif n == 'corridor_qp_ramp_ladder':
+                self.corridor_qp_ramp_ladder = bool(p.value)
+            elif n == 'static_plan_log':
+                self.static_plan_log = bool(p.value)
         return SetParametersResult(successful=True)
 
     #############
@@ -773,17 +1047,67 @@ class ObstacleSpliner(Node):
     # MAIN LOOP #
     #############
     def loop(self):
+        if self._rate_check is not None:
+            self._rate_check.tick()
         # decimate the (heavy) candidate markers to ~5 Hz so viz load never starves the 20 Hz plan
         self._marker_i += 1
         self._emit_markers = (self._marker_i % MARKER_DECIM == 0)
         if self.measuring:
             start = time.perf_counter()
+        t_plan = time.perf_counter()
         wpnts, mrks = self.do_spline(gb_wpnts=self.gb_scaled_wpnts.wpnts)
+        plan_ms = (time.perf_counter() - t_plan) * 1e3
         if self.measuring:
             self.latency_pub.publish(Float32(data=float(time.perf_counter() - start)))
         self.evasion_pub.publish(wpnts)
         if self._emit_markers:
             self.mrks_pub.publish(mrks)
+        if self.static_plan_log:
+            self._log_plan(wpnts, plan_ms)
+
+    def _log_plan(self, wpnts, plan_ms: float):
+        """One greppable line per cycle: what was planned, what it cost, and what the OTHER d(s)
+        generator would have done with the same cycle.
+
+            PLAN method=corridor_qp ms=11.4 pts=151 obs=3 squeeze=0 vcap=2.44 vs_sample=OPENED
+
+        `vs_sample` is the only way to see, from a bag, what changing the shape actually changed --
+        a refusal rate is a sweep statistic and a car does not drive one. It is computed by
+        RE-RUNNING THE REAL PIPELINE with the method swapped and `probe=True`, so it answers to the
+        same knots, the same gates and the same margins, and cannot drift from them the way a second
+        copy of the gate stack would.
+
+            OPENED   this cycle has a path and the sampled shape would have had none
+            LOST     the sampled shape would have had one and this cycle does not  (never seen
+                     offline; if a bag shows it, that is the finding)
+            same     both, or neither
+
+        OFF BY DEFAULT. The probe is a whole extra planning pass -- p50 ~5 ms for the quintic --
+        which is affordable inside a 50 ms period for a sim run and is not free. It is a diagnostic,
+        not telemetry.
+        """
+        n = len(wpnts.wpnts)
+        vcap = "-"
+        if n:
+            kap = max(abs(w.kappa_radpm) for w in wpnts.wpnts)
+            vcap = f"{math.sqrt(self._a_limits()[0] / max(kap, 1e-3)):.2f}"
+        alt = "-"
+        other = "sample" if self.static_plan_method == "corridor_qp" else "corridor_qp"
+        prev = self.static_plan_method
+        self.static_plan_method = other
+        try:
+            r = self.do_spline(gb_wpnts=self.gb_scaled_wpnts.wpnts, probe=True)
+            other_ok = bool(r is not None and r[0] is not None and len(r[0].wpnts))
+            alt = ("OPENED" if (n and not other_ok) else
+                   "LOST" if (not n and other_ok) else "same")
+        except Exception as e:                       # noqa: BLE001 -- a diagnostic never breaks a cycle
+            alt = f"probe-failed({type(e).__name__})"
+        finally:
+            self.static_plan_method = prev
+        self.get_logger().info(
+            f"[{self.name}] PLAN method={self.static_plan_method} ms={plan_ms:.1f} pts={n} "
+            f"obs={len(self.obstacles)} squeeze={int(wpnts.ot_line == 'squeeze')} vcap={vcap} "
+            f"vs_{other}={alt}")
 
     #########
     # UTILS #
@@ -1112,21 +1436,29 @@ class ObstacleSpliner(Node):
 
     def do_spline(self, gb_wpnts, safety_margin: float = None, wall_margin: float = None,
                   squeeze: bool = False,
-                  ramp_retry: Tuple[float, float] = None) -> Tuple[OTWpntArray, MarkerArray]:
+                  ramp_retry: Tuple[float, float] = None,
+                  probe: bool = False) -> Tuple[OTWpntArray, MarkerArray]:
         """Plan one static-avoidance path. `squeeze` marks a reduced-margin RETRY (see
         _squeeze_schedule); such a call returns None instead of an empty result so the caller can
         try the next step, and never publishes the feasibility verdict itself.
 
         `ramp_retry` is the same kind of retry one dimension over: (entry, exit) ramp lengths that
         OVERRIDE the adaptive fit, at the FULL margins. Both retries return None instead of an
-        empty result, and neither publishes a verdict -- only the top-level call does."""
+        empty result, and neither publishes a verdict -- only the top-level call does.
+
+        `probe` is a plan NOBODY ACTS ON: same margins, same everything, but no retries, no commit,
+        no feasibility verdict, no marker and no memory of the choice. It exists so the counterfactual
+        line in _log_plan ("would the other d(s) generator have found a path here?") can be answered
+        by the real pipeline instead of by a second copy of the gate stack that would drift from
+        it."""
         # The squeeze lowers `safety_margin`; both axes give up the SAME amount, so a squeeze after
         # the split behaves exactly as it did before it.
         safety_margin_d = self.safety_margin_d - (self.safety_margin - (
             self.safety_margin if safety_margin is None else safety_margin))
         safety_margin = self.safety_margin if safety_margin is None else safety_margin
         wall_margin = self.wall_margin if wall_margin is None else wall_margin
-        retry = squeeze or ramp_retry is not None      # a nested attempt: report nothing, return None
+        # a nested attempt, or one nobody acts on: report nothing, return None instead of empty
+        retry = squeeze or ramp_retry is not None or probe
         wpnts = OTWpntArray()
         wpnts.header.stamp = self.get_clock().now().to_msg()
         wpnts.header.frame_id = "map"
@@ -1349,7 +1681,18 @@ class ObstacleSpliner(Node):
                 f"[{self.name}] all {len(obs_ahead)} obstacle(s) ahead are already cleared by the "
                 f"followed line (>= {obs_margin:.2f} m) -> no avoidance needed",
                 throttle_duration_sec=2.0)
-            self._committed = None
+            # NOT UNDER PROBE. This method's contract says a probe is "a plan NOBODY ACTS ON ... no
+            # commit", and dropping the live commit is acting: the next real cycle would find
+            # _committed None, re-plan from scratch, and lay fresh geometry under a moving car --
+            # a path swap caused by a diagnostic that is only on when someone is watching.
+            #
+            # The probe is the ONLY caller that can get here with a commit in hand. A probe runs
+            # with retry=True, which skips the committed-path reuse above (so it plans instead of
+            # returning early) AND skips the clear gate (so the branch that gate normally
+            # pre-empts becomes reachable). The squeeze and ramp retries also set retry=True, but
+            # they only ever run after the top-level pass already reached this point.
+            if not probe:
+                self._committed = None
             return None if retry else _empty()
         # Anchor the gap sampling on the first box we are actually shaping around, not on the
         # nearest one in the list -- that one may have been skipped as already cleared.
@@ -1502,13 +1845,28 @@ class ObstacleSpliner(Node):
         # pinch for less. Floored at ramp_len_min_m; below that the curvature cost stops being
         # worth the feasibility.
         #
-        # Scanned ONCE per cycle at 0.5 m (about 20 grid-corridor calls, ~1.4 ms), not per
-        # candidate. The grid is built from the FULL ramp length, so a shortened ramp is a subset
-        # of it and no candidate needs its own grid.
+        # Scanned ONCE per cycle over the PUBLISHED grid, not per candidate. The grid is built from
+        # the FULL ramp length, so a shortened ramp is a subset of it and no candidate needs its own.
+        #
+        # AT wpnt_dist, NOT AT 0.5 m. The scan decides how much offset a ramp may carry, and it used
+        # to sample five times more coarsely than the path it is deciding for. Measured against the
+        # same corridor read at every published station, the 0.5 m scan was off by up to 1.10 m
+        # (ifac) and 1.80 m (ifac_0807) at stations it never visited -- a metre of corridor, on a
+        # track whose corridor is often not two metres wide. Restoring the scan's lateral WIDTH
+        # changes those numbers by ~0, so it was never the sweep; it was the station spacing.
+        #
+        # NOT SCANNED AT ALL ON A LADDER RUNG. `ramp_retry` hands _fit_ramp an explicit length that
+        # it takes as given -- the scan's answer is never consulted -- so every rung was paying for
+        # a corridor read whose result it discards, fifteen times over inside ramp_search_max_ms.
+        # At 0.5 m spacing that waste was 0.2 ms a rung and invisible; at the publishing grid it is
+        # 0.6 ms a rung, which is 5.7 ms of the ladder's 20 ms budget and cost 8 ifac corner cells.
+        # The SQUEEZE retry still scans: it re-enters with a different wall_margin, so its corridor
+        # is a different corridor.
         _RAMP_LADDER = (1.0, 0.85, 0.7, 0.6, 0.5)
         scan_lo_s = knots[0][0] - self.ramp_len
         scan_hi_s = knots[-1][0] + self.return_len
-        scan_s = np.arange(scan_lo_s, scan_hi_s + 1e-9, 0.5)
+        scan_s = (np.arange(scan_lo_s, scan_hi_s + 1e-9, wpnt_dist) if ramp_retry is None
+                  else np.empty(0))
         # ABSOLUTE stations for the corridor read. scan_s is path-local -- distance from the CAR,
         # like knots[i][0] -- and _grid_corridor_batch treats its argument as an absolute station
         # (`s_query % gb_max_s`). This is the same bug 6b8112e fixed for knot_cor, left behind in
@@ -1580,7 +1938,19 @@ class ObstacleSpliner(Node):
                     return R
             return limits[-1][0] if limits else full_len
 
+        # --- corridor over EVERY published station (corridor_qp only) --------------------------
+        # The sampled shape reads the corridor at the obstacle's station (the apex) and along the
+        # two ramps; nothing reads it between two apexes, and two thirds of the rejections are
+        # there. The QP is solved inside this array, so this is the one read that has to cover the
+        # whole maneuver. Same authority order and the same waypoint fallback as everything else.
+        qp_lo = qp_hi = None
+        qp_memo = {}                                          # see _corridor_profile: the sampled
+        if self.static_plan_method == "corridor_qp":          # offsets collapse onto a side choice
+            qp_lo, qp_hi = self._path_corridor(s_mod, idxs, gb_wpnts, wall_margin, sample_margin,
+                                               float(np.max(np.abs(d_ends))))
+
         dp0_full = cur_dp
+        n_qp_fallback = 0                                     # candidates the QP could not answer
         d_cands = np.zeros((N, n))
         cand_entry_i = np.zeros(N, dtype=int)                 # per-candidate prefix boundary
         for k, d_end in enumerate(d_ends):
@@ -1654,8 +2024,34 @@ class ObstacleSpliner(Node):
                 bp_s.append(max(s_exit_end, bp_s[-1] + 1e-3))
                 bp_d.append([0.0, 0.0, 0.0])
                 dv[m_span] = BPoly.from_derivatives(bp_s, bp_d)(s_local[m_span])
+                # --- THE BRANCH. Everything above built the sampled quintic; everything below --
+                # every gate, the cost, the commit, the publication -- is untouched and judges
+                # whichever profile comes out of here.
+                #
+                # corridor_qp re-decides d(s) over the SAME span, from the SAME knots, sides and
+                # apex offsets, as minimum bending inside the corridor those choices imply. The
+                # quintic is not thrown away: it is the start value the QP is pinned to, the apex
+                # values the pinned variant holds, and the answer whenever the QP has none.
+                if qp_lo is not None:
+                    dv_c = self._corridor_profile(
+                        dv, s_local, gap_wp, m_span, s_exit_end, knots, d_apex,
+                        qp_lo, qp_hi, wpnt_dist, obs_margin_s, obs_margin_d, cur_dp, qp_memo)
+                    if dv_c is None:
+                        n_qp_fallback += 1
+                    else:
+                        dv = dv_c
             dv[s_local > s_exit_end] = 0.0
             d_cands[k] = dv
+
+        if n_qp_fallback:
+            # Named, because it is the one way a corridor_qp run publishes a sampled shape. The
+            # corridor was unmeasurable, or the keep-outs of two boxes closed it entirely; there is
+            # nothing corridor-decided to offer and dropping the candidate outright would lose the
+            # planner a path for a reason that has nothing to do with the shape.
+            self.get_logger().warn(
+                f"[{self.name}] corridor_qp: {n_qp_fallback} of {N} candidate(s) fell back to the "
+                f"sampled quintic (corridor unmeasurable / closed by the keep-outs)",
+                throttle_duration_sec=2.0)
 
         # --- feasibility 1: track corridor (reject, don't clip) ---
         # Skipped when the grid is the corridor authority: _path_off_track then tests EVERY path
@@ -1794,7 +2190,25 @@ class ObstacleSpliner(Node):
             #
             # Rung 0 is today's adaptive geometry, which the pass above already tried, so the
             # ladder is a strict superset and cannot regress.
-            if self.ramp_search_enable and (self.ramp_search_entry_m or self.ramp_search_exit_m):
+            #
+            # NOT RUN UNDER corridor_qp, and this is measured rather than argued. What a rung buys
+            # the SAMPLE path is not really a ramp length: on the 90 (ifac) / 65 (ifac_0807) cells
+            # the ladder opens, EVERY one died at rung 0 on obs_box+grid+body and EVERY winning rung
+            # has a shorter ENTRY. A shorter entry moves s_entry0 -- and with it cand_entry_i, the
+            # station from which the grid and body gates hold a candidate responsible. The quintic
+            # cannot put its own early stations anywhere else, so its only way past a pinch there is
+            # to hand those stations back to the pre-ramp (which every candidate shares and none can
+            # change) and to the d = 0 tail. The QP can already put d(s) at the raceline over those
+            # stations inside the LONG window, so the rung has nothing left to offer it: over 8484
+            # (ifac) and 9462 (ifac_0807) race cells the ladder opens exactly ZERO -- refusal rate
+            # 32.0 % / 24.4 % with it and without it, published-path counts identical to the cell.
+            # It is not free: it costs the cell p95 111 -> 45 ms (ifac), which is the difference
+            # between fitting a 20 Hz cycle and not.
+            # corridor_qp_ramp_ladder puts it back, because the evidence is two maps and one
+            # profile, and a claim that costs nothing to re-test should stay testable.
+            ladder_ok = (self.ramp_search_enable and
+                         (self.static_plan_method != "corridor_qp" or self.corridor_qp_ramp_ladder))
+            if ladder_ok and (self.ramp_search_entry_m or self.ramp_search_exit_m):
                 t_ladder = time.perf_counter()
                 out_of_time = False
                 for r_in_try in (self.ramp_search_entry_m or [self.ramp_len]):
@@ -1859,7 +2273,8 @@ class ObstacleSpliner(Node):
             return wpnts, self._candidate_markers(xy_all, status, -1)
 
         status[best_k] = "selected"
-        self._d_end_prev = float(d_ends[best_k])
+        if not probe:
+            self._d_end_prev = float(d_ends[best_k])
         xy, psi_, kappa_ = best
 
         # --- HANDOVER BLEND ---------------------------------------------------------------
@@ -1928,7 +2343,7 @@ class ObstacleSpliner(Node):
             f"sampled {n_left}L+{n_right}R of {N} | reject bounds={n_bounds} obs={n_obs} "
             f"grid={n_grid} body={n_body} curv={n_curv} | "
             f"corridor d=[{d_lo:.2f},{d_hi:.2f}] ({cor_src}) obs keep-out d=[{obox_lo:.2f},{obox_hi:.2f}]",
-            throttle_duration_sec=2.0)
+            throttle_duration_sec=self.avoid_log_throttle_s)
 
         if SMOOTH_OTWPNTS:
             kappa_ = _savgol_safe(kappa_, SMOOTH_OTWPNTS_WINDOW)
@@ -1940,15 +2355,53 @@ class ObstacleSpliner(Node):
         #   1) point limit  v_curv = sqrt(a_lat/|kappa|)  -> minimum sits AT the apex (max curvature)
         #   2) backward decel pass -> brake EARLY so the car is already slow entering the apex
         #   3) forward accel pass  -> leave the apex and accelerate out GRADUALLY (bounded a_long_accel)
+        a_lat_max, a_long_max, a_long_accel = self._a_limits()
         v_gb_s = _savgol_safe(v_gb_arr, SMOOTH_VEL_WINDOW)
-        v_curv = np.sqrt(self.a_lat_max / np.maximum(np.abs(kappa_), 1e-3))
+        v_curv = np.sqrt(a_lat_max / np.maximum(np.abs(kappa_), 1e-3))
         v_arr = np.clip(_savgol_safe(np.minimum(v_gb_s, v_curv), SMOOTH_VEL_WINDOW), 0.0, v_gb_s)
-        # backward: v[i]^2 <= v[i+1]^2 + 2*a_brake*ds  (ds = wpnt_dist)
+        # FRICTION CIRCLE. The two passes used to spend the FULL longitudinal limit at every
+        # point while the curvature cap independently spent the full lateral one, so at the
+        # shoulders of an apex the profile demanded sqrt(7.0^2 + 7.0^2) = 9.90 m/s^2 of a tyre
+        # that has 7.0. Measured on the real car (g-g from a real bag, IMU longitudinal axis
+        # established): the ACCELERATION side collapses with longitudinal load --
+        #     a_x +0.5 -> a_lat p95 7.60      a_x +5.5 -> 6.40      a_x +6.5 -> 4.62
+        # A fast straight is exactly where the forward pass is at full a_long_accel, so that is
+        # where demand and capability diverge most: the avoidance was planned to a speed the car
+        # could not steer at and the manoeuvre did not happen. In a corner the speed is already
+        # pinned by the curvature cap, the longitudinal term is small, and nothing changes --
+        # which is why corner-exit avoidance worked and straight-line avoidance did not.
+        #
+        # What is left for longitudinal use is what the corner has not already taken:
+        #     a_long_avail = a_long * (1 - (a_lat_used / a_lat_max)^p)^(1/p),  a_lat_used = v^2|k|
+        # p is dyn_model_exp from racecar_f110.ini (see load_dyn_model_exp) -- the exponent the
+        # OFFLINE profile is solved with, so this planner shapes to the same envelope shape.
+        #
+        # SECOND IMPLEMENTATION, ON PURPOSE. vel_planner.calc_vel_profile already does this
+        # correctly and the global optimizer and the state machine both use it. It is not reused
+        # here because it takes a SCALAR v_max, and this profile's binding constraint is a
+        # PER-POINT cap (the raceline speed v_gb at each station); applying that afterwards would
+        # break the very accel/decel guarantees the passes exist to provide -- the same "the cap
+        # goes IN, not on afterwards" that state_machine_node's velocity cache documents. Cost is
+        # the other half: measured 4.7 ms vs 0.37 ms at N=220, once per solve in a 20 Hz loop.
+        # When the deferred veh_dyn consolidation happens, these two ellipses go with it.
+        p_exp = self._dyn_exp()
+
+        def _a_avail(v_i, kappa_i, a_long):
+            """Longitudinal budget left at speed v_i on curvature kappa_i."""
+            used = min((v_i * v_i * abs(float(kappa_i))) / max(a_lat_max, 1e-6), 1.0)
+            return a_long * max(0.0, 1.0 - used ** p_exp) ** (1.0 / p_exp)
+
+        # backward: v[i]^2 <= v[i+1]^2 + 2*a_brake_avail*ds  (ds = wpnt_dist)
+        # a_avail is evaluated at the point the step comes FROM, and inside the loop, because v
+        # is still changing as the pass runs -- a budget computed once from the pre-pass profile
+        # would be spending grip the profile no longer uses.
         for i in range(len(v_arr) - 2, -1, -1):
-            v_arr[i] = min(v_arr[i], float(np.sqrt(v_arr[i + 1] ** 2 + 2.0 * self.a_long_max * wpnt_dist)))
-        # forward: v[i]^2 <= v[i-1]^2 + 2*a_accel*ds  -> gentle exit ramp-up (lower a_long_accel = gentler)
+            a_av = _a_avail(v_arr[i + 1], kappa_[i + 1], a_long_max)
+            v_arr[i] = min(v_arr[i], float(np.sqrt(v_arr[i + 1] ** 2 + 2.0 * a_av * wpnt_dist)))
+        # forward: v[i]^2 <= v[i-1]^2 + 2*a_accel_avail*ds  -> gentle exit ramp-up
         for i in range(1, len(v_arr)):
-            v_arr[i] = min(v_arr[i], float(np.sqrt(v_arr[i - 1] ** 2 + 2.0 * self.a_long_accel * wpnt_dist)))
+            a_av = _a_avail(v_arr[i - 1], kappa_[i - 1], a_long_accel)
+            v_arr[i] = min(v_arr[i], float(np.sqrt(v_arr[i - 1] ** 2 + 2.0 * a_av * wpnt_dist)))
 
         d_sel = d_cands[best_k]
         psi_pub = psi_ + np.pi / 2                       # published heading convention (frenet tangent)
@@ -1958,7 +2411,7 @@ class ObstacleSpliner(Node):
                                   v=float(v_arr[i]), psi=psi_pub[i],
                                   kappa=kappa_[i], wpnts=wpnts))
 
-        if self.commit_enable:
+        if self.commit_enable and not probe:
             # obs_reach, NOT obs_enforce. The release condition compares this list against
             # everything inside the GATHER horizon, so it has to BE that set. obs_enforce is the
             # boxes the path was shaped around, and a box that found no free max_weave slot is in
@@ -1972,8 +2425,9 @@ class ObstacleSpliner(Node):
                                obs_margin=obs_margin_d, obs_margin_s=obs_margin_s, squeeze=squeeze,
                                s_entry0=float(s_local[cand_entry_i[best_k]]),
                                shaped=obs_enforce)
-        self._note_published(s_mod, d_sel)
-        self._publish_feasible(True)
+        if not probe:
+            self._note_published(s_mod, d_sel)
+            self._publish_feasible(True)
         return wpnts, self._candidate_markers(xy_all, status, best_k)
 
     ######################
@@ -2494,26 +2948,164 @@ class ObstacleSpliner(Node):
             return None, None
         free = free.reshape(n_s, n_d)
         i0 = int(np.argmin(np.abs(d_scan)))
-        lo = np.full(n_s, np.nan)
-        hi = np.full(n_s, np.nan)
-        for r in range(n_s):
-            fr = free[r]
-            if not fr.any():
-                continue
-            j0 = i0
-            if not fr[j0]:                       # raceline blocked here -> nearest free sample
-                cand = np.flatnonzero(fr)
-                j0 = int(cand[np.argmin(np.abs(d_scan[cand]))])
-            a_i = b_i = j0
-            while a_i > 0 and fr[a_i - 1]:
-                a_i -= 1
-            while b_i < n_d - 1 and fr[b_i + 1]:
-                b_i += 1
-            l, h = float(d_scan[a_i]) + wm, float(d_scan[b_i]) - wm
-            if h < l:
-                l = h = 0.5 * (float(d_scan[a_i]) + float(d_scan[b_i]))
-            lo[r], hi[r] = l, h
+        # VECTORISED, and it has to be: the per-row while-loops cost ~0.06 ms a row, which was
+        # nothing at the ramp scan's old 19 rows and is 5.7 ms at the publishing grid's ~90. That
+        # cost came straight out of ramp_search_max_ms and took 8 ifac corner cells with it -- a
+        # feasibility regression whose entire cause was a Python loop.
+        #
+        # Same three steps as the loop, expressed on the whole block: a free cell's RUN is
+        # identified by how many blocked cells precede it in its row, so two free cells share a run
+        # exactly when that count matches; the seed column is the raceline's, or the nearest free
+        # column to it where the raceline itself reads blocked; and the run's extent is the first
+        # and last column carrying the seed's run id.
+        run = np.cumsum(~free, axis=1)
+        dist = np.where(free, np.abs(np.arange(n_d) - i0), n_d + 1)
+        j0 = dist.argmin(axis=1)
+        rows = np.arange(n_s)
+        same = free & (run == run[rows, j0][:, None])
+        a_i = same.argmax(axis=1)
+        b_i = n_d - 1 - same[:, ::-1].argmax(axis=1)
+        lo = d_scan[a_i] + wm
+        hi = d_scan[b_i] - wm
+        narrow = hi < lo                          # narrower than 2*wall_margin -> its middle
+        mid = 0.5 * (d_scan[a_i] + d_scan[b_i])
+        lo = np.where(narrow, mid, lo)
+        hi = np.where(narrow, mid, hi)
+        blocked = ~free.any(axis=1)               # nothing free at all -> unmeasurable
+        lo[blocked] = np.nan
+        hi[blocked] = np.nan
         return lo, hi
+
+    def _path_corridor(self, s_mod: np.ndarray, idxs: np.ndarray, gb_wpnts, wall_margin: float,
+                       sample_margin: float, d_reach: float):
+        """[lo, hi] at EVERY published station: the corridor `corridor_qp` is solved inside.
+
+        Same authority order as everywhere else on this path -- the measured grid first, the
+        waypoint bounds where the grid cannot answer -- and the same narrowed lateral sweep the
+        ramp scan uses, since a corridor wider than the path can reach constrains nothing. The
+        sweep is read at grid_scan_step, NOT at the ramp scan's coarser 0.10 m: this array is the
+        constraint itself, so 10 cm of quantisation on its edge is 10 cm taken off the maneuver.
+        """
+        n_s = len(s_mod)
+        lo = hi = None
+        if self.trust_grid_bounds:
+            lo, hi = self._grid_corridor_batch(
+                s_mod, d_max=max(d_reach + self.apex_bulge + 0.10, 0.5),
+                d_step=self.grid_scan_step, wall_margin=wall_margin)
+        if lo is None:
+            lo, hi = np.full(n_s, np.nan), np.full(n_s, np.nan)
+        miss = ~np.isfinite(lo)
+        if miss.any():
+            jj = np.asarray(idxs)[miss]
+            lo[miss] = np.array([-(gb_wpnts[j].d_right - sample_margin) for j in jj])
+            hi[miss] = np.array([gb_wpnts[j].d_left - sample_margin for j in jj])
+        return lo, hi
+
+    def _corridor_profile(self, dv, s_local, gap_wp, m_span, s_exit_end, knots, d_apex,
+                          qp_lo, qp_hi, wpnt_dist, obs_margin_s, obs_margin_d, cur_dp,
+                          memo=None):
+        """One candidate's d(s), re-decided by the corridor. None when there is no answer.
+
+        `dv` comes in carrying the sampled quintic (and, before s_entry0, the pre-ramp decay). What
+        is taken FROM it: the value and slope at the seam, and -- under corridor_qp_pin_apex -- the
+        apex bands. What is taken from the KNOTS: which side of each box this candidate passes.
+        Everything else is the QP's.
+
+        THE APEX IS NOT PINNED BY DEFAULT. Side selection and keep-out are already in the bounds,
+        so the corridor forces the apex offset on its own; pinning the value as well over-constrains
+        a run whose two ends are pinned already, and the ceiling's own seam numbers are where that
+        showed. corridor_qp_pin_apex restores the pinned formulation so the two can be measured
+        against each other rather than argued about.
+        """
+        m = np.flatnonzero(m_span)
+        if m.size < 3:
+            return None
+        j0, j1 = int(m[0]), int(m[-1])
+        a = max(j0 - 1, 0)                      # one prefix station comes in as the C1 pin
+        sel = np.arange(a, j1 + 1)
+        if sel.size < 5:                        # three pinned at the start, two at the end
+            return None
+
+        # THE CANDIDATES COLLAPSE. Everything the QP is given -- the span, the corridor, the
+        # keep-outs, the start pin -- is fixed by (a, j1) and by WHICH SIDE of each box the path
+        # takes. The sampled terminal offset itself never enters: two candidates that pass the same
+        # boxes on the same sides hand the solver identical arguments and get identical answers
+        # back. So ten candidates are two or three solves, and the sampling grid stops being a
+        # per-candidate cost. (Not under corridor_qp_pin_apex: there the apex bands are pinned to
+        # each candidate's OWN quintic, which is exactly the thing that differs.)
+        L = self.gb_max_s
+        boxes = []
+        for (_s_c, o, _c), da in zip(knots, d_apex):
+            o_span = (o.s_end - o.s_start) % L
+            gc = (o.s_center - self.cur_s) % L
+            if gc > L / 2.0:
+                gc -= L
+            box_lo = min(o.d_right, o.d_left) - obs_margin_d
+            box_hi = max(o.d_right, o.d_left) + obs_margin_d
+            boxes.append((gc - o_span / 2.0 - obs_margin_s, gc + o_span / 2.0 + obs_margin_s,
+                          box_lo, box_hi, bool(da >= 0.5 * (box_lo + box_hi))))
+        key = None
+        if memo is not None and not self.corridor_qp_pin_apex:
+            key = (a, j1, tuple(b[4] for b in boxes))
+            if key in memo:
+                span = memo[key]
+                if span is None:
+                    return None
+                out = np.asarray(dv).copy()
+                out[sel] = span
+                return out
+
+        def _miss(v):
+            if key is not None:
+                memo[key] = None
+            return v
+
+        lo = np.asarray(qp_lo)[sel].copy()
+        hi = np.asarray(qp_hi)[sel].copy()
+        if not (np.all(np.isfinite(lo)) and np.all(np.isfinite(hi))):
+            return _miss(None)
+
+        # Every box this path is SHAPED AROUND becomes corridor, on the side the candidate's own
+        # apex offset already chose. Boxes with no knot are deliberately left out: the node makes no
+        # side choice for them (obs_ok still enforces every one of them, knot or no knot), and
+        # inventing one here would be changing the side selection this round is not touching.
+        g_sel = np.asarray(gap_wp)[sel]
+        for (g0, g1, box_lo, box_hi, left) in boxes:
+            cut_keepout(lo, hi, (g_sel >= g0) & (g_sel <= g1), box_lo, box_hi,
+                        pass_left=left, bulge=self.apex_bulge)
+
+        if self.corridor_qp_pin_apex:
+            dv_sel = np.asarray(dv)[sel]
+            for (g0, g1, _bl, _bh, _left) in boxes:
+                band = (g_sel >= g0) & (g_sel <= g1)
+                lo[band] = hi[band] = dv_sel[band]
+
+        # The maneuver ends ON the raceline -- everything past s_exit_end is published as d = 0 --
+        # so the last two stations are held there. Two, not one: that is what makes d' = 0 at the
+        # seam in the same one-sided difference the seam is measured with.
+        lo[-1] = hi[-1] = 0.0
+        lo[-2] = hi[-2] = 0.0
+        if np.any(hi < lo - 1e-9):
+            return _miss(None)
+
+        # C2, not C1. Matching value and slope still leaves the solver free to start bending at the
+        # first station it owns, and it does: over the full race profile the |d'| step there came
+        # out at p90 0.0548 (ifac) / 0.0504 (ifac_0807) with the slope pin alone. The quintic has
+        # never had that freedom -- its first breakpoint is [d_start, dp0, 0.0] -- so the third pin
+        # is not a new demand, it is the same continuity the shape being replaced already provides.
+        d0 = float(dv[a])
+        dp0 = float((dv[a] - dv[a - 1]) / wpnt_dist) if a >= 1 else float(cur_dp)
+        dpp0 = (float(dv[a] - 2.0 * dv[a - 1] + dv[a - 2]) / (wpnt_dist ** 2) if a >= 2 else 0.0)
+        sol = solve_corridor_path(s_local[sel], lo, hi, d0, dp0,
+                                  w_dev=self.corridor_qp_w_dev,
+                                  max_vars=int(self.corridor_qp_max_vars), dpp0=dpp0)
+        if sol is None:
+            return _miss(None)
+        if key is not None:
+            memo[key] = sol
+        out = np.asarray(dv).copy()
+        out[sel] = sol
+        return out
 
     def _grid_is_authority(self) -> bool:
         """True when the occupancy grid both replaces the waypoint corridor AND is checked per path

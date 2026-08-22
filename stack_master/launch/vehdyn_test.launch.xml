@@ -1,0 +1,50 @@
+<?xml version="1.0"?>
+<!--
+  vehdyn_test.launch.xml : vehicle-dynamics measurement.
+
+  low_level (VESC + sensors + simple_mux) and vehdyn_test_node. NOTHING ELSE: no planner, no
+  state machine, no controller. The point of the measurement is the car's response to a
+  commanded speed, and every one of those would shape the command before it arrived.
+
+  DEFAULTS TO A DRY RUN. As shipped this prints the plan and does not move the car; pass
+  dry_run:=false once you have read the table it prints.
+
+      ros2 launch stack_master vehdyn_test.launch.xml                    (plan only)
+      ros2 launch stack_master vehdyn_test.launch.xml dry_run:=false     (drive)
+      ros2 launch stack_master vehdyn_test.launch.xml mode:=full long_mode:=oval dry_run:=false
+
+  RECORD A BAG ALONGSIDE. This node measures nothing itself:
+      ros2 bag record -s mcap -o ~/vehdyn_$(date +%m%d_%H%M) \
+        /vesc/sensors/imu/raw /car_state/odom /vesc/odom /vesc/sensors/core \
+        /vesc/high_level/ackermann_cmd /vesc/commands/servo/position /joy
+  then
+      python3 stack_master/scripts/vehdyn_analyze.py ~/vehdyn_STAMP
+
+  /car_state/odom COMES FROM frenet_odom_republisher, which needs a global line, and is NOT
+  started by low_level. Pass map:= and bring the localization up, or point odom_topic at an
+  odometry you do have. The node fails CLOSED: no odometry, no motion.
+-->
+<launch>
+  <arg name="sim"        default="false" description="Use the simulator instead of the car"/>
+  <arg name="map"        default=""      description="Map name (needed for /car_state/odom)"/>
+  <arg name="dry_run"    default="true"  description="Plan and print only. Publish nothing."/>
+  <arg name="mode"       default="circle" description="circle | full | current"/>
+  <arg name="long_mode"  default="oval"   description="oval | shuttle | circle_accel"/>
+  <arg name="venue_mode" default="false"  description="Force circle and skip the rest"/>
+  <arg name="params"     default="$(find-pkg-share stack_master)/config/vehdyn_test_params.yaml"/>
+
+  <!-- VESC, sensors and simple_mux. No planner / SM / controller. -->
+  <include file="$(find-pkg-share stack_master)/launch/low_level.launch.xml">
+    <arg name="sim" value="$(var sim)"/>
+    <arg name="map" value="$(var map)"/>
+  </include>
+
+  <node pkg="stack_master" exec="vehdyn_test_node.py" name="vehdyn_test_node" output="screen">
+    <param from="$(var params)"/>
+    <!-- launch args win over the yaml, so a run can be re-aimed without editing the file -->
+    <param name="dry_run"    value="$(var dry_run)"/>
+    <param name="mode"       value="$(var mode)"/>
+    <param name="long_mode"  value="$(var long_mode)"/>
+    <param name="venue_mode" value="$(var venue_mode)"/>
+  </node>
+</launch>

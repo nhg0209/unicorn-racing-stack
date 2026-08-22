@@ -440,6 +440,16 @@ class PPHeadingController(Node):
         # The larger keeps the budget conservative on corner-entry loading (measured
         # lags) and understeer (front saturated) — never over-driving combined grip.
         # a_lat_used ≤ a_lat_use < a_total_max, so some longitudinal grip is always left.
+        # WARNING, measured on bag ggv_0812_1645: yaw_rate here is /car_state/odom's
+        # twist.angular.z, and the localizer NEVER FILLS IT -- it is 0.000000 for all 10595
+        # messages in that bag (twist.linear.x is a copy of /vesc/odom, matching the nearest
+        # sample exactly 95% of the time, so the whole twist looks populated at a glance). With
+        # a zero yaw rate this "measured" term is identically 0, `max()` always picks the
+        # geometric one, and use_measured_a_lat:true buys nothing. The signal that does exist is
+        # /vesc/sensors/imu/raw's angular_velocity.z, which tracks the pose's own dyaw/dt at
+        # +0.986. This node is not the one racing today; fixing it is its own change, and
+        # anything switching to it must fix this first or inherit a friction circle that only
+        # looks measured.
         a_lat_meas_raw = abs(vx * yaw_rate)
         a_d_lat = self._dt / (self.a_lat_meas_tau + self._dt) if self.a_lat_meas_tau > 0.0 else 1.0
         self._a_lat_meas += a_d_lat * (a_lat_meas_raw - self._a_lat_meas)

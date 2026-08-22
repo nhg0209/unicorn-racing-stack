@@ -2,9 +2,9 @@
 #
 # SINGLE SOURCE. These used to be twenty <arg> declarations duplicated across race.launch.xml and
 # base_system.launch.xml, plus six dataclass defaults inside closed_reopt.py that no launch file
-# could reach at all — and the closed_qp path is the DEFAULT one. Only `reopt` (enable) and
-# `reopt_method` (which solver) remain launch arguments, because those are per-run choices; every
-# tuning value lives here.
+# could reach at all — while closed_qp was already the default. `reopt` (enable) is the only
+# launch argument left, because that is a per-run choice; every tuning value lives here.
+# `reopt_method` went with the hump pipeline: there is one solver.
 #
 # THE COMMENTS ARE THE POINT. For most of these numbers this is the only record of why they are
 # what they are, and several were measured once at real cost. Do not strip them.
@@ -20,7 +20,7 @@ static_reopt_node:
   ros__parameters:
 
     # =================================================================================
-    # LIVE — closed_qp, the default solver (planner/gb_optimizer/gb_optimizer/closed_reopt.py)
+    # closed_qp — THE solver (planner/gb_optimizer/gb_optimizer/closed_reopt.py)
     #
     # These reach closed_reopt.ReoptParams. The dataclass keeps its own defaults so the module
     # still runs with no ROS at all (the offline gates depend on that); a key here overrides one.
@@ -55,8 +55,9 @@ static_reopt_node:
     # check_avoidance_margins.py asks for 5, and that check still reports the shortfall under a
     # named exception. The next centimetre is not available: 0.18 costs seven of 38 boxes and
     # every hold on ifac (planner/gb_optimizer/scripts/sweep_obs_margin.py).
-    # NOT the same quantity as `obs_margin` further down — that one is the hump's, and it is 0.35.
-    closed_qp_obs_margin: 0.17
+    # NOT the same quantity as `obs_margin` further down: that one is the node's own default
+    # floor for a box whose per-box floor is unknown, and it is 0.35.
+    closed_qp_obs_margin: 0.40
 
     # [m] SOLVED-FOR ONLY, never part of the safety requirement: it covers the sag a periodic
     # cubic introduces BETWEEN QP stations. At grid 0.10 there are no stations between QP
@@ -96,45 +97,12 @@ static_reopt_node:
     # drift apart.
 
     # =================================================================================
-    # FALLBACK — local_window ("hump"). Reached only with reopt_method:=local_window.
-    # DELETE THIS WHOLE SECTION when the hump path goes.
-    #
-    # Measured, not assumed: these six are the ONLY parameters used exclusively at the
-    # reoptimize_local_window() call site. Others that look hump-flavoured (relax_floor, fit_tol)
-    # are also read by the clearance veto and the drift trigger, so they are SHARED below.
+    # NODE-LEVEL — read by the machinery around the solver (rebuild triggers, the clearance
+    # veto, the swap gates, the wall gate), not by the QP itself.
     # =================================================================================
 
-    # [s] DEPRECATED seed for the old speed-scaled reach; the reach is now chosen by a lap-time
-    # search over [reach_min, reach_max]. Ignored.
-    reach_time: 0.0
-    # [m] MIN arc half-width searched. The reach is picked to MINIMISE estimated lap time, not by
-    # local speed.
-    reach_min: 1.0
-    # [m] MAX arc half-width searched. On a short tight track a wide arc is SLOW (ifac: R = 10 m
-    # costs ~2x the time a reactive line loses); raise only on long open tracks.
-    reach_max: 6.0
-    # [m] apex spacing below which two obstacles are treated as ONE cluster: same side -> merged
-    # into a single hump (weaving back to the raceline between boxes 2 m apart is motion the
-    # corridor pays for twice), opposite sides -> dropped as a pair when no reach can swing
-    # between them inside the curvature budget. 0 disables the pre-pass.
-    apex_merge_gap_m: 2.0
-    # [m] widest gap between two SAME-SIDE obstacles the line may HOLD its offset across instead
-    # of returning to the raceline between them. Returning costs two merge inflections and a speed
-    # dip and buys a stretch of racing line the car leaves again immediately. The held shape is
-    # offered to the reach search as an extra CANDIDATE; the lap-time ranking still picks. 0 off.
-    hold_max_gap_m: 8.0
-    # [1/m] the hold above is only offered where the RACELINE is straight: max |kappa_clean| over
-    # the bridged span. In a corner the line between two boxes is the apex, and holding an offset
-    # across it gives that away.
-    hold_kappa_max: 0.3
-
-    # =================================================================================
-    # SHARED — read outside the solver branch, so both paths depend on them.
-    # =================================================================================
-
-    # [m] safety_width for the obstacle-aware re-optimizer (incl. car width). NB: the tight ifac
-    # centerline only solves plain mincurv_iqp at 0.25 or lower. Used by the legacy `global`
-    # method and reported in the startup margin line.
+    # [m] safety_width for the obstacle-aware re-optimizer (incl. car width). Reported in the
+    # startup margin line; its old consumer, the whole-track mincurv_iqp path, is gone.
     safety_width: 0.5
     safety_width_sp: 0.5
     # also re-optimize the shortest_path line (ot_interpolator consumes it); false only if the OT
@@ -183,20 +151,19 @@ static_reopt_node:
     # bound. false reproduces the old corridor.
     reopt_grid_corridor: true
 
-    # [m] clearance of the re-optimized line off each obstacle's edge, for the HUMP path — and the
-    # node's own default floor wherever a per-box floor is unknown (coverage status, the clearance
-    # veto). MUST be >= the reactive keep-out (width_car/2 + safety_margin = 0.30) or the line
-    # sits inside the reactive planner's keep-out and gets re-avoided every lap.
-    obs_margin: 0.35
-    # [m] lowest clearance a hump may be ACCEPTED at when obs_margin is unreachable on either side
-    # (coverage ladder), AND the floor the drift trigger and the publish veto judge an unknown box
-    # by. Two constraints, higher wins: at least the REACTIVE keep-out (0.30) so a relaxed hump
+    # [m] the node's default clearance floor wherever a per-box floor is unknown (coverage
+    # status, the clearance veto). MUST be >= the reactive keep-out (width_car/2 + safety_margin
+    # = 0.30) or a line judged by it sits inside the reactive planner's keep-out and gets
+    # re-avoided every lap. closed_qp reports its OWN floor per box, so this is the fallback.
+    obs_margin: 0.3
+    # [m] the floor the drift trigger and the publish veto judge an unknown box by. Its other
+    # role -- the hump coverage ladder's lowest rung -- went with the hump; these two did not. Two constraints, higher wins: at least the REACTIVE keep-out (0.30) so a relaxed hump
     # still clears by what the reactive planner would itself have driven, AND at least 5 cm above
     # every consumer of that clearance (the reactive clear-gate entry at 0.28 is binding). The
     # ladder lands exactly on this floor by construction. Set equal to obs_margin to disable it.
     relax_floor: 0.33
-    # [m] corridor-fit tolerance of the hump fit, AND the slack the clearance veto allows a
-    # published line against the floor it promised. The corridor is a smoothed estimate rippling
+    # [m] the slack the clearance veto allows a published line against the floor it promised.
+    # Its other role -- the hump's corridor-fit tolerance -- went with the hump; this one did not. The corridor is a smoothed estimate rippling
     # ~2 mm between stations while the amplitude cap parks the hump peak exactly on it, so a zero
     # tolerance rejects every wide reach over a sub-mm violation and collapses the hump (ifac:
     # reach 5.00 -> 1.24 m, +1.62 s/lap, curvlim exceeded). Spent out of wall_margin.

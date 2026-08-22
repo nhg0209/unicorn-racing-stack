@@ -6,11 +6,12 @@ kiss_icp_localization:
   ros__parameters:
     # --- per-car: change ONLY these when deploying; never scp the whole file ---
     stamp_at_scan_end: false   # car1: true (msg_MID360 END-stamps) | car2: false (direct node)
-    adaptive_range: 60.0        # CAR2 (car1=15)
+    adaptive_range: 60.0       # both cars 60 (large-venue robustness)
     sensor_height: 0.158       # LiDAR height above ground [m]; car1: 0.158 | car2: tf2_echo map base_link
 
     # --- mode ---
     input_mode: "3d"           # "3d" (full scan) | "2.5d" (keep only floor..crop_z_max)
+    map_max_points_per_voxel: 0  # 0 = 캡 없음(맵 pcd 밀도 그대로; 파이프라인이 밀도 제어)
 
     # --- ground-band crop (2.5D + detection band); live-tunable, source of truth ---
     # height above ground = crop_ground_normal . p + crop_ground_offset.
@@ -30,10 +31,12 @@ kiss_icp_localization:
     # --- registration (ICP aggressiveness; all live-tunable) ---
     icp_kernel_scale: 2.0      # Geman-McClure width = th/scale; lower pulls harder on far residuals (snaps 2.5D along-track offsets)
     min_threshold: 0.3         # correspondence-radius floor kept at convergence (was 0.1)
+    max_range: 70.0            # scan range gate [m]; large-venue far walls (default 60)
 
     # --- BEV detection (opponents / obstacles) ---
     detect_en: true
     detect_track_filter: true  # drop returns off the track mask (walls/exterior)
+    detect_track_dist_min: 0.1 # off-track 필터 거리 [m] (기본 0.2)
     detect_z_min: 0.2          # detection z-band, MAP frame (separate from crop_z_*)
     detect_z_max: 0.50
     detect_res: 0.05           # BEV cell size [m]

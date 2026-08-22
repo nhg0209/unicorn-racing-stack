@@ -1133,7 +1133,7 @@ class MPCNode(Node):
         if not hasattr(self, '_obs_seen'):
             self._obs_seen = {}   # (x,y grid 0.3m) -> (x, y, t_first, t_last)
         for x, y in new:
-            k = (round(x / 0.3), round(y / 0.3))
+            k = (round(x / 0.5), round(y / 0.5))  # 0813 격자 0.3→0.5: 검출노이즈>0.3 셀호핑→정적확정 실패→동적 오인(vs2.97) 차단
             old = self._obs_seen.get(k)
             t_first = old[2] if old is not None else now
             self._obs_seen[k] = (x, y, t_first, now)

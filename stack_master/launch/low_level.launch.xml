@@ -17,7 +17,7 @@
        localization.launch alone brings it up, matching car1. Set livox:=false to
        launch livox_lidar.launch.py by hand instead. -->
   <arg name="livox"                default="true"  description="Start the Livox MID-360 driver (/livox/lidar, /livox/imu)"/>
-  <arg name="use_system_timestamp" default="true"  description="passed to livox_lidar.launch.py (informational on this car; see kiss.yaml stamp_at_scan_end)"/>
+  <arg name="use_system_timestamp" default="false"  description="INERT on this car: nuc uses upstream livox_ros_driver2 PointCloud2 path (xfer_format=0) which stamps header=scan BEGIN (device time) regardless; the arg is not passed to the driver Node. Kept false for clarity + to match kiss stamp_at_scan_end=false and car1."/>
   <!-- Keyboard teleop: start keyboard_joy (pynput -> /joy_keyboard) and route the
        mux to it. The pitwall panel's Joy/Keyboard buttons can still switch at runtime. -->
   <arg name="keyboard_teleop" default="false"              description="Drive the ego with the keyboard instead of a joystick"/>
@@ -27,7 +27,7 @@
   <arg name="virtual"        default="$(var sim)"          description="Inject virtual opponent/obstacles into the perception stack"/>
 
   <!-- map paths (needed by the simulator and by virtual_perception in both sim and real) -->
-  <let name="maps_dir" value="$(find-pkg-share stack_master)/maps"/>
+  <let name="maps_dir" value="$(env STACK_MASTER_MAPS_ROOT $(find-pkg-share stack_master)/maps)"/>
   <let name="map_path" value="$(var maps_dir)/$(var map)/$(var map)"/>
 
   <!-- ========== REAL HARDWARE SENSORS ========== -->
@@ -126,7 +126,7 @@
     <param from="$(var vehicle_config)"/>
     <param name="in_topic"      value="/vesc/high_level/ackermann_cmd"/>
     <param name="out_topic"     value="/vesc/ackermann_cmd"/>
-    <param name="joy_max_speed" value="4.0"/>
+    <param name="joy_max_speed" value="9.0"/>
     <param name="use_estop" value="$(var use_estop)"/>
     <param name="sim" value="$(var sim)"/>
     <!-- start honouring /joy_keyboard immediately when keyboard teleop is on -->

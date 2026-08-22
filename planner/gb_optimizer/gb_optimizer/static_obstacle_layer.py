@@ -32,7 +32,7 @@ from rclpy.node import Node
 
 from geometry_msgs.msg import Point
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Empty
+from std_msgs.msg import Empty, Int32MultiArray
 from visualization_msgs.msg import Marker, MarkerArray
 from f110_msgs.msg import ObstacleArray, WpntArray
 
@@ -50,6 +50,21 @@ class _Track:
     miss_laps: int = 0
     marker_id: int = 0
     clear_streak: int = 0    # consecutive tracking msgs with a clear in-window view and no sighting
+    # OBSERVATIONS, not messages. /tracking/obstacles is a 40 Hz timer that republishes the same
+    # detection until a new one arrives (multi_tracking.timer_callback -> publishObstacles, stamped
+    # with current_stamp, which only advances on /detect/raw_obstacles). On the car that is 4
+    # messages per real look, so `hits` overstates the evidence fourfold. Everything that means
+    # "how much have we actually seen of this box" counts this instead.
+    obs_count: int = 0
+    # Best look so far THIS APPROACH: the smallest ego->obstacle gap an observation was taken at,
+    # and the estimate at that moment. The published position freezes on this, not on the first
+    # frames -- see publish_cb.
+    best_gap: float = None
+    best_x: float = None
+    best_y: float = None
+    # The gap the CURRENT hold was taken at. Scales the dead-band: a hold measured from 7 m away
+    # is a guess and must be cheap to correct; one measured from 1 m is worth defending.
+    hold_gap: float = None
     # PUBLISHED position, held still until the estimate moves materially (see publish_deadband_m).
     # None until the track is first published.
     pub_x: float = None
@@ -120,7 +135,26 @@ class StaticObstacleLayer(Node):
         # its humps to a position 0.12 m stale, and floor 0.35 - 0.12 = 0.23 m of real clearance is
         # under the state machine's 0.25 m static-GB requirement: the line reads BLOCKED and the
         # car trails a box the line actually clears.
+        # DEPRECATED as the freeze trigger, kept as the floor on how much evidence a freeze needs
+        # (now counted in OBSERVATIONS -- see _Track.obs_count -- not in timer messages).
         self.declare_parameter("publish_seed_hits", 15)
+        # The published position is frozen when the car has PASSED the obstacle, at the estimate
+        # from the CLOSEST point of that pass. "First N frames" froze the least-informed estimate
+        # the track will ever have: the first frames are taken at the range the box becomes
+        # visible from (~7 m), off the sparsest returns, and every refinement the approach bought
+        # was then discarded inside the dead-band. The car already knows where it is; the best
+        # look is the one it takes going past.
+        self.declare_parameter("freeze_on_pass", True)
+        self.declare_parameter("freeze_min_obs", 4)        # real observations before a freeze
+        # [m] how far behind the car the obstacle must sit to count as passed.
+        self.declare_parameter("pass_behind_m", 2.0)
+        # Dead-band scaling. The band is publish_deadband_m at deadband_ref_gap_m and moves
+        # inversely with the range the hold was taken at, clamped. A hold from far away gets a
+        # SMALL band (correct it freely); a hold from close up gets a large one (only a real move
+        # should shift it).
+        self.declare_parameter("deadband_ref_gap_m", 2.0)
+        self.declare_parameter("deadband_scale_min", 0.35)
+        self.declare_parameter("deadband_scale_max", 1.5)
 
         self.static_vel_thresh = float(self.get_parameter("static_vel_thresh").value)
         self.require_is_static = bool(self.get_parameter("require_is_static").value)
@@ -142,6 +176,13 @@ class StaticObstacleLayer(Node):
         self.unlatch_swap_suspend_s = float(self.get_parameter("unlatch_swap_suspend_s").value)
         self.publish_deadband_m = float(self.get_parameter("publish_deadband_m").value)
         self.publish_seed_hits = int(self.get_parameter("publish_seed_hits").value)
+        self.freeze_on_pass = bool(self.get_parameter("freeze_on_pass").value)
+        self.freeze_min_obs = int(self.get_parameter("freeze_min_obs").value)
+        self.pass_behind_m = float(self.get_parameter("pass_behind_m").value)
+        self.deadband_ref_gap_m = float(self.get_parameter("deadband_ref_gap_m").value)
+        self.deadband_scale_min = float(self.get_parameter("deadband_scale_min").value)
+        self.deadband_scale_max = float(self.get_parameter("deadband_scale_max").value)
+        self._last_obs_stamp = None      # header stamp of the last message that carried NEW data
 
         self._ego_d: Optional[float] = None
         self._ego_vs: Optional[float] = None
@@ -150,6 +191,9 @@ class StaticObstacleLayer(Node):
         self._glb_change_t = 0.0              # wall time of the last /global_waypoints swap
         self._tracks: List[_Track] = []
         self._next_marker_id = 0
+        # marker ids the ACTIVE global line has a hump laid for (/static_reopt/active_cover).
+        # Empty until the first message and whenever the clean line is driving.
+        self._reopt_cover: set = set()
         self._ego_s: Optional[float] = None
         self._last_ego_s: Optional[float] = None
         self._lap = 0
@@ -162,6 +206,11 @@ class StaticObstacleLayer(Node):
         self.create_subscription(ObstacleArray, "/tracking/raw_obstacles",
                                  self.raw_obstacles_cb, 10)
         self.create_subscription(Odometry, "/car_state/odom_frenet", self.frenet_cb, 10)
+        # Which obstacles the ACTIVE global line is shaped around. Latched by the publisher, so a
+        # layer that starts late still learns it. See _reopt_cover_cb for why |ego_d| cannot
+        # answer this question on its own.
+        self.create_subscription(Int32MultiArray, "/static_reopt/active_cover",
+                                 self.reopt_cover_cb, 10)
         self.create_subscription(WpntArray, "/global_waypoints", self.glb_cb, 10)
         # Pit/bench reset: `ros2 topic pub --once /static_reopt/clear_obstacles std_msgs/msg/Empty`
         # drops every track at once (e.g. the obstacles were physically removed mid-race).
@@ -209,6 +258,26 @@ class StaticObstacleLayer(Node):
         except Exception as e:                            # never let bookkeeping kill the callback
             self.get_logger().warn(f"[static_obs_layer] s re-anchor failed: {e}")
 
+    def reopt_cover_cb(self, msg: Int32MultiArray):
+        """Which obstacles the ACTIVE global line is shaped around, from static_reopt_node.
+
+        WHY THE GUARD BELOW CANNOT USE ego_d. The unlatch streak suspends itself while the car is
+        off the line, because a car mid-avoidance is looking at the box from the wrong place to
+        judge whether it is still there. "Off the line" was measured as |d| from
+        /car_state/odom_frenet -- but that d is taken against /global_waypoints
+        (frenet_odom_republisher_node), and /global_waypoints IS the re-optimized line whenever
+        static_reopt has swapped one in. On a reopt lap the avoidance is BUILT INTO the line the
+        d is measured against: the car passes the box half a metre wide and still reads d ~ 0.
+        The guard therefore switches itself off in exactly the lap it is needed, the streak runs
+        to completion against a box that is still there, the track is demoted, the set empties,
+        the clean line comes back -- and the box is re-detected on the next lap. That is the
+        reopt/clean alternation this subscription removes.
+
+        The published line cannot answer "is the car avoiding this box", because the avoidance is
+        in it. The node that built the line can, and this is it saying so.
+        """
+        self._reopt_cover = {int(i) for i in msg.data}
+
     def frenet_cb(self, msg: Odometry):
         s = msg.pose.pose.position.x
         self._ego_s = s
@@ -244,6 +313,27 @@ class StaticObstacleLayer(Node):
                     t.opportunity_this_lap = True
 
     def obstacles_cb(self, msg: ObstacleArray):
+        # IS THERE NEW DATA IN THIS MESSAGE? /tracking/obstacles is a 40 Hz timer
+        # (multi_tracking.timer_callback) that republishes the last detection until a new one
+        # arrives; it stamps every message with current_stamp, which is set ONLY in
+        # obstacleCallback from /detect/raw_obstacles. On the car that chain runs at the Livox
+        # rate, so four consecutive messages carry one look. Re-running the EMA on a repeat pulls
+        # the estimate toward a value it has already absorbed and inflates `hits` fourfold, which
+        # is what made confirm_hits 5 worth 1.25 observations and publish_seed_hits 15 worth 3.75.
+        #
+        # The unlatch streak is DELIBERATELY left counting messages: it is a wall-clock budget
+        # that must complete inside one approach window, and converting it here would change a
+        # separate gate silently. See the rate table in the class docstring.
+        st = msg.header.stamp
+        key = (int(st.sec), int(st.nanosec))
+        # An UNSTAMPED message counts as new. The check can only ever suppress evidence, so when
+        # it cannot tell it must fail toward the old behaviour: a publisher that leaves the stamp
+        # at zero (a replay, a test rig, a hand-rolled republisher) would otherwise freeze this
+        # layer permanently and silently, which is a far worse failure than counting a repeat.
+        is_new = (key == (0, 0)) or (key != self._last_obs_stamp)
+        if is_new:
+            self._last_obs_stamp = key
+
         seen_now = set()      # tracks matched to a VISIBLE detection in this message
         for obs in msg.obstacles:
             if getattr(obs, "is_actually_a_gap", False):
@@ -260,7 +350,9 @@ class StaticObstacleLayer(Node):
             if not getattr(obs, "is_visible", True):
                 continue
             r = max(obs.size / 2.0, self.min_radius)
-            t = self._associate(obs.x_m, obs.y_m, r, obs.s_center)
+            # A REPEAT still has to associate: seen_now feeds the unlatch streak, and an empty
+            # seen_now on three messages out of four would read as "the box is gone".
+            t = self._associate(obs.x_m, obs.y_m, r, obs.s_center, update=is_new)
             if t is not None:
                 seen_now.add(id(t))
         self._update_unlatch_streaks(msg, seen_now)
@@ -271,7 +363,7 @@ class StaticObstacleLayer(Node):
             return slow and bool(obs.is_static)
         return slow
 
-    def _associate(self, x: float, y: float, r: float, s: float) -> _Track:
+    def _associate(self, x: float, y: float, r: float, s: float, update: bool = True) -> _Track:
         """Match a detection to an existing track, or start a new one.
 
         The gate scales with how BIG the two things are, not just `match_radius`. A flat radius
@@ -295,10 +387,16 @@ class StaticObstacleLayer(Node):
                 best_d = d
                 best = t
         if best is None:
-            t = _Track(x=x, y=y, r=r, s=s, hits=1, marker_id=self._next_marker_id)
+            if not update:
+                return None            # a repeat may not create a track out of stale data
+            t = _Track(x=x, y=y, r=r, s=s, hits=1, obs_count=1,
+                       marker_id=self._next_marker_id)
             self._next_marker_id += 1
             self._tracks.append(t)
+            self._note_best_look(t)
             return t
+        if not update:
+            return best                # matched, but this message carries nothing new
         # EMA update of position/size; count the sighting
         a = 0.3
         best.x = (1 - a) * best.x + a * x
@@ -306,9 +404,11 @@ class StaticObstacleLayer(Node):
         best.r = max((1 - a) * best.r + a * r, self.min_radius)
         best.s = s
         best.hits += 1
+        best.obs_count += 1
         best.seen_this_lap = True
         best.miss_laps = 0
-        if not best.confirmed and best.hits >= self.confirm_hits:
+        self._note_best_look(best)
+        if not best.confirmed and best.obs_count >= self.confirm_hits:
             best.confirmed = True
             self.get_logger().info(
                 f"[static_obs_layer] CONFIRMED static obstacle @({best.x:.2f},{best.y:.2f}) r={best.r:.2f}")
@@ -361,9 +461,20 @@ class StaticObstacleLayer(Node):
                 t.clear_streak = 0
                 survivors.append(t)
                 continue
+            if t.marker_id in self._reopt_cover:
+                # THE ACTIVE GLOBAL LINE IS SHAPED AROUND THIS BOX, so the car is avoiding it by
+                # driving the line -- at |d| ~ 0, which the next test would read as "on the line,
+                # not avoiding". Checked FIRST and independently of ego_d for that reason: on a
+                # reopt lap ego_d is measured against the reopt line itself and cannot see the
+                # offset at all. See reopt_cover_cb.
+                survivors.append(t)
+                continue
             if self._ego_d is not None and abs(self._ego_d) > self.unlatch_max_ego_d:
                 survivors.append(t)           # ego mid-avoidance (off-line): geometry unreliable,
                 continue                      # suspend the streak, don't count a miss
+                                              # NB: only catches a REACTIVE excursion. When the
+                                              # avoidance is in the global line d stays ~0 --
+                                              # that case is the _reopt_cover test above.
             if any(g < gap for g in dyn_gaps):
                 survivors.append(t)           # opponent between ego and the spot: suspend, don't count
                 continue
@@ -453,6 +564,58 @@ class StaticObstacleLayer(Node):
             survivors.append(t)
         self._tracks = survivors
 
+    def _gap_to(self, t) -> Optional[float]:
+        """SIGNED longitudinal offset from the ego to this track, in (-L/2, +L/2].
+
+        Signed, not the plain forward modulo: with the modulo alone "just ahead" and "just
+        behind" are 0 and L, and every threshold near L/2 has to guess which side of the car the
+        obstacle is on. Signed makes ahead > 0, behind < 0, and lets pass_behind_m mean the
+        metres it says.
+        """
+        if self._ego_s is None or not self._track_length:
+            return None
+        L = self._track_length
+        return ((t.s - self._ego_s + 0.5 * L) % L) - 0.5 * L
+
+    def _note_best_look(self, t) -> None:
+        """Remember the estimate from the smallest ego->obstacle gap seen this approach.
+
+        This is the whole of fix 1: the published position is not frozen on the first N frames,
+        it is frozen on the BEST frame, and the car itself says which one that is. Range decides
+        detection quality here -- the box is first visible around 7 m, off a handful of returns
+        spread over its far edge, and every metre closer adds points and angular resolution.
+        """
+        gap = self._gap_to(t)
+        if gap is None or gap < 0.0:
+            return                    # already behind: this approach's best look is in
+        if t.best_gap is None or gap < t.best_gap:
+            t.best_gap, t.best_x, t.best_y = gap, t.x, t.y
+
+    def _passed(self, t) -> bool:
+        """Has the car gone past this obstacle (so the approach's best look is in)?"""
+        gap = self._gap_to(t)
+        if gap is None:
+            return False
+        return gap < -self.pass_behind_m
+
+    def _deadband_for(self, t) -> float:
+        """Dead-band for this track, scaled by the range its hold was measured from.
+
+        A hold taken 7 m out is a guess made from a dozen returns and should be corrected by the
+        next decent look; one taken at 1 m is the best measurement the track will get and should
+        move only for a box that has actually been moved. The flat band treated the two as equal,
+        which is how a far-range estimate survived a whole approach of better data.
+
+        band = publish_deadband_m * clamp(ref_gap / hold_gap, scale_min, scale_max)
+        """
+        base = self.publish_deadband_m
+        g = t.hold_gap
+        if g is None or g <= 1e-3:
+            return base
+        scale = self.deadband_ref_gap_m / g
+        scale = max(self.deadband_scale_min, min(self.deadband_scale_max, scale))
+        return base * scale
+
     # ----------------------------------------------------------------------------------
     def publish_cb(self):
         arr = MarkerArray()
@@ -475,23 +638,47 @@ class StaticObstacleLayer(Node):
             # the track will ever have and threw away every refinement inside the dead-band.
             # While it is still settling the track is published LIVE and pub_x stays None, so the
             # hold is seeded from the settled estimate whatever rate this timer happens to run at.
-            if t.hits < self.publish_seed_hits:
-                px, py = t.x, t.y
+            # THE HOLD IS TAKEN ON THE WAY PAST, not on the first frames. Until the car has
+            # passed the box the track publishes LIVE, so a consumer always has the freshest
+            # estimate; at the pass it freezes on the closest-approach look (_note_best_look).
+            ready = (t.obs_count >= max(self.freeze_min_obs, 1)
+                     and t.best_x is not None and self._passed(t))
+            if not self.freeze_on_pass:
+                ready = t.obs_count >= self.publish_seed_hits and t.best_x is not None
+            if t.pub_x is None or t.pub_y is None:
+                if ready:
+                    t.pub_x, t.pub_y = t.best_x, t.best_y
+                    t.hold_gap = t.best_gap
+                    self.get_logger().info(
+                        f"[static_obs_layer] obstacle held at ({t.pub_x:.2f},{t.pub_y:.2f}) "
+                        f"— closest-approach estimate from {t.best_gap:.1f} m after "
+                        f"{t.obs_count} observations (live estimate now "
+                        f"({t.x:.2f},{t.y:.2f}), dead-band {self._deadband_for(t):.3f} m)")
+                    px, py = t.pub_x, t.pub_y
+                else:
+                    px, py = t.x, t.y          # still settling: publish live
             else:
-                if t.pub_x is None or t.pub_y is None:
-                    t.pub_x, t.pub_y = t.x, t.y
+                band = self._deadband_for(t)
+                moved = math.hypot(t.x - t.pub_x, t.y - t.pub_y)
+                # A LATER, CLOSER LOOK IS ALLOWED TO WIN. The band is what the current hold is
+                # worth; a pass that got nearer than the one the hold came from replaces it and
+                # the band tightens with the new range.
+                closer = (t.best_gap is not None and t.hold_gap is not None
+                          and t.best_gap < t.hold_gap and self._passed(t))
+                if moved > band or closer:
+                    nx, ny = ((t.best_x, t.best_y) if closer else (t.x, t.y))
                     self.get_logger().info(
-                        f"[static_obs_layer] obstacle @({t.x:.2f},{t.y:.2f}) settled after "
-                        f"{t.hits} sightings -> position held "
-                        f"(dead-band {self.publish_deadband_m:.2f} m)")
-                elif math.hypot(t.x - t.pub_x, t.y - t.pub_y) > self.publish_deadband_m:
-                    self.get_logger().info(
-                        f"[static_obs_layer] obstacle @({t.pub_x:.2f},{t.pub_y:.2f}) moved "
-                        f"{math.hypot(t.x - t.pub_x, t.y - t.pub_y):.2f} m "
-                        f"(> {self.publish_deadband_m:.2f}) -> republishing at "
-                        f"({t.x:.2f},{t.y:.2f})")
-                    t.pub_x, t.pub_y = t.x, t.y
+                        f"[static_obs_layer] obstacle @({t.pub_x:.2f},{t.pub_y:.2f}) -> "
+                        f"({nx:.2f},{ny:.2f}): "
+                        + (f"closer pass ({t.best_gap:.1f} m vs {t.hold_gap:.1f} m)" if closer
+                           else f"moved {moved:.2f} m > dead-band {band:.3f} m"))
+                    t.pub_x, t.pub_y = nx, ny
+                    if closer:
+                        t.hold_gap = t.best_gap
                 px, py = t.pub_x, t.pub_y
+            # a new approach gets a fresh closest-approach measurement
+            if self._passed(t):
+                t.best_gap = None
             m.pose.position.x = px
             m.pose.position.y = py
             m.pose.orientation.w = 1.0

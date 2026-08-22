@@ -46,6 +46,14 @@ import trajectory_planning_helpers as tph
 from frenet_conversion.frenet_converter import FrenetConverter
 
 from vel_planner.vel_planner import calc_vel_profile
+
+# OPTIONAL BY DESIGN. rate_check only ever prints a warning, so a workspace where it has not been
+# built yet loses the warning and nothing else -- which is exactly the state every node was in
+# before it existed. Hard-failing a live node on a missing diagnostic would be a worse trade.
+try:
+    from rate_check.rate_check import RateCheck
+except ImportError:                          # pragma: no cover - deployment shape, not logic
+    RateCheck = None
 from state_machine.states_types import StateType
 from state_machine import states
 from state_machine import state_transitions
@@ -138,6 +146,12 @@ class StateMachine(Node):
         # Convenience aliases (kept as attributes for parity with the ROS1 code which
         # read these directly off `self`). They mirror self.params.* values.
         self.rate_hz = self.params.rate_hz
+        self._rate_check = (RateCheck(
+            self, nominal_hz=self.rate_hz, name="state_machine",
+            consequence="the behaviour decision reaches the controller late by the same "
+                        "factor. The timeouts themselves are wall-clock and no longer "
+                        "stretch with the loop (see _check_ftg, _check_static_trailing_deadlock)")
+            if RateCheck else None)
         self.n_loc_wpnts = self.params.n_loc_wpnts
         self.timetrials_only = self.params.timetrials_only
         self.racecar_version = self.params.racecar_version
@@ -155,11 +169,15 @@ class StateMachine(Node):
         self.sectors_params = {}
         self.ot_sectors_params = {}
         self.only_ftg_zones = []
-        self.ftg_counter = 0
+        # Wall clock, not cycles: the time of the last cycle at which the car was NOT slow while
+        # trailing. Reset from two places (see _check_ftg and loop()), both stamping `now`.
+        self._ftg_slow_t0 = None
         # Static-obstacle trailing deadlock (see _check_static_trailing_deadlock). Shorter than
         # ftg_timer_sec: behind a stationary box there is nothing to wait for, the gap PID has
         # already converged to its only fixed point (v = 0).
-        self._static_deadlock_counter = 0
+        # Wall clock, not cycles: the time of the last cycle at which the car was NOT stalled
+        # behind a static obstacle. None until the first such cycle.
+        self._static_deadlock_t0 = None
         self.static_deadlock_speed_mps = 0.3
         # Mirrored so limit_local_window_accel can read them off the node like every other
         # _check_* condition does. Both are in StateMachineParams._NODE_MIRRORED_PARAMS; the alias
@@ -295,7 +313,6 @@ class StateMachine(Node):
 
         # spliner variables
         self.splini_ttl = self.params.splini_ttl
-        self.splini_ttl_counter = int(self.splini_ttl * self.rate_hz)
         self.avoidance_wpnts = None
         self.static_avoidance_wpnts = None
         self.start_wpnts = None
@@ -325,8 +342,12 @@ class StateMachine(Node):
         self.force_gbtrack_state = self.params.force_GBTRACK
 
         self.overtaking_ttl_sec = self.params.overtaking_ttl_sec
-        self.overtaking_ttl_count = 0
-        self.overtaking_ttl_count_threshold = int(self.overtaking_ttl_sec * self.rate_hz)
+        # Age in SECONDS of the current "in OVERTAKE, no enemy directly ahead" run. Recomputed
+        # once per cycle in _update_overtake_ttl and read by OvertakingTransition on the next one
+        # -- the same place and the same ordering as the cycle counter it replaces, so the latch
+        # still expires at the same instant; it just stops stretching when the loop runs slow.
+        self.overtaking_ttl_elapsed_sec = 0.0
+        self._overtake_ttl_t0 = None
 
         # Feasibility signal from the static avoidance planner. FAIL-CLOSED: the planner publishes
         # it every cycle (20 Hz), so a stale or never-received signal means the planner is dead or
@@ -689,15 +710,18 @@ class StateMachine(Node):
     def _update_overtake_ttl(self, prev_state, proposed_state):
         """Node-owned replacement for the counter mutation that used to live in
         OvertakingTransition (which violated the 'transitions have no side effects' rule). Mirrors
-        the old latch: while staying in OVERTAKE, count up as long as the OT path is sustainable but
-        no enemy is directly ahead; reset on enemy / loss of sustainability / leaving OVERTAKE."""
-        if prev_state == StateType.OVERTAKE and proposed_state == StateType.OVERTAKE:
-            if self._check_enemy_in_front():
-                self.overtaking_ttl_count = 0
-            else:
-                self.overtaking_ttl_count += 1
+        the old latch: while staying in OVERTAKE, age the run as long as the OT path is sustainable
+        but no enemy is directly ahead; reset on enemy / loss of sustainability / leaving OVERTAKE.
+
+        `_overtake_ttl_t0` is the time of the last RESET, so the elapsed value published here is
+        exactly what the old per-cycle counter held, expressed in seconds instead of cycles."""
+        now = self.now_sec()
+        if (prev_state == StateType.OVERTAKE and proposed_state == StateType.OVERTAKE
+                and self._overtake_ttl_t0 is not None and not self._check_enemy_in_front()):
+            self.overtaking_ttl_elapsed_sec = now - self._overtake_ttl_t0
         else:
-            self.overtaking_ttl_count = 0
+            self._overtake_ttl_t0 = now
+            self.overtaking_ttl_elapsed_sec = 0.0
 
     #############
     # CALLBACKS #
@@ -1103,14 +1127,16 @@ class StateMachine(Node):
         stalled = (self.cur_state == StateType.TRAILING
                    and abs(self.cur_vs) < self.static_deadlock_speed_mps
                    and target is not None and target.is_static)
+        now = self.now_sec()
         if not stalled:
-            self._static_deadlock_counter = 0
+            self._static_deadlock_t0 = now
             return False
-        self._static_deadlock_counter += 1
-        if self._static_deadlock_counter <= self.static_deadlock_timeout_s * self.rate_hz:
+        if self._static_deadlock_t0 is None:
+            self._static_deadlock_t0 = now
+        stalled_for = now - self._static_deadlock_t0
+        if stalled_for <= self.static_deadlock_timeout_s:
             return False
         gap = (target.s_start - self.cur_s) % self.track_length
-        now = self.now_sec()
         asked = False
         if (self._relax_sent_t is None) or (now - self._relax_sent_t) >= self.relax_repeat_sec:
             self.relax_pub.publish(Bool(data=True))
@@ -1119,7 +1145,7 @@ class StateMachine(Node):
         self.get_logger().error(
             f"[{self.name}] STATIC TRAILING DEADLOCK: stopped ({self.cur_vs:+.2f} m/s) "
             f"{gap:.2f} m behind static obstacle id={target.id} for "
-            f"{self._static_deadlock_counter / self.rate_hz:.1f} s. The avoidance planner is not "
+            f"{stalled_for:.1f} s. The avoidance planner is not "
             f"offering a usable path (static_feasible={self.static_avoidance_feasible}). "
             + ("Requested a reduced-margin retry on /planner/avoidance/relax."
                if asked else "Reduced-margin retry already requested; waiting."),
@@ -1127,7 +1153,6 @@ class StateMachine(Node):
         return True
 
     def _check_ftg(self) -> bool:
-        threshold = self.ftg_timer_sec * self.rate_hz
         # A static-obstacle deadlock is exactly the situation FTG exists for, and the car can be
         # fully stopped there (cur_vs == 0), so it satisfies the speed test below anyway — but the
         # dedicated check reports it and uses its own, shorter timeout.
@@ -1137,16 +1162,20 @@ class StateMachine(Node):
         elif deadlock:
             return True
         else:
+            now = self.now_sec()
             if (self.cur_state == StateType.TRAILING or self.cur_state == StateType.ATTACK) and \
                     self.cur_vs < self.ftg_speed_mps:
-                self.ftg_counter += 1
+                if self._ftg_slow_t0 is None:
+                    self._ftg_slow_t0 = now
+                slow_for = now - self._ftg_slow_t0
                 self.get_logger().warn(
-                    f"[{self.name}] FTG counter: {self.ftg_counter}/{threshold}",
+                    f"[{self.name}] FTG timer: {slow_for:.1f}/{self.ftg_timer_sec:.1f} s",
                     throttle_duration_sec=0.5,
                 )
             else:
-                self.ftg_counter = 0
-            return self.ftg_counter > threshold
+                self._ftg_slow_t0 = now
+                slow_for = 0.0
+            return slow_for > self.ftg_timer_sec
 
     def _check_on_spline(self, wpnt_data) -> bool:
         if wpnt_data.is_init:
@@ -2452,6 +2481,8 @@ class StateMachine(Node):
     # MAIN LOOP #
     #############
     def loop(self):
+        if self._rate_check is not None:
+            self._rate_check.tick()
         self._handle_momentary_params()
         if self.measuring:
             start = time.perf_counter()
@@ -2519,6 +2550,9 @@ class StateMachine(Node):
         # four copies of the same pass.
         local_wpnts = self.limit_local_window_accel(local_wpnts, self.cur_vs)
 
+        # The other half of the (reported, driven) = (LOSTLINE, GB_TRACK) pair NonObstacleTransition
+        # returns -- see the note there. This runs BEFORE the publish below, which is why LOSTLINE
+        # never reaches /state_machine, and why self.state_transitions has no LOSTLINE key.
         if self.cur_state == StateType.LOSTLINE:
             self.cur_state = StateType.GB_TRACK
 
@@ -2536,7 +2570,7 @@ class StateMachine(Node):
         self._pub_local_wpnts(local_wpnts)
 
         if self.cur_state != StateType.TRAILING and self.cur_state != StateType.ATTACK:
-            self.ftg_counter = 0
+            self._ftg_slow_t0 = self.now_sec()
 
         overtaking_target_mrk = Marker()
         overtaking_target_mrk.header.frame_id = "map"  # set always so the DELETEALL marker isn't dropped by RViz (empty frame)

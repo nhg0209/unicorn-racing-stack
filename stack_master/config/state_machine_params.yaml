@@ -17,7 +17,18 @@ state_machine:
     # discontinuity -- are bounded nowhere else. Measured off: |a_long| p50/p95/max
     # 4.88/35.6/56.8 m/s^2 against a ggv ax_max of 5.0, in 21.5% of windows.
     local_window_accel_limit_enable: true
-    local_window_a_long_mps2: 8.0
+    # local_window_a_long_mps2 IS A FALLBACK, NOT THE SOURCE OF TRUTH, since 2026-08-12. The node
+    # derives the bound at the car's speed from config/<SIM|CAR>/veh_dyn_info
+    # (state_machine_node._a_long_window):
+    #     min(ggv ax_max, ax_max_machines.csv, b_ax_max_machines.csv)     5.0 -> 7.00 at rest
+    # The tightest of both directions, because the backward (brake) and forward (drive) pass
+    # share one scalar. WHY: the measurement above is stated "against a ggv ax_max of 5.0" -- that
+    # ggv went to 7.0 on 2026-08-11 and this number did not follow, holding the assembled window
+    # to 71% of the envelope the raceline it is bounding was planned against.
+    # The value below is still used, and warned about once, if veh_dyn_info cannot be read.
+    # It stays declared (dropping it would break declare/YAML symmetry), but `ros2 param set
+    # local_window_a_long_mps2 ...` no longer moves the bound on a car whose config IS readable.
+    local_window_a_long_mps2: 5.0
 
     # |d| below which the car counts as back on the raceline when LEAVING a non-GB_TRACK state.
     # Lower half of the RECOVERY hysteresis band: entry uses gb_ego_width_m (0.4), exit uses this,

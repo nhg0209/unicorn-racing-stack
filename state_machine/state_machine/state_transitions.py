@@ -24,7 +24,7 @@ NOTE 2: notice that, when implementing new states, if an attribute/condition in 
 
 NOTE 3: transitions must not have side effects on the state machine!
     i.e. any attribute of the state machine should not be modified in the transitions.
-    (overtaking_ttl_count is now updated by the node in _update_overtake_ttl, not here.
+    (overtaking_ttl_elapsed_sec is now updated by the node in _update_overtake_ttl, not here.
      StartTransition still flips cur_start_wpnts.is_init - a remaining ROS1 carry-over.)
 """
 
@@ -71,14 +71,16 @@ def TrailingTransition(state_machine: "StateMachine") -> Tuple[StateType, StateT
 
 
 def OvertakingTransition(state_machine: "StateMachine") -> Tuple[StateType, StateType]:
-    """Transitions for being in `StateType.OVERTAKE` (pure: the ttl counter is updated by the node
+    """Transitions for being in `StateType.OVERTAKE` (pure: the ttl clock is updated by the node
     in `_update_overtake_ttl`, not here)."""
     ot_sustainability = state_machine._check_overtaking_mode_sustainability()
     enemy_in_front = state_machine._check_enemy_in_front()
     # Stay in OVERTAKE while the path is still sustainable AND either an enemy is directly ahead or
     # the ttl latch still has budget (keeps overtaking briefly after the enemy clears -> anti-chatter).
+    # The latch is wall-clock: overtaking_ttl_sec of no-enemy time, not overtaking_ttl_sec * rate
+    # cycles, so a slow loop shortens neither the budget nor the anti-chatter it buys.
     if ot_sustainability and (
-        enemy_in_front or state_machine.overtaking_ttl_count < state_machine.overtaking_ttl_count_threshold
+        enemy_in_front or state_machine.overtaking_ttl_elapsed_sec < state_machine.overtaking_ttl_sec
     ):
         return StateType.OVERTAKE, StateType.OVERTAKE
     close_to_raceline = (
@@ -148,6 +150,19 @@ def NonObstacleTransition(state_machine: "StateMachine", close_to_raceline) -> T
             if state_machine._check_on_spline(state_machine.cur_recovery_wpnts):
                 return StateType.RECOVERY, StateType.RECOVERY
 
+    # DELIBERATE, AND IT COSTS SOMETHING -- read this before using the state string to debug.
+    # The pair is (reported, driven) = (LOSTLINE, GB_TRACK), and the node resolves cur_state back
+    # to GB_TRACK at the end of the SAME cycle, before it publishes. So:
+    #   * LOSTLINE NEVER APPEARS on /state_machine. Confirmed on the car: bags
+    #     rosbag2_2026_08_19-22_38_39 and -22_42_37, 13590 state messages, zero LOSTLINE. Do not
+    #     go looking for it in a bag to find out whether the car lost the line -- it is not there,
+    #     and its absence is not evidence.
+    #   * it is still a committed transition while it lasts, so _commit_state stamps
+    #     _last_transition_time. Sitting in the in-between band (recovery_exit_d_m <= |d| <
+    #     recovery_entry_d_m) therefore re-arms min_dwell_sec every min_dwell_sec, which can hold
+    #     off a genuinely wanted dwell-gated switch (RECOVERY) by up to that long.
+    # Left as is on purpose: collapsing it to a plain GB_TRACK return would change the dwell
+    # bookkeeping, and that is a behaviour change, not a notation fix.
     return StateType.LOSTLINE, StateType.GB_TRACK
 
 

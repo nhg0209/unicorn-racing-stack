@@ -16,7 +16,7 @@ controller_manager:
     end_scale_speed: 10.0
     downscale_factor: 0.5
     speed_lookahead_for_steer: 0.0
-    trailing_gap: 1.5
+    trailing_gap: 4.0
     trailing_vel_gain: 0.25
     trailing_p_gain: 1.35
     trailing_i_gain: 0.0
@@ -25,9 +25,9 @@ controller_manager:
     curvature_factor: 0.145
     speed_factor_for_lat_err: 1.0
     speed_factor_for_curvature: 1.0
-    KP: 0.8
+    KP: 0.5
     KI: 0.0
-    KD: 0.05
+    KD: 0.08
     heading_error_thres: 10.0
     steer_gain_for_speed: 1.0
     future_constant: 0.05
@@ -50,11 +50,114 @@ controller_manager:
     speed_diff_thres: 0.1
     start_speed: 10.0
     start_curvature_factor: 1.5
-    # Longitudinal slew limit on the PUBLISHED speed command. Mirrors veh_dyn_info/ggv.csv
-    # (ax_max = 5.0) and ax_max_machines.csv (5.0) — the same limits the global trajectory is
-    # planned against, so this never clips a feasible plan, only steps. Measured before it
-    # existed: the command moved at up to 86.8 m/s^2 (p99 12.2) on a real run. Raise only if the
-    # ggv is raised too; lowering it makes the car sluggish out of TRAILING.
-    max_accel_mps2: 7.0
-    max_decel_mps2: 7.0
+    # Longitudinal slew limit on the PUBLISHED speed command. Measured before it existed: the
+    # command moved at up to 86.8 m/s^2 (p99 12.2) on a real run.
+    #
+    # THESE TWO ARE FALLBACKS, NOT THE SOURCE OF TRUTH, since 2026-08-12. The controller derives
+    # the real pair at the current speed from config/<SIM|CAR>/veh_dyn_info
+    # (Controller._slew_limits):
+    #     max_accel_mps2 <- min(ggv ax_max, ax_max_machines.csv)      5.0 -> 7.00 at rest
+    #     max_decel_mps2 <- min(ggv ax_max, b_ax_max_machines.csv)    5.0 -> 7.00
+    # WHY: this block used to say it "mirrors ggv.csv (ax_max = 5.0) and ax_max_machines.csv
+    # (5.0)". That was true when written and false from 2026-08-11, when ggv ax_max went to 7.0
+    # and this pair stayed at 5.0 — so the slew limit was clipping plans the car could serve, and
+    # the instruction to "raise only if the ggv is raised too" was not carried out because
+    # nothing connected the two. A hand-copied number is a number that goes stale; race-day
+    # re-gripping needs k to land in ONE file.
+    # The values below are still used, and warned about once, if veh_dyn_info cannot be read.
+    # Because the controller re-derives at every cycle, `ros2 param set max_accel_mps2 ...` no
+    # longer changes anything on a car whose config IS readable. Deliberate, and free: the
+    # re-grip workflow restarts the stack anyway.
+    max_accel_mps2: 5.0
+    max_decel_mps2: 5.0
+    # TYRE LIMIT on the steering command:
+    #     delta_max = atan(wheelbase * a_lat_ctrl(v) / max(v, a_lat_v_floor)^2)
+    #     a_lat_ctrl(v) = ggv_ay(v) * a_lat_margin
+    # applied after every steering modifier and BEFORE the rate limit / +-0.53 saturation.
+    # ggv_ay(v) is INTERPOLATED from config/<SIM|CAR>/veh_dyn_info/ggv.csv -- the same table the
+    # raceline is planned against -- and is deliberately not a number in this file. Measured on
+    # bag ggv_0812_1645 (5 clean laps, FULL coverage): the controller commands a lateral
+    # acceleration of p90 14.36 / max 22.37 m/s^2 against a car that never achieved more than
+    # 11.71. LIVE-TOGGLABLE:
+    #     ros2 param set /controller_manager a_lat_limit_enable false
+    # restores the previous behaviour on the car with no relaunch.
+    a_lat_limit_enable: true
+    # [-] multiplies the ggv's ay_max. NOT 1.0: 5.7 is the PLANNER's limit and the raceline
+    # SPENDS ALL OF IT (its own worst demand is vx^2*|kappa| = 5.70), so a ceiling of 5.70
+    # leaves exactly zero budget for returning to the line at a corner apex. That shipped and
+    # came back as "path tracking is far too sluggish". The controller's ceiling must exceed the
+    # planner's, and the difference IS the recovery budget.
+    # The roof is NOT a "6.0-6.5 tyre knee" -- that came from a replay that was silently dying
+    # at the first lap boundary and covering 16.3% of the bag. At full coverage there is no
+    # cliff: achieved keeps climbing with demand (6-8 -> 5.55, 8-10 -> 5.53, 10-14 -> 6.26,
+    # 14-25 -> 7.39) and the car demonstrably makes p50 4.96 / p90 7.62 / max 11.71.
+    # From the margin sweep (replay_steering.py --sweep), 잘라내는량 = the share of the run where
+    # the car's ACHIEVED lateral acceleration exceeded that ceiling, i.e. real capability given up:
+    #     margin  ceiling  budget   cut     p50    p90    max
+    #       1.00    5.70    0.00   41.4%   5.70   5.70   5.70   <- the regression
+    #       1.05    5.99    0.29   35.6%   5.98   5.99   5.99
+    #       1.10    6.27    0.57   29.9%   6.27   6.27   6.27   <- also too tight
+    #       1.15    6.55    0.85   23.5%   6.55   6.55   6.56
+    #       1.25    7.12    1.43   14.5%   6.71   7.12   7.13
+    #       1.35    7.70    2.00    9.5%   6.69   7.70   7.70   <- chosen
+    #    (baseline)         --      0.0%   6.69  14.36  22.37
+    # The rule is: ANCHOR THE CEILING AT THE p90 OF WHAT THE TYRE DEMONSTRABLY DELIVERS (7.62),
+    # which 1.35 realises at 7.70. It gives up the least capability of any row that still clips,
+    # leaves the MEDIAN command exactly where no-clip leaves it (p50 6.69) so only the tail is
+    # touched, and still removes the whole unachievable region (p90 14.36 -> 7.70, max 22.37 ->
+    # 7.70) against an achieved max of 11.71.
+    # A ">6.0 %" column used to live here and was dropped: once the clip is active it only
+    # reports how often the clip binds, so every margin read the same number.
+    a_lat_margin: 3.0
+    # [m/s] floor in the v^2 denominator. delta_max -> pi/2 as v -> 0; the +-0.53 saturation
+    # happens to absorb that, which is luck rather than design.
+    a_lat_v_floor: 0.5
+    # FRICTION CIRCLE on the speed command. The UP slew allowance becomes
+    #     ax_avail = min(ax_machines(v), ax_max(v) * (1 - (a_lat/(ay_max(v)*margin))^p)^(1/p))
+    #     a_lat    = v^2 * |kappa| of the raceline at the nearest waypoint
+    # so past the circle ax_avail is 0 and the command may not RISE. It never commands braking:
+    # the decel allowance is untouched, because forcing a decrease is a different intervention
+    # that would move every other section of the lap.
+    # ax_max, ay_max, ax_machines and p are READ, not written here -- ggv.csv,
+    # ax_max_machines.csv and racecar_f110.ini's dyn_model_exp, from config/<SIM|CAR>. They are
+    # the same three inputs the offline velocity profile is solved against.
+    # Measured on ifac_0807's right-hand slalom (real bag, laps 2 and 3 alike): at the apex
+    # s=5.2 the line asks kappa -0.27 at a planned 4.51 m/s, the car is at 5.13, and
+    # 5.13^2*0.27 = 7.1 m/s^2 against ay_max 5.7 -- already outside the circle, and still
+    # accelerating (4.90 -> 5.13 -> 5.51) because speed_lookahead 0.25 s reads 1.21 m ahead,
+    # which at the apex is the corner EXIT. d then grows monotonically -0.04 -> +0.41 and the
+    # car enters the next straight wide and 0.76 m/s under target.
+    # LIVE-TOGGLABLE: ros2 param set /controller_manager a_comb_limit_enable false
+    a_comb_limit_enable: true
+    # [-] multiplies ay_max in the circle. 1.0 HERE, unlike a_lat_margin above, and the
+    # difference is not an inconsistency -- the two answer different questions. a_lat_margin
+    # asks "how much steering may I command", and its honest anchor is what the tyre has been
+    # measured DELIVERING (p90 7.62). This one asks "may I add speed while already using this
+    # much grip", and its anchor is the envelope THE VELOCITY PROFILE WAS PLANNED AGAINST: the
+    # plan puts the car at 4.51 m/s at that apex, which is 5.5 m/s^2 of lateral -- the plan sits
+    # ON the ggv circle, so a circle drawn anywhere else stops matching the plan it is policing.
+    a_comb_margin: 1.0
+    # IMU FUSION WEIGHTS in calc_future_position. 1.0 = pure kinematic model, 0.0 = pure IMU.
+    # Both were hardcoded at 1.0, i.e. the measured yaw rate arrived and was multiplied by zero;
+    # together with acc_scaler/dec_scaler at 1.0 that left the controller with NO dynamic
+    # feedback at all, which is why it could ask for 22 m/s^2 and never notice getting 7.
+    #
+    # lambda_weight -- slip angle. STAYS AT 1.0, measured. beta_imu is not a slip angle:
+    # substituting yaw_rate = v*tan(delta)/L into arcsin(L*yaw_rate/v) gives ~delta, the
+    # STEERING angle, where the slip angle carries an extra L_r/L = 0.48. Mixing that in makes
+    # the future-position prediction monotonically worse (p50 error 0.0455 m at 1.0 -> 0.0555 m
+    # at 0.0, replay_steering.py --gamma). Fix the formula before raising the mix.
+    lambda_weight: 1.0
+    # gamma_weight -- future heading. 0.0 = use the measured yaw rate. Over future_constant
+    # (0.05 s) that is 4.4x more accurate than the model: |predicted - actual| p50 1.754 deg at
+    # gamma 1.0 vs 0.396 deg at 0.0, p90 3.911 vs 1.484.
+    # HONEST SCOPE: this changes NOTHING about the command today. future_position[0,2] is read
+    # by exactly one consumer, viz_future_position's RViz arrow; every functional consumer takes
+    # [0,:2], and calc_steering_angle_for_future computes eta from the CURRENT yaw. The sweep
+    # shows it: demanded a_lat and |delta| are bit-identical across all five gammas. So this is
+    # a visualization fix plus the right value already in place for the day future_psi is
+    # actually wired into the steering law -- which is the change that would close the loop.
+    # It is only safe to set below 1.0 because imu_cb's yaw-rate sign was corrected in the same
+    # commit; with the old -gz, gamma 0.0 would have predicted the heading turning the wrong way.
+    gamma_weight: 0.0
     save_params: false
