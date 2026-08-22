@@ -295,6 +295,7 @@ def select_sides(pts: np.ndarray,
     the track.
     """
     out: List[int] = []
+    meas = []                                  # (station, room_hi, room_lo) per obstacle
     for o in obstacles:
         j = int(np.argmin(np.hypot(pts[:, 0] - o.x, pts[:, 1] - o.y)))
         du = float((np.array([o.x, o.y]) - pts[j]) @ nv[j])
@@ -306,8 +307,93 @@ def select_sides(pts: np.ndarray,
             why.append(f"box at station {j}: neither side fits -- the left corridor is "
                        f"{-room_hi:.3f} m short and the right corridor {-room_lo:.3f} m short "
                        f"of the keep-out at that station")
+        meas.append((j, room_hi, room_lo))
         out.append(0 if blocked else (1 if room_hi >= room_lo else -1))
+    _agree_on_overlapping(pts, obstacles, meas, out, params, why)
     return out
+
+
+def _agree_on_overlapping(pts: np.ndarray,
+                          obstacles: Sequence[Obstacle],
+                          meas: Sequence[Tuple[int, float, float]],
+                          out: List[int],
+                          params: ReoptParams,
+                          why: Optional[List[str]]) -> None:
+    """Boxes whose keep-outs overlap along the track have to be passed on ONE side. In place.
+
+    The loop above answers "which side has more room" for each box ALONE. Nothing there
+    asks whether the line can get from one side to the other in the distance between two
+    boxes, and for boxes closer than 2R it cannot: their keep-outs overlap, so between
+    them the corridor asks the offset to be above one box's band and below the other's at
+    the same station. `lo` then exceeds `hi` and the QP is handed an EMPTY box constraint.
+
+    Measured on bldg_0822_4, two boxes 0.8 m apart at stations 180 and 188: sides came out
+    (-1, +1), the corridor width ran -1.144 m over four stations, `lo` stepped 1.496 m in
+    one 0.1 m station, and the published line came out at |kappa| 10.7 against a curvlim of
+    1.5. The node refused it -- correctly, but the pair then got no obstacle-aware line at
+    all, and each box is trivially passable on its own.
+
+    So decide the cluster together, on the WORST room any member has on each side: that is
+    what the line must actually fit through. If neither side clears the whole cluster it is
+    not passable as a unit, and every member is dropped and named -- the reactive layer's
+    job, and an honest answer rather than an empty corridor.
+
+    Clusters are transitive (a chain of overlapping boxes is one cluster), because the
+    corridor argument is: any two links closer than 2R cannot be taken on opposite sides.
+    """
+    n = len(obstacles)
+    if n < 2:
+        return
+    seg = np.roll(pts, -1, axis=0) - pts
+    el = np.hypot(seg[:, 0], seg[:, 1])
+    s_st = np.concatenate([[0.0], np.cumsum(el)])[:len(pts)]
+    L = float(s_st[-1] + el[-1])
+    R2 = 2.0 * (params.obs_margin + 0.5 * params.w_veh + params.disc_allow_m
+                + max((float(o.r) for o in obstacles), default=0.0))
+
+    def gap(a: int, b: int) -> float:
+        d = abs(s_st[meas[a][0]] - s_st[meas[b][0]])
+        return min(d, L - d)
+
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for a in range(n):
+        for b in range(a + 1, n):
+            if gap(a, b) < R2:
+                parent[find(a)] = find(b)
+
+    groups: dict = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        if len({out[i] for i in members}) == 1 and out[members[0]] != 0:
+            continue                            # already agree, and passable
+        room_hi = min(meas[i][1] for i in members)
+        room_lo = min(meas[i][2] for i in members)
+        stations = [meas[i][0] for i in members]
+        if room_hi < 0.0 and room_lo < 0.0:
+            for i in members:
+                out[i] = 0
+            if why is not None:
+                why.append(f"boxes at stations {stations} overlap along the track and cannot be "
+                           f"passed as one: the left corridor is {-room_hi:.3f} m short and the "
+                           f"right {-room_lo:.3f} m short for the tightest member")
+            continue
+        side = 1 if room_hi >= room_lo else -1
+        for i in members:
+            out[i] = side
+        if why is not None:
+            why.append(f"boxes at stations {stations} overlap along the track -> both passed on "
+                       f"side {side:+d} (rooms: hi {room_hi:+.3f}, lo {room_lo:+.3f})")
 
 
 def locality_envelope(ci: np.ndarray,
