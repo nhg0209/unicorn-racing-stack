@@ -1,6 +1,6 @@
 /**:
   ros__parameters:
-    wheelbase: 0.33
+    wheelbase: 0.333
     scan_topic: 'scan'
     odometry_topic: 'vesc/odom'
 
@@ -24,6 +24,10 @@ urg_node:
 
 vesc/**:
   ros__parameters:
+    # Fallback only — low_level.launch.xml overrides this with the vesc_port arg
+    # ($(env VESC_PORT /dev/ttyACM0)). USB serial names differ per machine/OS, so set
+    # VESC_PORT in unicorn.local.sh (mac: /dev/cu.usbmodem*, Linux: /dev/ttyACM* or a
+    # stable /dev/serial/by-id/... path) instead of editing this shared file.
     port: "/dev/ttyACM0"
     publish_tf: false
     brake_max: 200000.0
@@ -36,10 +40,10 @@ vesc/**:
     position_min: 0.0
     servo_max: 1.0
     servo_min: 0.0
-    speed_max: 46500.0
-    speed_min: -46500.0
-    speed_to_erpm_gain: 4014.0
+    speed_max: 69000.0
+    speed_min: -69000.0
+    speed_to_erpm_gain: 3447.54
     speed_to_erpm_offset: 0.0
-    steering_angle_to_servo_gain: 0.568
-    steering_angle_to_servo_offset: 0.5745
+    steering_angle_to_servo_gain: 0.53
+    steering_angle_to_servo_offset: 0.575
     use_servo_cmd_to_calc_angular_velocity: true
