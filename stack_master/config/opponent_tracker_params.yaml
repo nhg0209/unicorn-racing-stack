@@ -27,7 +27,7 @@ tracking:
     measurment_var_vd: 0.2
     process_var_vs: 2.0
     process_var_vd: 8.0
-    max_dist: 0.5
+    max_dist: 0.8
     var_pub: 1.0
     aggro_multi: 2.0
     dist_deletion: 7.0
@@ -43,7 +43,7 @@ tracking:
     diag_assoc_throttle_s: 1.0
     max_std: 0.2
     min_std: 0.16
-    min_nb_meas: 3
+    min_nb_meas: 1
     # false = keep a tracked STATIC obstacle alive across missed detection frames (memory on).
     # With true + low ttl_static the obstacle was dropped after 3 missed frames, so /tracking/obstacles
     # flickered empty and the spline/OVERTAKE commit flickered -> the car crawled up before avoiding.
@@ -91,7 +91,7 @@ tracking:
     # track then spent its first frames classified dynamic, the static planner dropped it, and the
     # state machine fell out of the overtake into TRAILING. An opponent at 2 m/s covers 0.30 m in
     # the same window, so the veto that keeps a static ghost off a moving car is unaffected.
-    static_net_floor_m: 0.12
+    static_net_floor_m: 0.15
     demote_speed_mps: 0.6
     # a track whose measurement lies within this radius of an initialized DYNAMIC track is a
     # spare detection cluster of that car (the box detector splits the opponent into 2 clusters

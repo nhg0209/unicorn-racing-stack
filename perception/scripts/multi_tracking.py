@@ -197,6 +197,7 @@ class ObstacleSD:
     ttl = None
     min_std = None
     max_std = None
+    static_net_floor = 0.12   # 2026-08-21 B: 순변위 정적-거부 문턱[m]
 
     def __init__(self, id, s_meas, d_meas, lap, size, isVisible):
         """
@@ -256,13 +257,31 @@ class ObstacleSD:
     def std_d(self):
         return np.std(self.measurments_d)
 
+    def _net_disp(self, track_length):
+        # 2026-08-21 B: 측정창 전반부평균 vs 후반부평균 순변위[m]. mover는 크고
+        # 정적 박스 노이즈는 평균 상쇄로 작음 -> std보다 이동 감지에 민감.
+        n = len(self.measurments_s)
+        if n < 2:
+            return 0.0
+        h = max(1, n // 2)
+        s1 = sum(self.measurments_s[:h]) / h
+        s2 = sum(self.measurments_s[-h:]) / h
+        d1 = sum(self.measurments_d[:h]) / h
+        d2 = sum(self.measurments_d[-h:]) / h
+        return math.hypot(normalize_s(s2 - s1, track_length), d2 - d1)
+
     def isStatic(self, track_length):
         # --- get a representative data set for the obstacle ---
         if self.nb_meas > ObstacleSD.min_nb_meas:
             std_s = self.std_s(track_length)
             std_d = self.std_d()
+            # 2026-08-21 B: 순변위 가드 우선 — 창 동안 net_floor 이상 움직였으면
+            # (std 작아도) 정적 투표 무효 -> mover의 static 오분류 차단.
+            net = self._net_disp(track_length)
+            if ObstacleSD.static_net_floor is not None and net > ObstacleSD.static_net_floor:
+                self.static_count = 0
             # --- create a voting system so that the outliers don't affect much the result ---
-            if (std_s < ObstacleSD.min_std and std_d < ObstacleSD.min_std):
+            elif (std_s < ObstacleSD.min_std and std_d < ObstacleSD.min_std):
                 self.static_count = self.static_count + 1
             # --- assert for sure that an obstacle is dynamic and not static ---
             elif (std_s > ObstacleSD.max_std or std_d > ObstacleSD.max_std):
@@ -401,6 +420,7 @@ class StaticDynamic(Node):
         ObstacleSD.min_nb_meas = self.min_nb_meas
         ObstacleSD.min_std = self.min_std
         ObstacleSD.max_std = self.max_std
+        ObstacleSD.static_net_floor = self._get_param("static_net_floor_m")   # 2026-08-21 B
         self.vs_reset = self.vs_reset
 
         # save-back path (ROS1 dynamic_tracker_server wrote both detect + tracking
@@ -991,7 +1011,7 @@ class StaticDynamic(Node):
                 if(tracked_obstacle.staticFlag == False):
                     if tracked_obstacle.dynamic_state.isInitialised:
                         tracked_obstacle.dynamic_state.useTargetVel = False
-                        if(tracked_obstacle.dynamic_state.avg_vs < self.vs_reset and len(tracked_obstacle.dynamic_state.vs_list) > 10 and self.publish_static):
+                        if(tracked_obstacle.dynamic_state.avg_vs < self.vs_reset and len(tracked_obstacle.dynamic_state.vs_list) > 3 and self.publish_static):
                             tracked_obstacle.dynamic_state.isInitialised = False
                             tracked_obstacle.staticFlag = True
                             tracked_obstacle.static_count = 0

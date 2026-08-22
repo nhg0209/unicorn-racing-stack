@@ -82,7 +82,8 @@ class StaticObstacleLayer(Node):
         # letting a head-to-head opponent corrupt the obstacle-aware re-optimized line.
         self.declare_parameter("require_is_static", True)
         self.declare_parameter("match_radius", 0.5)          # [m] associate detection to a track
-        self.declare_parameter("confirm_hits", 5)            # sightings to confirm a static obstacle
+        self.declare_parameter("confirm_hits", 2)            # 2026-08-19 5->2: tracking(min_nb_meas)이 이미 검증한 관측을 이어받아 총 2관측 판단
+        self.declare_parameter("seed_obs_count", 2)          # 새 static 트랙 obs_count 시작값 = tracking 분류창(min_nb_meas+1). carry-over.
         self.declare_parameter("min_radius", 0.10)           # [m] floor on obstacle radius
         self.declare_parameter("obs_horizon_m", 6.0)         # [m] range within which the ego can see
         self.declare_parameter("removal_enable", True)
@@ -103,14 +104,14 @@ class StaticObstacleLayer(Node):
         self.declare_parameter("unlatch_gap_min", 1.0)       # [m] window near edge
         self.declare_parameter("unlatch_gap_max", 5.0)       # [m] window far edge (< obs_horizon_m,
                                                              # sized so a fast pass still fits the streak)
-        self.declare_parameter("unlatch_clear_msgs", 20)     # consecutive clear msgs -> unlatch (~0.5 s @40 Hz)
+        self.declare_parameter("unlatch_clear_msgs", 5)     # consecutive clear msgs -> unlatch (~0.5 s @10 Hz)
         # ...but the streak must COMPLETE within one approach, and the ego is only inside the
         # window for (gap_max - gap_min)/v seconds. At the shipped 4 m window that is 20 messages
         # only up to 8 m/s; above it the streak is structurally impossible and the fast-unlatch
         # path silently stops existing. So the requirement is scaled by the crossing time, floored
         # so the decision never rests on a couple of frames. See _clear_msgs_needed.
-        self.declare_parameter("unlatch_msg_rate_hz", 40.0)  # tracking publish rate used for the scale
-        self.declare_parameter("unlatch_clear_msgs_min", 6)  # never unlatch on fewer than this
+        self.declare_parameter("unlatch_msg_rate_hz", 10.0)  # tracking publish rate used for the scale (rate_tracking=10)
+        self.declare_parameter("unlatch_clear_msgs_min", 2)  # never unlatch on fewer than this
         # Streak is also SUSPENDED while the ego is OFF the raceline (|d| above this): mid-avoidance
         # the sensor geometry on the very obstacle being avoided is skewed (wall-adjacent boxes
         # flicker under detect's boundary inflation at those angles) — observed: a live obstacle
@@ -160,6 +161,7 @@ class StaticObstacleLayer(Node):
         self.require_is_static = bool(self.get_parameter("require_is_static").value)
         self.match_radius = float(self.get_parameter("match_radius").value)
         self.confirm_hits = int(self.get_parameter("confirm_hits").value)
+        self.seed_obs_count = max(1, int(self.get_parameter("seed_obs_count").value))
         self.min_radius = float(self.get_parameter("min_radius").value)
         self.obs_horizon_m = float(self.get_parameter("obs_horizon_m").value)
         self.removal_enable = bool(self.get_parameter("removal_enable").value)
@@ -389,8 +391,12 @@ class StaticObstacleLayer(Node):
         if best is None:
             if not update:
                 return None            # a repeat may not create a track out of stale data
-            t = _Track(x=x, y=y, r=r, s=s, hits=1, obs_count=1,
+            t = _Track(x=x, y=y, r=r, s=s, hits=1, obs_count=self.seed_obs_count,
                        marker_id=self._next_marker_id)
+            if t.obs_count >= self.confirm_hits:   # seed가 문턱 충족 -> 생성 즉시 확정 (tracking 2관측 이어받아 총 2관측)
+                t.confirmed = True
+                self.get_logger().info(
+                    f"[static_obs_layer] CONFIRMED (seeded) static obstacle @({t.x:.2f},{t.y:.2f}) r={t.r:.2f}")
             self._next_marker_id += 1
             self._tracks.append(t)
             self._note_best_look(t)
