@@ -1,0 +1,29 @@
+speed_sector_tuner:
+  ros__parameters:
+    save_params: false
+    global_limit: 1.0
+    n_sectors: 4
+    Sector0:            # s 0~13 (대회전)
+      start: 0
+      end: 130
+      scaling: 1.0
+      only_FTG: false
+      no_FTG: false
+    Sector1:            # s 13~19 (V진입+최협) — 실측 제동 -5.5 로 소화 가능한 속도로
+      start: 131
+      end: 191
+      scaling: 0.8
+      only_FTG: false
+      no_FTG: false
+    Sector2:            # s 19~24
+      start: 192
+      end: 240
+      scaling: 1.0
+      only_FTG: false
+      no_FTG: false
+    Sector3:            # s 24~31.7 (상단 코너 — 0820 이탈 0.7~1.05)
+      start: 241
+      end: 319
+      scaling: 0.85
+      only_FTG: false
+      no_FTG: false

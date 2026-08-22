@@ -1011,7 +1011,7 @@ class StaticDynamic(Node):
                 if(tracked_obstacle.staticFlag == False):
                     if tracked_obstacle.dynamic_state.isInitialised:
                         tracked_obstacle.dynamic_state.useTargetVel = False
-                        if(tracked_obstacle.dynamic_state.avg_vs < self.vs_reset and len(tracked_obstacle.dynamic_state.vs_list) > 10 and self.publish_static):
+                        if(tracked_obstacle.dynamic_state.avg_vs < self.vs_reset and len(tracked_obstacle.dynamic_state.vs_list) > 3 and self.publish_static):
                             tracked_obstacle.dynamic_state.isInitialised = False
                             tracked_obstacle.staticFlag = True
                             tracked_obstacle.static_count = 0

@@ -385,7 +385,9 @@ def _cap_speed_to_published_curvature(traj: np.ndarray, ggv, axm) -> None:
 
 
 def _resample_uniform(traj: np.ndarray, d_right: np.ndarray, d_left: np.ndarray,
-                      target_n: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                      target_n: int,
+                      d_m: np.ndarray = None,
+                      ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Resample a CLOSED trajectory [s,x,y,psi,kappa,vx,ax] to UNIFORM arc-length spacing over
     EXACTLY `target_n` unique points (+1 duplicated closing point). Laying the avoidance offset on
     the raceline COMPRESSES the point spacing on the inner side of curves (the clean line's uniform
@@ -406,14 +408,17 @@ def _resample_uniform(traj: np.ndarray, d_right: np.ndarray, d_left: np.ndarray,
     Spacing therefore becomes L_new/target_n (~1.4% off the clean 0.0998 m for a 0.5 m detour) —
     uniformity, which is what fixed the wiggle, is fully preserved.
 
-    x,y,kappa,vx,ax,d_right,d_left are linearly interpolated along the arc; psi + s are recomputed
-    from the resampled xy. Returns (traj_M, d_right_M, d_left_M) with a duplicated closing point."""
+    x,y,kappa,vx,ax,d_right,d_left and d_m are linearly interpolated along the arc; psi + s are
+    recomputed from the resampled xy. d_m rides along for the same reason the widths do: the
+    redistribution moves every station along the arc, so a lateral field taken before the resample
+    no longer lines up with traj row for row (a 0.5 m detour shifts the far end by ~5 points).
+    Returns (traj_M, d_right_M, d_left_M, d_m_M) with a duplicated closing point."""
     xy = traj[:, 1:3]
     dup = np.allclose(xy[-1], xy[0])
     xyu = xy[:-1] if dup else xy
     n = len(xyu)
     if n < 4 or int(target_n) < 4:
-        return traj, d_right, d_left
+        return traj, d_right, d_left, d_m
     seg = np.vstack([np.diff(xyu, axis=0), xyu[0] - xyu[-1]])   # closed-loop segments
     el = np.hypot(seg[:, 0], seg[:, 1])
     s = np.concatenate([[0.0], np.cumsum(el)])                 # s[-1] = L (arc length)
@@ -428,17 +433,20 @@ def _resample_uniform(traj: np.ndarray, d_right: np.ndarray, d_left: np.ndarray,
     new_xy = np.column_stack([_interp(traj[:, 1]), _interp(traj[:, 2])])
     kap = _interp(traj[:, 4]); vx = _interp(traj[:, 5]); ax = _interp(traj[:, 6])
     dr = _interp(d_right); dl = _interp(d_left)
+    dm = _interp(d_m) if d_m is not None else None
     # close the loop (duplicate the start point) to match the clean-bundle convention
     new_xy = np.vstack([new_xy, new_xy[:1]])
     kap = np.append(kap, kap[0]); vx = np.append(vx, vx[0]); ax = np.append(ax, ax[0])
     dr = np.append(dr, dr[0]); dl = np.append(dl, dl[0])
+    if dm is not None:
+        dm = np.append(dm, dm[0])
     # recompute psi + s on the uniformly-spaced closed line
     segm = np.roll(new_xy, -1, axis=0) - new_xy
     elm = np.hypot(segm[:, 0], segm[:, 1])
     psi_m, _ = tph.calc_head_curv_num.calc_head_curv_num(path=new_xy, el_lengths=elm, is_closed=True)
     s_m = np.concatenate([[0.0], np.cumsum(elm)])[:len(new_xy)]
     traj_m = np.column_stack([s_m, new_xy[:, 0], new_xy[:, 1], psi_m, kap, vx, ax])
-    return traj_m, dr, dl
+    return traj_m, dr, dl, dm
 
 def _menger_kappa(xy_closed: np.ndarray) -> np.ndarray:
     """Signed curvature of a CLOSED polyline from circumscribed circles (Menger). Unlike
@@ -536,10 +544,19 @@ def conv_psi(psi: float) -> float:
     return new_psi
 
 
-def build_wpnts(traj: np.ndarray, d_right: np.ndarray, d_left: np.ndarray, second_traj: bool = False):
+def build_wpnts(traj: np.ndarray, d_right: np.ndarray, d_left: np.ndarray, second_traj: bool = False,
+                d_m: np.ndarray = None):
     """Build (WpntArray, MarkerArray) from an optimizer trajectory [s,x,y,psi,kappa,vx,ax].
 
     ROS message imports are lazy so the numeric core can be used without a ROS session.
+
+    d_m is the lateral deviation from the CLEAN raceline, signed LEFT-positive, and defaults to 0
+    (which is what the clean line itself is). It is not decoration: Controller.py reads it as
+    column 8 and takes max |d_m| over the local window to decide whether the path it is following
+    is legitimately offset -- an avoidance line -- and therefore gets the looser garbage-path bar
+    (AEB_thres_overtake) instead of the tight one (AEB_thres). Leaving it at 0 on a line with a
+    hump in it made the tight 0.5 m bar fire against the hump the car was deliberately driving,
+    clamping the speed command to 2.0 m/s on approach and releasing it after the obstacle.
     """
     from f110_msgs.msg import Wpnt, WpntArray
     from visualization_msgs.msg import Marker, MarkerArray
@@ -557,6 +574,7 @@ def build_wpnts(traj: np.ndarray, d_right: np.ndarray, d_left: np.ndarray, secon
         w.y_m = float(pnt[2])
         w.d_right = float(d_right[i])
         w.d_left = float(d_left[i])
+        w.d_m = float(d_m[i]) if d_m is not None else 0.0
         w.psi_rad = float(conv_psi(pnt[3]))
         w.kappa_radpm = float(pnt[4])
         w.vx_mps = float(pnt[5])

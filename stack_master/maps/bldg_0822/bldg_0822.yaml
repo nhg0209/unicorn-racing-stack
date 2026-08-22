@@ -1,0 +1,6 @@
+image: bldg_0822.pgm
+resolution: 0.05
+origin: [-7.7722, -10.1462, 0.0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196

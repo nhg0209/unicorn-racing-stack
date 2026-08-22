@@ -129,6 +129,9 @@ def _impl(clean_xy, clean_dr, clean_dl, reftrack, obstacles, input_path, params,
     traj = np.column_stack([s_full, stitch_xy[:, 0], stitch_xy[:, 1], psi_full, kap, vx, ax])
 
     offset = np.einsum("ij,ij->i", stitch_xy - xy_all, nvec_rl)
+    # nvec_rl is the +RIGHT normal (see core._wrap_normals), so a positive offset is a line that
+    # moved right, while f110_msgs/Wpnt.d_m is LEFT-positive -- hence the sign flip.
+    d_m = -offset
     d_right = np.maximum(dr - offset, 0.0)
     d_left = np.maximum(dl + offset, 0.0)
     bound_r = xy_all + dr[:, None] * nvec_rl
@@ -139,7 +142,7 @@ def _impl(clean_xy, clean_dr, clean_dl, reftrack, obstacles, input_path, params,
         # UNIFORM resample to the clean line's point count. Not cosmetic: a length-derived count
         # kills sector_tuner (IndexError -> /global_waypoints_scaled stops -> the car keeps
         # following the OLD line) and shifts the index-based sector bounds.
-        traj, d_right, d_left = core._resample_uniform(traj, d_right, d_left, N - 1)
+        traj, d_right, d_left, d_m = core._resample_uniform(traj, d_right, d_left, N - 1, d_m=d_m)
         traj[:, 4] = core._republish_kappa(traj, xy_all, clean_kappa)
         _sg = np.roll(traj[:, 1:3], -1, axis=0) - traj[:, 1:3]
         _el = np.maximum(np.hypot(_sg[:, 0], _sg[:, 1]), 1e-6)
@@ -182,6 +185,7 @@ def _impl(clean_xy, clean_dr, clean_dl, reftrack, obstacles, input_path, params,
             "kappa_published_max": float(k_pub[i_worst]),
             "kappa_published_allow": float(k_allow[i_worst]),
             "main": (traj, bound_r, bound_l, est), "d_right": d_right, "d_left": d_left,
+            "d_m": d_m,
             "n_windows": n_solved, "n_failed": len(rep.infeasible),
             "apex_dropped": apex_dropped, "apex_laid": apex_laid, "curvlim": float(curvlim),
             "alpha": offset, "clip_bite": 0.0,

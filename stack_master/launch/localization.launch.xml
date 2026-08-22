@@ -26,7 +26,7 @@
        unicorn.local.sh); the tracked fallback is car2's IP (correct for car1).
        car2 sets OPPONENT_IP=192.168.70.48 (car1). Update env if the DHCP lease
        changes, or pass opponent_ip:=... on the command line. -->
-  <arg name="opponent_bridge" default="true"           description="Run the UDP opponent-pose bridge"/>
+  <arg name="opponent_bridge" default="false"           description="Run the UDP opponent-pose bridge"/>
   <arg name="opponent_ip"     default="$(env OPPONENT_IP 192.168.70.14)"  description="The opponent car's LAN IP (env OPPONENT_IP; fallback = car2)"/>
   <arg name="opponent_port"   default="47600"          description="UDP port (same on both cars)"/>
   <arg name="opponent_rate"   default="50.0"           description="Send-rate cap [Hz]"/>

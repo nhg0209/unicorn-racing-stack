@@ -1055,12 +1055,12 @@ class StaticReoptNode(Node):
             d_r, d_l = res["d_right"], res["d_left"]
         else:
             d_r, d_l = core.dist_to_bounds(traj[:, 1:3], br, bl)  # traj is [s,x,y,...]
-        glb_w, glb_m = core.build_wpnts(traj, d_r, d_l, second_traj=False)
+        glb_w, glb_m = core.build_wpnts(traj, d_r, d_l, second_traj=False, d_m=res.get("d_m"))
 
         if self.compute_sp and "sp" in res:
             sp_traj, sbr, sbl, sp_est = res["sp"]
             sd_r, sd_l = core.dist_to_bounds(sp_traj[:, 1:3], sbr, sbl)
-            sp_w, sp_m = core.build_wpnts(sp_traj, sd_r, sd_l, second_traj=True)
+            sp_w, sp_m = core.build_wpnts(sp_traj, sd_r, sd_l, second_traj=True, d_m=res.get("sp_d_m"))
         else:
             sp_w, sp_m = copy.deepcopy(self.clean_bundle.sp_wpnts), copy.deepcopy(self.clean_bundle.sp_markers)
 

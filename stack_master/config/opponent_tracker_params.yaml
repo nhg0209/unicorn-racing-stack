@@ -91,7 +91,7 @@ tracking:
     # track then spent its first frames classified dynamic, the static planner dropped it, and the
     # state machine fell out of the overtake into TRAILING. An opponent at 2 m/s covers 0.30 m in
     # the same window, so the veto that keeps a static ghost off a moving car is unaffected.
-    static_net_floor_m: 0.12
+    static_net_floor_m: 0.15
     demote_speed_mps: 0.6
     # a track whose measurement lies within this radius of an initialized DYNAMIC track is a
     # spare detection cluster of that car (the box detector splits the opponent into 2 clusters

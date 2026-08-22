@@ -132,6 +132,14 @@
     <node pkg="gp_traj_predictor" exec="opp_prediction"            name="opponent_propagation_predictor" output="screen"/>
   </group>
 
+  <!-- ===== Lap timing ===== -->
+  <!-- Subscribes /state_marker, /global_waypoints and /car_state/odom{,_frenet}, all of which this
+       launch already provides, and publishes /lap_analyser/lap_data plus the RViz markers. It only
+       listens, so it cannot affect the drive; it is an arg so a run can drop it. -->
+  <arg name="lap_analyser" default="true" description="Run the lap timer (/lap_analyser/lap_data + RViz lap markers)"/>
+  <node pkg="lap_analyser" exec="lap_analyser" name="lap_analyser" output="screen"
+        if="$(var lap_analyser)"/>
+
   <!-- ===== Control: L1 / Pure-Pursuit ===== -->
   <node pkg="controller" exec="controller_manager" name="controller_manager" output="screen"
         unless="$(var use_pp_heading)">
