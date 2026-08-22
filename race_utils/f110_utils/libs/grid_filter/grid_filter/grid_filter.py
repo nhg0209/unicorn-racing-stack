@@ -58,7 +58,23 @@ class GridFilter:
         if self.image is None:
             self._log("Map image not initialized.")
             return
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (self.kernel_size, self.kernel_size))
+        # ELLIPSE, not RECT. Every caller states its kernel as a DISTANCE -- half a car for
+        # the body-safety image (body_kernel_size), the wall reserve for the re-opt gate --
+        # and a square structuring element does not erode by one distance. It reaches
+        # floor(k/2) cells along the axes but floor(k/2)*sqrt(2) diagonally, so a 7-cell
+        # kernel that means 0.15 m takes 0.21 m off a wall that runs at 45 degrees.
+        #
+        # That is not a rounding error where the track is diagonal. On bldg_0822_4, whose
+        # loop runs corner to corner, it blocked 13 stations at which the RACELINE ITSELF
+        # measures 0.16-0.21 m of real clearance -- above the 0.15 m the check claims to
+        # ask for -- and every avoidance candidate there died in _path_body_unsafe with
+        # nothing else rejecting it (reject bounds=0 obs_box=0 grid=0 body=6 curv=0).
+        #
+        # An ellipse is isotropic to within a cell (0.150 axis / 0.158 diagonal at k=7), so
+        # the distance each caller documents is the distance it gets, in every direction.
+        # This RELAXES the erosion, never tightens it: the square kernel was over-reserving
+        # off-axis, so no caller loses clearance it was relying on.
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.kernel_size, self.kernel_size))
         self.eroded_image = cv2.erode(self.image, kernel)
 
     def world_to_pixel(self, x, y):
