@@ -6,40 +6,21 @@
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/SIM" if="$(var sim)"/>
   <let name="config_dir" value="$(find-pkg-share stack_master)/config/CAR" unless="$(var sim)"/>
   <arg name="vehicle_config" default="$(var config_dir)/vehicle_config.yaml"/>
-  <!-- VESC serial port. USB serial device names differ per machine/OS (Linux
-       /dev/ttyACM*, macOS /dev/cu.usbmodem*, and they renumber on replug), so it is
-       NOT baked into the shared vehicle_config.yaml. Set VESC_PORT per-machine in
-       unicorn.local.sh (ideally a stable /dev/serial/by-id/... path), or override
-       with vesc_port:=/dev/... . Defaults to /dev/ttyACM0 when VESC_PORT is unset. -->
-  <arg name="vesc_port"      default="$(env VESC_PORT /dev/ttyACM0)" description="VESC serial port; overrides the port in vehicle_config.yaml"/>
   <arg name="use_estop"      default="false"               description="Use emergency stop (true) or not (false)"/>
-  <!-- ELRS RC receiver -> /joy (same topic the mux drives the car from). Mirrors the
-       ros2_ws low_level_mac setup: elrs_joy streams /joy at 100Hz (failsafe neutral
-       when no signal). simple_mux routes /joy to the car unless keyboard teleop is
-       selected. Real car only (needs the USB receiver). -->
-  <arg name="elrs"           default="true"   description="Start elrs_joy (ELRS RC -> /joy) on the real car"/>
-  <arg name="elrs_ft232"     default="true"   description="ELRS variant: true=FT232 (CRSF 420000), false=CP2102 (/dev/ELRS)"/>
-  <!-- Livox MID-360 3D LiDAR: coexists with urg (2D /scan). Publishes /livox/lidar
-       (PointCloud2) + /livox/imu in frame_id 'livox_frame'. Real car only; needs the
-       livox network (host 192.168.1.2, see livox_ros_driver2/config/MID360_config.json).
-       The wrapper launch also fixes macOS DYLD_LIBRARY_PATH for the plugin dlopen. -->
-  <arg name="livox"                default="true" description="Start the Livox MID-360 driver on the real car"/>
-  <arg name="use_system_timestamp" default="false" description="Livox stamp source: false=device HW clock (epoch after mac driver fix; matches car2, header=scan BEGIN -> kiss stamp_at_scan_end=false). true=ROS now() at publish (scan END)."/>
-  <!-- see3cam via opencv_cam. macOS denies /dev/video access to processes not
-       attached to a GUI session (SSH is one such case); headless:=true skips
-       the camera node for exactly that situation, leave false on a GUI login. -->
-  <arg name="camera"        default="true"  description="Start the see3cam (opencv_cam) driver on the real car"/>
-  <arg name="headless"      default="false" description="Skip the camera node (no attached macOS GUI session, e.g. plain SSH)"/>
-  <arg name="camera_index"  default="0"     description="OpenCV device index"/>
-  <arg name="camera_width"  default="1280"  description="Capture width in pixels"/>
-  <arg name="camera_height" default="720"   description="Capture height in pixels"/>
-  <arg name="camera_fps"    default="60"    description="Capture framerate (fps)"/>
-  <!-- Hokuyo 2D LiDAR (urg_node -> /scan). Disabled by default; set hokuyo:=true to
-       start it. The Livox MID-360 is the primary LiDAR. -->
-  <arg name="hokuyo"               default="false" description="Start the Hokuyo (urg_node) 2D LiDAR driver on the real car"/>
+  <!-- 2026-07-30: 이 차(nuc14)는 Hokuyo 2D 라이다가 없다. 설정은 192.168.0.10 을
+       보는데 NUC 이더넷은 192.168.1.102/24 (Livox MID360 192.168.1.197 전용) 라
+       urg_node 가 2.5초마다 'could not open ethernet port' 를 무한 반복했다.
+       주행에는 영향 없지만(localization=Livox, MPCC detector=false 라 /scan 미사용)
+       로그가 묻혀 진짜 에러를 놓친다. Hokuyo 달린 차에서는 use_2d_lidar:=true. -->
+  <arg name="use_2d_lidar"   default="false"              description="Hokuyo 2D LiDAR(urg_node) 사용. 이 차엔 없어서 기본 false"/>
+  <!-- Livox MID-360: now started from low_level (was launched separately). So
+       localization.launch alone brings it up, matching car1. Set livox:=false to
+       launch livox_lidar.launch.py by hand instead. -->
+  <arg name="livox"                default="true"  description="Start the Livox MID-360 driver (/livox/lidar, /livox/imu)"/>
+  <arg name="use_system_timestamp" default="false"  description="INERT on this car: nuc uses upstream livox_ros_driver2 PointCloud2 path (xfer_format=0) which stamps header=scan BEGIN (device time) regardless; the arg is not passed to the driver Node. Kept false for clarity + to match kiss stamp_at_scan_end=false and car1."/>
   <!-- Keyboard teleop: start keyboard_joy (pynput -> /joy_keyboard) and route the
        mux to it. The pitwall panel's Joy/Keyboard buttons can still switch at runtime. -->
-  <arg name="keyboard_teleop" default="false"             description="Drive the ego with the keyboard instead of a joystick"/>
+  <arg name="keyboard_teleop" default="false"              description="Drive the ego with the keyboard instead of a joystick"/>
   <!-- virtual_perception (scan_overlay + virtual opponent + static obstacles).
        Defaults ON in sim (preserves prior behavior), OFF on the real car; toggle
        with virtual:=true (e.g. to overlay a virtual opponent onto the real LiDAR). -->
@@ -56,7 +37,6 @@
       <push_ros_namespace namespace="vesc"/>
       <node pkg="vesc_driver" exec="vesc_driver_node" name="vesc_driver_node" output="screen">
         <param from="$(var vehicle_config)"/>
-        <param name="port" value="$(var vesc_port)"/>
       </node>
       <include file="$(find-pkg-share vesc_ackermann)/launch/ackermann_to_vesc_node.launch.xml">
         <arg name="vesc_config" value="$(var vehicle_config)"/>
@@ -71,50 +51,31 @@
          identity remap leaves it on /scan. -->
     <let name="lidar_scan_out" value="/scan_raw" if="$(var virtual)"/>
     <let name="lidar_scan_out" value="/scan"     unless="$(var virtual)"/>
-    <group if="$(var hokuyo)">
+    <group if="$(var use_2d_lidar)">
       <node pkg="urg_node" exec="urg_node_driver" name="urg_node" output="screen">
         <param from="$(var vehicle_config)"/>
         <remap from="/scan" to="$(var lidar_scan_out)"/>
       </node>
     </group>
 
-    <!-- Static TFs (base_link->laser, IMU frames) now come from per-vehicle config
-         so they can differ by SIM/CAR — edit config/CAR/static_transforms.yaml,
-         no launch change needed. config_dir is CAR here (this is the unless-sim
-         group); in sim base_link->laser comes from the gym URDF and there is no IMU. -->
-    <node pkg="stack_master" exec="static_tf_publisher.py" name="static_tf_publisher" output="screen">
-      <param from="$(var config_dir)/static_transforms.yaml"/>
-    </node>
-
-    <!-- ELRS RC receiver -> /joy. FT232 by default; elrs_ft232:=false uses CP2102
-         (/dev/ELRS). Override the serial port with port:=/dev/tty.usbserial-XXX. -->
-    <group if="$(var elrs)">
-      <include file="$(find-pkg-share elrs_joy)/launch/elrs_joy_ft232.launch.py"
-               if="$(var elrs_ft232)"/>
-      <include file="$(find-pkg-share elrs_joy)/launch/elrs_joy.launch.py"
-               unless="$(var elrs_ft232)"/>
-    </group>
-
-    <!-- Livox MID-360 3D LiDAR (coexists with urg). Wrapper sets macOS DYLD before
-         launching livox_ros_driver2's msg_MID360 driver. -->
+    <!-- Livox MID-360 3D LiDAR -> /livox/lidar (PointCloud2) + /livox/imu.
+         Uses this car's own livox_lidar.launch.py (direct Node, xfer_format=0).
+         Do NOT also run livox_lidar.launch.py by hand (double-launch). -->
     <group if="$(var livox)">
       <include file="$(find-pkg-share stack_master)/launch/livox_lidar.launch.py">
         <arg name="use_system_timestamp" value="$(var use_system_timestamp)"/>
       </include>
     </group>
 
-    <!-- see3cam (opencv_cam) -> /image_raw (+ /image_raw/compressed). Skipped
-         entirely when headless:=true (see the arg comment above). -->
-    <node pkg="opencv_cam" exec="opencv_cam_main" name="opencv_cam_node" output="screen"
-          if="$(eval '\'$(var camera)\' == \'true\' and \'$(var headless)\' != \'true\'')">
-      <param name="index"  value="$(var camera_index)"/>
-      <param name="width"  value="$(var camera_width)"/>
-      <param name="height" value="$(var camera_height)"/>
-      <param name="fps"    value="$(var camera_fps)"/>
-      <param name="camera_info_path"
-             value="$(find-pkg-share opencv_cam)/config/see3cam.yaml"/>
-      <param name="image_raw.compressed.jpeg_quality" value="30"/>
-    </node>
+    <!-- Static TF: base_link → laser -->
+    <node pkg="tf2_ros" exec="static_transform_publisher" name="base_to_laser_broadcaster"
+          args="--x 0.27 --y 0 --z 0.11 --qx 0 --qy 0 --qz 0 --qw 1 --frame-id base_link --child-frame-id laser"/>
+    <!-- Static TF: base_link -> vesc_imu (yaw +90 deg, Z axis same as base_link) -->
+    <node pkg="tf2_ros" exec="static_transform_publisher" name="base_to_vesc_imu_broadcaster"
+          args="--x 0 --y 0 --z 0.0 --roll 0 --pitch 0 --yaw 1.5707963 --frame-id base_link --child-frame-id vesc_imu"/>
+    <!-- Static TF: vesc_imu -> vesc_imu_rot (reverse yaw=-90 deg: same orientation as base_link) -->
+    <node pkg="tf2_ros" exec="static_transform_publisher" name="vesc_imu_to_rot_broadcaster"
+          args="--x 0 --y 0 --z 0 --roll 0 --pitch 0 --yaw -1.5707963 --frame-id vesc_imu --child-frame-id vesc_imu_rot"/>
 
   </group>
 
@@ -136,11 +97,17 @@
        tracking_merger run. Gated by `virtual`; when off, the sensor owns /scan
        directly and none of these nodes start. -->
   <group if="$(var virtual)">
+    <!-- The kinematic opponent_vehicle IS the opponent in BOTH sim and real:
+         gym_bridge_launch.py hardcodes use_external_opponent=true, so the gym runs
+         EGO-ONLY (no /goal_pose sub, no opp pubs/TF) and the virtual opponent owns the
+         whole /goal_pose -> /opp_* -> overlay chain. Do NOT disable it in sim, or a
+         2D Goal Pose spawns nothing. -->
     <include file="$(find-pkg-share virtual_perception)/launch/virtual_perception.launch.xml">
       <arg name="map_path"       value="$(var map_path).yaml"/>
       <arg name="ego_odom_topic" value="/car_state/odom"/>
       <arg name="scan_in"        value="/scan_raw"/>
       <arg name="scan_out"       value="/scan"/>
+      <arg name="virtual_opponent" value="true"/>
     </include>
   </group>
 
@@ -159,7 +126,7 @@
     <param from="$(var vehicle_config)"/>
     <param name="in_topic"      value="/vesc/high_level/ackermann_cmd"/>
     <param name="out_topic"     value="/vesc/ackermann_cmd"/>
-    <param name="joy_max_speed" value="$(env JOY_MAX_SPEED 4.0)"/>   <!-- per-car via JOY_MAX_SPEED in unicorn.local.sh; MUST be a float e.g. 7.0 (an int crashes the double param). default 4.0 -->
+    <param name="joy_max_speed" value="9.0"/>
     <param name="use_estop" value="$(var use_estop)"/>
     <param name="sim" value="$(var sim)"/>
     <!-- start honouring /joy_keyboard immediately when keyboard teleop is on -->

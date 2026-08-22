@@ -27,10 +27,6 @@ class SimpleMuxNode(Node):
         self.declare_parameter('rate_hz',                        50.0)
         self.declare_parameter('joy_max_speed',                  4.0)
         self.declare_parameter('joy_max_steer',                  0.4)
-        # 2026-07-21 축 매핑 파라미터화: 송신기 채널 순서 바뀌면 여기만 조정.
-        # 실측(axprobe): 스로틀=axis3, 조향=axis1 (기존 하드코딩 1/3 뒤바뀜).
-        self.declare_parameter('joy_speed_axis',                 1)
-        self.declare_parameter('joy_steer_axis',                 3)
         self.declare_parameter('joy_freshness_threshold',        1.0)
         self.declare_parameter('servo_min',                      0.15)
         self.declare_parameter('servo_max',                      0.85)
@@ -54,8 +50,6 @@ class SimpleMuxNode(Node):
         self.use_estop = p('use_estop')
         self.max_speed               = p('joy_max_speed')
         self.max_steer               = p('joy_max_steer')
-        self.speed_axis              = int(p('joy_speed_axis'))
-        self.steer_axis              = int(p('joy_steer_axis'))
         self.joy_freshness_threshold = p('joy_freshness_threshold')
 
         servo_offset = p('steering_angle_to_servo_offset')
@@ -143,9 +137,8 @@ class SimpleMuxNode(Node):
         if use_human:
             drive = AckermannDriveStamped()
             drive.header.stamp = self.get_clock().now().to_msg()
-            _sa = int(self.get_parameter('joy_steer_axis').value); _va = int(self.get_parameter('joy_speed_axis').value)  # 2026-07-21 live 반영 (재시작 없이 rqt/param set)
-            drive.drive.steering_angle = -msg.axes[_sa] * self.max_steer if len(msg.axes) > _sa else 0.0  # 조이 부호: IFAC servo gain(+0.7579)에 맞춤
-            drive.drive.speed          = msg.axes[_va] * self.max_speed  if len(msg.axes) > _va else 0.0
+            drive.drive.steering_angle = msg.axes[3] * self.max_steer if len(msg.axes) > 3 else 0.0
+            drive.drive.speed          = msg.axes[1] * self.max_speed  if len(msg.axes) > 1 else 0.0
             self.human_drive   = drive
             self.current_host  = 'humandrive'
         elif use_auto:
@@ -161,10 +154,7 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        # On Ctrl-C, rclpy's signal handler already shut the context down;
-        # guard so the explicit shutdown doesn't raise "rcl_shutdown already called".
-        if rclpy.ok():
-            rclpy.shutdown()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

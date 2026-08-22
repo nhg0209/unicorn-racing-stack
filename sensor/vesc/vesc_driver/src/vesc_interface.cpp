@@ -147,10 +147,7 @@ void VescInterface::Impl::packet_creation_thread()
 void VescInterface::Impl::connect(const std::string & port)
 {
   uint32_t baud_rate = 115200;
-  // macOS USB CDC serial does not support hardware flow control (RTS/CTS);
-  // set_option fails with "Operation not supported on socket". VESC over USB is a
-  // virtual serial port with no flow control, so NONE is correct on all platforms.
-  auto fc = drivers::serial_driver::FlowControl::NONE;
+  auto fc = drivers::serial_driver::FlowControl::HARDWARE;
   auto pt = drivers::serial_driver::Parity::NONE;
   auto sb = drivers::serial_driver::StopBits::ONE;
   device_config_ =
