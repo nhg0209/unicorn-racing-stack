@@ -187,6 +187,16 @@ class StateMachine(Node):
         # per-cycle) because each request drops the planner's committed path.
         self._relax_sent_t = None
         self.relax_repeat_sec = 2.0
+        # Sustain counter for the PRE-EMPTIVE request (see _request_preemptive_relax).
+        # Separate from _static_deadlock_counter: the two are disjoint by speed and
+        # must not consume each other's dwell.
+        self._relax_preempt_counter = 0
+        # Mirrors of the pre-emptive relax params, read off the node like every other
+        # _check_* input (StateMachineParams._NODE_MIRRORED_PARAMS keeps them live).
+        self.relax_preemptive_enable = self.params.relax_preemptive_enable
+        self.relax_preemptive_gap_m = self.params.relax_preemptive_gap_m
+        self.relax_preemptive_dwell_s = self.params.relax_preemptive_dwell_s
+        self.relax_preemptive_max_speed_mps = self.params.relax_preemptive_max_speed_mps
         # Velocity-profile cache, one slot per path source (see update_velocity). The quantum is
         # how much v_start may drift before the profile is re-solved: fine enough that the
         # commanded head speed tracks the car, coarse enough that a frozen path is solved once.
@@ -1088,6 +1098,91 @@ class StateMachine(Node):
         if (self.now_sec() - time_to_float(src_wpnts.header.stamp)) > wpnts_data.latest_threshold:
             return False
         return bool(self._check_on_spline(wpnts_data))
+
+    def _request_preemptive_relax(self) -> bool:
+        """Ask the static planner for a reduced-margin retry BEFORE the car has to stop.
+
+        _check_static_trailing_deadlock raises the same request on
+        /planner/avoidance/relax, but only once the car has been under
+        static_deadlock_speed_mps for static_deadlock_timeout_s -- that is, once it has
+        already stopped. An obstacle that only becomes visible late (a corner exit, a box
+        occluded until the car was committed) is exactly the case where waiting for that
+        is waiting too long: TRAILING's gap PID has no fixed point but v = 0 behind a
+        stationary box, so the car converges on a standstill while the planner is still
+        reporting no candidate, and the escape hatch opens after the outcome it was meant
+        to prevent.
+
+        So raise the same request on the SYMPTOM instead of the outcome: a static obstacle
+        inside relax_preemptive_gap_m, the planner reporting no feasible candidate, and
+        the car still moving.
+
+        DISJOINT FROM THE DEADLOCK CHECK, by speed. Below static_deadlock_speed_mps this
+        returns early and the deadlock check owns the case; at or above it, that check
+        cannot fire. Both share _relax_sent_t, so the planner never sees two requests
+        inside one relax_repeat_sec no matter which path is live.
+
+        FAIL-CLOSED on the feasibility signal. Only a FRESH False counts: stale or
+        never-received means the planner is dead or miswired, and reduced margins are not
+        the answer to that -- the same reasoning as the commit gate in
+        _check_static_overtaking_mode.
+
+        WHAT THIS TRADES. A relax overrides the planner's squeeze enable flag AND its
+        speed gate, down to its floors (squeeze_safety_floor_m, squeeze_wall_floor_m).
+        That gate exists because trading clearance for motion is only defensible where a
+        mis-clearance is survivable, and it used to be safe to override precisely because
+        the only caller had established the car was stopped. That is no longer true here,
+        so the exposure is bounded explicitly by relax_preemptive_max_speed_mps instead of
+        implicitly by the car being stationary. Below the planner's own
+        squeeze_max_speed_mps this changes nothing: there the squeeze already runs
+        unasked.
+
+        Held for relax_preemptive_dwell_s before firing, because static_feasible drops for
+        a cycle whenever the planner is mid-solve and each request costs it its committed
+        path -- the flicker the rate limit alone does not prevent.
+
+        Side-effecting (it publishes), so it is called from the loop, NEVER from a
+        transition function.
+        """
+        if not self.relax_preemptive_enable:
+            self._relax_preempt_counter = 0
+            return False
+        target = self.obstacles_in_interest[0] if self.obstacles_in_interest else None
+        if target is None or not target.is_static or not self.track_length:
+            self._relax_preempt_counter = 0
+            return False
+        # Below this the deadlock check owns the case; above it, that check cannot fire.
+        v = abs(self.cur_vs)
+        if v < self.static_deadlock_speed_mps or v > self.relax_preemptive_max_speed_mps:
+            self._relax_preempt_counter = 0
+            return False
+        # FRESH False only -- see the fail-closed note above.
+        if self._static_feasible_t is None:
+            self._relax_preempt_counter = 0
+            return False
+        feas_age = self.now_sec() - self._static_feasible_t
+        if self.static_avoidance_feasible or feas_age > self.static_feasible_stale_sec:
+            self._relax_preempt_counter = 0
+            return False
+        gap = (target.s_start - self.cur_s) % self.track_length
+        if gap > self.relax_preemptive_gap_m:
+            self._relax_preempt_counter = 0
+            return False
+
+        self._relax_preempt_counter += 1
+        if self._relax_preempt_counter <= self.relax_preemptive_dwell_s * self.rate_hz:
+            return False
+        now = self.now_sec()
+        if (self._relax_sent_t is not None) and (now - self._relax_sent_t) < self.relax_repeat_sec:
+            return False
+        self.relax_pub.publish(Bool(data=True))
+        self._relax_sent_t = now
+        self.get_logger().warn(
+            f"[{self.name}] PRE-EMPTIVE RELAX: {gap:.2f} m from static obstacle id={target.id} "
+            f"at {self.cur_vs:+.2f} m/s with static_feasible=False for "
+            f"{self._relax_preempt_counter / self.rate_hz:.2f} s. Requested a reduced-margin "
+            f"retry on /planner/avoidance/relax before the trailing deadlock can form.",
+            throttle_duration_sec=2.0)
+        return True
 
     def _check_static_trailing_deadlock(self) -> bool:
         """TRAILING behind a STATIC obstacle is a dead end, and nothing said so.
@@ -2475,6 +2570,13 @@ class StateMachine(Node):
         # Unconditional, every cycle, before any transition logic runs: the planner gates its
         # engage on this and fails closed when it goes stale.
         self._publish_ot_section_check()
+
+        # Also unconditional and also before the transition logic: this asks the
+        # static planner to retry at reduced margins while the car is still moving,
+        # so the answer can arrive before TRAILING has braked to the standstill the
+        # deadlock check waits for. obstacles_in_interest is written by
+        # obstacle_perception_cb, so it is fresh here regardless of loop ordering.
+        self._request_preemptive_relax()
 
         self.update_waypoints()
         self.gb_closest_target = None

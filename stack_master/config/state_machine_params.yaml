@@ -94,6 +94,21 @@ state_machine:
     pred_splini_ttl: 2.0
     overtaking_ttl_sec: 3.0
     ftg_speed_mps: 0.1
+
+    # PRE-EMPTIVE RELAX. The static planner already answers /planner/avoidance/relax with a
+    # reduced-margin retry, but the only caller used to be the trailing deadlock, which fires
+    # after the car has stopped. For a box that appears late (a corner exit) that is after the
+    # outcome it was meant to prevent, so the same request is now also raised while the car is
+    # still moving. See _request_preemptive_relax.
+    relax_preemptive_enable: true
+    relax_preemptive_gap_m: 6.0        # [m] ask once the nearest static obstacle is this close
+    relax_preemptive_dwell_s: 0.3      # [s] static_feasible must stay False this long first
+    # [m/s] ceiling on the ask. A relax lets the planner squeeze to its floors (5 cm to the box,
+    # 8 cm to the wall) and overrides the speed gate that guards that trade -- a gate it was safe
+    # to override only while the car was stopped. At or below the planner's squeeze_max_speed_mps
+    # (static_avoidance_params.yaml, 3.0) this whole feature is a no-op: under that speed the
+    # planner already squeezes without being asked.
+    relax_preemptive_max_speed_mps: 6.0
     ftg_timer_sec: 3.0
     ftg_active: false
     force_GBTRACK: false

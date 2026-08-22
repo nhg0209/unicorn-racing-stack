@@ -1322,8 +1322,13 @@ class ObstacleSpliner(Node):
         give -- so the caller falls through to the existing diagnostic + feasible=False.
 
         A live relax request (see relax_cb) overrides the enable flag and the speed gate, but never
-        the floors: the SM has established that the car is stopped and stuck, which is the thing
-        those two gates were approximating.
+        the floors. It used to mean only one thing -- the SM had established that the car was
+        stopped and stuck, which is what those two gates were approximating. It no longer does:
+        the SM also raises it PRE-EMPTIVELY, while the car is still moving, for an obstacle that
+        appeared too late to solve at the design margins (see _request_preemptive_relax). So the
+        speed this runs at is now bounded on the SM side by relax_preemptive_max_speed_mps rather
+        than implicitly by the car being stationary; the floors here remain the only clearance
+        guarantee either caller gets.
 
         The schedule interpolates linearly to the floor in squeeze_steps attempts rather than
         jumping straight to it, so a section that only needs a couple of centimetres is driven with
