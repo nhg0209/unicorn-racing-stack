@@ -325,6 +325,17 @@ class MPC:
         # satisfy both → braked to 2.9 m/s every lap to soften slack.
         # 0.3 m matches car_R 0.135 + obs_marker 0.135 + 0.03 m margin and
         # keeps the required offset (0.435 m) inside the corridor.
+        # ── 좁은 틈 통과 문턱 (2026-08-22) ────────────────────────────
+        # 0723 에 만든 narrow-pass 예외가 문턱 0.70 으로 하드코딩돼 있었는데,
+        # 이후 R_safe(0.40)+R_car(0.30) 이 정확히 0.70 이 되면서 주 판정과
+        # 값이 같아져 **예외가 완전히 무효화**됐다 (좁은 틈 = 항상 side 0 =
+        # BLOCK-STOP). 대회 규정은 "틈 50cm 이상이면 통과"이므로 물리 최소로
+        # 되돌린다: 장애물중심→벽 r ≥ r_obs(0.15) + [차반폭0.15+여유0.05]
+        # + [차반폭0.15+벽여유0.05] = 0.55.  50cm 틈이면 r=0.65 라 통과.
+        self.narrow_room_live   = 0.55   # [m] 이 이상이면 서행 통과 허용
+        self.narrow_pass_v_live = 1.5    # [m/s] 통과 중 속도 상한 (0=제한없음)
+        self.narrow_pass_hold   = 1.5    # [s]  판정 후 속도상한 유지 시간
+        self._narrow_pass_until = 0.0
         self.R_safe_live    = 0.3
         # 2026-08-06 최종리뷰 G1: OT 상태기계가 obstacle 제약(p_arr[7])만
         # 축소하기 위한 전용 채널. None=비활성(R_safe_live 그대로 사용).
@@ -1937,8 +1948,11 @@ class MPC:
                     # 0723d 문턱 0.60→0.70: 실측 최소폭 = 장애물쪽 0.31(반폭 합)
                     # + 벽쪽 코너 0.33 ≈ 0.68 (bag 13_10 산수. gym 직사각형 판정
                     # 픽스와 세트 — 그 전 원형 0.44 기준으론 0.77도 불가였음).
-                    nk_up = (r_up - float(extra_up) >= 0.70) and (+1 not in _stuck)
-                    nk_dn = (r_dn - float(extra_dn) >= 0.70) and (-1 not in _stuck)
+                    # 0822: 하드코딩 0.70 → narrow_room_live. 0.70 은 주 판정
+                    # w_car_safe 와 값이 같아 예외가 죽어 있었다 (위 주석 참조).
+                    _nr = float(getattr(self, 'narrow_room_live', 0.55))
+                    nk_up = (r_up - float(extra_up) >= _nr) and (+1 not in _stuck)
+                    nk_dn = (r_dn - float(extra_dn) >= _nr) and (-1 not in _stuck)
                     if nk_up and nk_dn:
                         _side = +1 if (r_up - extra_up) >= (r_dn - extra_dn) else -1
                     elif nk_up:
@@ -1947,6 +1961,18 @@ class MPC:
                         _side = -1
                     else:
                         _side = 0    # 물리적으로도 불가 → BLOCK-STOP
+                    if _side != 0:
+                        # 좁은 틈 통과 확정 — 추종오차가 그대로 접촉이 되는
+                        # 구간이라 속도를 낮춘다 (mpc_node 가 이 시각을 본다).
+                        self._narrow_pass_until = (
+                            time.monotonic()
+                            + float(getattr(self, 'narrow_pass_hold', 1.5)))
+                        self._log.info_throttle(
+                            1.0,
+                            "[MPC] 좁은틈 통과 side=%+d (r_up=%.2f r_dn=%.2f "
+                            "문턱=%.2f, 주판정 %.2f 미달)",
+                            _side, r_up - float(extra_up), r_dn - float(extra_dn),
+                            _nr, w_car_safe)
                 # 0723c keepout 공간맞춤(shift): 선택 side의 실측 room에 keepout이
                 # 안 들어가면 그 차이만큼 solver 경계를 안쪽으로 — h_obs vs corridor
                 # soft 모순(횡마비→정면 STUCK, bag 13_01 s14.5 3/6랩)의 원천 제거.
@@ -2470,6 +2496,49 @@ class MPC:
             side_pref = 0
             e_c_obs_val = 0.0
             _s_obs1 = None
+            # ── 2026-08-22 v2: 선택기·커밋과 무관하게 "경로 위" 장애물은 무조건 제약 ──
+            # v1(sel_is_real 요구)은 select_front_obstacle 이 센티넬을 내면(실차 32.9%)
+            # 발동하지 않았다. 실차 실측(맥 14:38): 2 m 내 제약활성 100% 인 장애물만
+            # 무접촉, 8~28% 인 것들은 전부 접촉/스침 — 활성률과 접촉이 완전 상관.
+            # 규칙: 라인 횡거리가 (차반폭 0.175 + 장애물반폭 0.15 + 여유 0.10) 이내이고
+            #       전방 6 m 안이면, 커밋 슬롯 상태와 무관하게 가장 가까운 것을 제약한다.
+            try:
+                _s_car_b = float(initial_state[IDX_S]) % L
+                _band = 0.175 + 0.15 + 0.10
+                _best = None
+                for _ob in (obstacles or []):
+                    if not (hasattr(_ob, '__len__') and len(_ob) >= 2):
+                        continue
+                    _ox, _oy = float(_ob[0]), float(_ob[1])
+                    _so, _eo = self._obstacle_frenet(_ox, _oy)
+                    _dsb = (_so - _s_car_b) % L
+                    if _dsb > 0.5 * L:
+                        _dsb -= L
+                    if -0.5 <= _dsb <= 6.0 and abs(float(_eo)) <= _band:
+                        if _best is None or _dsb < _best[0]:
+                            _best = (_dsb, _ox, _oy, _so, _eo)
+                if _best is not None:
+                    _dd = math.hypot(initial_state[0] - _best[1],
+                                     initial_state[1] - _best[2])
+                    _sd1 = self.decide_side_pref(_best[3], _best[4],
+                                                 obs_xy=(_best[1], _best[2]))
+                    if _sd1 != 0:
+                        sel = [_dd, _best[1], _best[2]]
+                        side_pref = float(_sd1)
+                        e_c_obs_val = float(self._narrow_shifted(
+                            _best[1], _best[2], _sd1, _best[4]))
+                        _s_obs1 = float(_best[3])
+                        self._log.info_throttle(
+                            2.0, "[MPC] 경로상 장애물 강제제약 (d=%.2f Δs=%.2f e_c=%+.2f side=%+d)",
+                            _dd, _best[0], float(_best[4]), int(_sd1))
+                    else:
+                        # 피할 방향이 없다 → 감속/정지. 노드 명령단이 이 값을 보고
+                        # 장애물 앞에서 멈춘다(BLOCK-STOP). "멈추고 생각하기".
+                        self._obs_blocked_d = float(_dd)
+                        self._log.warn_throttle(
+                            1.0, "[MPC] 경로상 장애물인데 피할 쪽 없음 (d=%.2f) — 정지가드", _dd)
+            except Exception as _e1x:
+                self._log.warn_throttle(5.0, "[MPC] 경로상 제약 실패: %s", _e1x)
         self.dbg_side_pref = float(side_pref)
         # ── P2 Stage-B (0722o): 2번째 장애물 슬롯 — 매 사이클 fresh ──────
         # sel(#1)·committed 외 장애물 중 차 전방 Δs∈(0.3,9m) 최근접 1개.

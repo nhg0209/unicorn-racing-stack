@@ -63,7 +63,7 @@ mpc_node:
     brake_anticip_d_min: 1.0  # 2026-07-16 anticip 캡 근거리(d<1m) 제외 — 직선 가속목줄 해제(plan6.9→cmd5.8 손실 복구). 0=기존
     speed_cmd_err_max: 0.0  # 2026-07-21 NUC: off로 시작 (VESC 명령체인 실측 후 재튜닝). Mac값=2.2 → 원주석: 직선 서징 수정: cmd<=실속+1.5 (지터필터+erpm캡 슬래밍 방지, VESC 구동력은 유지). 0=off
     brake_preview_s: 0.4   # 2026-07-16 min-guard 창만 짧게 — 직선 후반 조기제동 해소 (가속 preview 1.0 유지, 원거리 제동은 anticip 담당). 0=기존
-    slew_up_rate: 5.0   # 2026-07-16 명령 톱니 필터 (실가속 ~3 이라 무손실). 기본 8
+    slew_up_rate: 3.0   # 0822 mu스케일 재적용: mu0.55 원(5.40)에서 5.0 은 횡여유 2.0 뿐 — 재출발 조향무력 사고(17:03). 되돌리기 5.0
     corridor_hard2_s0: 0.8   # 0821b bldg_0821 심 리허설 스캔 근거(침범 s16.5/19.0)
     corridor_hard2_s1: 8.2
     corridor_hard2_factor: 1.0   # 0821b

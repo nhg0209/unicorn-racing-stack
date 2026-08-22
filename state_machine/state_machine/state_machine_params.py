@@ -51,6 +51,10 @@ class StateMachineParams:
         "free_check_predict_dynamic",
         "free_check_pass_speed",
         "free_check_dynamic_ot_slow",
+        "relax_preemptive_enable",
+        "relax_preemptive_gap_m",
+        "relax_preemptive_dwell_s",
+        "relax_preemptive_max_speed_mps",
     }
 
     def __init__(self, node: "StateMachine") -> None:
@@ -352,6 +356,63 @@ class StateMachineParams:
             ),
         )
         self.ftg_speed_mps: float = node.get_parameter("ftg_speed_mps").value
+
+        # ---- PRE-EMPTIVE RELAX ------------------------------------------- #
+        # _check_static_trailing_deadlock already asks the static planner for a
+        # reduced-margin retry on /planner/avoidance/relax, but only after the car has
+        # been under static_deadlock_speed_mps for static_deadlock_timeout_s -- i.e.
+        # after it has already stopped. For an obstacle that only becomes visible late
+        # (a corner exit, a box occluded until the car was committed) that is too late
+        # to be a recovery: the gap PID converges on v = 0 first and the run ends with
+        # the car parked short of a box it had the room to pass. These raise the SAME
+        # request on the symptom -- no feasible candidate, obstacle close, still moving.
+        self._declare(
+            "relax_preemptive_enable", True,
+            ParameterDescriptor(
+                description="Ask the static planner for a reduced-margin retry BEFORE the car "
+                            "has to stop, instead of only after the trailing deadlock",
+                type=ParameterType.PARAMETER_BOOL,
+            ),
+        )
+        self.relax_preemptive_enable: bool = node.get_parameter("relax_preemptive_enable").value
+
+        self._declare(
+            "relax_preemptive_gap_m", 6.0,
+            ParameterDescriptor(
+                description="Ask only once the nearest static obstacle is within this gap [m]",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=1.0, to_value=20.0, step=0.5)],
+            ),
+        )
+        self.relax_preemptive_gap_m: float = node.get_parameter("relax_preemptive_gap_m").value
+
+        self._declare(
+            "relax_preemptive_dwell_s", 0.3,
+            ParameterDescriptor(
+                description="How long static_feasible must stay False before asking [s]. The flag "
+                            "drops for a cycle whenever the planner is mid-solve, and each request "
+                            "costs it its committed path",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=2.0, step=0.05)],
+            ),
+        )
+        self.relax_preemptive_dwell_s: float = node.get_parameter("relax_preemptive_dwell_s").value
+
+        self._declare(
+            "relax_preemptive_max_speed_mps", 6.0,
+            ParameterDescriptor(
+                description="Do not ask above this speed [m/s]. A relax lets the planner squeeze "
+                            "down to its floors (5 cm to the box, 8 cm to the wall), and the "
+                            "squeeze speed gate it overrides exists because that trade is only "
+                            "defensible where a mis-clearance is survivable. Setting this at or "
+                            "below squeeze_max_speed_mps makes the feature a no-op: under that "
+                            "speed the planner already squeezes without being asked",
+                type=ParameterType.PARAMETER_DOUBLE,
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=15.0, step=0.25)],
+            ),
+        )
+        self.relax_preemptive_max_speed_mps: float = node.get_parameter(
+            "relax_preemptive_max_speed_mps").value
 
         self._declare(
             "ftg_timer_sec", 3.0,

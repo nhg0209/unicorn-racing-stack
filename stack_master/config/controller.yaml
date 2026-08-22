@@ -38,7 +38,7 @@ controller_manager:
     # the cases where the SM hands the same avoidance geometry to the controller under TRAILING
     # (holding the avoidance reference through a drop, and on the trailing approach) -- there the
     # 0.5 m bar fired and released repeatedly, i.e. a sawtooth in the speed command.
-    AEB_thres_overtake: 0.9
+    AEB_thres_overtake: 1.2
     AEB_offline_d_thres: 0.1
     # The bar is LATCHED. Without hysteresis every wobble of the measured distance around it is a
     # fresh engage and release, i.e. a 2 m/s clamp toggling at the loop rate -- measured on the
