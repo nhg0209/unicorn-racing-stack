@@ -1,0 +1,66 @@
+[2026-07-14 06:57:20.410] [glim] [info] config_path: /cfg
+[2026-07-14 06:57:20.411] [glim] [info] load libodometry_estimation_gpu.so
+[2026-07-14 06:57:20.552] [glim] [info] load libsub_mapping.so
+[2026-07-14 06:57:20.553] [glim] [info] load libglobal_mapping.so
+[2026-07-14 06:57:20.558] [glim] [info] topics:
+[2026-07-14 06:57:20.558] [glim] [info] - /livox/imu
+[2026-07-14 06:57:20.558] [glim] [info] - /livox/lidar
+[2026-07-14 06:57:20.558] [glim] [info] - /image
+[2026-07-14 06:57:20.558] [glim] [info] bag_filenames:
+[2026-07-14 06:57:20.558] [glim] [info] - /bag/_0.mcap
+[2026-07-14 06:57:20.558] [glim] [warning] param glim_ros/playback_speed not found
+[2026-07-14 06:57:20.558] [glim] [warning] use default_value=100
+[2026-07-14 06:57:20.558] [glim] [info] opening /bag/_0.mcap
+[2026-07-14 06:57:20.622] [odom] [info] estimate initial IMU state
+Initial error: 2945.57, values: 33
+iter      cost      cost_change    lambda  success iter_time
+   0      1.21498      2.9e+03      1e-05      1          0
+   1         0.99         0.22      1e-06      1          0
+   2         0.99      1.6e-08      1e-07      1          0
+[2026-07-14 06:57:20.623] [odom] [info] initial IMU state estimation result
+[2026-07-14 06:57:20.623] [odom] [info] T_world_imu=se3(-0.001050,-0.002139,0.001869,-0.006532,0.134514,0.000030,0.990890)
+[2026-07-14 06:57:20.623] [odom] [info] v_world_imu=vec(-0.025431,-0.011379,-0.013914)
+[2026-07-14 06:57:20.623] [odom] [info] imu_bias=vec(0.003427,0.000264,-0.000080,0.007260,-0.006647,-0.000031)
+[2026-07-14 06:57:30.774] [glim] [info] playback speed: 4.688x
+[2026-07-14 06:57:35.793] [glim] [info] playback speed: 2.450x
+[2026-07-14 06:57:36.663] [odom] [warning] IMU prediction is not good.
+[2026-07-14 06:57:36.663] [odom] [warning] Possibly T_lidar_imu is not accurate or IMU bias is not well estimated.
+[2026-07-14 06:57:36.663] [odom] [warning] IMU validation results:
+[2026-07-14 06:57:36.663] [odom] [warning] num_validations=384
+[2026-07-14 06:57:36.663] [odom] [warning] No-IMU errors rot=0.672 +- 0.801 deg, trans=0.003 +- 0.002 m, vel=0.019 +- 0.018 m/s
+[2026-07-14 06:57:36.663] [odom] [warning] IMU errors rot=0.068 +- 0.047 deg, trans=0.003 +- 0.002 m, vel=0.015 +- 0.009 m/s
+[2026-07-14 06:57:36.663] [odom] [warning] IMU better ratios rot=0.93, trans=0.40, vel=0.62
+[2026-07-14 06:57:40.816] [glim] [info] playback speed: 1.613x
+[2026-07-14 06:57:41.284] [odom] [warning] IMU prediction is not good.
+[2026-07-14 06:57:41.284] [odom] [warning] Possibly T_lidar_imu is not accurate or IMU bias is not well estimated.
+[2026-07-14 06:57:41.284] [odom] [warning] IMU validation results:
+[2026-07-14 06:57:41.284] [odom] [warning] num_validations=448
+[2026-07-14 06:57:41.284] [odom] [warning] No-IMU errors rot=0.965 +- 1.156 deg, trans=0.003 +- 0.002 m, vel=0.022 +- 0.019 m/s
+[2026-07-14 06:57:41.284] [odom] [warning] IMU errors rot=0.074 +- 0.059 deg, trans=0.003 +- 0.002 m, vel=0.015 +- 0.010 m/s
+[2026-07-14 06:57:41.284] [odom] [warning] IMU better ratios rot=0.94, trans=0.39, vel=0.65
+[2026-07-14 06:57:45.816] [glim] [info] playback speed: 1.854x
+[2026-07-14 06:57:50.839] [glim] [info] playback speed: 1.359x
+[2026-07-14 06:57:55.844] [glim] [info] playback speed: 2.138x
+[2026-07-14 06:58:00.844] [glim] [info] playback speed: 1.609x
+[2026-07-14 06:58:05.856] [glim] [info] playback speed: 1.627x
+[2026-07-14 06:58:10.879] [glim] [info] playback speed: 2.747x
+[2026-07-14 06:58:15.910] [glim] [info] playback speed: 2.286x
+[2026-07-14 06:58:20.940] [glim] [info] playback speed: 1.849x
+[2026-07-14 06:58:22.416] [global] [warning] previous submap has only a small overlap with the current submap (0.18852685079390094)
+[2026-07-14 06:58:22.416] [global] [warning] create a between factor to prevent the submap from being isolated
+[2026-07-14 06:58:25.972] [glim] [info] playback speed: 2.365x
+[2026-07-14 06:58:30.480] [glim] [info] waiting for odometry estimation
+[2026-07-14 06:58:31.571] [glim] [info] waiting for local mapping
+[2026-07-14 06:58:31.919] [glim] [info] waiting for global mapping
+[2026-07-14 06:58:31.929] [global] [info] saving to /out/dump...
+[2026-07-14 06:58:31.930] [global] [info] serializing factor graph to /out/dump/graph.bin
+[2026-07-14 06:58:32.151] [global] [info] saving config
+[2026-07-14 06:58:32.152] [global] [info] saved
+[2026-07-14 06:58:33.578] [global] [info] Load submaps (session_id=0)
+[2026-07-14 06:58:33.609] [global] [info] deserializing factor graph
+[2026-07-14 06:58:33.610] [global] [info] deserializing values
+[2026-07-14 06:58:33.610] [global] [info] creating matching cost factors
+[2026-07-14 06:58:33.610] [global] [info] optimize
+[2026-07-14 06:58:33.610] [global] [info] done
+merged points: 94920
+wrote /out/merged.ply (94920 points)

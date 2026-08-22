@@ -1,0 +1,14 @@
+trajectory_optimizer:
+  ros__parameters:
+    # safety_margin: 0.4   # original (wrong key — node never read this)
+    # v_max:         6.0   # original (not a ROS param; set in planner/config/racecar.ini)
+    # a_lat_max:     6.0   # original (not a ROS param; set in planner/config/racecar.ini)
+    # a_long_max:    4.0   # original (not a ROS param; set in planner/config/racecar.ini)
+    # target_ds:     0.5   # original (not a ROS param; set in planner/config/racecar.ini)
+
+    # Correct parameter names matching trajectory_optimizer.py PARAMS dict.
+    safety_width_iqp:     0.5    # [m] vehicle safety width for IQP (min-curvature) optimisation
+    safety_width_sp:      0.5  # [m] vehicle safety width for shortest-path optimisation
+    safety_width_mintime: 0.50   # [m] vehicle safety width for min-time optimisation
+    enable_check_traj:    true
+    enable_mintime:       false

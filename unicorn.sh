@@ -80,6 +80,13 @@ if [ -n "${ZSH_VERSION:-}" ]; then _urs_setup=setup.zsh; else _urs_setup=setup.b
 [ -f "$_URS_WS/install/$_urs_setup" ] && source "$_URS_WS/install/$_urs_setup"
 export RAYCASTER_DIR="$_URS_REPO/race_utils/raycaster"
 
+# stack_master no longer installs maps/**/*.pcd into share/ (see its CMakeLists),
+# so point the map-reading launch files at the source tree. All of them resolve
+# their maps dir as $(env STACK_MASTER_MAPS_ROOT $(find-pkg-share stack_master)/maps),
+# and the pcd only lives in the former now. Respects an already-exported value, and
+# unicorn.local.sh is sourced later so a per-machine override still wins.
+export STACK_MASTER_MAPS_ROOT="${STACK_MASTER_MAPS_ROOT:-$_URS_REPO/stack_master/maps}"
+
 # --- macOS portability (no-op on Linux) ---
 # (1) Linux-only CLIs (taskset, ...) some launch files use via launch-prefix:
 #     put repo-tracked shims on PATH so they don't crash on macOS.

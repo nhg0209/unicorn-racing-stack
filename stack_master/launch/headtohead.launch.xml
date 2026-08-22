@@ -1,0 +1,84 @@
+<?xml version="1.0"?>
+<!--
+  headtohead.launch.xml  (ROS2 port of the ROS1 stack_master/headtohead.launch)
+  ==============================================================================
+  Full head-to-head racing autonomy on top of base_system:
+
+    perception   : detect_node + tracking_node      (/scan -> /detections -> /tracked_obstacles)
+    state machine: state_machine                     (/tracking/obstacles + raceline -> /local_waypoints, /behavior_strategy, /state_machine)
+    planning     : spliner_node                      (avoidance spline -> /planner/avoidance/otwpnts)
+    control      : pp_node                           (follows /local_waypoints -> /vesc/high_level/ackermann_cmd)
+
+  The virtual opponent and its obstacle injection (/tracking/obstacles with
+  Frenet fields) come from base_system -> low_level -> virtual_perception pkg
+  (scan_overlay overlays the box on /scan; tracking_merger publishes
+  /tracking/obstacles). Spawn / drive the opponent from the RViz Sim Control
+  panel (2D Goal Pose, then Path/FTG).
+
+  SIM : ros2 launch stack_master headtohead.launch.xml map:=f sim:=true
+  REAL: ros2 launch stack_master headtohead.launch.xml map:=f sim:=false
+-->
+<launch>
+  <arg name="map"        description="Map name (folder in stack_master/maps/)"/>
+  <arg name="sim"        default="false" description="Use simulator (true) or real hardware (false)"/>
+  <arg name="ot_planner" default="spliner" description="overtake planner the state machine listens to"/>
+  <arg name="control_topic" default="/local_waypoints"
+       description="WpntArray the controller follows: /local_waypoints (state-machine output w/ avoidance) or /global_waypoints (robust raceline)"/>
+  <!-- virtual_perception injection seam is chosen at RUNTIME from the Sim Control
+       panel (/vp/inject_mode: overlay | merge; default 'overlay'). In BOTH modes
+       tracking publishes /tracking/obstacles_raw and tracking_merger owns
+       /tracking/obstacles (passes the real tracking through, and adds the virtual
+       objects ONLY in 'merge' mode). So the REAL detect->track pipeline reaches the
+       state machine in 'overlay' (detection-in-the-loop), and ground-truth object
+       injection works in 'merge' — switchable live, no relaunch. -->
+
+  <!-- ===== Base system: sensors/sim + opponent + raceline + frenet odom ===== -->
+  <include file="$(find-pkg-share stack_master)/launch/base_system.launch.xml">
+    <arg name="map" value="$(var map)"/>
+    <arg name="sim" value="$(var sim)"/>
+  </include>
+
+  <!-- ===== Perception: LiDAR obstacle detection + tracking ===== -->
+  <node pkg="perception" exec="detect_node" name="detect_node" output="screen"/>
+  <node pkg="perception" exec="tracking_node" name="tracking_node" output="screen">
+    <!-- ALWAYS feed the merger; tracking_merger owns /tracking/obstacles. -->
+    <param name="output_topic" value="/tracking/obstacles_raw"/>
+  </node>
+
+  <!-- ===== State machine: the racing brain ===== -->
+  <node pkg="state_machine" exec="state_machine" name="state_machine" output="screen">
+    <param from="$(find-pkg-share state_machine)/config/state_machine_params.yaml"/>
+    <param name="sim"             value="$(var sim)"/>
+    <param name="timetrials_only" value="false"/>
+    <param name="ot_planner"      value="$(var ot_planner)"/>
+  </node>
+
+  <!-- ===== Opponent prediction (constant-velocity along the raceline) =====
+       Feeds /opponent_prediction/obstacles(_pred) to the state machine and the
+       predictive planners. -->
+  <node pkg="perception" exec="opponent_predictor" name="opponent_predictor" output="screen"/>
+
+  <!-- ===== Planning: spliner avoidance (publishes /planner/avoidance/otwpnts) ===== -->
+  <node pkg="spliner" exec="spliner_node" name="spliner_node" output="screen"/>
+
+  <!-- ===== Control: PP + heading-PID controller (friction-circle limited) =====
+       Follows the state machine's local waypoints. Subscribes /local_waypoints +
+       /vesc/odom; remap to control_topic and, on the real car, to the EKF odom. -->
+  <group if="$(var sim)">
+    <node pkg="controller" exec="pp_heading_node" name="pp_heading_controller" output="screen">
+      <param from="$(find-pkg-share stack_master)/config/pp_heading_params.yaml"/>
+      <!-- unicorn mux subscribes /vesc/high_level/ackermann_cmd (low_level.launch.xml);
+           the IFAC default (.../input/nav_1) goes nowhere here → car won't move. -->
+      <param name="drive_topic" value="/vesc/high_level/ackermann_cmd"/>
+      <remap from="/local_waypoints" to="$(var control_topic)"/>
+    </node>
+  </group>
+  <group unless="$(var sim)">
+    <node pkg="controller" exec="pp_heading_node" name="pp_heading_controller" output="screen">
+      <param from="$(find-pkg-share stack_master)/config/pp_heading_params.yaml"/>
+      <param name="drive_topic" value="/vesc/high_level/ackermann_cmd"/>
+      <remap from="/local_waypoints" to="$(var control_topic)"/>
+      <remap from="/vesc/odom"       to="/car_state/odom"/>
+    </node>
+  </group>
+</launch>

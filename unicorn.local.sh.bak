@@ -1,0 +1,23 @@
+# per-machine overrides for the mac mini (macOS). NOT tracked (see .gitignore).
+# VESC USB serial is /dev/cu.usbmodem* on macOS (Linux hosts use /dev/ttyACM*).
+export VESC_PORT=/dev/cu.usbmodem3041
+# ELRS FT232 port number drifts on macOS (re-plug/hub) -- pin explicitly.
+export ELRS_PORT=/dev/tty.usbserial-21210
+
+# torch(GP residual 로드용) + conda libomp 중복 회피 — 2026-07-02
+export KMP_DUPLICATE_LIB_OK=TRUE
+# l4acados (GP residual 로드용, offline/build-time import)
+export PYTHONPATH="$HOME/l4acados/src:${PYTHONPATH:-}"
+
+# 2026-07-31 노트북과 DDS 통신.
+# 이 맥은 인터페이스가 둘이다(en0 192.168.1.2 / en1 192.168.70.48). repo 의
+# cyclonedds.xml 은 루프백을 먼저 적어 두는데, cyclonedds 는 XML 순서가 아니라
+# priority 로 선호 인터페이스를 고르고 루프백에 자동으로 높은 값(2)을 준다.
+# 그대로 두면 외부 주소를 lo 로 보내려다 ddsi_udp_conn_write ... retcode -3 으로
+# 전부 실패한다(증상: 토픽이 하나도 안 보임). en1 에 priority 10 을 명시하고
+# 노트북을 유니캐스트 피어로 직접 지정한다. — nuc14 에서 실제로 데인 건.
+export CYCLONEDDS_URI=file:///Users/mini/cyclonedds_mac_car.xml
+export JOY_MAX_SPEED=7.0  # car1 joy speed cap [m/s] (float!)
+
+# 새 맵을 src에 넣으면 바로 읽도록(install 복사/symlink 불필요). runtime에서 src maps 직접 로드.
+export STACK_MASTER_MAPS_ROOT=/Users/mini/unicorn_ws/src/unicorn-racing-stack/stack_master/maps

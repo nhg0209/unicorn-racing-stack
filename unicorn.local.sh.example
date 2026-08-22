@@ -1,0 +1,35 @@
+# unicorn.local.sh — per-machine overrides (NOT tracked; copy this file).
+#
+#   cp unicorn.local.sh.example unicorn.local.sh
+#
+# unicorn.sh sources this LAST (after conda + colcon + DDS setup), so anything here
+# overrides the tracked defaults. Use it for host-specific bits that must never be
+# committed: a different ROS_DOMAIN_ID, extra PATH/LD_LIBRARY_PATH, sensor enables,
+# hardware device paths, etc. Runs under bash AND zsh — keep it POSIX-ish.
+#
+# The repo root and workspace are available as $_URS_REPO and $_URS_WS.
+
+# --- examples (uncomment/edit as needed) ---
+
+# Put this host on its own DDS domain:
+# export ROS_DOMAIN_ID=7
+
+# Pin CycloneDDS to a specific interface on a multi-homed box (otherwise the tracked
+# cyclonedds.xml, which lists all known interfaces with presence_required="false",
+# is used). Alternatively drop a cyclonedds.local.xml next to unicorn.sh.
+# export CYCLONEDDS_URI="file://$_URS_REPO/cyclonedds.local.xml"
+
+# Extra runtime libs (e.g. a locally-built dependency in ~/.local):
+# export LD_LIBRARY_PATH="$HOME/.local/lib:${LD_LIBRARY_PATH:-}"
+
+# USB serial device paths differ per machine/OS and renumber on replug. The launch
+# files auto-detect, but you can pin them here. Prefer a stable /dev/serial/by-id/...
+# path on Linux (find with: ls -l /dev/serial/by-id/).
+#   VESC  — low_level.launch.xml reads $VESC_PORT (default /dev/ttyACM0)
+#   ELRS  — elrs_joy_ft232.launch.py reads $ELRS_PORT when port:=auto
+# Linux (nuc / dev PC):
+# export VESC_PORT=/dev/serial/by-id/usb-STMicroelectronics_ChibiOS_RT_Virtual_COM_Port-if00
+# export ELRS_PORT=/dev/ttyUSB0
+# macOS (mac mini):
+# export VESC_PORT=/dev/cu.usbmodem3041
+# export ELRS_PORT=/dev/tty.usbserial-310
