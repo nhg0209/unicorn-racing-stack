@@ -37,3 +37,9 @@ COLCON_IGNORE
 
 # Large point-cloud map assets — distribute out-of-band, not via git
 stack_master/maps/**/*.pcd
+
+# per-machine local overrides (see unicorn.sh: sourced last so a machine can win).
+# These name that machine only -- serial ports, its own maps root, its DDS peer --
+# so tracking one hands every other machine a config that cannot work there.
+unicorn.local.sh
+cyclonedds.local.xml
