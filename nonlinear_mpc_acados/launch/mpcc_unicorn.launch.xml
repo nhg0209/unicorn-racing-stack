@@ -35,6 +35,7 @@
 
   <!-- acados 런타임 libs: unicorn.sh 가 DYLD 를 필터링하므로 launch 에서 직접 주입.
        => run_mpcc.sh 없이 'ros2 launch' 만으로 동작 (IFAC2026 방식). -->
+  <arg name="gp"            default="false" description="CasADi-GP 잔차모델 on/off (0818). 기본 OFF — yaml use_gp_casadi 를 덮어쓴다. GP 데이터 수집 주행은 반드시 gp:=false. codegen 스탬프가 플래그를 보므로 토글 시 자동 재생성."/>
   <arg name="enable_logger" default="false" description="mpc_debug_logger CSV 기록 노드 on/off (2026-07-16 기본 OFF — GP/refv 데이터 충분히 수집됨. 필요시 enable_logger:=true)"/>
 
   <set_env name="DYLD_LIBRARY_PATH" value="$(env HOME)/acados/lib:$(env DYLD_LIBRARY_PATH '')"/>
@@ -54,6 +55,7 @@
     <param name="track_source"      value="$(var track_source)"/>
     <param name="track_name"        value="$(var map)"/>   <!-- CSV 폴백: tracks/track{map}/track{map}_*.csv -->
     <param name="use_gp_residual"   value="false"/>
+    <param name="use_gp_casadi"     value="$(var gp)"/>   <!-- 0818: gp:=true 로만 켠다 -->
     <param name="enable_sim_reset"  value="false"/>   <!-- 실차 안전: stuck 시 /sim/initialpose 발행 안 함 -->
     <!-- VESC /vesc/odom(wheel-only, drifts) -> EKF /car_state/odom (real-car 검증 배선 미러) -->
     <remap from="/vesc/odom" to="/car_state/odom"/>

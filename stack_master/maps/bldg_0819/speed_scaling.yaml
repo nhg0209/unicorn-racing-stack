@@ -1,0 +1,10 @@
+speed_sector_tuner:
+  ros__parameters:
+    global_limit: 0.8   # 0819: 맥은 0818 실주행 검증값(0.9x0.7)으로 시작. nuc 원본 0.8
+    n_sectors: 1
+    Sector0:
+      start: 0
+      end: 372
+      scaling: 0.7   # 0819 첫주행: 0818 검증 러그. rqt 로 0.75->0.8 사다리
+      only_FTG: false
+      no_FTG: false

@@ -64,10 +64,24 @@ install(PROGRAMS
   RENAME tracking_node
 )
 
-# KISS BEV-detection -> /detect/raw_obstacles adapter (no 2D scan; car2).
+# KISS BEV-detection -> /detect/raw_obstacles front-ends (no 2D scan; car2).
+# Two variants, different inputs -- both are used, so both get installed:
+#   kiss_obstacle_adapter.py : /kiss_loc/obstacle_poses (PoseArray)   -- old NUC
+#   kiss_obstacle_bridge.py  : /kiss_loc/detections     (MarkerArray) -- race.launch.xml
 install(PROGRAMS
   scripts/kiss_obstacle_adapter.py
   DESTINATION lib/${PROJECT_NAME}
+)
+
+# race.launch.xml launches this as `exec="kiss_obstacle_bridge"`, so drop the .py.
+# NOTE: RENAME is not part of ament's symlink-install reimplementation of install(PROGRAMS)
+# (its parser knows only OPTIONAL/DESTINATION/PROGRAMS), so a renamed program falls through to
+# native CMake install and is COPIED, not symlinked -- edits to the source need a rebuild to take
+# effect, unlike the un-renamed adapter above. Same as tracking_node.
+install(PROGRAMS
+  scripts/kiss_obstacle_bridge.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME kiss_obstacle_bridge
 )
 
 ament_package()

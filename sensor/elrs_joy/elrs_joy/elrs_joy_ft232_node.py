@@ -557,7 +557,15 @@ class ELRSJoyFT232Node(Node):
             return False
 
     def run(self):
-        if not self.connect_serial():
+        # Retry the initial open instead of giving up. The FT232 is often not ready
+        # on the first attempt right after boot/replug (macOS USB enumeration lag), or
+        # the port is still held by the previous run — that is why ELRS "never worked
+        # on the first launch". Keep retrying until it opens (or shutdown).
+        while rclpy.ok() and not self.connect_serial():
+            self.get_logger().warn(
+                "serial open failed (port not ready or busy?) — retrying in 1s ...")
+            time.sleep(1.0)
+        if not rclpy.ok():
             return
 
         period = 1.0 / max(self.publish_rate, 1.0)

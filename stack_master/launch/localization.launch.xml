@@ -26,7 +26,7 @@
        unicorn.local.sh); the tracked fallback is car2's IP (correct for car1).
        car2 sets OPPONENT_IP=192.168.70.48 (car1). Update env if the DHCP lease
        changes, or pass opponent_ip:=... on the command line. -->
-  <arg name="opponent_bridge" default="true"           description="Run the UDP opponent-pose bridge"/>
+  <arg name="opponent_bridge" default="false"           description="Run the UDP opponent-pose bridge"/>
   <arg name="opponent_ip"     default="$(env OPPONENT_IP 192.168.70.14)"  description="The opponent car's LAN IP (env OPPONENT_IP; fallback = car2)"/>
   <arg name="opponent_port"   default="47600"          description="UDP port (same on both cars)"/>
   <arg name="opponent_rate"   default="50.0"           description="Send-rate cap [Hz]"/>
@@ -125,11 +125,14 @@
       <param from="$(find-pkg-share stack_master)/config/kiss.yaml"/>
       <!-- The node reads explicit file paths (it does NOT derive them from a map
            name), so inject them from the active map folder here. map_path =
-           maps_dir/<map>/<map>. map_pcd_3d is the ICP target; the 2D grid
-           <map>.yaml (same file map_server loads for /map) is the detection track
-           mask. The ground-band crop (crop_*) is set in kiss.yaml. -->
+           maps_dir/<map>/<map>. map_pcd_3d is the ICP target.
+           0810: track mask = <map>_track.yaml (전용 바이너리 래스터). 이전엔 SLAM
+           점유맵(<map>.yaml)을 썼는데 unknown(205) 구역이 트랙으로 통과돼 트랙 밖
+           유령 검출이 범람 (0810 bag 실측: 검출의 96%가 unknown 구역 → stop guard
+           오발동으로 콘 회피 선점). 모든 맵 폴더에 <map>_track.yaml 필요.
+           The ground-band crop (crop_*) is set in kiss.yaml. -->
       <param name="map_pcd_3d"      value="$(var map_path).pcd"/>
-      <param name="track_map_yaml"  value="$(var map_path).yaml"/>  <!-- kiss는 PCD로 정합하므로 <map>.yaml/pgm은 viz 전용 -> 검출 track mask도 이 파일 하나로 통일(별도 _track 불필요). <map>.pgm을 깨끗한 트랙 래스터로 만들면 viz+검출 겸용. (pf/carto는 여기 대신 occupancy 필요) -->
+      <param name="track_map_yaml"  value="$(var map_path).yaml"/>
     </node>
   </group>
 

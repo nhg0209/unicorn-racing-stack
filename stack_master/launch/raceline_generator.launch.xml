@@ -19,6 +19,7 @@
        description="ROS params YAML for the global planner node"/>
   <arg name="reverse"            default="false"   description="Reverse raceline direction"/>
   <arg name="show_plots"         default="false"   description="Show optimization result plots"/>
+  <arg name="slice_gui"          default="false"    description="Open the matplotlib sector-slicing GUI. false = headless: write ONE sector over the whole track and exit. The GUI blocks forever with no display, so use false over SSH."/>
 
   <!-- sim -> SIM config folder, real hardware -> CAR config folder. The folder
        name doubles as racecar_version (holds racecar_f110.ini + veh_dyn_info/). -->
@@ -54,8 +55,10 @@
        the global planner above and writes its sector yaml into the map folder. -->
   <node pkg="sector_tuner" exec="sector_slicer" name="sector_node" output="screen">
     <param name="save_dir" value="$(var maps_dir)/$(var map)"/>
+    <param name="use_gui" value="$(var slice_gui)"/>
   </node>
   <node pkg="overtaking_sector_tuner" exec="ot_sector_slicer" name="ot_sector_node" output="screen">
     <param name="save_dir" value="$(var maps_dir)/$(var map)"/>
+    <param name="use_gui" value="$(var slice_gui)"/>
   </node>
 </launch>

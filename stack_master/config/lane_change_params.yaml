@@ -1,0 +1,229 @@
+# Lane-hold dynamic overtaking planner (lane_change_planner / change_avoidance_node,
+# launched as planner_change in race.launch.xml). All values live-tunable via rqt.
+#
+# Maneuver (IDLE -> HOLD -> CLOSE): the planner stays SILENT while TRAILING closes in at
+# speed; once the gap is below engage_gap_m it latches a side and enters HOLD, re-solving
+# the lane every cycle against the opponent's latest position; once the opponent is passed
+# it ramps back to the raceline (CLOSE).
+#
+# The lane is NOT a constant offset and NOT centerline-parallel (older comments here said
+# both). It is a lateral profile d(s) in the RACELINE frame that PREFERS d = 0 and is pushed
+# off it only inside the meeting band around meet_s -- so the car holds the racing line until
+# the point where the two cars are actually level, and only steps aside there.
+#
+# There is no separate blend-on phase: the profile is anchored at the car and re-gridded from
+# the current s every cycle, so such a phase terminated on its first cycle by construction.
+# The blend lives in _build_path.
+planner_change:
+  ros__parameters:
+    # gate: only ENGAGE inside overtaking sectors (/ot_section_check fresh + true).
+    # A maneuver already in progress is never aborted by sector state.
+    require_ot_section: true
+    ot_gate_stale_s: 1.0       # [s] /ot_section_check older than this fails the gate CLOSED.
+                               # The SM publishes it every loop tick, so staleness means the SM
+                               # is down or mis-wired -- trailing is the safe answer.
+
+    # --- engagement ---
+    engage_gap_m: 8.0          # trail (at speed) until the s-gap to the target is below
+    engage_gap_min_m: 1.5      # ...and the LOWER bound. engage_gap_m alone let the planner
+                               # engage at gap=0.4 m: the cars are 0.55 m long, so their
+                               # bodies already overlap there and the lane only 'fits'
+                               # because the profile is anchored wherever the car is -- the
+                               # swerve then goes INTO the opponent. Measured: below ~1.5 m
+                               # no point on the lap admits a pass anyway.
+    bail_hold_max_s: 3.0       # how long the lane may be HELD beside the target before
+                               # giving up and merging back. Arming CLOSE immediately was
+                               # the other half of the drop-the-lane mistake: once the
+                               # return ramp freezes it merges regardless of the corridor,
+                               # so abandoning a maneuver alongside an opponent steers into
+                               # them either way. The lane already clears them -- hold it.
+    bail_block_m: 1.5          # while the target is within this |ds|, a failed maneuver may
+                               # NOT drop to IDLE -- it merges back through CLOSE instead.
+                               # Dropping the lane there stops publication, the SM falls to
+                               # GB_TRACK and the car steers at the raceline through the
+                               # opponent it is beside: the return-phase contact.
+                               # this, then start the lane change. Must be ABOVE the
+                               # trailing hold distance (controller: 0.25*v + 1.55 m,
+                               # ~2-3 m) or the gap never closes enough to engage,
+                               # and BELOW the SM commit gate (10 m).
+    obs_traj_tresh: 1.0        # engage only if |obs d - ego d| below this (they block our line)
+    # --- clearance: DERIVED from the SM, not declared here ---------------------------------
+    # The state machine runs an independent free-check on the lane we publish and rejects it
+    # unless  min_dist - obs.size/2 - gb_ego_width_m/2 >= lateral_width_m. Two nodes therefore
+    # have to agree on one number. That coupling used to live only in a prose comment here, and
+    # the comment had already drifted from the values (it claimed 0.05 m of slack while the
+    # numbers gave 0.02). So the planner now MIRRORS the SM's inputs and derives the rest in
+    # _apply_margins(); startup logs sm_required/sep_margin/sep_monitor, and
+    # stack_master/scripts/check_avoidance_margins.py verifies the mirrors offline.
+    #
+    #   sm_required  = sm_gb_ego_width_m/2 + sm_lateral_width_m   <- the SM's accept line
+    #   sep_margin_m = sm_required + sep_slack_m                  <- what the SOLVER targets
+    #   sep_monitor  = sm_required + sep_monitor_slack_m          <- where the MONITORS abort
+    #
+    # Keep sep_slack_m SMALL: with the s-varying lane the pass is separation-limited, so every
+    # cm costs feasibility -- on ifac a 0.42 target gives 49% of the lap, 0.45 drops it to 37%.
+    sm_gb_ego_width_m: 0.4     # MIRROR of state_machine_params.yaml: gb_ego_width_m
+    sm_lateral_width_m: 0.15   # MIRROR of planners/dynamic_avoidance_planner.yaml: lateral_width_m
+    sep_slack_m: 0.07          # -> sep_margin_m = 0.35 + 0.07 = 0.42 (unchanged from before)
+    sep_monitor_slack_m: 0.02  # -> monitors abort at 0.37, just ABOVE the SM's 0.35 reject line.
+                               # Was sep_margin_m*0.8 = 0.336, i.e. BELOW the SM's line: the
+                               # planner happily held a lane the SM rejected and the car flapped
+                               # OVERTAKE<->TRAILING with neither side ever giving up. Must stay
+                               # >= 0 and <= sep_slack_m; _apply_margins() clamps and logs an
+                               # error otherwise. Negative is permitted only to reproduce the old
+                               # behaviour for A/B.
+    # --- lane profile solver ---
+    # The lane is an s-varying profile inside the track corridor, not a constant offset from
+    # the centerline. A constant offset had to clear the walls AND the opponent at every
+    # sample of the pass window, so the narrowest point in the next few metres vetoed the
+    # maneuver even when the opponent was nowhere near it: 8% of the ifac lap admitted a pass.
+    # Requiring the opponent clearance only where the pass actually overlaps them -- which is
+    # all the SM free-check ever reads, one point at argmin|s - obs_s| -- takes the same
+    # margins to 40% of the lap.
+    pass_overlap_m: 0.55       # [m] +-s around the meeting point where lateral clearance is
+                               # enforced. The cars are 0.55 m long, so their bodies overlap
+                               # exactly while |ds| < 0.55 -- this is the physical figure, not
+                               # a margin. Every extra cm is run-up taken away from the lane
+                               # change, so padding it here is paid for twice.
+    opp_pred_slack_m: 0.20     # [m] how far the GP prediction may move the opponent SIDEWAYS
+                               # beyond what its measured vd explains over the time-to-meet.
+                               # The tracker's measured d is the anchor; the prediction refines
+                               # it. A diverged GP fit otherwise returns a line swinging metres
+                               # and blocks both sides of the track at once.
+    pass_hold_max_m: 12.0      # [m] cap on how far past the meeting point the pass offset is
+                               # held. Drawing level is not passing: the lane must stay out
+                               # until the ego is pass_gap_m clear, which takes several metres
+                               # of track at realistic closing speeds. Returning earlier steers
+                               # back into the opponent and makes the SM free-check flap between
+                               # TRAILING and OVERTAKE. The return itself is CLOSE's job.
+    pass_lead_max_s: 5.0       # [s] cap on the predicted time-to-meet. Guards a near-zero
+                               # closing speed from projecting the meeting point a whole lap
+                               # away; if it lands past the solve horizon the engage is
+                               # refused rather than accepted with nothing checked.
+    lane_max_slope: 0.35       # PREFERRED max |dd/ds| of the lane (19 deg heading). The
+                               # solver tries this first.
+    lane_max_slope_close: 0.55 # ...and escalates to this (29 deg) ONLY when nothing fits at
+                               # the preferred one -- a close trailing gap, where the whole
+                               # lane change has to fit in gap - pass_overlap_m. At a fixed
+                               # 0.35 a pass from 1.8 m was refused everywhere on the lap.
+                               # The cap is not a grip limit: the SM re-plans the avoidance
+                               # path's velocity from its curvature, so a steeper lane costs
+                               # pass SPEED. It is not free either -- the lane stays on the
+                               # raceline as long as the rate allows, so a globally higher cap
+                               # makes every pass move later and sharper. Hence try-then-escalate.
+
+    offset_slew_mps: 0.6       # how fast the live offset may grow/shrink [m/s]
+    spline_bound_mindist: 0.12 # path may never come closer than this to the track bounds
+    # --- corridor source ---------------------------------------------------------------
+    # MEASURE the lateral corridor in the eroded occupancy grid instead of reading the
+    # waypoints' d_left/d_right. Those cannot be trusted: on the f map they are stored EXACTLY
+    # SWAPPED across the whole lap. Verified two ways -- at corner apexes
+    # corr(kappa, d_left-d_right) is +0.85 on f vs -0.65 on ifac (a clean mirror), and the
+    # measured corridor at s=68.4 is [-0.35, +2.15] where the waypoints claim
+    # dl=0.41 dr=2.16, i.e. [-2.16, +0.41]. A planner that believes them rejects the side that
+    # is actually open and aims the accepted lane INTO the wall, where the post-smoothing map
+    # check in _publish_path then kills the whole maneuver and eats reengage_block_s.
+    # Measured on the real f map: lane-fit rate 22/32 -> 26/32 on straights, 26/32 -> 28/32 in
+    # corners. The static planner already switched to the grid for the same reason.
+    trust_grid_bounds: true    # false = use the waypoint d_left/d_right (legacy)
+    grid_scan_max: 3.0         # [m] half-width of the lateral scan around the raceline
+    grid_scan_step: 0.05       # [m] scan resolution
+    bounds_warn_m: 0.5         # [m] disagreement above which the map reports itself as swapped
+    lane_solve_ds: 0.25        # [m] grid the lateral profile is solved on. Also sets the
+                               # solver's per-step slope budget (lane_max_slope * this) and the
+                               # band slack in _lane_bounds. Finer = more Python loop per cycle.
+                               # NOTE the PUBLISHED path is resampled at PATH_DS (0.1 m), which
+                               # is a module constant, not a parameter: the CCMA window and the
+                               # curvature el_lengths both assume it.
+    width_car: 0.30            # [m] car width; with spline_bound_mindist it sets the wall keep-out
+
+    # --- transition geometry (lengths speed-scale: max(min_m, time_s * v)) ---
+    open_ramp_min_m: 3.0
+    open_ramp_time_s: 0.8      # (the entry blend is additionally capped to finish BEFORE
+                               # the target when engaging close behind it)
+    blend_min_m: 1.5           # HOLD re-anchor blend from the car onto the lane
+    close_ramp_min_m: 3.0
+    close_ramp_time_s: 0.8
+    close_arm_m: 1.0           # return ramp starts this far ahead of the car (slides while
+                               # the car is still on the lane -> SM adoption is step-free)
+    tail_m: 2.0                # raceline tail after the return ramp
+
+    # --- hold / pass logic ---
+    hold_horizon_m: 22.0       # published path length. Keep > SM interest_horizon_m (20):
+                               # an opponent past the path end makes the SM free-check fail.
+    pass_gap_m: 1.2            # ego must lead the opponent by this (wrapped s) to close
+    pass_hyst_s: 0.3           # pass condition must hold this long (anti flicker)
+    target_lost_s: 1.0         # coast the target on its EKF velocity this long before
+                               # treating it as lost (occlusion robustness)
+    reengage_block_s: 1.0      # idle time after finishing/aborting a maneuver
+
+    # --- HOLD target-clearance re-verification ---
+    # The lane's clearance against the opponent being overtaken used to be checked exactly ONCE,
+    # on the single cycle the old OPEN phase lasted. _path_blocked_ahead deliberately skips the
+    # latched target, so for the rest of the maneuver nothing re-verified it -- even though
+    # _build_path post-processes the solved profile with an entry blend and a corridor clip that
+    # can both eat into the margin the solver promised. Now checked every HOLD cycle, before
+    # publishing, so a failing lane is never handed to the SM.
+    blocked_dwell_s: 0.3       # [s] an obstacle must sit on the path this long before
+                               # _path_blocked_ahead reports it (one noisy frame must not abort)
+    hold_clear_check: true     # false = old behaviour (checked only at engage)
+
+    # --- lane commit -------------------------------------------------------------------
+    # The lane is solved ONCE at engage and then followed. It used to be re-solved every
+    # cycle on a grid starting at the moving car, and _build_path re-blended from the live
+    # pose; because the SM adopts every publish younger than latest_threshold, the path the
+    # controller was tracking got redefined 20 times a second and the car wobbled along the
+    # evasion spline. Same fix the STATIC planner already uses (its commit/_reuse_committed).
+    # Freezing the lane is also what makes ENTRY's "am I on the lane" test meaningful.
+    lane_commit: true          # false = legacy per-cycle re-solve
+    commit_horizon_m: 30.0     # [m] span the lane is solved over at engage. Must cover the
+                               # WHOLE maneuver (meeting point + pass_hold_max_m + return
+                               # ramp), not one published window, because it is not re-solved.
+                               # Samples outside the meeting band are only wall-constrained,
+                               # which the car alone always clears, so a longer span is free.
+    entry_join_tol_m: 0.15     # [m] |d - committed lane| below which ENTRY is complete
+    # Re-plan triggers. These are the ONLY things that replace a committed lane; everything
+    # else is verified and either tolerated or aborted. Too tight and the churn comes back.
+    commit_dev_max_m: 0.35     # [m] car this far off the committed lane -> re-plan (+ ENTRY)
+    commit_meet_ds_m: 1.5      # [m] meeting point drifted this far -> re-plan
+    commit_obs_dd_m: 0.40      # [m] opponent moved this far laterally -> re-plan
+    hold_clear_fail_s: 0.15    # [s] dwell before acting on a failure (3 cycles at 20 Hz), so a
+                               # single noisy tracker frame cannot abort a good maneuver. If we
+                               # are already alongside/ahead the lane is HELD anyway with a
+                               # warning: bailing to the raceline next to the opponent is worse
+                               # than a lane that is a few cm short.
+
+    # --- opponent prediction (P1 temporal, P2 spatial GP) ---
+    use_prediction: false          # master toggle; false = react to the opponent's CURRENT
+                                  # position only (pre-P1/P2 behavior), for A/B testing
+
+    # --- engage gating (NOT a prediction feature: reads the tracker's measured vs) ---
+    # An overtake target must be MOVING. `is_static` is the tracker's position-persistence
+    # verdict, and it is False on every freshly created track (staticFlag stays None until
+    # min_nb_meas), so "not is_static" also means "just appeared" -- a parked box arrives here as a
+    # dynamic obstacle reading vs~0. The closing gate below cannot catch that: closing = ego - vs is
+    # LARGEST for a stationary object, so a parked box passes it maximally. In sim with no opponent
+    # at all this engaged on static boxes (v_opp=0.0 and 0.2) while the static planner was avoiding
+    # the SAME box the OTHER way; the SM adopted the dynamic path and the reference stepped 1.58 m,
+    # which saturated the steering and put the car in the wall.
+    #
+    # MIRRORS static_avoidance_params.yaml's static_demote_mps / static_demote_sec. Keep
+    # engage_min_vs_mps >= static_near_zero_mps (0.15): below that the static planner treats the
+    # obstacle as static, and if this floor dipped under it BOTH planners would claim the same
+    # obstacle -- which is the crash. The band between them (0.15-0.35 m/s sustained) is owned by
+    # neither and resolves to TRAILING, the designed fallback. check_avoidance_margins.py asserts
+    # the no-overlap direction; it cannot assert the gap away, because closing it would re-admit
+    # the 0.2 m/s reading that engaged on a stationary box.
+    engage_min_vs_mps: 0.35       # |v| (max of |vs|,|vd|) an obstacle must show to be a target
+    engage_moving_s: 0.3          # ...continuously for this long. Sustained, because a parked
+                                  # box's tracked speed brushes past any single-sample threshold.
+
+    engage_min_closing_mps: -0.5  # don't ENGAGE on an opponent pulling away faster than this
+                                  # (m/s, ego_vs - opp_vs). Set very negative (-3.0) to disable;
+                                  # this parameter is its own off-switch.
+                                  # NOTE: this is NOT the same value as the SM's getting_closer
+                                  # gate (state_machine_params.yaml: getting_closer_rel_vel_mps,
+                                  # currently -0.1). The planner is the looser of the two, so the
+                                  # SM gate binds first; an earlier comment here claimed they
+                                  # matched, which they never did. Deliberately kept looser --
+                                  # the planner may prepare a lane the SM has not committed to.

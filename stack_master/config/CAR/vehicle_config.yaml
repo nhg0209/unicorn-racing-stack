@@ -45,5 +45,5 @@ vesc/**:
     speed_to_erpm_gain: 3447.54
     speed_to_erpm_offset: 0.0
     steering_angle_to_servo_gain: 0.53
-    steering_angle_to_servo_offset: 0.577
+    steering_angle_to_servo_offset: 0.575
     use_servo_cmd_to_calc_angular_velocity: true

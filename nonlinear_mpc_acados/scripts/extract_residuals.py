@@ -29,13 +29,16 @@ import numpy as np
 import pandas as pd
 import torch
 
-# Model parameters (mirrors mpc_core/acados_kinematic.py)
+# Model parameters (mirrors mpc_core/acados_kinematic.py:119-124 deployed values)
+# 2026-07-28: m/Iz/lf/lr/h_cg 정정 (기존 값은 6개 상수 모두 어긋나 있었음:
+# m+2%, Iz+23%, lf+2%, lr-15%, h_cg-81%). MU(0.7)는 yaml dyn_mu 배포값과 이미
+# 일치하므로 변경 없음.
 L_WB = 0.307
-M = 3.54
-IZ = 0.05797
-LF = 0.162
-LR = 0.145
-H_CG = 0.014
+M = 3.47
+IZ = 0.04712
+LF = 0.15875
+LR = 0.17145
+H_CG = 0.074
 MU = 0.7
 BF = BR = 10.0
 DF = DR = 1.0           # tanh: F_y = mu * D * F_z * tanh(B * alpha)
@@ -49,9 +52,22 @@ MPC_LOGS = Path.home() / "mpc_logs"
 # 이후 모든 CSV (autoreg v=5/6/7/8 overnight 데이터 포함) 자동 매치.
 POST_TANH_CUTOFF_EPOCH = 1779865200   # 2026-05-27 16:00 KST
 
-# /mpc_debug index 0 컬럼명은 역사적 이유로 "v_cmd" 이지만 실제 값은 a_x 명령이다
-# (mpc_node.py: con_first[0]). ekf source 에서 이 컬럼을 a_x 입력으로 쓴다. 리네임 금지.
-A_X_CMD_COL = "v_cmd"
+# /mpc_debug index 0 컬럼. 2026-07-28 이전 CSV는 "v_cmd"로 잘못 이름 붙었지만
+# 실제 값은 항상 a_x 명령이었다(mpc_node.py: con_first[0]). B-1 로거 수정으로
+# 신규 CSV는 정확한 이름 "a_x_cmd"로 기록된다. ekf source 에서 이 컬럼을 a_x
+# 입력으로 쓴다.
+A_X_CMD_COL = "a_x_cmd"
+A_X_CMD_COL_LEGACY = "v_cmd"  # 2026-07-28 이전 CSV 호환용 폴백 컬럼명
+
+
+def _resolve_a_x_cmd_col(columns) -> str | None:
+    """새 CSV는 A_X_CMD_COL, 과거(2026-07-28 이전) CSV는 A_X_CMD_COL_LEGACY.
+    둘 다 없으면 None (ekf source 스킵 신호)."""
+    if A_X_CMD_COL in columns:
+        return A_X_CMD_COL
+    if A_X_CMD_COL_LEGACY in columns:
+        return A_X_CMD_COL_LEGACY
+    return None
 
 
 # ────────────────────────────────────────────────────────────────
@@ -228,11 +244,17 @@ def _extract_finitediff(df, min_vx: float, dt_tol: float):
 
 
 def _extract_ekf(df, csv_path, min_vx: float, dt_tol: float):
-    """로깅된 EKF 속도상태(vy_ekf/r_ekf) + 명령 a_x 직접 사용. 유한차분 없음."""
+    """로깅된 EKF 속도상태(vy_ekf/r_ekf) + 명령 a_x 직접 사용. 유한차분 없음.
+
+    a_x 명령 컬럼은 CSV 시기에 따라 이름이 다르다: A_X_CMD_COL(신규, 정확한
+    이름) 없으면 A_X_CMD_COL_LEGACY("v_cmd", 2026-07-28 이전 CSV)로 폴백.
+    """
+    a_x_col = _resolve_a_x_cmd_col(df.columns)
     needed = {"t", "v_actual", "steer_cmd", "car_x", "car_y", "car_yaw",
-              "current_s", "feasible", "vy_ekf", "r_ekf", A_X_CMD_COL}
-    if not needed.issubset(df.columns):
-        print(f"  [skip:ekf] {csv_path.name}: vy_ekf/r_ekf/{A_X_CMD_COL} 컬럼 없음 "
+              "current_s", "feasible", "vy_ekf", "r_ekf"}
+    if a_x_col is None or not needed.issubset(df.columns):
+        print(f"  [skip:ekf] {csv_path.name}: vy_ekf/r_ekf/"
+              f"{A_X_CMD_COL}(또는 구버전 {A_X_CMD_COL_LEGACY}) 컬럼 없음 "
               "(2단계 이전 CSV)")
         return np.empty((0, 5)), np.empty((0, 3))
 
@@ -242,7 +264,7 @@ def _extract_ekf(df, csv_path, min_vx: float, dt_tol: float):
     vy = df["vy_ekf"].to_numpy()
     r = df["r_ekf"].to_numpy()
     delta = df["steer_cmd"].to_numpy()
-    a_x = df[A_X_CMD_COL].to_numpy()
+    a_x = df[a_x_col].to_numpy()
     x = df["car_x"].to_numpy()
     y = df["car_y"].to_numpy()
     yaw = np.unwrap(df["car_yaw"].to_numpy())
@@ -300,6 +322,7 @@ def process_csv(csv_path: Path,
 
 
 def main():
+    global MU
     p = argparse.ArgumentParser()
     p.add_argument("--csv", default=None, help="단일 CSV 테스트")
     p.add_argument("--out", default=str(Path.home() / "bo_results" / "gp_train_data.pt"))
@@ -307,7 +330,12 @@ def main():
     p.add_argument("--max_csvs", type=int, default=0, help="0 = 전체")
     p.add_argument("--source", choices=["ekf", "finitediff"], default="ekf",
                    help="ekf(기본): 로깅 EKF/명령 컬럼 / finitediff: 기존 유한차분(비교군)")
+    p.add_argument("--mu", type=float, default=0.7,
+                   help="명목모델 타이어 μ — 반드시 그 차의 배포 dyn_mu 와 같게 "
+                        "(잔차 = 실측 − MPC 명목모델. 0818: 맥 0.79)")
     args = p.parse_args()
+    MU = float(args.mu)
+    print(f"nominal MU = {MU}")
 
     if args.csv:
         files = [Path(args.csv)]

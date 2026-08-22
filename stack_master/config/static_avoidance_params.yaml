@@ -1,0 +1,466 @@
+# Params for the Frenet grid-sampling static-avoidance planner (node: static_avoidance_planner,
+# planner/spliner/spliner/static_avoidance_node.py). Loaded in race.launch.xml via <param from=.../>.
+# All values are live-reconfigurable (ros2 param set /static_avoidance_planner <name> <val>).
+static_avoidance_planner:
+  ros__parameters:
+    measure: true          # publish /planner/avoidance/latency (loop time) for the <10 ms budget check
+    from_bag: false
+
+    # --- planning horizon (bounds how far ahead an obstacle is considered) ---
+    # MUST be >= global_tracking.yaml's max_horizon (15.0), which is the distance at which the SM
+    # declares the raceline not-free and drops to TRAILING. The escape path has to already exist at
+    # the moment that verdict is made; if the planner only starts considering the obstacle closer
+    # in, the car is forced into TRAILING and the gap PID -- whose only fixed point behind a
+    # STATIONARY box is v = 0 -- creeps it to a standstill before the spline ever appears.
+    # Was 8.0 against a 15 m free-check horizon, i.e. 7 m of guaranteed blind trailing. Verified by
+    # stack_master/scripts/check_avoidance_margins.py.
+    lookahead_min: 15.0     # [m]  minimum planning distance ahead of the car
+    lookahead_k: 1.5        # [s]  lookahead = max(lookahead_min, lookahead_k * cur_vs)
+
+    # --- terminal-offset sampling ---
+    n_d_samples: 20         # number of lateral offsets sampled across the drivable width at the obstacle.
+                            #   NOT a feasibility knob: measured over 62 ifac stations x gap {12,8,4,2} m
+                            #   x tracking error {0, 0.3, 0.5} m, 10 and 24 give byte-identical results in
+                            #   all 12 cells. Whether a section is passable is decided by the body/grid
+                            #   gates and the corridor, not by how finely the offsets between them are
+                            #   sampled -- with sample_gaps on, the samples are already anchored to the
+                            #   two drivable gaps. Raise it only for candidate-marker resolution.
+    sample_gaps: true       # sample the two DRIVABLE GAPS beside the obstacle (box-edge -> wall on each
+                            #   side) instead of a uniform sweep of the whole corridor. On a wide, lopsided
+                            #   corridor (map f's wall-hugging raceline) the uniform sweep put ~all samples
+                            #   on the roomy side and gave the narrow free gap ZERO candidates -> avoidance
+                            #   flipped to the wrong side. Gap-anchored sampling always covers both sides
+                            #   that have room. false = legacy uniform sweep (n_d_samples across corridor).
+    width_car: 0.30         # [m]  car width (half is reserved as clearance to walls/obstacles)
+    # Near-stationary fallback: a DYNAMIC-flagged obstacle is treated as static only when it
+    # has read below static_near_zero_mps CONTINUOUSLY for static_promote_sec. A freshly
+    # detected opponent (ego rounding a corner, opponent entering the FOV) reads vs=0.00 for a
+    # few cycles while its KF spins up, so speed alone cannot tell 'parked' from 'just seen' --
+    # but a genuinely parked obstacle keeps reading 0.00 for as long as you look at it.
+    # Raise if the car still twitches out of corners; lower if a real static box is picked up
+    # too late. 0.0 restores the old behaviour (promote immediately).
+    # Throttle [s] on the per-cycle `avoid ... | corridor d=[..] obs keep-out d=[..]` line -- the
+    # only record of which side this planner chose and why. At 2.0 s / 20 Hz that is 1 line per 40
+    # cycles, and the sequence it has to order (a lane-change engage, an SM planner swap, 15
+    # saturated steering cycles, a wall) fits inside 1 s, so 2.0 loses exactly the ordering. Left at
+    # 2.0 so race-day log volume is unchanged; set 0.0 for a reproduction run:
+    #   ros2 param set /static_avoidance_planner avoid_log_throttle_s 0.0
+    # There is no save_params in this node, so nothing can persist a debug value by accident.
+    avoid_log_throttle_s: 2.0
+    static_near_zero_mps: 0.15
+    static_promote_sec: 0.5
+    # Hysteresis: once promoted it stays static until it reads clearly moving (above
+    # static_demote_mps) for static_demote_sec. A bare promote-delay makes the avoidance path
+    # blink whenever the tracked speed brushes the band.
+    static_demote_mps: 0.35
+    static_demote_sec: 0.3
+    safety_margin: 0.15     # [m]  extra clearance around the obstacle box. obs_margin = half_car(0.15)+
+                            #      safety must cover the SIM ego collision radius (0.29 m = half car
+                            #      LENGTH in gym_bridge); 0.16 -> 0.31 clears it so the car no longer
+                            #      grazes-then-teleports. Raise if the car still clips the box. Lowering
+                            #      it to recover a tight section is the squeeze pass's job, not a
+                            #      standing setting -- and see the wall_margin note below for why the
+                            #      corridor margins are not the binding constraint anyway.
+    # LATERAL half of the keep-out, split from safety_margin above so the two axes obs_margin
+    # conflates can be tuned independently. safety_margin now bounds only the LONGITUDINAL one --
+    # obs_ok inflates the box's s-interval by it, and that has to cover half the CAR'S LENGTH
+    # (0.29 m), since a car whose nose is level with the box edge is still half a length from
+    # having passed it. This one bounds the lateral keep-out, whose floor comes from somewhere
+    # else entirely: the SM's accept lines, the reactive clear-gate entry (0.28), and the
+    # tracker's own position error.
+    # Equal to safety_margin here on purpose -- the split shipped as a pure refactor, verified
+    # bit-identical over 1656 planning cases. Move it, not safety_margin, to narrow the avoidance.
+    safety_margin_d: 0.15
+    wall_margin: 0.1        # [m]  how close to the wall a candidate may reach (corridor room).
+                            #   NOT a feasibility knob either, despite what the safety_margin note above
+                            #   implies about tight sections: measured over the same grid, feasible
+                            #   stations at a 12 m gap go 40 -> 38 -> 38 for wall_margin 0.10 -> 0.05 ->
+                            #   0.00, i.e. lowering it does not help and slightly hurts. The body gate
+                            #   (body_kernel_size, half a car against the eroded map) already binds
+                            #   before this does, so giving away wall margin buys nothing and spends
+                            #   the reserve the squeeze pass needs.
+
+    # --- squeeze pass: reduced-margin retry before conceding TRAILING ---
+    # When EVERY candidate is rejected at the design margins the planner retries the same geometry
+    # at reduced ones. This is not a loosening of the design margins; it is the answer to sections
+    # where they are arithmetically unavailable. On ifac the track narrows below 1.20 m, and a box
+    # in the middle of that needs width_car/2 + safety_margin = 0.30 m per side plus its own
+    # half-width -- it does not fit. Without a squeeze pass the planner's only output there is
+    # feasible=False, and behind a STATIONARY box the trailing gap PID's fixed point is v = 0, so
+    # "stop 1.5 m short, forever" becomes the correct behaviour.
+    # The result is MARKED (ot_line = "squeeze") and the state machine caps its speed at
+    # squeeze_speed_cap_mps -- the planner cannot enforce that itself, the SM owns the velocity
+    # profile of every path it receives.
+    # The squeeze may give up the two clearances below -- reserve ON TOP of the car's own width --
+    # and NOTHING else. In particular it cannot relax the body floor (body_kernel_size): that floor
+    # IS the car's width, so relaxing it would not buy a tighter pass, it would buy a collision.
+    # Structurally it cannot: a squeeze retry re-enters the planner with new safety_margin /
+    # wall_margin scalars only, and every candidate of every pass is checked against the same body
+    # image. A section too narrow for the body floor has no answer here and TRAILING is the right one.
+    squeeze_enable: true
+    squeeze_steps: 2            # attempts between the design margin and the floor (linear)
+    squeeze_safety_floor_m: 0.05  # [m] tightest obstacle clearance the pass may ask for
+    squeeze_wall_floor_m: 0.08    # [m] tightest wall reserve the pass may ask for. 0.05 -> 0.08:
+                                  #     the obstacle floor is a distance to a box the perception
+                                  #     pipeline has MEASURED; the wall reserve is a distance to a
+                                  #     map whose own error (localization + grid discretization)
+                                  #     is of the same order as the reserve itself, so 5 cm of it
+                                  #     is not a margin, it is a rounding.
+    squeeze_max_speed_mps: 3.0    # [m/s] above this, "no feasible candidate" still means TRAILING.
+                                  #       Trading clearance for motion is only defensible where a
+                                  #       mis-clearance is survivable.
+    relax_hold_s: 2.0             # [s] how long a /planner/avoidance/relax request (the SM's static
+                                  #     TRAILING deadlock recovery) forces the squeeze pass, overriding
+                                  #     squeeze_enable and squeeze_max_speed_mps but never the floors.
+                                  #     The SM only sends it once the car is STOPPED behind an obstacle
+                                  #     this planner reported infeasible -- a stronger statement than
+                                  #     the speed gate was approximating.
+
+    # --- maneuver shape: gentle ramp OUT -> APEX (peak offset at obstacle, curvature loaded) -> gentle ramp back ---
+    # Two quintics meet at the apex; outer ends are tangent to the raceline (d''=0) so entry/exit are
+    # gentle and the sharpest bend sits right beside the obstacle. Must still return to the raceline
+    # (a held offset violates the narrow corridor downstream -> all-red). Slalom handled by replanning.
+    # [m] how close in s two apexes may be before the second is MERGED into the first. Interacts
+    # with how far ahead the first knot may sit: while the car was beside a box, that box's knot was
+    # pinned 0.3 m ahead and this window then swallowed the NEXT box's knot -- which obs_ok went on
+    # rejecting, so every candidate died and the path went empty. A box the car is already past no
+    # longer takes a knot at all (it still keeps its keep-out), so this window only ever merges
+    # boxes genuinely ahead.
+    knot_merge_s_m: 1.2
+    shift_min: 1.0          # [m]  min apex arc length (keeps the apex ahead of the car when very close)
+    shift_buffer: 1.0       # [m]  (unused in apex-loaded profile; kept for param compatibility)
+    # Ramp lengths 3.0 -> 4.5. The maneuver's peak curvature scales as amplitude/length^2, so
+    # stretching the ramps by 1.5x cuts it by ~2.2x -- and the speed the avoidance is driven at is
+    # sqrt(a_lat/kappa), so on a straight the curvature-limited cap rises from ~3.75 to ~5.0 m/s
+    # for the same apex offset and the same lateral-accel budget. Nothing else changes: the apex,
+    # the clearance and the corridor test are untouched, the hump just opens and closes further
+    # out. Affordable now that lookahead_min is 15 m -- at 8 m a 4.5 m entry ramp would not have
+    # fitted ahead of the obstacle. Feasibility still rejects a ramp the corridor cannot hold.
+    ramp_len: 4.5           # [m]  gentle entry-ramp length (raceline -> apex)
+    hold_after: 0.5         # [m]  (unused in apex-loaded profile; kept for param compatibility)
+    return_len: 4.5         # [m]  gentle exit-ramp length (apex -> raceline)
+    # Floor for the ADAPTIVE shortening of the two above. The corridor used to be tested at the
+    # obstacle's own station and nowhere else, while the path carries offset over ramp_len +
+    # return_len = 9 m of track; where that 9 m runs through a pinch, every candidate died. The
+    # ramps are now scanned over their whole length and shortened ONLY where the corridor will not
+    # accept the offset -- a shorter ramp decays faster, so it asks the pinch for less. Wherever
+    # there is room the full 4.5 m is kept, because a quintic's peak curvature goes as A/L^2 and
+    # these lengths were raised to carry speed. Below this floor that trade stops paying.
+    ramp_len_min_m: 2.5     # [m]
+    # RAMP LADDER. The adaptive shortening above only fires where the CORRIDOR SCAN refuses the
+    # offset. In a narrow corner the ramp is refused by things the scan does not look at -- the
+    # obstacle keep-out, the body floor, curvature -- so the 4.5 m entry ramp is laid straight
+    # across the pinch and nothing shortens it. The only way a path appeared was the gap itself
+    # falling below the ramp length, i.e. the car arriving on top of the box: measured on ifac,
+    # over the 33 stations with |kappa| > 0.8, the first distance at which a plan existed averaged
+    # 11.1 m and at some of them was one or two metres.
+    #
+    # So the ramp PAIR is retried when every candidate at the adaptive geometry was rejected:
+    # longest first, entry outer / exit inner, first success adopted. Longest-first is not a
+    # preference but a requirement -- peak curvature goes as amplitude/length^2 and the speed the
+    # maneuver can be driven at as sqrt(a_lat/kappa), so picking a shorter rung on cost would buy
+    # feasibility with speed that was available. The entry list deliberately goes BELOW
+    # ramp_len_min_m; that floor governs the automatic shortening, and this is the deliberate
+    # last resort. The exit list starts at the full 4.5 m so that shortening the entry alone is
+    # tried first, and it is searched at all because the stations whose bottleneck is the RETURN
+    # regress without it.
+    #
+    # Runs at the FULL margins, ahead of the squeeze pass, and the squeeze is not nested inside a
+    # rung: a shorter ramp pays in curvature, a squeeze pays in clearance, and that is the order
+    # the two should be spent in.
+    ramp_search_enable: true
+    ramp_search_entry_m: [3.15, 2.5, 2.0, 1.5, 1.0]   # [m]
+    ramp_search_exit_m: [4.5, 2.5, 1.5]               # [m]
+    # [ms] budget for the whole ladder, checked before each rung; over it, fall through to the
+    # squeeze. One rung is a full re-plan (~5 ms here, slower on the car), so this is a count of
+    # rungs as much as a time.
+    #
+    # 8 -> 20. Where it matters is CORNERS; on the flat four-box scenario 8, 20 and 40 give
+    # identical results (every success is rung 1, 9.3 ms cumulative). Measured over the 33 ifac
+    # stations with |kappa| > 0.8, planning at 8 m, with the per-cycle wall time of the planner:
+    #        budget   corner feasible   loop p50   loop p95
+    #          8 ms        14/33         12.9 ms    14.4 ms
+    #         20 ms        19/33         20.2 ms    25.8 ms
+    #         40 ms        21/33         23.6 ms    43.2 ms
+    # 20 ms takes most of the corner gain; 40 ms buys two more stations and pushes p95 to 43 ms
+    # against a 50 ms loop period ON A DEVELOPMENT MACHINE -- the car is slower, and a planner
+    # that overruns its period feeds the state machine's own staleness gate. That trade is not
+    # worth two stations.
+    #
+    # Do NOT raise n_d_samples alongside it: that takes a rung from 4.31 to 6.53 ms, and the
+    # budget then cannot even afford rung 1.
+    ramp_search_max_ms: 20.0
+    # [m] extra offset at the box CENTRE beyond the clearance value: the path peaks here (widest,
+    # furthest from the obstacle). Limited by the corridor (a bulge past the wall is clipped to it).
+    #
+    # 0.10 -> 0.05. The design clearance to a box EDGE was width_car/2 + safety_margin + apex_bulge
+    # = 0.40 m, and measured over 123 ifac stations the paths averaged more than that. The bulge is
+    # the only one of the three that can move: safety_margin is pinned from three directions at
+    # once (obs_margin also inflates the s-window, which must cover half the car's LENGTH, 0.29 m;
+    # the SM's overtake free-check wants 0.30; the clear-gate entry 0.28), so the reserve comes
+    # out of the comfort term or not at all.
+    #
+    # Measured, one box walked around the lap, mean over the feasible stations:
+    #                       bulge 0.10   bulge 0.05
+    #   mean peak |d|          0.570        0.507   m
+    #   mean edge clearance    0.420        0.357   m
+    #   feasible @ 12 m gap      78           80    of 123 stations
+    #   feasible @  8 m gap      69           70
+    #   feasible @  4 m gap      63           64
+    #   mean min speed         2.155        2.164   m/s
+    # A tighter line is also a slightly more feasible one, because the peak is what the corridor
+    # and the body gate reject.
+    #
+    # DO NOT set 0. obs_ok's keep-out test is INCLUSIVE at the boundary, so a candidate sitting
+    # exactly on the edge is rejected and the choice falls to the next sample further out: measured
+    # mean peak 0.596 m and only 75 feasible stations -- wider AND less feasible than 0.05.
+    apex_bulge: 0.05
+    # 2 -> 3. The node already supported 3; the yaml was the binding limit, and it does not merely
+    # cost coverage of the third box -- it makes the whole plan infeasible. The feasibility filter
+    # (obs_ok) tests EVERY obstacle inside the 15 m lookahead, while only max_weave of them get a
+    # knot. A third box therefore contributes a keep-out that nothing shapes the path around, and
+    # the return ramp after the second apex runs straight through it, so every candidate is
+    # rejected -> feasible=False -> TRAILING. The IFAC format is 3 boxes.
+    max_weave: 3            # max obstacles woven into ONE path (slalom). At 1 a close pair broke:
+                            #       every single-apex candidate around obstacle A ran through B and
+                            #       was rejected by the box check -> NO feasible path (TRAILING) and
+                            #       B's apex was never captured, so the re-opt only ever knew A.
+                            #       2 covers the IFAC two-obstacle format; raise to 3 for triples.
+    tail_m: 0.0             # [m]  short raceline (d=0) tail after the return (on_spline horizon)
+    # [m] how far PAST the lookahead obstacles are still COLLECTED. The path is longer than the
+    # lookahead -- it runs return_len + tail_m past its last apex -- and obs_ok used to be filtered
+    # by the lookahead, so a candidate could be certified while its own exit ramp went through a
+    # box just outside it. That path is not merely optimistic: _commit_slice_clear re-checks the
+    # frozen slice against EVERY live obstacle, so the box-1-only path failed its own re-check on
+    # the next cycle, published feasible=False, was re-planned identically, and flapped at 20 Hz.
+    # Measured with two boxes and the car swept 6 -> 19 m, cycles with NO path published:
+    #     spacing  1.5 m   2.5 m   3.5 m   5.0 m
+    #     before      3       8      13      20
+    #     after       0       0       0       0
+    # Knots still go to the driving horizon FIRST (the list is sorted by gap, so the boxes inside
+    # the lookahead have first claim on the max_weave slots); a box past it takes a slot only when
+    # one is left over, and is enforced only if it got one -- enforcing a box no knot could be
+    # spent on rejects every candidate, which is a blackout in place of a path that was correct
+    # for the whole driving horizon.
+    obs_gather_extra_m: 4.5   # = return_len + tail_m
+
+    # --- feasibility limits ---
+    # Curvature is checked CORNER-FAIR: bound the curvature the maneuver ADDS over the raceline
+    # (kappa_add_max) AND an absolute steering ceiling (kappa_abs_max). An absolute-only check
+    # rejected every offset in a corner (raceline curvature alone ate the budget) -> flat spline,
+    # no avoidance. kappa_max is kept only as a DEPRECATED alias of kappa_abs_max.
+    kappa_add_max: 6.0      # [1/m] max curvature the maneuver may ADD over the raceline
+    kappa_abs_max: 6.5      # [1/m] absolute curvature ceiling (physical min turn radius)
+    # THE NEXT THREE ARE FALLBACKS, NOT THE SOURCE OF TRUTH. At startup the node replaces them
+    # from config/<SIM|CAR>/veh_dyn_info (static_avoidance_node.load_veh_dyn_tables):
+    #     a_lat_max    <- ggv.csv ay_max                              6.0 -> 5.70
+    #     a_long_max   <- min(ggv ax_max, b_ax_max_machines.csv)      4.0 -> 7.00
+    #     a_long_accel <- min(ggv ax_max, ax_max_machines.csv)        3.0 -> 7.00
+    # a_long_max read 5.00 until 2026-08-12: b_ax_max_machines.csv was 5.0 and BOUND the pair.
+    # Measured braking is -12.6..-14.1 m/s^2, so that table was ~2.6x low; it is now 10.0 and the
+    # binding term on BOTH longitudinal limits is ggv ax_max (7.0). This is a LIVE change -- the
+    # node re-reads these at startup, so it does not wait for a raceline regeneration.
+    # WHY: race day resurfaces the grip, and the procedure is to multiply a factor k into
+    # ggv.csv and regenerate the raceline (seconds). That only works if k lands in ONE file.
+    # These three sat outside that path, so a re-grip would have left avoidance planning
+    # against the old surface -- and nobody would have seen it until the car pushed wide.
+    # The values below are still used, and warned about once, if veh_dyn_info cannot be read.
+    # Because the node re-reads them at startup, `ros2 param set a_lat_max ...` no longer
+    # changes anything on a car whose config IS readable. That is deliberate and costs nothing
+    # here: the re-grip workflow restarts the stack anyway.
+    a_lat_max: 6.0          # [m/s^2] lateral-accel cap used for v = min(v_gb, sqrt(a_lat_max/kappa))
+    a_long_max: 4.0         # [m/s^2] longitudinal DECEL; backward pass brakes EARLY into the apex (slow-in)
+    a_long_accel: 3.0       # [m/s^2] longitudinal ACCEL; forward pass ramps speed up GRADUALLY out of the
+                            #         apex (fast-out). lower = gentler/longer exit acceleration.
+    use_grid_check: true    # reject candidates crossing the eroded /map (GridFilter)
+    kernel_size: 3          # [cells] GridFilter erosion KERNEL size (8 ate ~0.2 m and rejected the
+                            #      raceline on ifac). NB: the kernel size is not the erosion DEPTH.
+                            #      cv2.erode with a k x k rect kernel eats floor(k/2) cells, so at the
+                            #      maps' 0.05 m/cell a kernel of 3 reserves 0.05 m, not 0.15 m -- the
+                            #      old note here read "3 cells @0.05 m = 0.15 m ~= half car" and the
+                            #      8 -> ~0.2 m figure beside it already contradicted that (8 -> 4
+                            #      cells -> 0.2 m). It matters because _grid_corridor takes only
+                            #      wall_margin off the measured free extent, on the stated grounds
+                            #      that "the erosion already reserves the clearance a car-centre
+                            #      point needs": it reserves 0.05 m, a third of half a car. With
+                            #      trust_grid_bounds the real car-centre wall reserve is therefore
+                            #      erosion + wall_margin = 0.05 + 0.10 = 0.15 m = exactly half the
+                            #      car and nothing more, against 0.25 m (half_car + wall_margin) on
+                            #      the waypoint-corridor path. Corrected as a comment only -- raising
+                            #      the kernel changes feasibility and is a tuning decision.
+    # --- body-safety floor: a SECOND view of the same map, eroded by half a car ---
+    # kernel_size above is the SAMPLING image and must stay generous, or narrow sections stop being
+    # samplable at all and the planner concedes TRAILING where it could still pass. But it reserves
+    # one cell = 0.05 m, and a path point is a CAR CENTRE: with trust_grid_bounds the waypoint
+    # corridor test is skipped entirely, so every published point used to be vetted against that
+    # 0.05 m alone -- a 0.30 m car on such a path has 0.10 m of itself inside the wall.
+    # This image erodes floor(7/2) = 3 cells = 0.15 m = width_car/2, and a path point that is not
+    # free in it is rejected outright (candidate loop AND committed-slice re-check). It is a FLOOR:
+    # the squeeze pass lowers safety_margin and wall_margin, never this.
+    # Measured on the shipped maps: the raceline is free at k=7 at 368/368 stations on ifac and
+    # 766/766 on f, and ifac's narrowest k=7 free span is 0.45 m -- the floor does not take away a
+    # line the car can actually drive.  1 = no erosion = floor disabled (not recommended).
+    body_kernel_size: 7     # [cells] floor(k/2) * resolution must cover width_car/2 (0.15 m @ 0.05)
+
+    # --- corridor source: measure the drivable width from the MAP, not from the waypoints ---
+    # d_left/d_right come from gb_optimizer, which labels the two track contours left/right with ONE
+    # global decision taken from the start pose (extract_track_bounds), plus an optional second flip
+    # from reverse_mapping. When that comes out inverted the whole lap ships with d_left/d_right
+    # EXCHANGED -- measured on map f: 125 of 128 sampled waypoints swapped, values exact mirrors
+    # (json L/R = 2.72/0.24 where the walls really are 0.24 left / 2.72 right); map ifac: 0 swapped.
+    # The planner then thinks the roomy side is the side the wall is on, samples every terminal
+    # offset into that wall, and the corridor filter rejects the genuinely free side -> "candidates
+    # on the opposite side of the gap", and with the obstacle pushed to one side the spline is drawn
+    # beyond the wall instead of through the open space. The occupancy grid is the only wall source
+    # that cannot be mislabelled, so measure the free lateral extent there and let it win.
+    # Offline check on the real maps: correct roomy side 60/60 on f and 46/46 on ifac, 0 sampled
+    # offsets inside a wall (vs 136 with the waypoint corridor). Cost 0.07 ms/call, <=2 calls/cycle.
+    # Set false to force the old waypoint-bounds behaviour (e.g. to reproduce the bug).
+    # NOTE: needs use_grid_check: true. The per-point grid test is what REPLACES the waypoint
+    # corridor filter; with use_grid_check false the waypoint bounds stay in charge of feasibility
+    # (conservative: a swapped map then trails instead of cutting a corner, as it did before).
+    trust_grid_bounds: true
+    grid_scan_max: 3.0      # [m] half-width of the lateral scan around the raceline (>= widest half-track)
+    grid_scan_step: 0.05    # [m] scan resolution; one map cell is the useful floor
+    bounds_warn_m: 0.5      # [m] warn when the waypoint bounds and the measured corridor disagree by
+                            #      more than this -- near-mirrored values in that warning mean the map's
+                            #      global_waypoints.json has d_left/d_right swapped and wants regenerating
+
+    # --- raceline-clear gate (idle when the CURRENT global line already avoids everything) ---
+    # After static_reopt swaps in the obstacle-aware line, the keep-out no longer contains d=0,
+    # so this planner goes idle: no re-avoidance of an already-cleared obstacle, no apex
+    # re-recording (which walked the re-opt line outward every lap), SM stays GB_TRACK.
+    clear_gate_enable: true
+    clear_hyst_m: 0.03      # [m] EXTRA clearance required to enter idle (leave only on a real violation)
+    clear_max_cur_d: 0.15   # [m] above this |cur_d| a stand-down CANCELS an excursion, so it must be
+                            #      earned at the full entry margin and may never ride on a latch. It no
+                            #      longer gates whether the clearance is EVALUATED: the steady-state
+                            #      tracking error is ~0.5 m, so gating evaluation on 0.15 meant the gate
+                            #      simply did not run after a line swap and every pass re-avoided a box
+                            #      the global line already cleared.
+    clear_latch_ttl_s: 10.0 # [s] how long a per-obstacle clear latch survives while that obstacle is
+                            #      outside the lookahead. The latch is per tracker id and deliberately
+                            #      OUTLIVES the lookahead -- a box leaves the horizon on every approach,
+                            #      and resetting there made it re-earn idle at the entry margin each lap
+                            #      (one re-triggered maneuver per pass). The TTL only bounds the dict.
+    clear_margin_m: 0.10    # [m] extra beyond half_car(0.15) for the CLEAR trigger -> need = 0.25 m from
+                            #      the box edge (+clear_hyst_m when entering idle). This is "does the car
+                            #      fit past the box", NOT the clearance a new path is designed to
+                            #      (obs_margin = half_car + safety_margin = 0.30). The gate used
+                            #      obs_margin, which left only 0.35-0.33 = 2 cm against the line
+                            #      static_reopt actually builds (reopt_obs_margin 0.35): any error past
+                            #      2 cm made an already-cleared obstacle read as on-path, the planner
+                            #      then failed to re-clear it at the full 0.30 in the corridor the line
+                            #      had already used, rejected every candidate and dropped to TRAILING.
+                            #      Raise toward 0.15 if the car idles past boxes it should still avoid;
+                            #      lower if a cleared obstacle still re-triggers avoidance.
+
+    # --- path commitment (temporal consistency: plan once, reuse) ---
+    # The planner re-solved from the car's instantaneous pose every 20 Hz cycle. Once the obstacle
+    # came within ramp_len the entry ramp re-anchored to the moving/erroring car and the chosen
+    # candidate shifted as the gap shrank, so the car re-avoided the SAME box weirdly on approach.
+    # With commitment the chosen path is frozen in the world frame and just re-sliced/re-published;
+    # a fresh plan is taken only on a real trigger (car off the path, box moved, slice no longer
+    # clears a live box, or maneuver done). Safety is NOT frozen: the committed slice is re-checked
+    # against live obstacles every cycle and publishes feasible=False the instant it stops clearing.
+    commit_enable: true
+    # Release the commit when a QUALIFYING obstacle it was never planned around comes into the
+    # lookahead. A frozen path is a statement about the obstacles that were known when it was
+    # frozen, and "a new box appeared" was not among the release conditions -- the one that
+    # eventually fired was the safety re-check, which fires later (once the frozen geometry is
+    # already violated) and publishes feasible=False, the state machine's cue to abandon the
+    # overtake. Measured with a box arriving from beyond the gather horizon: box 2 was planned
+    # around 15.0 m ahead with this on, and not at all with it off until the commit expired.
+    commit_drop_on_new_obstacle: true
+    commit_dev_max: 0.6     # [m] deviation at which the committed path's ENTRY is re-anchored onto
+                            #      the car. Was 0.35 -- BELOW the controller's ~0.5 m steady-state
+                            #      tracking error -- and it dropped the commit outright, so normal
+                            #      tracking error triggered a full re-plan, the fresh plan was
+                            #      anchored at the displaced car, the controller tracked it with the
+                            #      same error, and the next cycle dropped it again. That loop is the
+                            #      oscillation. Now above the error, and the response is a soft
+                            #      re-anchor of the entry only (apex, clearance and exit untouched).
+    commit_reanchor_len_m: 2.0  # [m] arc length the entry correction is faded out over (smootherstep)
+    commit_reanchor_max_m: 1.0  # [m] beyond this it is not an entry fix -> take the full re-plan
+    # [m] the published path before the hump's entry ramp used to HOLD the car's current lateral
+    # offset flat all the way to s_entry0 -- with a 15 m lookahead and a 4.5 m entry ramp that is up
+    # to 10.5 m of path carrying the instantaneous tracking error as a DC offset, and the hump then
+    # started from that offset instead of from the raceline. Decay it to the raceline within this
+    # distance (quintic, C2 at both ends) and hold zero until the hump opens. 0 = no pre-ramp.
+    preramp_len_m: 3.0
+    commit_obs_ds: 0.75     # [m] drop the commit if the triggering box's s drifts this far (re-plan apex)
+    commit_obs_dd: 0.40     # [m] ... or its d drifts this far
+    # [m] a box the commit KNEW ABOUT but never shaped the path around -- one that found no free
+    # max_weave slot -- is re-planned for once it is this close. The commit records the collected
+    # set and the SHAPED set separately, and this trigger is the difference between them.
+    # Sized as the maneuver: ramp_len 4.5 + shift_min 1.0 + 1.5 m of headroom, i.e. the shortest
+    # range at which a hump can still be laid. It is clamped at lookahead_min on load, and that
+    # clamp is the safety argument: the shaped set contains every box inside the lookahead, so the
+    # re-plan this trigger causes records the box as shaped and it cannot fire twice.
+    commit_replan_gap_m: 7.0
+
+    # --- which shape carries the sampled terminal offset -----------------------------------
+    # sample      the quintic hump: raceline -> apex -> raceline, with the corridor consulted at the
+    #             obstacle's own station and along the two outer ramps. This is what ships.
+    # corridor_qp minimum bending inside the measured corridor, solved once per candidate over the
+    #             WHOLE span the maneuver owns -- entry ramp, every apex, the inter-apex weave and
+    #             the return -- with the keep-out of each shaped box and the terminal d = 0 folded
+    #             into the bounds. Knots, sides, apex offsets, lookahead and every gate afterwards
+    #             are the sampled path's, unchanged; only d(s) is re-decided.
+    #
+    # WHY THE OPTION EXISTS, in one line each (planner/spliner/RAMP_CEILING_NOTE.md):
+    #   67 % of the rejections that a corridor could fix sit in the inter-apex weave -- the one
+    #   segment nothing scans; the two ramps together are 11 %. The ceiling for re-deciding the
+    #   whole span, answering every gate the node runs, is 25.6 % / 35.1 % of ALL refusals.
+    # WHAT IT COSTS: the corridor-decided shape is more curved than a quintic through the same
+    #   apex, so its curvature-limited speed is lower. A slower real path where there was no path
+    #   is the trade; a refusal is a TRAILING standstill behind a stationary box.
+    # DEFAULT corridor_qp AS OF SIM. It was 'sample' while every corridor_qp number was offline;
+    # sim now reports paths generated early and tracked well, and the offline gates agree -- the
+    # stability sweep passes on both methods once G2 measures the step the car did NOT drive to
+    # (see the G2 note in sweep_avoidance_stability.py), and corridor_qp publishes on 415 of 585
+    # cycles there against sample's 139.
+    # THE SWITCH STAYS. The sampled path is still present and still the fallback: this is a
+    # default, not a deletion, and 'sample' remains selectable at runtime.
+    static_plan_method: "corridor_qp"     # sample | corridor_qp
+    # corridor_qp: weight on ||d||^2 against ||d''||^2 in the objective. NOT a fraction -- the
+    # bending block carries 1/ds^4, which is 1e4 at the 0.1 m publishing grid, so this is only felt
+    # in the hundreds. 0 = pure minimum bending, which the terminal pins already keep bounded.
+    corridor_qp_w_dev: 0.0
+    # corridor_qp: hold the apex bands at the quintic's own values instead of letting the keep-out
+    # bounds decide them. Side selection and keep-out are ALREADY in the bounds, so the corridor
+    # forces the apex offset on its own and pinning the value as well over-constrains a run whose
+    # two ends are pinned already. Kept so the two formulations can be measured against each other
+    # (sweep_static_race.py --method corridor_qp --pin-apex).
+    corridor_qp_pin_apex: false
+    # corridor_qp: control points per solve. The BOUNDS are enforced at every published station
+    # whatever this is, so lowering it costs expressiveness and never costs feasibility. A three-box
+    # maneuver is 200+ stations at 0.1 m and the solve runs once per candidate inside a 20 Hz cycle;
+    # 60 keeps that at ~0.6 ms.
+    corridor_qp_max_vars: 60
+    # corridor_qp: run the ramp ladder as well. OFF, and measured rather than assumed.
+    # The ladder re-throws the candidate grid over a different ramp pair. What that buys the SAMPLE
+    # path is not a ramp length: on the 90 (ifac) / 65 (ifac_0807) cells it opens, every one died at
+    # rung 0 on obs_box+grid+body and every winning rung has a SHORTER ENTRY -- which moves
+    # s_entry0, and with it cand_entry_i, the station from which the grid and body gates hold a
+    # candidate responsible. The quintic's only way past an early pinch is to hand those stations
+    # back to the pre-ramp and the d = 0 tail. The QP can already sit on the raceline there inside
+    # the long window, so over 8484 / 9462 race cells the ladder opens exactly ZERO for it --
+    # identical refusal rate (32.0 % / 24.4 %) and identical published-path counts, at 2.4x the
+    # cell time. Set true to re-test the claim on a new map.
+    corridor_qp_ramp_ladder: false
+    # One PLAN line per cycle, for SIM runs. OFF: it costs a whole extra planning pass.
+    #   PLAN method=corridor_qp ms=11.4 pts=151 obs=3 squeeze=0 vcap=2.44 vs_sample=OPENED
+    # vs_sample re-runs the REAL pipeline with the other d(s) generator and probe=true, so it
+    # answers to the same knots, gates and margins. OPENED = this shape found a path the other one
+    # would not have; LOST = the reverse, never seen offline and worth investigating if a bag shows
+    # it. A refusal rate is a sweep statistic; this is the only way to see, from a bag, what
+    # changing the shape actually changed on a car.
+    static_plan_log: false
+
+    # --- cost weights  J = w_d*Σ|d| + w_k*Σκ² + w_c*|d_end-d_end_prev| + w_obs*Σexp(-dist/σ) ---
+    w_d: 1.0                # raceline deviation
+    w_k: 0.1                # curvature (smoothness)
+    w_c: 5.0                # consistency with previous choice (anti-chatter)
+    w_obs: 2.0              # soft obstacle proximity
+    obs_sigma: 0.5          # [m]  soft-penalty length scale

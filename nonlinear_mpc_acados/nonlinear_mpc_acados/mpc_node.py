@@ -130,6 +130,11 @@ LIVE_PARAMS = [
     ('q_p_scale_live', 1.0),
     ('q_drate_scale_live', 1.0),
     ('q_dv_scale_live',    1.0),   # 2026-05-27 #8 — a_x penalty
+    # 0822 좁은틈 통과: 장애물중심→벽 거리가 이 값 이상이면 서행 통과 허용.
+    # 물리 최소 0.55 = r_obs0.15 + (차반폭0.15+여유0.05) + (차반폭0.15+벽여유0.05).
+    # 종전엔 0.70 하드코딩이라 주 판정(R_safe+R_car=0.70)과 같아 예외가 죽어있었다.
+    ('narrow_room_live',   0.55),
+    ('narrow_pass_v_live', 1.5),    # [m/s] 좁은틈 통과 중 속도 상한 (0=무제한)
 ]
 
 
@@ -240,6 +245,27 @@ class MPCNode(Node):
         self.declare_parameter('brake_anticip_d_min', 0.0)  # 2026-07-16 anticip 캡 근거리 제외 [m]: d_i<d_min 스테이지는 캡 후보서 제외. 0=기존(직선서 캡≈v_next=가속목줄, bag 재계산으로 확정). 코너 정직성은 brake min-guard+원거리 캡이 유지.
         self.declare_parameter('speed_cmd_err_max', 0.0)  # 2026-07-16 발행 v_cmd <= v_now+err_max [m/s]. d_min 해방 후 cmd 7.8>erpm캡 6.74 슬래밍+plan지터 증폭(톱니 0.2/실속출렁 0.6) → 캡이 물리면 cmd=실속+상수(매끈)+VESC 최대구동 유지. 0=off
         self.declare_parameter('speed_cmd_gain', 1.0)  # 2026-07-09 가속 오차증폭 G: v_cmd=v_now+G*(v_plan-v_now), 가속국면만. VESC 약한 속도PID의 소프트웨어 보상. 1.0=off
+        # ── 0821 sight-limited speed (갑작스러운 장애물) ──
+        # ── 조향 데드밴드 보상 (2026-08-22 실측) ──────────────────────
+        # 0822 bag(4084행/11랩)을 실제 서보지령 + VESC 자이로로 재측정한 결과,
+        # 명령 조향 중 상수 ~0.028 rad(1.6°)가 요레이트를 전혀 만들지 않는다.
+        # 달성률이 |δ|0.02~0.08 에서 0.571, 0.25~0.45 에서 0.909 로 '올라가는'
+        # 형태 = 곱셈 게인오차가 아니라 상수 손실(링키지 유격). 언더스티어는
+        # 배제됨(손실각-횡가속 구배 음수, R²=0.10). 0=off.
+        # 0822 저녁: 기본 OFF 로 내림. 실차 미검증인데 0 부근 감도를 키워
+        # 중립 편향까지 증폭했다(좌벽/우벽 왕복). 중립(servo offset)을 먼저
+        # 정적 직진 테스트로 확정한 뒤, 깨끗한 bag 으로 A/B 하고 켠다.
+        # 켜기: ros2 param set /mpc_node steer_deadband_ff 0.030
+        self.declare_parameter('steer_deadband_ff', 0.0)        # [rad] 보상량(0=off)
+        # 0822 실차: 0.030 이면 0 부근 기울기가 1+db/ds = 2.0 배 — 중립 감도를
+        # 두 배로 만들어 잔존 편향까지 증폭했다(좌벽 붙음). 0.060 = 기울기 1.5.
+        self.declare_parameter('steer_deadband_smooth', 0.060)  # [rad] tanh 전이폭
+        # 0.40 = mpc_max_steering. 서보 물리한계 0.4189, 그 위는 엔드스톱이라
+        # 응답이 평탄해지고 초과 명령은 서보를 갈아먹는다(0703 실측, yaml:93).
+        # 따라서 FF 는 한계 미만 구간에서만 보상하고 절대 넘기지 않는다.
+        self.declare_parameter('steer_ff_limit', 0.40)          # [rad] 보상후 클램프
+        self.declare_parameter('sight_brake_a', 4.0)   # [m/s²] 안전속도 계산용 제동. 0=off
+        self.declare_parameter('sight_v_floor', 1.2)   # [m/s] 하한 — 완전정지 방지
         # 2026-07-09 국소 corridor 하드닝: s∈[s0,s1] 예측 스테이지의 corridor slack
         # 벌금을 factor배 (스텁 s≈21.6 soft-corridor 뚫림 대응). factor<=1 = off. live.
         self.declare_parameter('corridor_hard_s0', 20.8)
@@ -265,7 +291,18 @@ class MPCNode(Node):
         self.declare_parameter('corridor_hard6_factor', 1.0)
         # 2026-07-21 헤어핀 q_cte 존 부스트: corridor_hard 존 안 스테이지의
         # q_cte_scale ×factor (라인추종 타이트닝). 1.0=off. live.
+        # 2026-08-19: 전역 스칼라 1개라 "존A는 조이고 존B는 푸는" 조합이 불가능했다.
+        # 아래 존별 qcte factor 를 신설하고, 이 전역값은 존별 값이 1.0(미설정)일 때의
+        # 폴백으로만 남긴다 — 기존 yaml 이 무수정으로 같은 거동을 내야 하므로.
         self.declare_parameter('qcte_zone_factor', 1.0)
+        # 2026-08-19 존별 q_cte 배율. 1.0 = 이 존은 q_cte 를 건드리지 않음.
+        # slack factor 와 독립이라 "코리도는 그대로 두고 q_cte 만" 이 가능하다.
+        self.declare_parameter('corridor_hard_qcte_factor', 1.0)
+        self.declare_parameter('corridor_hard2_qcte_factor', 1.0)
+        self.declare_parameter('corridor_hard3_qcte_factor', 1.0)
+        self.declare_parameter('corridor_hard4_qcte_factor', 1.0)
+        self.declare_parameter('corridor_hard5_qcte_factor', 1.0)
+        self.declare_parameter('corridor_hard6_qcte_factor', 1.0)
         # 2026-07-28: corridor_hard 존/ s 눈금자를 /mpc/zone_markers 로 발행.
         # 발행 전용(제어 무영향). 존 구성이 바뀐 사이클에만 다시 그린다.
         self.declare_parameter('publish_zone_markers', True)
@@ -282,6 +319,11 @@ class MPCNode(Node):
         # 0722n 2.5→3.3: 2.5 플로어가 "회피가 너무 느림" 체감의 정체 (순항 4.5 대비).
         # slack×10으로 계획이 keepout을 지키게 된 뒤라 감속 의존도 낮아짐.
         self.declare_parameter('obs_pass_speed', 3.3)
+        # 0818 좁은통로(정중앙 장애물, side-decide shift>0) 사전 감속 캡. 라이브.
+        self.declare_parameter('narrow_pass_speed', 2.5)
+        # 0818 정적 전용 스위치: true 면 동적 확정 무시(전 검출 정적 경로). 정적 장애물 실험용.
+        # 트레일링/추월 땐 false. 라이브.
+        self.declare_parameter('static_only_obstacles', False)
         # 0723z: 동적 상대 추월 허용 스위치 — 기본 False(트레일링만). 추후 GP
         # 예측 신뢰도가 충분할 때 True로 (사용자 로드맵: 학습되면 오버테이킹).
         self.declare_parameter('overtake_enabled', False)
@@ -1140,6 +1182,17 @@ class MPCNode(Node):
         # 와서 mpc 가 commit release -> warm-start 리셋 -> 재commit 진동 (실측: 장애물
         # 가시중 steer 지터 p90 +25%). 빈 수신은 아래 TTL 3s 동안 이전 목록 유지.
         new = [(p.position.x, p.position.y) for p in msg.poses]
+        # 0813 kiss 정적/동적 플래그 수신 (orientation.z: <0.25 정적확정 / 0.5 미확정 / ≥0.75 동적).
+        # 정적확정만 위치안정 게이트 우회. 미확정·동적은 기존 MPCC 경로 그대로.
+        # 구 kiss 가드: 송신 패치 전 kiss 는 orientation 정확히 0 → 정적확정과 구분 불가.
+        # 세션 중 z∉{0}(0.5/1.0) 이 한 번이라도 보이면 신 kiss 로 래치. 그 전엔 불신(안전).
+        if not getattr(self, '_kiss_flag_ok', False):
+            self._kiss_flag_ok = any(p.orientation.z > 0.1 for p in msg.poses)
+        self._kiss_static_xy = ([(p.position.x, p.position.y) for p in msg.poses
+                                 if p.orientation.z < 0.25]
+                                if getattr(self, '_kiss_flag_ok', False) else [])
+        self._kiss_dyn_v = {(p.position.x, p.position.y): (p.orientation.x, p.orientation.y)
+                            for p in msg.poses if p.orientation.z >= 0.75}
         # ── 0807 실차: 트랙 밖 클러스터 게이트 (노트북 8f1c90a 동일) ──
         # kiss 클러스터 raw 입력이라 트랙 밖 6.5~7.5 m 피트/구조물이
         # side-decide 스팸 + 유령 동적 래치(vs=-0.73)를 만들던 것 차단.
@@ -1522,7 +1575,7 @@ class MPCNode(Node):
         # 블록 담장이 됐고, 높이 0.9 m 가 궤적을 가렸다. 이음매 없는 커튼으로
         # 바꾸고 높이를 0.5 m 로 낮춘다 — 존은 보이되 궤적을 안 가리게.
         ZW = 0.5        # 커튼 높이 [m]
-        for zi, (pfx, s0, s1, fac) in enumerate(zone_specs):
+        for zi, (pfx, s0, s1, fac, qfac) in enumerate(zone_specs):
             span = (s1 - s0) if s1 >= s0 else (s1 + L - s0)
             t = min(max((float(fac) - 1.0) / 5.0, 0.0), 1.0)   # 1.0~6.0 → 0~1
 
@@ -1565,7 +1618,9 @@ class MPCNode(Node):
             lab.pose.position.x, lab.pose.position.y, lab.pose.position.z = lx, ly, ZW + 0.45
             lab.scale.z = 0.40
             lab.color.r, lab.color.g, lab.color.b, lab.color.a = 1.0, 1.0, 1.0, 1.0
-            lab.text = f"{pfx}  s{s0:.1f}~{s1:.1f}  x{fac:.1f}"
+            # 2026-08-19: slack 배율(x)과 q_cte 배율(q) 을 같이 찍는다.
+            lab.text = (f"{pfx}  s{s0:.1f}~{s1:.1f}  x{fac:.1f}"
+                        + (f"  q{qfac:.2f}" if qfac != 1.0 else ""))
             arr.markers.append(lab)
 
         self.zone_markers_pub.publish(arr)
@@ -1668,7 +1723,7 @@ class MPCNode(Node):
         self._imk_server.clear()
         self._imk_map = {}
         L = float(self._track.element_arc_lengths_orig[-1])
-        for pfx, s0, s1, _fac in zone_specs:
+        for pfx, s0, s1, _fac, _qfac in zone_specs:
             for which, s_val, (cr, cg, cb) in (('s0', s0, (0.1, 1.0, 0.2)),
                                                ('s1', s1, (0.2, 0.5, 1.0))):
                 name = f"{pfx}_{which}"
@@ -1901,7 +1956,9 @@ class MPCNode(Node):
         # 존 키는 yaml 에 없더라도 반드시 기록(없으면 재시작 시 유실)
         for pfx in ('corridor_hard', 'corridor_hard2', 'corridor_hard3',
                     'corridor_hard4', 'corridor_hard5', 'corridor_hard6'):
-            for suf in ('_s0', '_s1', '_factor'):
+            # 2026-08-19: _qcte_factor 추가 — 빠뜨리면 존별 q_cte 배율이
+            # zone-save 후 재시작 때 통째로 사라진다 (yaml 에 안 써지므로).
+            for suf in ('_s0', '_s1', '_factor', '_qcte_factor'):
                 try:
                     keys[pfx + suf] = float(self.get_parameter(pfx + suf).value)
                 except Exception:  # noqa: BLE001
@@ -1956,8 +2013,8 @@ class MPCNode(Node):
             return
         # unified 7-dim state [x,y,ψ,vx,vy,r,s] (both modes) → s = x0[6].
         s_now = float(x0[6])
-        # 국소 corridor 하드닝 존 전달 (live 튜닝 가능)
-        _chf = float(self.get_parameter('corridor_hard_factor').value)
+        # 국소 corridor 하드닝 존 전달 (live 튜닝 가능) — 존 1 도 아래 _zone_of()
+        # 루프에서 나머지와 같이 처리한다 (2026-08-19 이전에는 존 1 만 별도 분기였다).
         self.mpc.straight_qv_factor = float(self.get_parameter('straight_qv_factor').value)
         self.mpc.straight_kappa_thr = float(self.get_parameter('straight_kappa_thr').value)
         # _zone_specs 는 (파라미터 접두어, s0, s1, factor) — 시각화/드래그 편집이
@@ -1967,19 +2024,26 @@ class MPCNode(Node):
         # 좁은 시케인(s21-24, 폭 ±0.13-0.23)은 강한 corridor push 가 반대편
         # 클립을 유발해(0602 재현) 오히려 벌점을 낮춰야 통과한다 (아침 bag:
         # 실효 60/45 로 통과, 200/120+ 로 매랩 충돌). 1.0 만 '비활성'.
+        # 2026-08-19: 등록 게이트가 slack factor 만 보던 탓에 q_cte 존을 켜려면
+        # slack factor 를 1.05 같은 근중립값으로 두는 해킹이 필요했다. 둘 중
+        # 하나라도 활성이면 등록한다 — slack 은 그대로 두고 q_cte 만 조절 가능.
+        def _zone_of(_zn):
+            _sf = float(self.get_parameter(_zn + '_factor').value)
+            _qf = float(self.get_parameter(_zn + '_qcte_factor').value)
+            if not ((_sf != 1.0 and _sf > 0.0) or (_qf != 1.0 and _qf > 0.0)):
+                return None
+            return (_zn,
+                    float(self.get_parameter(_zn + '_s0').value),
+                    float(self.get_parameter(_zn + '_s1').value),
+                    _sf, _qf)
+
         _zone_specs = []
-        if _chf != 1.0 and _chf > 0.0:
-            _zone_specs.append(('corridor_hard',
-                                float(self.get_parameter('corridor_hard_s0').value),
-                                float(self.get_parameter('corridor_hard_s1').value), _chf))
-        for _zn in ('corridor_hard2', 'corridor_hard3', 'corridor_hard4',
-                    'corridor_hard5', 'corridor_hard6'):
-            _zf = float(self.get_parameter(_zn + '_factor').value)
-            if _zf != 1.0 and _zf > 0.0:
-                _zone_specs.append((_zn,
-                                    float(self.get_parameter(_zn + '_s0').value),
-                                    float(self.get_parameter(_zn + '_s1').value), _zf))
-        _zones = [(a, b, c) for _, a, b, c in _zone_specs]
+        for _zn in ('corridor_hard', 'corridor_hard2', 'corridor_hard3',
+                    'corridor_hard4', 'corridor_hard5', 'corridor_hard6'):
+            _z = _zone_of(_zn)
+            if _z is not None:
+                _zone_specs.append(_z)
+        _zones = [(a, b, c, d) for _, a, b, c, d in _zone_specs]
         self.mpc.corridor_hard_zones = _zones
         if bool(self.get_parameter('publish_zone_markers').value):
             try:
@@ -2042,6 +2106,10 @@ class MPCNode(Node):
             if _trk is not None:
                 _trk.predict(_now_dyn)
             _dyn = _trk is not None and _trk.confirmed_dynamic(_now_dyn)
+            # 0818 정적 전용 스위치 — 고속 검출 밀림이 정적 물체를 동적으로 오판해
+            # 원형 keepout/추종 모드로 빠지는 것을 차단 (정적 장애물 실험 중).
+            if bool(self.get_parameter('static_only_obstacles').value):
+                _dyn = False
             if _dyn != _dyn_prev:
                 self.get_logger().info(
                     "[P3] dynamic opp %s (vs=%.2f)" % (
@@ -2069,7 +2137,17 @@ class MPCNode(Node):
                     if self._q_fast is None:
                         self._q_fast = {k: float(getattr(self.mpc, k))
                                         for k in self._Q_KEYS}
-                    _qset = self._q_safe if _want_safe else self._q_fast
+                    _qset = dict(self._q_safe if _want_safe else self._q_fast)
+                    # 2026-08-22: 하드코딩 SAFE 세트가 yaml 의 차량 고유 안정화
+                    # 대책을 되돌리지 못하게 하한을 깐다. q_drate 는 감쇠항이라
+                    # 낮추면 0.6 Hz 자기발진(맥 위빙)이 살아난다.
+                    for _fk in ('q_drate_scale_live', 'q_cte_scale_live'):
+                        try:
+                            _yv = float(self.get_parameter(_fk).value)
+                            if _qset.get(_fk, _yv) < _yv:
+                                _qset[_fk] = _yv
+                        except Exception:
+                            pass
                     for _k, _v in _qset.items():
                         setattr(self.mpc, _k, float(_v))
                     _reason = 'dyn' if _dyn else (
@@ -2124,19 +2202,30 @@ class MPCNode(Node):
                 # 0813 D6: 트래커 퇴출 판정용 최신 pose 스탬프
                 self._last_pose_xy = (float(x0[0]), float(x0[1]), float(x0[2]))
                 _seen = getattr(self, '_commit_seen', {})
+                # 0813 kiss 가 정적으로 확정한 검출은 위치안정 게이트를 즉시 통과 —
+                # 등록시각을 1s 전으로 박아 _young=False. kiss 판정이 MPCC 재판단(0.25s+
+                # 고속 반경붕괴)보다 빠르고 정확. 없으면(구 kiss) 기존 경로 그대로.
+                for _kx, _ky in getattr(self, '_kiss_static_xy', []):
+                    if not any(math.hypot(_k2[0]-_kx, _k2[1]-_ky) < 0.35 for _k2 in _seen):
+                        _seen[(float(_kx), float(_ky))] = _now_cls - 1.0
                 _nx, _ny = min(self._obstacles,
                                key=lambda o: (float(o[0]) - float(x0[0])) ** 2
                                + (float(o[1]) - float(x0[1])) ** 2)[:2]
                 # 0813 D6: 확정 트랙(기억 1s+)이면 위치안정 게이트 우회 플래그 —
                 # 이미 오래 본 물체라 0.25s 재관찰이 불필요 (랩당 커밋지연 제거).
                 # 아래 최종 대입에서 (_young and not _memorized) 로 반영.
+                # 0813 속도비례 반경: 고속에선 정지 장애물 검출이 진행방향으로 v·지연 만큼
+                # 밀려(0.3s 에 ~1m) 고정 0.35/0.5m 안에 안 머문다 → 게이트가 영원히 안 열림.
+                # +0.2·v 여유 (7m/s → +1.4m). 움직이는 상대 차단 목적은 유지(초당 수 m 이동).
+                _gate_r_v = 0.20 * abs(float(x0[3]))
+                _mem_r2 = (0.5 + _gate_r_v) ** 2
                 _memorized = any(
                     (_tr['t'] - _tr['t0'] >= 1.0 and _tr['hits'] >= 4
                      and _tr['inn'] < 0.25
                      and (_tr['x'] - float(_nx)) ** 2
-                     + (_tr['y'] - float(_ny)) ** 2 < 0.25)
+                     + (_tr['y'] - float(_ny)) ** 2 < _mem_r2)
                     for _tr in getattr(self, '_obs_trk', []))
-                _best = None; _bd = 0.35
+                _best = None; _bd = 0.35 + _gate_r_v
                 for _k2 in _seen:
                     _d2k = math.hypot(_k2[0] - float(_nx), _k2[1] - float(_ny))
                     if _d2k < _bd:
@@ -2677,9 +2766,26 @@ class MPCNode(Node):
                                                  traj[:, 1] - float(_oy)).min())
                         except Exception:
                             _pd = 0.0
-                        if _pd > 0.5:
+                        # 0818 좁은통로 판정: side-decide 가 이 장애물에 shift>0 을 기록했으면
+                        # (keepout 이 통로보다 넓어 제약선을 밀어야 함 = 정중앙 배치) 계획-간극
+                        # 게이트를 우회하고 narrow_pass_speed 로 미리 감속. bag 21_47: 이 배치에서
+                        # 커밋 왕복 중 저속 정지→QP 10건 + 스침 0.25m. 넓은 통로는 영향 없음.
+                        _nsd = getattr(self.mpc, '_narrow_shift', None) or {}
+                        _nit = _nsd.get((round(float(_ox) * 2.0) / 2.0,
+                                         round(float(_oy) * 2.0) / 2.0))
+                        # 0818b 티어: 남은 keepout 절대폭(keep_eff)으로 판단. shift 유무는 거의 모든
+                        # 장애물에서 참이라(사용자 실측: 전 회피 감속) 기준으로 부적합.
+                        #   keep_eff ≥0.55 → 감속 없음(기존 게이트) / 0.40~0.55 → 4.0 / <0.40 → narrow_pass_speed
+                        _keep_left = (float(_nit[2]) if (_nit is not None and len(_nit) > 2
+                                      and time.monotonic() - float(_nit[1]) < 10.0) else 9.9)
+                        _narrow = _keep_left < 0.55
+                        if _pd > 0.5 and not _narrow:
                             continue
                         _vp = float(self.get_parameter('obs_pass_speed').value)
+                        if _keep_left < 0.40:
+                            _vp = min(_vp, float(self.get_parameter('narrow_pass_speed').value))
+                        elif _keep_left < 0.55:
+                            _vp = min(_vp, 4.0)
                         # 0723c narrow-pass 감속: 계획 간극이 좁을수록 통과속도를
                         # 비례 축소 (0.5m→vp 그대로, 0.3m→~2.2, 바닥 2.0).
                         # keepout 공간맞춤으로 좁은 통로를 "지나가게" 된 대신
@@ -2769,6 +2875,32 @@ class MPCNode(Node):
         self._last_speed_pub = float(cmd.drive.speed)
         self._last_speed_t = _now_sp_t
 
+        # ── 좁은틈 통과 서행 (2026-08-22) ───────────────────────────────
+        # decide_side_pref 가 narrow-pass 를 택하면 여유가 수 cm 뿐이라
+        # 추종오차가 그대로 접촉이 된다. 통과 판정 후 hold 초 동안 속도 상한.
+        try:
+            _npu = float(getattr(self.mpc, '_narrow_pass_until', 0.0))
+            _npv = float(getattr(self.mpc, 'narrow_pass_v_live', 0.0))
+            if _npv > 0.0 and time.monotonic() < _npu:
+                if float(cmd.drive.speed) > _npv:
+                    cmd.drive.speed = float(_npv)
+        except Exception:
+            pass
+
+        # ── 조향 데드밴드 보상 (2026-08-22) ─────────────────────────────
+        # C-STEER 제한 '앞'에 둔다: 영교차에서 -db → +db 로 튀는 계단을 제한기가
+        # 눌러주므로 중립 채터링이 생기지 않는다. tanh 로 0 부근을 매끄럽게.
+        try:
+            _db = float(self.get_parameter('steer_deadband_ff').value)
+        except Exception:
+            _db = 0.0
+        if _db > 0.0:
+            _dbs = float(self.get_parameter('steer_deadband_smooth').value)
+            _dbl = float(self.get_parameter('steer_ff_limit').value)
+            _s0 = float(cmd.drive.steering_angle)
+            cmd.drive.steering_angle = float(max(-_dbl, min(_dbl,
+                _s0 + _db * math.tanh(_s0 / max(_dbs, 1e-3)))))
+
         # C-STEER (2026-06-19): hard OUTPUT steering-rate limit to servo slew.
         # The solver's first control jumps full-lock on the flat cost surface
         # (documented sign-flip hunting) → launch swerve + crash. Clamp published
@@ -2785,6 +2917,58 @@ class MPCNode(Node):
                 max(_prev_st - _dmax, min(_prev_st + _dmax, _s)))
         self._last_steer_pub = float(cmd.drive.steering_angle)
         self._last_steer_t = _now_t
+        # ── 0822: 솔버의 delta_prev 를 실제 발행값으로 되돌린다 ────────────
+        # acados_kinematic 은 _last_delta_applied = filt_steer 로 두고 그 값이
+        # 다음 사이클 x0[7](delta_prev)이 된다. 그 주석("what actually goes to
+        # the actuator")은 0619 에 바로 위 C-STEER 출력 제한기가 생기기 전
+        # 이야기고, 지금은 제한기가 사이클의 61.6% 에서 평균 0.047 rad 를
+        # 깎는다. 그래서 솔버가 믿는 직전조향 ≠ 차가 받은 조향이 되고, 그
+        # 불일치를 매 사이클 반대부호로 보정하려다 조향이 교번한다
+        # (bag 16_49_19 실측: 교번율 0.68, 사이클간 변화 p95 0.0800 rad =
+        #  sv_max·dT 경계에 정확히 붙은 bang-bang. feasible 100%, solve 6.3ms
+        #  이므로 솔버 성능 문제가 아니라 액추에이터 모델 불일치다).
+        # 실제 발행값을 돌려줘 루프를 닫는다.
+        try:
+            self.mpc._last_delta_applied = float(cmd.drive.steering_angle)
+        except Exception:
+            pass
+
+        # v2 (0821): 유클리드 거리는 방향을 모른다 — 옆을 지나가는 중/이미 지나친/
+        # 횡으로 충분히 벗어난 장애물에도 감속이 걸려 레이스 페이스를 깎았다(실측).
+        # 충돌 코스일 때만 건다: ①전방(Δs>0) ②횡으로 겹침 ③회피 커밋 전.
+        _sl_a = float(self.get_parameter('sight_brake_a').value)
+        if _sl_a > 0.0 and getattr(self.mpc, 'path_length', None):
+            try:
+                _sx = float(getattr(self.mpc, 'dbg_sel_x', 0.0))
+                _sy = float(getattr(self.mpc, 'dbg_sel_y', 0.0))
+                _dsel = float(getattr(self.mpc, 'dbg_sel_dmin', float('inf')))
+                _od = self._last_odom
+                if _dsel < 1e5 and _od is not None and (abs(_sx) + abs(_sy)) > 1e-6:
+                    _L = float(self.mpc.path_length)
+                    _s_o, _e_o = self.mpc._obstacle_frenet(_sx, _sy)
+                    _s_c, _e_c = self.mpc._obstacle_frenet(
+                        _od.pose.pose.position.x, _od.pose.pose.position.y)
+                    _ds = (_s_o - _s_c + 0.5 * _L) % _L - 0.5 * _L   # 전방 양수
+                    _keep = (float(getattr(self.mpc, 'R_safe_live', 0.45))
+                             + float(getattr(self.mpc, 'R_car_live', 0.27)))
+                    # ③ 이미 side 커밋 = 회피가 처리 중 → 감속 불필요
+                    _committed = getattr(self.mpc, '_committed_obs', None) is not None
+                    # ② 횡 겹침: 안 비켜도 지나갈 만큼 벗어나 있으면 위협 아님
+                    _lat_free = abs(_e_o - _e_c) > (_keep + 0.10)
+                    # Δs 하한 0.6m: 이미 옆을 지나는 중이면 감속해도 무의미, 페이스만 손해
+                    if (not _committed) and (not _lat_free) and 0.6 < _ds < 12.0:
+                        _free = max(0.0, _ds - _keep)
+                        _v_lim = max(float(self.get_parameter('sight_v_floor').value),
+                                     math.sqrt(2.0 * _sl_a * _free))
+                        if _v_lim < float(cmd.drive.speed):
+                            self.get_logger().warn(
+                                f'[sight] 전방 {_ds:.2f}m 횡{abs(_e_o-_e_c):.2f} → '
+                                f'상한 {_v_lim:.2f} (요청 {float(cmd.drive.speed):.2f})',
+                                throttle_duration_sec=1.0)
+                            cmd.drive.speed = _v_lim
+                            self._last_speed_pub = _v_lim
+            except Exception:
+                pass   # 안전속도 실패가 제어를 죽이지 않는다
 
         self.ackermann_pub.publish(cmd)
 

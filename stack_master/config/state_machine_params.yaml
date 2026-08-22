@@ -11,14 +11,83 @@ state_machine:
     track_length: 1.0
     # geometry / horizons
     gb_ego_width_m: 0.4
+    # Bound d(vx)/ds over the ASSEMBLED local window before it is published: one backward
+    # pass, then one forward pass seeded with the car's current speed. The two seams it
+    # covers -- the avoidance-to-global padding join and the raceline's own s = 0
+    # discontinuity -- are bounded nowhere else. Measured off: |a_long| p50/p95/max
+    # 4.88/35.6/56.8 m/s^2 against a ggv ax_max of 5.0, in 21.5% of windows.
+    local_window_accel_limit_enable: true
+    # local_window_a_long_mps2 IS A FALLBACK, NOT THE SOURCE OF TRUTH, since 2026-08-12. The node
+    # derives the bound at the car's speed from config/<SIM|CAR>/veh_dyn_info
+    # (state_machine_node._a_long_window):
+    #     min(ggv ax_max, ax_max_machines.csv, b_ax_max_machines.csv)     5.0 -> 7.00 at rest
+    # The tightest of both directions, because the backward (brake) and forward (drive) pass
+    # share one scalar. WHY: the measurement above is stated "against a ggv ax_max of 5.0" -- that
+    # ggv went to 7.0 on 2026-08-11 and this number did not follow, holding the assembled window
+    # to 71% of the envelope the raceline it is bounding was planned against.
+    # The value below is still used, and warned about once, if veh_dyn_info cannot be read.
+    # It stays declared (dropping it would break declare/YAML symmetry), but `ros2 param set
+    # local_window_a_long_mps2 ...` no longer moves the bound on a car whose config IS readable.
+    local_window_a_long_mps2: 5.0
+
+    # |d| below which the car counts as back on the raceline when LEAVING a non-GB_TRACK state.
+    # Lower half of the RECOVERY hysteresis band: entry uses gb_ego_width_m (0.4), exit uses this,
+    # so it must stay < gb_ego_width_m or RECOVERY chatters. Was hardcoded at 0.05 m -- tighter
+    # than the controller's steady-state tracking error, so RECOVERY latched and the local line
+    # was sourced from the recovery spline for the whole lap.
+    recovery_exit_d_m: 0.2
+    # |d| at or above which the raceline counts as LOST -> RECOVERY entry (_check_line_lost).
+    # Upper half of the band; must stay > recovery_exit_d_m. Entry was previously keyed off the
+    # per-state close_to_raceline flag, which is 0.4 m in GB_TRACK but recovery_exit_d_m elsewhere
+    # -- so trailing an opponent at |d| ~ 0.3 m entered RECOVERY while plain global tracking at the
+    # same offset did not. That asymmetry is why the recovery line only appeared while trailing.
+    recovery_entry_d_m: 0.4
     gb_horizon_m: 15.0
     interest_horizon_m: 20.0
+    # [m] warn when an incoming obstacle's (s,d) has to be re-anchored into this node's frenet
+    # frame by more than this. Non-zero means upstream tracking did not re-project on a
+    # static_reopt line swap, and the free-check would have judged the swapped line against
+    # lateral offsets measured on the OLD one.
+    reframe_warn_m: 0.05
+    # [m/s] speed ceiling for a static-avoidance path the planner marked ot_line="squeeze" -- one
+    # it could only solve by reducing its clearance margins (static_avoidance_params.yaml
+    # squeeze_*). The geometry is legal but the error budget is spent, so it is driven slowly.
+    # This node owns the velocity profile of every path it receives, so the cap has to live here.
+    squeeze_speed_cap_mps: 2.5
+    # [m/s^2] lateral-accel limit used when THIS node re-profiles an AVOIDANCE path, replacing the
+    # global ggv's ay column (4.5) for that path only. The ggv is tuned for the raceline; an
+    # avoidance is a brief deliberate excursion, and the planner already sizes it at a_lat_max 6.0
+    # (static_avoidance_params.yaml) before this node overwrites the profile -- so re-profiling at
+    # the raceline limit was silently undoing the planner's own intent and making the spline crawl.
+    # 5.0 splits the difference. The global line is unaffected.
+    avoidance_ay_max: 5.0
+    # [s] how long a STATIC obstacle stays in the interest list after it was last reported
+    # is_visible. The flag is a per-frame lidar verdict that drops out on occlusion, at the FOV
+    # edge, and on sparse returns at range -- while a static obstacle cannot actually leave. Acting
+    # on each drop emptied obstacles_in_interest for that cycle, flipping the state
+    # (ObstacleTransition -> NonObstacleTransition) and the trailing target with it. The detection
+    # gate is preserved: never-seen, or gone longer than this, is still ignored. 0 = old behaviour.
+    static_invisible_grace_sec: 1.5
     overtaking_horizon_m: 6.9
     emergency_break_horizon: 0.5
     # safety
     volt_threshold: 11.0
     # dynamic (replaces dyn_statemachine_tuner.cfg)
     lateral_width_gb_m: 0.3
+    # GB_FREE margin vs STATIC obstacles, distance-independent. The SM requirement it forms,
+    #     gb_ego_width_m/2 + lateral_width_static_gb_m   (= 0.20 + 0.05 = 0.25 m, line centre to
+    #                                                      obstacle EDGE)
+    # is ONE link of the margin chain and must sit at or below the next one:
+    #     SM requirement  <=  planner clear-gate STAY threshold (width_car/2 + clear_margin_m,
+    #                         static_avoidance_params.yaml = 0.25)
+    #                     <=  enforced re-opt clearance floor (reopt_obs_margin = 0.35) - slack
+    # Was 0.15 -> SM required 0.35 while the planner idled from 0.25 (0.28 to ENTER idle). In the
+    # [0.28, 0.35) band BOTH sides stood down: the SM read the swapped line as blocked and fell to
+    # TRAILING while the planner, correctly, published nothing to overtake with -- a deadlock
+    # behind a line that already cleared the obstacle. 0.05 closes that dead band exactly (SM
+    # requirement == clear-gate stay threshold). Verified by
+    # stack_master/scripts/check_avoidance_margins.py (ordering rule).
+    lateral_width_static_gb_m: 0.05
     lateral_width_ot_m: 0.3
     splini_hyst_timer_sec: 0.7
     splini_ttl: 2.0
@@ -29,3 +98,41 @@ state_machine:
     ftg_active: false
     force_GBTRACK: false
     use_force_trailing: false
+    # overtake-decision thresholds (were hardcoded magic numbers in the node)
+    getting_closer_rel_vel_mps: -0.1
+    # transition hysteresis: min time [s] a state is held before switching to a NON-safe state
+    # (anti-chatter). Switches toward TRAILING/FTGONLY bypass this. 0.2 s = 16 loops @ 80 Hz.
+    min_dwell_sec: 0.2
+    # How long the dynamic avoidance path may read NOT-free before OVERTAKE is dropped [s].
+    # The free-check tests one point per obstacle, so a single noisy tracker cycle fails it;
+    # believing that cycle steers the car off the pass line and back toward the opponent it is
+    # alongside, then the check passes again -- the car flaps between the spline and the global
+    # line. Entry still requires free NOW; this only debounces staying. 0 restores the old
+    # behaviour. Mirrors the static path's static_feasible_lost_sec (0.4).
+    # Raised 0.4 -> 0.8: the SM's own view of the avoidance path is 0.3-0.5 s stale (executor
+    # lag, see dynamic_avoidance_planner.yaml:latest_threshold), so a 0.4 s debounce could not
+    # even cover one refresh of the thing it debounces. Note the hysteresis here is deliberately
+    # asymmetric in the WRONG direction and only half-fixed by this value: ENTRY needs a single
+    # free cycle, while min_dwell_sec provides no damping at all on this edge because TRAILING
+    # and OVERTAKE are both in _IMMEDIATE_STATES. Removing TRAILING from that set would delay a
+    # safe-direction transition, so it is intentionally NOT bundled with this change.
+    ot_free_lost_sec: 0.8
+    # Free-check: for a DYNAMIC obstacle with no usable prediction, propagate it over the
+    # ttc..tt0 window (when the ego is actually alongside) instead of testing the path where the
+    # opponent stands now. The prediction branch already does exactly this; this makes the
+    # fallback agree with it. Near-stationary obstacles take the static branch and are never
+    # propagated. False restores the old current-s test.
+    free_check_predict_dynamic: true
+    # Time the alongside window from the speed the ego runs ONCE COMMITTED (local raceline
+    # pace), not from the trailing closing speed. Trailing holds station, so cur_vs - obs.vs
+    # collapses to the 0.5 m/s floor and the window lands metres too far ahead -- which forced
+    # the planner to hold its pass offset across narrow track the maneuver never touches.
+    free_check_pass_speed: true
+    # Keep a SLOW-but-moving opponent on the free-check's DYNAMIC branch when the path under
+    # test is the dynamic overtaking lane. The near-stationary reclassification above exists to
+    # protect the STATIC avoidance spline; applied to the dynamic path it is fatal, because the
+    # static branch evaluates the lane at the obstacle's CURRENT s and the lane-hold planner
+    # deliberately keeps the lane on the raceline until the meeting point -- so the lane reads
+    # NOT-free structurally and OVERTAKE can never commit against a slow opponent. Only affects
+    # obstacles whose tracker is_static is already False. False restores the old routing.
+    free_check_dynamic_ot_slow: true

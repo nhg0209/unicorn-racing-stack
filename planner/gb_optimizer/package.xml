@@ -16,6 +16,7 @@
   <depend>interactive_markers</depend>
   <depend>stack_master</depend>
   <depend>frenet_conversion</depend>
+  <depend>grid_filter</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

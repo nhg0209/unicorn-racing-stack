@@ -40,6 +40,7 @@ from std_msgs.msg import String, Bool, Float32
 
 # To write global waypoints
 from .readwrite_global_waypoints import write_global_waypoints
+from . import track_bounds
 
 
 class GlobalPlanner(Node):
@@ -450,13 +451,18 @@ class GlobalPlanner(Node):
         # get morphological skeleton of the map
         skeleton = skeletonize(opening, method='lee')
 
-        # ! For debugging
-        # origin='lower' flips the display about the x-axis so the map shows
-        # right-side-up (viz only; the underlying arrays / waypoints are unchanged).
-        f, (ax0, ax1) = plt.subplots(2, 1)
-        ax0.imshow(opening, cmap='gray', origin='lower')
-        ax1.imshow(skeleton, cmap='gray', origin='lower')
-        plt.show()
+        # Debug view of the filtered map and the skeleton extracted from it.
+        # Gated on show_plots like every other plot in this file: plt.show()
+        # blocks until the window is closed, so leaving it unconditional hangs
+        # the one-shot raceline run (raceline_generator.launch.xml) forever when
+        # there is no display to close it on -- headless, or over SSH.
+        if self.show_plots:
+            # origin='lower' flips the display about the x-axis so the map shows
+            # right-side-up (viz only; the underlying arrays / waypoints are unchanged).
+            f, (ax0, ax1) = plt.subplots(2, 1)
+            ax0.imshow(opening, cmap='gray', origin='lower')
+            ax1.imshow(skeleton, cmap='gray', origin='lower')
+            plt.show()
 
         ################################################################################################################
         # Extract centerline from filtered occupancy grid map
@@ -527,7 +533,10 @@ class GlobalPlanner(Node):
             centerline_smooth = np.flip(centerline_smooth, axis=0)
             centerline_meter_int = np.flip(centerline_meter_int, axis=0)
 
-        # Flip again if necessary
+        # Flip again if necessary. reverse_mapping now means ONE thing -- drive the track the
+        # other way round -- and no longer has any bearing on which bound is called left. That
+        # coupling (dist_to_bounds swapping its return when this was set) is what made the
+        # labelling depend on an operator flag; sides come from the geometry below.
         if self.reverse_mapping:
             centerline_smooth = np.flip(centerline_smooth, axis=0)
             centerline_meter_int = np.flip(centerline_meter_int, axis=0)
@@ -559,11 +568,23 @@ class GlobalPlanner(Node):
                                                centerline_meter=centerline_meter_int,
                                                dist_transform=dist_transform,
                                                bound_r=bound_r_water,
-                                               bound_l=bound_l_water,
-                                               reverse=self.reverse_mapping)
+                                               bound_l=bound_l_water)
 
         # Write centerline in a csv file and get a marker array of it
         centerline_waypoints, centerline_markers = self.write_centerline(cent_with_dist)
+
+        # Also persist the reference track (centerline + track widths) next to
+        # global_waypoints.json so the static re-optimization node (reopt:=true) can load it
+        # as its clean reftrack -- static_reopt_node reads maps/<map>/centerline.csv at startup.
+        # Same [x_m, y_m, w_tr_right_m, w_tr_left_m] format the trajectory optimizer consumes
+        # (write_centerline only drops it to /tmp for the optimizer, not the map folder).
+        try:
+            cent_csv = os.path.join(self.map_dir, 'centerline.csv')
+            np.savetxt(cent_csv, np.asarray(cent_with_dist)[:, :4], delimiter=',',
+                       header='x_m,y_m,w_tr_right_m,w_tr_left_m', comments='', fmt='%.6f')
+            self.get_logger().info(f'[GB Planner]: Wrote reference track -> {cent_csv}')
+        except Exception as e:
+            self.get_logger().warn(f'[GB Planner]: Could not write centerline.csv: {e}')
 
         # Add curvature and angle to centerline waypoints
         centerline_coords = np.array([
@@ -606,8 +627,7 @@ class GlobalPlanner(Node):
         d_right_iqp, d_left_iqp = self.dist_to_bounds(trajectory=global_trajectory_iqp,
                                                       bound_r=bound_r_iqp,
                                                       bound_l=bound_l_iqp,
-                                                      centerline=centerline_meter_int,
-                                                      reverse=self.reverse_mapping)
+                                                      centerline=centerline_meter_int)
 
         global_traj_wpnts_iqp, global_traj_markers_iqp = self.create_wpnts_markers(trajectory=global_trajectory_iqp,
                                                                                    d_right=d_right_iqp,
@@ -638,8 +658,7 @@ class GlobalPlanner(Node):
                                                    centerline_meter=global_trajectory_iqp_ot[:, 1:3],
                                                    dist_transform=None,
                                                    bound_r=bound_r_water,
-                                                   bound_l=bound_l_water,
-                                                   reverse=self.reverse_mapping)
+                                                   bound_l=bound_l_water)
 
         _, new_centerline_markers = self.write_centerline(new_cent_with_dist, sp_bool=True)
 
@@ -673,8 +692,7 @@ class GlobalPlanner(Node):
         d_right_sp, d_left_sp = self.dist_to_bounds(trajectory=global_trajectory_sp,
                                                     bound_r=bound_r_sp,
                                                     bound_l=bound_l_sp,
-                                                    centerline=centerline_meter_int,
-                                                    reverse=self.reverse_mapping)
+                                                    centerline=centerline_meter_int)
 
         global_traj_wpnts_sp, global_traj_markers_sp = self.create_wpnts_markers(trajectory=global_trajectory_sp,
                                                                                  d_right=d_right_sp,
@@ -704,7 +722,42 @@ class GlobalPlanner(Node):
             bounds_markers,
             map_editor_bool=self.map_editor,
         )
+        # THE CHEAPEST MOMENT TO CATCH IT IS NOW. check_track_bounds.py has always been able to
+        # detect exchanged d_right/d_left, and it was a manual command wired to no gate -- so maps
+        # f and ifac_0807 shipped with them exchanged and the defect surfaced laps later as
+        # "neither side fits" in the re-optimizer. Run the same measurement on what was just
+        # written, and shout if it is wrong: at this point the operator is still standing at the
+        # map and can regenerate.
+        self._verify_written_bounds(global_traj_wpnts_iqp)
         return True
+
+    def _verify_written_bounds(self, wpnts) -> None:
+        """Check the just-written labels against the map's own geometry. Loud, never fatal.
+
+        Not fatal because the file is already on disk and the rest of the pipeline (sectors) still
+        has work to do; an ERROR that names the fix is worth more than a traceback here. The
+        authoritative gate is stack_master/scripts/check_track_bounds.py --all.
+        """
+        try:
+            map_dir = os.path.join(get_package_share_directory('stack_master'), 'maps',
+                                   self.map_name)
+            pts = [[w.x_m, w.y_m] for w in wpnts]
+            v, n_ok, n_sw, _amb = track_bounds.verdict(
+                pts, [w.d_right for w in wpnts], [w.d_left for w in wpnts], map_dir, self.map_name)
+        except Exception as e:
+            self.get_logger().warning(f'[GB Planner]: bounds self-check unavailable: {e}')
+            return
+        if v == 'SWAPPED':
+            self.get_logger().error(
+                f"[GB Planner]: THE MAP JUST WRITTEN HAS d_right/d_left EXCHANGED "
+                f"({n_sw} sampled stations against {n_ok}). Every corridor derived from it is "
+                f"mirrored -- static avoidance and the re-optimizer will read obstacles on the "
+                f"wrong side. REGENERATE this map; --fix on check_track_bounds.py relabels the "
+                f"file but the raceline was already optimized through the mirrored corridor.")
+        elif v == 'ok':
+            self.get_logger().info(
+                f'[GB Planner]: bounds self-check: labelling matches the map geometry '
+                f'({n_ok} sampled stations, {n_sw} disagree)')
 
     def extract_centerline(self, skeleton, cent_length: float) -> np.ndarray:
         """
@@ -764,11 +817,7 @@ class GlobalPlanner(Node):
             if self.test_on_car and math.fabs(cent_length / line_length - 1.0) < 0.15:
                 line_lengths[i] = line_length
             if not self.test_on_car or self.map_editor:
-                # 2026-07-16: skeleton의 기생 소형 루프(교차점 사이클 등)가 min()에
-                # 잡혀 ~30셀 센터라인 → smooth_centerline 브로드캐스트 크래시
-                # (ifac_0714 맵에서 실증). 실제 트랙 루프는 수십 m — 10m 미만 제외.
-                if line_length > 10.0:
-                    line_lengths[i] = line_length
+                line_lengths[i] = line_length
 
         # take the shortest line
         min_line_length = min(line_lengths)
@@ -956,16 +1005,24 @@ class GlobalPlanner(Node):
         bound_direction = np.angle([complex(bound_long_meter[min_dist_ind, 0] - bound_long_meter[min_dist_ind - 1, 0],
                                             bound_long_meter[min_dist_ind, 1] - bound_long_meter[min_dist_ind - 1, 1])])
 
-        norm_angle_right = self.initial_position[2] - math.pi
-        if norm_angle_right < -math.pi:
-            norm_angle_right = norm_angle_right + 2 * math.pi
-
-        if self.compare_direction(norm_angle_right, bound_direction):
-            bound_right = bound_long_meter
-            bound_left = bound_short_meter
-        else:
-            bound_right = bound_short_meter
-            bound_left = bound_long_meter
+        # SIDES BY GEOMETRY, NOT BY WINDING OR BY A FLAG. This used to compare the outer
+        # contour's local traversal direction against the start pose, having already picked
+        # "outer" by contour LENGTH. Contour winding comes from cv2 and outer/inner has nothing to
+        # do with left/right; worse, `centerline` has been flipped up to twice before this point
+        # (once when its direction disagrees with the start pose, once more for reverse_mapping)
+        # and neither flip corrected the labels -- the only thing that put them back was
+        # dist_to_bounds swapping its return when reverse_mapping was set. Correctness rested on
+        # an operator setting a flag, and a double correction was one mistake away. Maps f and
+        # ifac_0807 shipped with d_right/d_left exchanged on 402 and 461 stations because of it.
+        #
+        # track_bounds.assign_sides takes the tangent of THIS centerline -- the final one, after
+        # every flip -- and asks which contour lies along its left normal. Flip the centerline and
+        # the answer flips with it. It is the same function stack_master/scripts/check_track_bounds.py
+        # judges the result with, so the generator and the checker cannot drift apart.
+        cent_m = np.stack([centerline[:, 0] * self.map_resolution + self.map_origin.position.x,
+                           centerline[:, 1] * self.map_resolution + self.map_origin.position.y], 1)
+        bound_right, bound_left = track_bounds.assign_sides(cent_m, bound_long_meter,
+                                                            bound_short_meter)
 
         # if self.show_plots and not self.map_editor:
         if self.show_plots:
@@ -980,7 +1037,7 @@ class GlobalPlanner(Node):
 
         return bound_right, bound_left
 
-    def dist_to_bounds(self, trajectory: np.ndarray, bound_r, bound_l, centerline: np.ndarray, reverse=False):
+    def dist_to_bounds(self, trajectory: np.ndarray, bound_r, bound_l, centerline: np.ndarray):
         """
         Calculate the distance to track bounds for every point on a trajectory.
 
@@ -1071,15 +1128,16 @@ class GlobalPlanner(Node):
             plt.legend()
 
             plt.show()
-        # Return flipped distances if map_editor reversing
-        if reverse:
-            return dists_left, dists_right
-        else:
-            return dists_right, dists_left
+        # NO `reverse` CORRECTION. bound_r/bound_l are labelled from the final centerline's own
+        # geometry now (see extract_track_bounds), so they are already right for the direction the
+        # car drives and swapping here would UNDO that. This branch is what made the labelling
+        # depend on reverse_mapping being set correctly, and it is why a double correction was
+        # possible.
+        return dists_right, dists_left
 
     def add_dist_to_cent(self, centerline_smooth: np.ndarray,
                          centerline_meter: np.ndarray, dist_transform=None,
-                         bound_r: np.ndarray = None, bound_l: np.ndarray = None, reverse=False) -> np.ndarray:
+                         bound_r: np.ndarray = None, bound_l: np.ndarray = None) -> np.ndarray:
         """
         Add distance to track bounds to the centerline points.
 
@@ -1113,7 +1171,7 @@ class GlobalPlanner(Node):
         elif bound_r is not None and bound_l is not None:
             width_track_right, width_track_left = self.dist_to_bounds(centerline_meter, bound_r, bound_l,
                                                                       centerline=centerline_meter,
-                                                                      reverse=reverse)
+                                                                      )
         else:
             raise IOError("No closed contours found...")
 

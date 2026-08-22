@@ -22,9 +22,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'spliner_node = spliner.spliner_node:main',
             'static_avoidance_node = spliner.static_avoidance_node:main',
-            'start_spline_node = spliner.start_spline_node:main',
             'start_spline_node_v2 = spliner.start_spline_node_v2:main',
         ],
     },

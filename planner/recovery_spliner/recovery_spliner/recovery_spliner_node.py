@@ -92,6 +92,15 @@ class ObstacleSpliner(Node):
         self.spline_scale = 0.8
         self.kernel_size = 5
         self.smooth_len = 1.0
+        # Publish gate. The node used to spline and publish EVERY cycle regardless of where the
+        # car was, so /planner/recovery/wpnts was permanently fresh and on-spline (the path is
+        # anchored at the car, so _check_on_spline is trivially true) -- i.e. RECOVERY was always
+        # "available" to the state machine, and the line was always drawn in RViz. Only emit a
+        # path once the raceline is actually lost.
+        self.activate_d_m = 0.4        # |d| at/above which we start publishing (= SM recovery_entry_d_m)
+        self.deactivate_d_m = 0.15     # |d| below which we stop; deliberately UNDER the SM's
+        self._active = False           # recovery_exit_d_m (0.2) so the SM, not this node, owns the exit
+        self._idle_published = False
 
         int_lookahead_pd = ParameterDescriptor(
             type=ParameterType.PARAMETER_INTEGER,
@@ -113,6 +122,10 @@ class ObstacleSpliner(Node):
             type=ParameterType.PARAMETER_DOUBLE,
             floating_point_range=[FloatingPointRange(from_value=0.0, to_value=3.0, step=0.001)]
         )
+        double_d_gate_pd = ParameterDescriptor(
+            type=ParameterType.PARAMETER_DOUBLE,
+            floating_point_range=[FloatingPointRange(from_value=0.0, to_value=2.0, step=0.001)]
+        )
         bool_pd = ParameterDescriptor(type=ParameterType.PARAMETER_BOOL)
 
         param_dicts = [
@@ -122,6 +135,8 @@ class ObstacleSpliner(Node):
             {'name': 'spline_scale', 'default': self.spline_scale, 'descriptor': double_spline_scale_pd},
             {'name': 'kernel_size', 'default': self.kernel_size, 'descriptor': int_kernel_pd},
             {'name': 'smooth_len', 'default': self.smooth_len, 'descriptor': double_smooth_len_pd},
+            {'name': 'activate_d_m', 'default': self.activate_d_m, 'descriptor': double_d_gate_pd},
+            {'name': 'deactivate_d_m', 'default': self.deactivate_d_m, 'descriptor': double_d_gate_pd},
         ]
         self.declare_all_parameters(param_dicts=param_dicts)
 
@@ -192,13 +207,19 @@ class ObstacleSpliner(Node):
 
     # Callback for global waypoint topic
     def gb_cb(self, data: WpntArray):
-
-        self.waypoints = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in data.wpnts])
+        new_wp = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in data.wpnts])
+        changed = (self.waypoints is None or new_wp.shape != self.waypoints.shape
+                   or not np.allclose(new_wp, self.waypoints))
+        self.waypoints = new_wp
         self.gb_wpnts = data
         if self.gb_vmax is None:
             self.gb_vmax = np.max(np.array([wpnt.vx_mps for wpnt in data.wpnts]))
             self.gb_max_idx = data.wpnts[-1].id
             self.gb_max_s = data.wpnts[-1].s_m
+        # global line can CHANGE at runtime (static re-opt swap) -> rebuild the FrenetConverter so
+        # recovery splines are relative to the CURRENT line, not the startup (clean) one.
+        if changed and getattr(self, "converter", None) is not None:
+            self.converter = self.initialize_converter()
 
         # psi_array = np.array([wpnt.psi_rad for wpnt in data.wpnts])
         kappas = np.array([wpnt.kappa_radpm for wpnt in data.wpnts])
@@ -255,6 +276,10 @@ class ObstacleSpliner(Node):
                 self.kernel_size = param.value
             elif param_name == 'smooth_len':
                 self.smooth_len = param.value
+            elif param_name == 'activate_d_m':
+                self.activate_d_m = param.value
+            elif param_name == 'deactivate_d_m':
+                self.deactivate_d_m = param.value
 
         if hasattr(self, 'map_filter'):
             self.map_filter.set_erosion_kernel_size(self.kernel_size)
@@ -263,14 +288,60 @@ class ObstacleSpliner(Node):
             f"[{self.name}] Dynamic reconf triggered new params: "
             f"min_candidates_lookahead_n: {self.min_candidates_lookahead_n}, "
             f"num_kappas: {self.num_kappas}, spline_scale: {self.spline_scale}, "
-            f"kernel_size: {self.kernel_size}, smooth_len: {self.smooth_len}"
+            f"kernel_size: {self.kernel_size}, smooth_len: {self.smooth_len}, "
+            f"activate_d_m: {self.activate_d_m}, deactivate_d_m: {self.deactivate_d_m}"
         )
         return SetParametersResult(successful=True)
 
     #############
     # MAIN LOOP #
     #############
+    def _recovery_needed(self) -> bool:
+        """Hysteresis gate on |d|: engage once the raceline is genuinely lost, disengage only well
+        after we are back on it. Deactivating BELOW the state machine's recovery_exit_d_m keeps the
+        exit decision with the state machine -- if this node cut the path off at the same threshold
+        the two would race and RECOVERY would chatter at the boundary."""
+        if self.cur_d is None:
+            return False
+        d = abs(self.cur_d)
+        if self._active:
+            if d < self.deactivate_d_m:
+                self._active = False
+                self.get_logger().info(
+                    f"[{self.name}] back on the raceline (|d|={d:.2f} < {self.deactivate_d_m:.2f}) "
+                    f"-- recovery path withdrawn")
+        elif d >= self.activate_d_m:
+            self._active = True
+            self.get_logger().info(
+                f"[{self.name}] raceline lost (|d|={d:.2f} >= {self.activate_d_m:.2f}) "
+                f"-- publishing recovery path")
+        return self._active
+
+    def _publish_idle(self):
+        """Emit an EMPTY waypoint set (the state machine's _check_latest_wpnts rejects it, so
+        RECOVERY stays unavailable) and clear the RViz markers. Published once per idle spell —
+        the topics are latched by content, so there is nothing to refresh while idle."""
+        if self._idle_published:
+            return
+        empty = WpntArray()
+        empty.header.stamp = self.get_clock().now().to_msg()
+        empty.header.frame_id = "map"
+        self.recovery_wpnts_pub.publish(empty)
+        for pub in (self.mrks_pub, self.spline_samples_pub):
+            clear = MarkerArray()
+            del_mrk = Marker()
+            del_mrk.header.frame_id = "map"
+            del_mrk.action = Marker.DELETEALL
+            clear.markers.append(del_mrk)
+            pub.publish(clear)
+        self._idle_published = True
+
     def loop(self):
+        if not self._recovery_needed():
+            self._publish_idle()
+            return
+        self._idle_published = False
+
         if self.measuring:
             start = time.perf_counter()
         # Sample data

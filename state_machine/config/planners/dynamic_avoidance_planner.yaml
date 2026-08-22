@@ -1,9 +1,41 @@
 free_scaling_reference_distance_m: 1
-hyst_timer_sec: 6.0
+# How long the SM trusts the CACHED dynamic path before re-initializing from the latest
+# publish (_check_availability). 6.0 was tuned for the old snapshot spliner whose per-cycle
+# publishes jittered (adopting them made the controller chase re-anchoring noise). The
+# lane-hold planner publishes phase-latched stable geometry -- identical lane until the
+# return ramp is armed -- so frequent adoption is step-free BY CONSTRUCTION and the return
+# (CLOSE) must be adopted quickly or the car overstays the overtaking lane.
+hyst_timer_sec: 1.5
 is_closed: false
 killing_timer_sec: 10.0
-lateral_width_m: 0.2
-latest_threshold: 0.1
+# Extra clearance the SM demands ON TOP OF gb_ego_width_m/2 (0.20) and the obstacle's own
+# half-size. Total SM accept line = 0.20 + lateral_width_m.
+# Lowered 0.2 -> 0.15. At 0.2 the SM demanded 0.40 m while the planner's solver targets
+# sep_margin_m = 0.42 -- 2 cm of slack, less than one CCMA lateral displacement (~16 mm) plus
+# the 0.25 m solve grid vs 0.1 m publish grid. Any tracker d jitter flipped the gate and the
+# car flapped OVERTAKE<->TRAILING.
+# Fixed on THIS side, not by raising sep_margin_m: lane_change_params.yaml records that 0.42
+# already admits a pass on only ~49% of the ifac lap (0.45 -> 37%), and every cm added to the
+# planner is paid twice, in clearance AND in run-up. The SM free-check is a sanity gate on a
+# producer that already owns the go/no-go decision (the same architecture the static path uses),
+# so it must be LOOSER than the producer's design margin, never tighter. Physical clearance is
+# unchanged -- the planner still solves to 0.42 and remains the binding constraint. 0.15 is
+# still 50% above the static path's lateral_width_m (0.1).
+lateral_width_m: 0.15
+# The single-threaded state_machine executor runs ~0.3-0.5 s behind on the 20 Hz avoidance
+# messages (it re-runs the heavy vel profiler inline in avoidance_cb), so measured against the
+# SM clock a perfectly-fresh publish reads as 0.3-0.5 s "old". This is the SAME failure the
+# static path hit and fixed -- see static_avoidance_planner.yaml:8-15: "At 0.1 s the freshness
+# gate NEVER passed and the car never committed to OVERTAKE." The dynamic path was simply never
+# given the same treatment.
+# This value gates TWO things, which is why it blocks entry AND sustain at once:
+#   _check_latest_wpnts  -> the 3rd AND-term of _check_overtaking_mode (entry)
+#   update_waypoints     -> whether a new publish is even a candidate for cache adoption
+# 1.0 s still bounds staleness (the car moves < ~4 m) and hyst_timer_sec/killing_timer_sec
+# remain the backstop if the planner goes silent.
+latest_threshold: 1.0
+# The lane-hold path always extends hold_horizon_m (22 m) ahead, but cap the free-check
+# window at the same horizon the old planner used.
 max_horizon: 10.0
 min_horizon: 0.0
 on_spline_front_horizon_thres_m: 2.0

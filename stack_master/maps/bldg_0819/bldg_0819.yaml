@@ -1,0 +1,6 @@
+image: bldg_0819.pgm
+resolution: 0.05
+origin: [-22.7487, -14.5735, 0.0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196
