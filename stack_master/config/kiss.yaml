@@ -37,7 +37,7 @@ kiss_icp_localization:
     detect_en: true
     detect_track_filter: true  # drop returns off the track mask (walls/exterior)
     detect_track_dist_min: 0.1 # off-track 필터 거리 [m] (기본 0.2)
-    detect_z_min: 0.3          # detection z-band, MAP frame (separate from crop_z_*)
+    detect_z_min: 0.15         # detection z-band, MAP frame (separate from crop_z_*)
     detect_z_max: 0.50
     detect_res: 0.05           # BEV cell size [m]
     detect_debug_ds_voxel: 0.5  # /kiss_loc/detect_debug_ds voxel[m] (다운샘플 디버그, 구독시에만 생성)
