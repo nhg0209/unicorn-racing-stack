@@ -57,7 +57,7 @@ static_reopt_node:
     # every hold on ifac (planner/gb_optimizer/scripts/sweep_obs_margin.py).
     # NOT the same quantity as `obs_margin` further down: that one is the node's own default
     # floor for a box whose per-box floor is unknown, and it is 0.35.
-    closed_qp_obs_margin: 0.40
+    closed_qp_obs_margin: 0.35
 
     # [m] SOLVED-FOR ONLY, never part of the safety requirement: it covers the sag a periodic
     # cubic introduces BETWEEN QP stations. At grid 0.10 there are no stations between QP
@@ -155,7 +155,7 @@ static_reopt_node:
     # status, the clearance veto). MUST be >= the reactive keep-out (width_car/2 + safety_margin
     # = 0.30) or a line judged by it sits inside the reactive planner's keep-out and gets
     # re-avoided every lap. closed_qp reports its OWN floor per box, so this is the fallback.
-    obs_margin: 0.3
+    obs_margin: 0.35
     # [m] the floor the drift trigger and the publish veto judge an unknown box by. Its other
     # role -- the hump coverage ladder's lowest rung -- went with the hump; these two did not. Two constraints, higher wins: at least the REACTIVE keep-out (0.30) so a relaxed hump
     # still clears by what the reactive planner would itself have driven, AND at least 5 cm above
