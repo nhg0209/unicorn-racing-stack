@@ -5,7 +5,7 @@ from rclpy.node import Node
 from f110_msgs.msg import LapData, WpntArray
 from std_msgs.msg import Float32, Empty
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import Pose, Point
+from geometry_msgs.msg import Pose, Point, PoseStamped
 from visualization_msgs.msg import Marker
 
 from ament_index_python.packages import get_package_share_directory
@@ -40,7 +40,13 @@ class LapAnalyser(Node):
         self.wp_flag = False
         self.car_distance_to_boundary = []
         self.global_lateral_waypoints = None
+        self.gb_sxy = None  # [s_m, x_m, y_m] per waypoint, for goal-pose -> s lookup
         self.gb_wpnts_sub = self.create_subscription(WpntArray, "/global_waypoints", self.waypoints_cb, 10)
+
+        # RViz "2D Goal Pose" re-defines the start/finish line: the crossing s is moved to
+        # the waypoint nearest the clicked point and the lap stats are reset.
+        self.start_s = 0.0
+        self.goal_sub = self.create_subscription(PoseStamped, '/goal_pose', self.goal_pose_cb, 10)
 
         # car odom in frenet frame (ROS1 unicorn authoritative topic name)
         self.odom_frenet_sub = self.create_subscription(Odometry, '/car_state/odom_frenet', self.frenet_odom_cb, 10)
@@ -114,6 +120,7 @@ class LapAnalyser(Node):
             self.global_lateral_waypoints = np.array([
                 [w.s_m, w.d_right, w.d_left] for w in data.wpnts
             ])
+            self.gb_sxy = np.array([[w.s_m, w.x_m, w.y_m] for w in data.wpnts])
             self.wp_flag = True
         else:
             pass
@@ -200,12 +207,53 @@ class LapAnalyser(Node):
         self.lap_count = -1
         self.n_datapoints = 0
 
+    def goal_pose_cb(self, msg: PoseStamped):
+        '''RViz 2D Goal Pose: move the start/finish line to the nearest waypoint and reset.'''
+        if self.gb_sxy is None:
+            self.get_logger().warn("LapAnalyser: goal pose ignored, waiting for /global_waypoints")
+            return
+        gx, gy = msg.pose.position.x, msg.pose.position.y
+        idx = int(np.argmin((self.gb_sxy[:, 1] - gx) ** 2 + (self.gb_sxy[:, 2] - gy) ** 2))
+        self.start_s = float(self.gb_sxy[idx, 0])
+        # reset lap state so the next crossing of start_s begins lap 0
+        self.lap_count = -1
+        self.accumulated_error = 0
+        self.max_error = 0
+        self.n_datapoints = 0
+        self.odom_points = []
+        self.car_distance_to_boundary = []
+        self.get_logger().info(
+            f"LapAnalyser: start/finish line set to s={self.start_s:.2f} m "
+            f"(nearest wpnt to {gx:.2f}, {gy:.2f}); lap stats reset")
+        self.publish_start_marker(self.gb_sxy[idx, 1], self.gb_sxy[idx, 2])
+
+    def publish_start_marker(self, x, y):
+        mark = Marker()
+        mark.header.stamp = self.get_clock().now().to_msg()
+        mark.header.frame_id = 'map'
+        mark.ns = 'lap_start'
+        mark.id = 20
+        mark.type = Marker.CYLINDER
+        mark.action = Marker.ADD
+        mark.pose.position.x = float(x)
+        mark.pose.position.y = float(y)
+        mark.pose.position.z = 0.0
+        mark.scale.x = 0.3
+        mark.scale.y = 0.3
+        mark.scale.z = 1.0
+        mark.color.r = 1.0
+        mark.color.g = 0.0
+        mark.color.b = 1.0
+        mark.color.a = 0.9
+        self.lap_marker_pub.publish(mark)
+
     def check_for_finish_line_pass(self, current_s):
-        # detect wrapping of the track, should happen exactly once per round
-        if (self.last_s - current_s) > 1.0:
-            return True
-        else:
-            return False
+        # Detect a forward crossing of the start/finish line (start_s). For the default
+        # start_s == 0 this is the once-per-lap track wrap (last_s high -> current_s low);
+        # for a goal-pose start_s > 0 it is the once-per-lap pass through that s.
+        if self.start_s <= 1e-6:
+            return (self.last_s - current_s) > 1.0
+        return self.last_s < self.start_s <= current_s
 
     def publish_lap_info(self):
         msg = LapData()
