@@ -318,6 +318,33 @@ class StateMachine(Node):
         self.last_valid_avoidance_array = None
         self.last_valid_static_avoidance_wpnts = None
 
+        # --- Reverse recovery: the relax retry (/planner/avoidance/relax) reduces the
+        # evasion margin but cannot create longitudinal room, so when the car creeps to a
+        # stop right behind a static box its evasion stays geometrically infeasible. Back
+        # up a short bounded distance so the next attempt has room. Complements, does not
+        # replace, the relax/FTG deadlock handling above. ---
+        self.declare_parameter('reverse_enable', True)
+        self.declare_parameter('reverse_stuck_time', 1.0)      # [s] stationary before triggering
+        self.declare_parameter('reverse_stuck_speed', 0.1)     # [m/s] |v| below this == stopped
+        self.declare_parameter('reverse_max_dist', 1.0)        # [m] hard cap on back-up distance
+        self.declare_parameter('reverse_rear_margin', 0.2)     # [m] keep-clear behind the car
+        self.declare_parameter('reverse_corridor_d', 0.35)     # [m] lateral band for "behind me"
+        self.declare_parameter('reverse_cooldown', 3.0)        # [s] wait before re-triggering
+        self.declare_parameter('reverse_max_attempts', 2)      # attempts per trailing episode
+        self.reverse_enable = bool(self.get_parameter('reverse_enable').value)
+        self.reverse_stuck_time = float(self.get_parameter('reverse_stuck_time').value)
+        self.reverse_stuck_speed = float(self.get_parameter('reverse_stuck_speed').value)
+        self.reverse_max_dist = float(self.get_parameter('reverse_max_dist').value)
+        self.reverse_rear_margin = float(self.get_parameter('reverse_rear_margin').value)
+        self.reverse_corridor_d = float(self.get_parameter('reverse_corridor_d').value)
+        self.reverse_cooldown = float(self.get_parameter('reverse_cooldown').value)
+        self.reverse_max_attempts = int(self.get_parameter('reverse_max_attempts').value)
+        self._reverse_active = False
+        self._reverse_target = 0.0
+        self._reverse_stuck_since = None
+        self._reverse_cooldown_until = 0.0
+        self._reverse_attempts = 0
+
         self.overtaking_horizon_m = self.params.overtaking_horizon_m
         self.lateral_width_ot_m = self.params.lateral_width_ot_m
         self.splini_hyst_timer_sec = self.params.splini_hyst_timer_sec
@@ -482,6 +509,9 @@ class StateMachine(Node):
         # at reduced margins". Absolute name and deliberately NOT remapped per-planner, mirroring
         # /planner/avoidance/static_feasible: it is a static-planner interlock, not an OT lane.
         self.relax_pub = self.create_publisher(Bool, "/planner/avoidance/relax", 10)
+        # Reverse recovery: request a short back-up to controller_manager (m; 0 = cancel)
+        self.reverse_cmd_pub = self.create_publisher(Float32, "/state_machine/reverse_cmd", 1)
+        self.create_subscription(Bool, "/controller/reverse_done", self.reverse_done_cb, 10)
         # ROS1 published this from dynamic_statemachine_server when the save_start_traj
         # rqt button was pressed; re-homed here as a momentary param (see loop()).
         self.save_start_traj_pub = self.create_publisher(Bool, "/save_start_traj", 1)
@@ -675,6 +705,86 @@ class StateMachine(Node):
 
     def now_sec(self) -> float:
         return time_to_float(self.get_clock().now().to_msg())
+
+    def reverse_done_cb(self, msg: Bool):
+        # controller_manager reports the back-up finished (or aborted); stop requesting
+        # reverse and start the cooldown before we can try again.
+        if msg.data and self._reverse_active:
+            self._reverse_active = False
+            self._reverse_target = 0.0
+            self._reverse_stuck_since = None
+            self._reverse_cooldown_until = self.now_sec() + self.reverse_cooldown
+
+    def _rear_clearance(self) -> float:
+        # Max safe back-up distance: capped at reverse_max_dist, reduced by the nearest
+        # obstacle behind the car within a narrow lateral corridor (keeps rear_margin).
+        # Returns 0.0 when there is no usable room behind.
+        allowed = self.reverse_max_dist
+        L = self.track_length if self.track_length else 1e9
+        window = self.reverse_max_dist + self.reverse_rear_margin
+        for obs in self.obstacles:
+            if abs(obs.d_center - self.cur_d) > self.reverse_corridor_d:
+                continue
+            back_gap = (self.cur_s - obs.s_end) % L  # >=0, small == right behind ego
+            if back_gap < window:
+                allowed = min(allowed, back_gap - self.reverse_rear_margin)
+        return max(0.0, allowed)
+
+    def _handle_reverse_recovery(self):
+        # Called once per loop. Detects "stopped behind a static obstacle whose evasion is
+        # infeasible" and drives a bounded reverse via controller_manager. Publishes the
+        # reverse target on /state_machine/reverse_cmd (0 = cancel).
+        if not self.reverse_enable:
+            self.reverse_cmd_pub.publish(Float32(data=0.0))
+            return
+
+        now = self.now_sec()
+
+        # Already reversing: keep re-asserting the target until the controller reports done.
+        if self._reverse_active:
+            self.reverse_cmd_pub.publish(Float32(data=float(self._reverse_target)))
+            return
+
+        # Only meaningful in the avoidance-related states; driving normally again
+        # (GB_TRACK/START/...) resets the per-episode attempt budget. Deliberately does
+        # NOT gate on is_static / static_avoidance_feasible: those flicker and kept
+        # resetting the 1 s timer so the trigger fired only intermittently.
+        trigger_states = (StateType.OVERTAKE, StateType.TRAILING, StateType.RECOVERY)
+        if self.cur_state not in trigger_states:
+            self._reverse_stuck_since = None
+            self._reverse_attempts = 0
+            self.reverse_cmd_pub.publish(Float32(data=0.0))
+            return
+
+        stuck = abs(self.cur_vs) < self.reverse_stuck_speed
+
+        if not stuck or now < self._reverse_cooldown_until:
+            if not stuck:
+                self._reverse_stuck_since = None
+            self.reverse_cmd_pub.publish(Float32(data=0.0))
+            return
+
+        if self._reverse_stuck_since is None:
+            self._reverse_stuck_since = now
+            self.reverse_cmd_pub.publish(Float32(data=0.0))
+            return
+
+        if now - self._reverse_stuck_since < self.reverse_stuck_time:
+            self.reverse_cmd_pub.publish(Float32(data=0.0))
+            return
+
+        allowed = self._rear_clearance()
+        if allowed > 0.1 and self._reverse_attempts < self.reverse_max_attempts:
+            self._reverse_active = True
+            self._reverse_target = allowed
+            self._reverse_attempts += 1
+            self.get_logger().warn(
+                f"[{self.name}] REVERSE recovery: stuck behind static obs, backing up "
+                f"{allowed:.2f} m (attempt {self._reverse_attempts}/{self.reverse_max_attempts})"
+            )
+            self.reverse_cmd_pub.publish(Float32(data=float(allowed)))
+        else:
+            self.reverse_cmd_pub.publish(Float32(data=0.0))
 
     def _commit_state(self, proposed_state, proposed_src, force=False):
         """Apply a proposed (state, wpnts_src) with min_dwell transition hysteresis.
@@ -2543,6 +2653,8 @@ class StateMachine(Node):
         self.behavior_strategy.local_wpnts = local_wpnts if local_wpnts is not None else []
         self.behavior_strategy.state = self.cur_state.value
         self.behavior_strategy.need_vel_planner = need_vel_planner
+
+        self._handle_reverse_recovery()
 
         self.behavior_strategy_pub.publish(self.behavior_strategy)
 

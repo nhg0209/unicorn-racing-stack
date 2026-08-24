@@ -172,6 +172,19 @@ class ControllerManager(Node):
         if self.measuring:
             self.measure_pub = self.create_publisher(Float32, '/controller/latency', 10)
 
+        # Reverse recovery: state_machine requests a bounded straight back-up (target dist
+        # in m; 0 = none) when it is stuck behind a static obstacle. We bypass the normal
+        # controller (which clamps speed >= 0) and command a fixed negative speed until the
+        # target distance is travelled or a timeout fires, then report done.
+        self.reverse_speed = float(self._get_param('reverse_speed', 1.0))     # [m/s] back-up speed
+        self.reverse_timeout = float(self._get_param('reverse_timeout', 3.0))  # [s] safety cap
+        self._reverse_active = False
+        self._reverse_target = 0.0
+        self._reverse_start_xy = None
+        self._reverse_start_t = 0.0
+        self.reverse_done_pub = self.create_publisher(Bool, '/controller/reverse_done', 10)
+        self.create_subscription(Float32, '/state_machine/reverse_cmd', self.reverse_cmd_cb, 10)
+
         # FTG controller (params injected from /state_machine/* equivalents)
         self.ftg_controller = FTG(
             node=self,
@@ -418,6 +431,39 @@ class ControllerManager(Node):
             self.controller.yaw_rate = self.yaw_rate
 
     ############################################ MAIN LOOP ############################################
+    def reverse_cmd_cb(self, msg: Float32):
+        target = float(msg.data)
+        if target > 0.0:
+            if not self._reverse_active:
+                self._reverse_active = True
+                self._reverse_start_xy = None          # captured on first execute tick
+                self._reverse_start_t = self.get_clock().now().nanoseconds * 1e-9
+            self._reverse_target = target
+        elif self._reverse_active:
+            # state_machine cancelled the request
+            self._reverse_active = False
+            self._reverse_target = 0.0
+            self._reverse_start_xy = None
+
+    def _reverse_execute(self):
+        # Straight bounded back-up. Stops (and reports done) once the target distance is
+        # travelled or the timeout fires. Manual/ELRS override is handled downstream by
+        # simple_mux (it routes /joy instead of our output), so no explicit abort here.
+        now = self.get_clock().now().nanoseconds * 1e-9
+        xy = np.array(self.position_in_map[0][:2], dtype=float)
+        if self._reverse_start_xy is None:
+            self._reverse_start_xy = xy
+            self._reverse_start_t = now
+        traveled = float(np.linalg.norm(xy - self._reverse_start_xy))
+        if traveled >= self._reverse_target or (now - self._reverse_start_t) >= self.reverse_timeout:
+            self.drive_pub.publish(self.create_ack_msg(0.0, 0, 0, 0.0))
+            self.reverse_done_pub.publish(Bool(data=True))
+            self._reverse_active = False
+            self._reverse_start_xy = None
+            self.get_logger().warn(f"[{self.name}] REVERSE done: backed up {traveled:.2f} m")
+            return
+        self.drive_pub.publish(self.create_ack_msg(-self.reverse_speed, 0, 0, 0.0))
+
     def control_loop(self):
         # save-back requested via the param callback (done here, outside the
         # on-set-parameters callback, so set_parameters() is safe).
@@ -432,6 +478,11 @@ class ControllerManager(Node):
             return
         # gate until lazy-init + first inputs
         if self.controller is None or self.waypoint_array_in_map is None or len(self.position_in_map) == 0 or len(self.position_in_map_frenet) == 0:
+            return
+
+        # Reverse recovery takes over the drive output until it finishes.
+        if self._reverse_active:
+            self._reverse_execute()
             return
 
         if self.measuring:
