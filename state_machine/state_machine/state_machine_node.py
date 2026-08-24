@@ -1664,6 +1664,22 @@ class StateMachine(Node):
                 f"{self._static_ot_cooldown_until - self.now_sec():.2f} s after a drop",
                 throttle_duration_sec=0.5)
             return False
+        # Dynamic-priority: obstacles_in_interest is sorted by forward gap, so [0] is the
+        # single closest thing ahead. If that nearest obstacle is dynamic, do not commit to a
+        # static-obstacle overtake (which owns nothing about the dynamic one) -- trailing it is
+        # the correct response. Without this, a fresh static avoidance path for a FARTHER static
+        # obstacle could still win the commit while a closer dynamic obstacle sits directly in
+        # front. Measured on car: this is exactly how a real head-on collision happened -- the
+        # car swerved for a static box while driving straight through a nearer moving obstacle
+        # (debug bag, t~229s: dynamic obstacle gap 1.3m dead-ahead vs static obstacle 3.8m
+        # off-center; state committed OVERTAKE on the static path and hit the dynamic one).
+        nearest = self.obstacles_in_interest[0] if self.obstacles_in_interest else None
+        if nearest is not None and not nearest.is_static:
+            self.get_logger().info(
+                f"[{self.name}] static_OT check: nearest obstacle in interest (id={nearest.id}) "
+                f"is dynamic -> trailing takes priority, static commit blocked",
+                throttle_duration_sec=0.5)
+            return False
         feas_age = (self.now_sec() - self._static_feasible_t) if self._static_feasible_t is not None else -1.0
         c_feasible = (self.static_avoidance_feasible
                       and self._static_feasible_t is not None
@@ -2039,9 +2055,9 @@ class StateMachine(Node):
         far too little to strand the window behind the car.
         """
         arr = wpnts.array
-        n = len(arr)
-        if n == 0:
+        if arr is None or len(arr) == 0:   # uninitialised cache -> no anchor to find
             return 0
+        n = len(arr)
         L = self.track_length if self.track_length else self.max_s
         cand = np.arange(n)
         if L:
@@ -2115,6 +2131,26 @@ class StateMachine(Node):
             wpnts = self.cur_static_avoidance_wpnts
         else:
             wpnts = self.cur_avoidance_wpnts
+
+        # OVERTAKE as a SOURCE is reachable WITHOUT a commit: _hold_static_avoidance_reference
+        # returns (TRAILING, OVERTAKE) while the car is still out on a cached static path. If no
+        # static commit ever ran this session (e.g. the dynamic-priority gate blocked them all),
+        # static_overtaking_mode is still False and the selector above picks the DYNAMIC cache --
+        # which on a lane-change-suppressed car was never initialised (array is None). That exact
+        # combination crashed the node mid-run (TypeError in _splini_anchor_index, bag
+        # 2026-08-24-18_58_26 @ t=160.7). Serve whichever avoidance cache actually holds a path;
+        # if neither does, fall back to the global window instead of dying.
+        if not wpnts.is_init:
+            other = (self.cur_static_avoidance_wpnts if wpnts is self.cur_avoidance_wpnts
+                     else self.cur_avoidance_wpnts)
+            if other.is_init:
+                wpnts = other
+            else:
+                self.get_logger().warn(
+                    f"[{self.name}] OVERTAKE source requested but no avoidance cache is "
+                    f"initialised (static_overtaking_mode={self.static_overtaking_mode}); "
+                    f"serving the global window instead", throttle_duration_sec=1.0)
+                return self.states[StateType.GB_TRACK](self)
 
         min_idx = self._splini_anchor_index(wpnts)
         avoidance_wpnts = wpnts.list[min_idx:min_idx + self.n_loc_wpnts]
