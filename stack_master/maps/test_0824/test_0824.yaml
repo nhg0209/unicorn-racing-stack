@@ -1,0 +1,6 @@
+image: test_0824.pgm
+resolution: 0.05
+origin: [-22.3378, -28.7391, 0.0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196

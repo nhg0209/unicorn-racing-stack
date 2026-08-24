@@ -2327,6 +2327,28 @@ class StateMachine(Node):
             mrk.color.b = 1.0
         self.state_mrk.publish(mrk)
 
+        # Battery voltage next to the state sphere: same /state_marker topic, own id, so
+        # RViz's existing Marker display shows both without any config change. Red once the
+        # pack drops under volt_threshold (the level that already trips the STOP warning).
+        volt_mrk = Marker()
+        volt_mrk.type = Marker.TEXT_VIEW_FACING
+        volt_mrk.id = 2
+        volt_mrk.action = Marker.ADD
+        volt_mrk.header.frame_id = "map"
+        volt_mrk.header.stamp = self.get_clock().now().to_msg()
+        volt_mrk.pose.position.x = float(self.x_viz)
+        volt_mrk.pose.position.y = float(self.y_viz)
+        volt_mrk.pose.position.z = 1.0          # above the state sphere
+        volt_mrk.pose.orientation.w = 1.0
+        volt_mrk.scale.z = 0.5                  # text height
+        volt_mrk.color.a = 1.0
+        low = self.cur_volt < self.volt_threshold
+        volt_mrk.color.r = 1.0 if low else 0.2
+        volt_mrk.color.g = 0.2 if low else 1.0
+        volt_mrk.color.b = 0.2
+        volt_mrk.text = f"{self.cur_volt:.2f} V"
+        self.state_mrk.publish(volt_mrk)
+
     def publish_not_ready_marker(self):
         mrk = Marker()
         mrk.type = mrk.TEXT_VIEW_FACING

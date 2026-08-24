@@ -108,7 +108,8 @@ controller_manager:
     # 7.70) against an achieved max of 11.71.
     # A ">6.0 %" column used to live here and was dropped: once the clip is active it only
     # reports how often the clip binds, so every margin read the same number.
-    a_lat_margin: 7.0
+    a_lat_margin: 1.2   
+    #7.0
     # [m/s] floor in the v^2 denominator. delta_max -> pi/2 as v -> 0; the +-0.53 saturation
     # happens to absorb that, which is luck rather than design.
     a_lat_v_floor: 0.5
