@@ -130,6 +130,11 @@ LIVE_PARAMS = [
     ('q_p_scale_live', 1.0),
     ('q_drate_scale_live', 1.0),
     ('q_dv_scale_live',    1.0),   # 2026-05-27 #8 — a_x penalty
+    # 0822 좁은틈 통과: 장애물중심→벽 거리가 이 값 이상이면 서행 통과 허용.
+    # 물리 최소 0.55 = r_obs0.15 + (차반폭0.15+여유0.05) + (차반폭0.15+벽여유0.05).
+    # 종전엔 0.70 하드코딩이라 주 판정(R_safe+R_car=0.70)과 같아 예외가 죽어있었다.
+    ('narrow_room_live',   0.55),
+    ('narrow_pass_v_live', 1.5),    # [m/s] 좁은틈 통과 중 속도 상한 (0=무제한)
 ]
 
 
@@ -289,6 +294,15 @@ class MPCNode(Node):
         self.declare_parameter('speed_cmd_err_max', 0.0)  # 2026-07-16 발행 v_cmd <= v_now+err_max [m/s]. d_min 해방 후 cmd 7.8>erpm캡 6.74 슬래밍+plan지터 증폭(톱니 0.2/실속출렁 0.6) → 캡이 물리면 cmd=실속+상수(매끈)+VESC 최대구동 유지. 0=off
         self.declare_parameter('speed_cmd_gain', 1.0)  # 2026-07-09 가속 오차증폭 G: v_cmd=v_now+G*(v_plan-v_now), 가속국면만. VESC 약한 속도PID의 소프트웨어 보상. 1.0=off
         # ── 0821 sight-limited speed (갑작스러운 장애물) ──
+        # ── 조향 데드밴드 보상 (2026-08-22 실측) ──────────────────────
+        # 0822 bag(4084행/11랩)을 실제 서보지령 + VESC 자이로로 재측정한 결과,
+        # 명령 조향 중 상수 ~0.028 rad(1.6°)가 요레이트를 전혀 만들지 않는다.
+        # 달성률이 |δ|0.02~0.08 에서 0.571, 0.25~0.45 에서 0.909 로 '올라가는'
+        # 형태 = 곱셈 게인오차가 아니라 상수 손실(링키지 유격). 언더스티어는
+        # 배제됨(손실각-횡가속 구배 음수, R²=0.10). 0=off.
+        self.declare_parameter('steer_deadband_ff', 0.0)        # [rad] 보상량(0=off, 중립 확정 후 A/B)
+        self.declare_parameter('steer_deadband_smooth', 0.060)  # [rad] tanh 전이폭(0 부근 기울기 1.5배)
+        self.declare_parameter('steer_ff_limit', 0.40)          # [rad] 서보한계 0.4189 미만 클램프
         self.declare_parameter('sight_brake_a', 4.0)   # [m/s²] 안전속도 계산용 제동. 0=off
         self.declare_parameter('sight_v_floor', 1.2)   # [m/s] 하한 — 완전정지 방지
         # ── 0820 loc-guard: 로컬라이제이션 점프 가드 (kiss 종방향 톱니 사고 대응) ──
@@ -1274,8 +1288,32 @@ class MPCNode(Node):
             _rlf = self._rl_arrays()
             if _rlf is not None:
                 _, rxF, ryF = _rlf
-                new = [(x, y) for x, y in new
-                       if float(np.min((rxF - x) ** 2 + (ryF - y) ** 2)) <= 6.25]
+                # ── 0822 트랙폭 게이트 (거리 2.5 m 게이트 대체 강화) ─────────
+                # 벽 밖 구조물이 라인에서 1.8~2.4 m 인 구간에선 기존 반경
+                # 게이트(2.5 m)를 통과했다. bag 19_47: s35 유령 e_c=-1.84
+                # (왼벽 0.46 밖 1.38 m) 에 keepout 1.06·shift 2.75 가 걸려
+                # 라인 이탈 0.94 m 헛회피. 라인 접선 기준 횡편차를 그 지점
+                # 벽거리와 비교해 벽 밖 +0.30 m 이상이면 버린다.
+                _wp = self._ref_wpnts
+                _kept = []
+                for x, y in new:
+                    _d2 = (rxF - x) ** 2 + (ryF - y) ** 2
+                    _j = int(np.argmin(_d2))
+                    if float(_d2[_j]) > 6.25:
+                        continue
+                    try:
+                        _jp = (_j + 1) % len(rxF); _jm = (_j - 1) % len(rxF)
+                        _tx = float(rxF[_jp] - rxF[_jm]); _ty = float(ryF[_jp] - ryF[_jm])
+                        _nrm = math.hypot(_tx, _ty) + 1e-9
+                        # e_c 규약(acados 985행)과 동일: sin_t·dx − cos_t·dy, 음수=왼쪽
+                        _e = (_ty * (x - float(rxF[_j])) - _tx * (y - float(ryF[_j]))) / _nrm
+                        if (_e < -(float(_wp[_j].d_left) + 0.30)
+                                or _e > (float(_wp[_j].d_right) + 0.30)):
+                            continue          # 벽 밖 유령 — 폐기
+                    except Exception:
+                        pass                  # 벽정보 이상 시 기존 동작(통과)
+                    _kept.append((x, y))
+                new = _kept
         except Exception:
             pass
         now = time.monotonic()
@@ -2211,7 +2249,17 @@ class MPCNode(Node):
                     if self._q_fast is None:
                         self._q_fast = {k: float(getattr(self.mpc, k))
                                         for k in self._Q_KEYS}
-                    _qset = self._q_safe if _want_safe else self._q_fast
+                    _qset = dict(self._q_safe if _want_safe else self._q_fast)
+                    # 0822 재적용: 하드코딩 SAFE 세트가 yaml 의 차량 고유 안정화
+                    # 대책을 되돌리지 못하게 하한을 깐다. q_drate 는 감쇠항이라
+                    # 낮추면 0.6 Hz 자기발진(맥 위빙)이 살아난다.
+                    for _fk in ('q_drate_scale_live', 'q_cte_scale_live'):
+                        try:
+                            _yv = float(self.get_parameter(_fk).value)
+                            if _qset.get(_fk, _yv) < _yv:
+                                _qset[_fk] = _yv
+                        except Exception:
+                            pass
                     for _k, _v in _qset.items():
                         setattr(self.mpc, _k, float(_v))
                     _reason = 'dyn' if _dyn else (
@@ -2939,6 +2987,32 @@ class MPCNode(Node):
         self._last_speed_pub = float(cmd.drive.speed)
         self._last_speed_t = _now_sp_t
 
+        # ── 좁은틈 통과 서행 (2026-08-22) ───────────────────────────────
+        # decide_side_pref 가 narrow-pass 를 택하면 여유가 수 cm 뿐이라
+        # 추종오차가 그대로 접촉이 된다. 통과 판정 후 hold 초 동안 속도 상한.
+        try:
+            _npu = float(getattr(self.mpc, '_narrow_pass_until', 0.0))
+            _npv = float(getattr(self.mpc, 'narrow_pass_v_live', 0.0))
+            if _npv > 0.0 and time.monotonic() < _npu:
+                if float(cmd.drive.speed) > _npv:
+                    cmd.drive.speed = float(_npv)
+        except Exception:
+            pass
+
+        # ── 조향 데드밴드 보상 (2026-08-22) ─────────────────────────────
+        # C-STEER 제한 '앞'에 둔다: 영교차에서 -db → +db 로 튀는 계단을 제한기가
+        # 눌러주므로 중립 채터링이 생기지 않는다. tanh 로 0 부근을 매끄럽게.
+        try:
+            _db = float(self.get_parameter('steer_deadband_ff').value)
+        except Exception:
+            _db = 0.0
+        if _db > 0.0:
+            _dbs = float(self.get_parameter('steer_deadband_smooth').value)
+            _dbl = float(self.get_parameter('steer_ff_limit').value)
+            _s0 = float(cmd.drive.steering_angle)
+            cmd.drive.steering_angle = float(max(-_dbl, min(_dbl,
+                _s0 + _db * math.tanh(_s0 / max(_dbs, 1e-3)))))
+
         # C-STEER (2026-06-19): hard OUTPUT steering-rate limit to servo slew.
         # The solver's first control jumps full-lock on the flat cost surface
         # (documented sign-flip hunting) → launch swerve + crash. Clamp published
@@ -2955,6 +3029,14 @@ class MPCNode(Node):
                 max(_prev_st - _dmax, min(_prev_st + _dmax, _s)))
         self._last_steer_pub = float(cmd.drive.steering_angle)
         self._last_steer_t = _now_t
+        # ── 0822 재적용: 솔버 delta_prev 를 실제 발행값으로 (sync 로 유실됐던 것) ──
+        # C-STEER 출력 제한기가 61.6% 사이클에서 평균 0.047 rad 를 깎는데 솔버는
+        # 자기 원본(filt_steer)을 직전조향으로 믿어 매 사이클 반대보정 → 교번
+        # (bag 16_49 실측: 교번율 0.68, Δp95=0.0800=sv_max·dT bang-bang).
+        try:
+            self.mpc._last_delta_applied = float(cmd.drive.steering_angle)
+        except Exception:
+            pass
 
         # ── 0820 loc-guard v2: LOST/odom두절 시 램프 정지 (즉시 0 = 휠락이라 금지) ──
         _lg_stop = getattr(self, '_loc_lost', False) or getattr(self, '_solver_lost', False)
