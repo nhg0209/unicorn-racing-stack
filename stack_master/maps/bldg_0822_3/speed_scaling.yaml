@@ -5,6 +5,6 @@ speed_sector_tuner:
     Sector0:
       start: 0
       end: 405
-      scaling: 0.9
+      scaling: 1.0
       only_FTG: false
       no_FTG: false

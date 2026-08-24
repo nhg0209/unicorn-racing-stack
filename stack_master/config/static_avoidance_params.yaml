@@ -18,7 +18,7 @@ static_avoidance_planner:
     lookahead_k: 1.5        # [s]  lookahead = max(lookahead_min, lookahead_k * cur_vs)
 
     # --- terminal-offset sampling ---
-    n_d_samples: 20         # number of lateral offsets sampled across the drivable width at the obstacle.
+    n_d_samples: 30         # number of lateral offsets sampled across the drivable width at the obstacle.
                             #   NOT a feasibility knob: measured over 62 ifac stations x gap {12,8,4,2} m
                             #   x tracking error {0, 0.3, 0.5} m, 10 and 24 give byte-identical results in
                             #   all 12 cells. Whether a section is passable is decided by the body/grid

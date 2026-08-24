@@ -6,7 +6,7 @@ C_Sr: 9.618871913816136 # Cornering stiffness coefficient, rear
 lf: 0.162 # Distance from center of gravity to front axle
 lr: 0.145 # Distance from center of gravity to rear axle
 h: 0.014 # Height of center of gravity
-m: 3.54 # Total mass of the vehicle
+m: 4.62 # Total mass of the vehicle  3.54
 I: 0.05797 # Moment of inertial of the entire vehicle about the z axis
 s_min: -0.4189 # Minimum steering angle constraint
 s_max: 0.4189 # Maximum steering angle constraint
