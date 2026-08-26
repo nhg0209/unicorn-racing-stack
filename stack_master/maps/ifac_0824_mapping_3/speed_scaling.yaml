@@ -1,0 +1,32 @@
+speed_sector_tuner:
+  ros__parameters:
+    # global_limit is a CEILING applied as clip(SectorN.scaling, 0, global_limit), not a
+    # factor. Held below the sector values it collapses them all onto itself and their rqt
+    # sliders stop doing anything -- which is what 0.85 was doing to all four here. Keep it
+    # open and tune the sectors; lower it only to put a hard lid on the whole lap.
+    global_limit: 1.0
+    n_sectors: 4
+    Sector0:
+      start: 0
+      end: 187
+      scaling: 0.9
+      only_FTG: false
+      no_FTG: false
+    Sector1:
+      start: 188
+      end: 251
+      scaling: 0.8
+      only_FTG: false
+      no_FTG: false
+    Sector2:
+      start: 252
+      end: 362
+      scaling: 1.0
+      only_FTG: false
+      no_FTG: false
+    Sector3:
+      start: 363
+      end: 421
+      scaling: 0.9
+      only_FTG: false
+      no_FTG: false
