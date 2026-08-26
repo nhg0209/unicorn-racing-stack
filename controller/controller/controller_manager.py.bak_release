@@ -40,8 +40,6 @@ L1_PARAMS = [
     'a_lat_limit_enable', 'a_lat_margin', 'a_lat_v_floor',
     'a_comb_limit_enable', 'a_comb_margin',
     'lambda_weight', 'gamma_weight',
-    'trailing_release_enable', 'trailing_release_scale', 'trailing_release_hold_s',
-    'trailing_release_dynamic_only',
 ]
 
 # Fallbacks for L1_PARAMS a yaml predating them does not carry. Everything else is required
@@ -55,10 +53,6 @@ L1_PARAM_DEFAULTS = {
     'a_comb_margin': 1.0,
     'lambda_weight': 1.0,
     'gamma_weight': 0.0,
-    'trailing_release_enable': True,
-    'trailing_release_scale': 0.85,
-    'trailing_release_hold_s': 1.0,
-    'trailing_release_dynamic_only': True,
 }
 
 
@@ -294,10 +288,6 @@ class ControllerManager(Node):
         self.controller.a_lat_v_floor = self.a_lat_v_floor
         self.controller.a_comb_limit_enable = self.a_comb_limit_enable
         self.controller.a_comb_margin = self.a_comb_margin
-        self.controller.trailing_release_enable = self.trailing_release_enable
-        self.controller.trailing_release_scale = self.trailing_release_scale
-        self.controller.trailing_release_hold_s = self.trailing_release_hold_s
-        self.controller.trailing_release_dynamic_only = self.trailing_release_dynamic_only
         # not params: read once from the config dir
         self.controller.ggv_table = self.ggv_table
         self.controller.ggv_ax_table = self.ggv_ax_table

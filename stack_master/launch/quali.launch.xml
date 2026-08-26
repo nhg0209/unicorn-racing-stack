@@ -1,0 +1,186 @@
+<?xml version="1.0"?>
+<!--
+  quali.launch.xml — qualification variant of race.launch.xml
+  ==============================================================================
+  Differences from race.launch.xml (everything else identical):
+
+  1. quali_lap_manager (lap_analyser pkg) sits between the controller and
+     simple_mux: the controller's drive_topic param points at
+     /quali/ackermann_cmd_raw and the manager republishes to
+     /vesc/high_level/ackermann_cmd.
+       - Arm the start/finish line with RViz "2D Goal Pose" (nearest global
+         waypoint; magenta cylinder + status text markers). Until armed, and
+         during the first num_slow_laps laps, drive.speed *= slow_speed_scale.
+       - After num_slow_laps laps it latches /quali/obstacles_off=True.
+  2. tracking_quali replaces tracking_node: quali has no opponent, so EVERY
+     /detect/raw_obstacles measurement is forwarded as a STATIC obstacle
+     (stable ids, no static/dynamic EKF classification) -> the state machine
+     only ever takes the static-avoidance OVERTAKING path, dynamic trailing
+     never triggers. Obstacles are seen ONLY during the slow laps: once
+     /quali/obstacles_off is latched the node publishes an empty array (the
+     crew is clearing the track; full pace on the raceline).
+
+  3. lap_analyser is OFF (quali_lap_manager owns /goal_pose + lap counting).
+  4. reopt is OFF: the global line never swaps; static boxes are handled by
+     the splini static-avoidance path only.
+
+  REAL: ros2 launch stack_master quali.launch.xml map:=<map>
+-->
+<launch>
+  <arg name="map"        description="Map name (folder in stack_master/maps/)"/>
+  <arg name="sim"        default="false" description="Use simulator (true) or real hardware (false)"/>
+  <arg name="localization" default="kiss" description="Real-car localization: cartographer | pf | kiss (ignored in sim, which uses gym ground truth)"/>
+  <arg name="detection_source" default="kiss" description="Obstacle detection front-end: kiss (Livox 3D BevDetector -> kiss_obstacle_bridge) | scan (2D perception/detect on /scan)"/>
+  <arg name="kiss_marker_topic" default="/kiss_loc/detections"
+       description="MarkerArray (CUBE, map frame) the kiss BEV detector publishes. Change if this car's kiss build uses another name; the bridge reads it and emits /detect/raw_obstacles"/>
+  <arg name="virtual"    default="$(var sim)" description="Inject a virtual opponent + static obstacles (on in sim, off on the real car; virtual:=true overlays a virtual opponent onto the real LiDAR)"/>
+  <arg name="opp_spawn"  default="false" description="(virtual) spawn the kinematic opponent at startup on the map centerline"/>
+  <arg name="opp_mode"   default="manual" description="(virtual) opponent driving mode: manual | path | ftg"/>
+  <arg name="ot_planner" default="predictive_spliner" description="overtake planner the state machine listens to (listens to BOTH /planner/avoidance/otwpnts and /planner/avoidance/static_otwpnts)"/>
+  <arg name="control_topic" default="/local_waypoints"
+       description="WpntArray the controller follows: /local_waypoints (state-machine output w/ avoidance) or /global_waypoints (robust raceline)"/>
+  <arg name="use_pp_heading" default="false"
+       description="Run pp_heading_controller instead of controller_manager (only one runs)"/>
+  <!-- quali knobs -->
+  <arg name="num_slow_laps"    default="8"   description="Laps at reduced speed after the start line is armed"/>
+  <arg name="slow_speed_scale" default="0.5" description="Controller speed multiplier during the slow laps (the 0.x)"/>
+
+  <arg name="use_hokuyo" default="false" description="(real) start the Hokuyo urg_node (/scan). OFF: this car runs the Livox MID-360; without /scan the FTG fallback + estop are inert"/>
+  <arg name="use_livox"  default="true"  description="(real) start the Livox MID-360 driver (/livox/lidar + /livox/imu for kiss 3D localization + detection)"/>
+  <arg name="rviz"       default="false" description="(real) also start RViz with the pitwall config (2D Pose Estimate seeds kiss via /initialpose)"/>
+  <arg name="reopt"      default="false" description="OFF in quali: keep the clean global line the whole run (no static_reopt line swaps); splini static avoidance handles the boxes. race.launch keeps its own default"/>
+  <!-- sim has no Livox -> force the 2D 'scan' path there; the real car honours detection_source. -->
+  <let name="det_src" value="scan" if="$(var sim)"/>
+  <let name="det_src" value="$(var detection_source)" unless="$(var sim)"/>
+  <!-- sim -> SIM config (racecar_f110.ini + veh_dyn_info); real hardware -> CAR. Folder name == racecar_version. -->
+  <let name="racecar_version" value="SIM" if="$(var sim)"/>
+  <let name="racecar_version" value="CAR" unless="$(var sim)"/>
+
+  <!-- ===== Base system: sensors + localization + raceline (+ reopt) + frenet odom ===== -->
+  <include file="$(find-pkg-share stack_master)/launch/base_system.launch.xml">
+    <arg name="map"          value="$(var map)"/>
+    <arg name="sim"          value="$(var sim)"/>
+    <arg name="localization" value="$(var localization)"/>
+    <arg name="virtual"      value="$(var virtual)"/>
+    <arg name="opp_spawn"    value="$(var opp_spawn)"/>
+    <arg name="opp_mode"     value="$(var opp_mode)"/>
+    <arg name="reopt"        value="$(var reopt)"/>
+    <arg name="use_hokuyo"   value="$(var use_hokuyo)"/>
+    <arg name="use_livox"    value="$(var use_livox)"/>
+  </include>
+
+  <!-- Optional on-car RViz. 2D Pose Estimate publishes /initialpose, which seeds kiss. -->
+  <group unless="$(var sim)">
+    <node pkg="rviz2" exec="rviz2" name="rviz" output="log" if="$(var rviz)"
+          args="-d $(find-pkg-share stack_master)/config/pitwall.rviz"/>
+  </group>
+
+  <!-- ===== Perception ===== -->
+  <!-- detection_source=scan: 2D perception/detect on /scan (Hokuyo, or Livox via pointcloud_to_laserscan) -->
+  <group if="$(eval '\'$(var det_src)\' == \'scan\'')">
+    <node pkg="perception" exec="detect" name="detect" output="screen">
+      <param from="$(find-pkg-share stack_master)/config/opponent_tracker_params.yaml"/>
+      <param name="map" value="$(var map)"/>
+    </node>
+  </group>
+
+  <!-- detection_source=kiss: kiss BEV detector (detect_en:true in kiss.yaml) publishes CUBE
+       markers; the bridge converts them to Frenet-filled /detect/raw_obstacles.
+       Requires localization:=kiss and maps/<map>/<map>_track.yaml + <map>_ground_lidar.yaml. -->
+  <group if="$(eval '\'$(var det_src)\' == \'kiss\'')">
+    <node pkg="perception" exec="kiss_obstacle_bridge" name="kiss_obstacle_bridge" output="screen">
+      <param name="marker_topic" value="$(var kiss_marker_topic)"/>
+    </node>
+  </group>
+
+  <!-- with virtual:=true tracking_merger owns /tracking/obstacles -->
+  <let name="tracking_out" value="/tracking/obstacles_raw" if="$(var virtual)"/>
+  <let name="tracking_out" value="/tracking/obstacles"     unless="$(var virtual)"/>
+  <!-- quali tracking: every detection is a STATIC obstacle (stable ids); empty after /quali/obstacles_off. -->
+  <node pkg="perception" exec="tracking_quali" name="tracking" output="screen">
+    <remap from="/tracking/obstacles" to="$(var tracking_out)"/>
+  </node>
+
+  <!-- ===== Quali lap manager: start line + slow laps + obstacles-off latch ===== -->
+  <node pkg="lap_analyser" exec="quali_lap_manager" name="quali_lap_manager" output="screen">
+    <param name="num_slow_laps"    value="$(var num_slow_laps)"/>
+    <param name="slow_speed_scale" value="$(var slow_speed_scale)"/>
+    <param name="cmd_in_topic"     value="/quali/ackermann_cmd_raw"/>
+    <param name="cmd_out_topic"    value="/vesc/high_level/ackermann_cmd"/>
+  </node>
+
+  <!-- ===== State machine ===== -->
+  <node pkg="state_machine" exec="state_machine" name="state_machine" output="screen">
+    <param from="$(find-pkg-share stack_master)/config/state_machine_params.yaml"/>
+    <param name="sim"             value="$(var sim)"/>
+    <param name="racecar_version" value="$(var racecar_version)"/>
+    <param name="timetrials_only" value="false"/>
+    <param name="ot_planner"      value="$(var ot_planner)"/>
+    <param name="map"             value="$(var map)"/>
+  </node>
+
+  <!-- Recovery planner -> /planner/recovery/wpnts -->
+  <node pkg="recovery_spliner" exec="recovery_spliner_node" name="recovery_spliner_node" output="screen"/>
+
+  <!-- Start planner -> /planner/start_wpnts -->
+  <node pkg="spliner" exec="start_spline_node_v2" name="start_planner" output="screen"/>
+
+  <!-- Static avoidance (Frenet grid-sampling) -> /planner/avoidance/static_otwpnts
+       + /planner/avoidance/static_feasible (Bool) <- /planner/avoidance/relax (Bool).
+       Both Bools are planner interlocks, deliberately NOT remapped. -->
+  <node pkg="spliner" exec="static_avoidance_node" name="static_avoidance_planner" output="screen">
+    <param from="$(find-pkg-share stack_master)/config/static_avoidance_params.yaml"/>
+    <remap from="/planner/avoidance/otwpnts" to="/planner/avoidance/static_otwpnts"/>
+  </node>
+
+  <!-- Dynamic avoidance (lane-hold overtake) -> /planner/avoidance/otwpnts + /planner/avoidance/merger -->
+  <node pkg="lane_change_planner" exec="change_avoidance_node" name="planner_change" output="screen">
+    <param from="$(find-pkg-share stack_master)/config/lane_change_params.yaml"/>
+  </node>
+  <node pkg="lane_change_planner" exec="update_waypoints" name="waypoint_updater" output="screen"/>
+
+  <!-- ===== GP opponent-trajectory predictor ===== -->
+  <!-- OFF by default. The three nodes publish /opponent_trajectory and
+       /opponent_prediction/{obstacles,obstacles_pred,force_trailing}. In this launch only two
+       consumers exist: change_avoidance_node, which reads the trajectory ONLY when
+       use_prediction is true (it ships false), and the state machine's force_trailing, which
+       simply never fires without the topic. sqp_planner / spliner_planner also subscribe but are
+       not started here. So with no opponent on track these cost CPU and produce nothing anyone
+       reads, and gaussian_process_opp_traj is heavy enough to be pinned to its own core
+       (taskset -c 1; on macOS that prefix is a no-op shim, so there it is not pinned at all).
+       Turn it on for head-to-head: gp_pred:=true. -->
+  <arg name="gp_pred" default="false" description="Run the GP opponent-trajectory predictor (opponent_trajectory + gaussian_process_opp_traj + opp_prediction). Needed for head-to-head prediction; set true together with lane_change use_prediction."/>
+  <group if="$(var gp_pred)">
+    <node pkg="gp_traj_predictor" exec="opponent_trajectory"       name="OpponentHalflap"                output="screen"/>
+    <node pkg="gp_traj_predictor" exec="gaussian_process_opp_traj" name="GP_trajectory"                  output="screen" launch-prefix="taskset -c 1"/>
+    <node pkg="gp_traj_predictor" exec="opp_prediction"            name="opponent_propagation_predictor" output="screen"/>
+  </group>
+
+  <!-- ===== Lap timing ===== -->
+  <!-- Subscribes /state_marker, /global_waypoints and /car_state/odom{,_frenet}, all of which this
+       launch already provides, and publishes /lap_analyser/lap_data plus the RViz markers. It only
+       listens, so it cannot affect the drive; it is an arg so a run can drop it. -->
+  <arg name="lap_analyser" default="false" description="OFF in quali: quali_lap_manager owns /goal_pose + lap counting"/>
+  <node pkg="lap_analyser" exec="lap_analyser" name="lap_analyser" output="screen"
+        if="$(var lap_analyser)"/>
+
+  <!-- ===== Control: L1 / Pure-Pursuit ===== -->
+  <node pkg="controller" exec="controller_manager" name="controller_manager" output="screen"
+        unless="$(var use_pp_heading)">
+    <param from="$(find-pkg-share stack_master)/config/controller.yaml"/>
+    <param name="save_yaml_path" value="$(find-pkg-share stack_master)/config/controller.yaml"/>
+    <param name="sim" value="$(var sim)"/>
+    <!-- picks config/<SIM|CAR>/veh_dyn_info/ggv.csv for the steering tyre limit -->
+    <param name="racecar_version" value="$(var racecar_version)"/>
+    <!-- quali governor seam: quali_lap_manager consumes this and republishes
+         to /vesc/high_level/ackermann_cmd (scaled during the slow laps) -->
+    <param name="drive_topic" value="/quali/ackermann_cmd_raw"/>
+  </node>
+
+  <node pkg="controller" exec="pp_heading_controller" name="pp_heading_controller" output="screen"
+        if="$(var use_pp_heading)">
+    <param from="$(find-pkg-share controller)/config/pp_heading_params.yaml"/>
+    <remap from="/local_waypoints" to="$(var control_topic)"/>
+    <param name="drive_topic" value="/quali/ackermann_cmd_raw"/>
+  </node>
+</launch>

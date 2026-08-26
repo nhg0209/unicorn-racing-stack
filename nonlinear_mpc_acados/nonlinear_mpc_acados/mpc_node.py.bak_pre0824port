@@ -135,8 +135,6 @@ LIVE_PARAMS = [
     # 종전엔 0.70 하드코딩이라 주 판정(R_safe+R_car=0.70)과 같아 예외가 죽어있었다.
     ('narrow_room_live',   0.55),
     ('narrow_pass_v_live', 1.5),    # [m/s] 좁은틈 통과 중 속도 상한 (0=무제한)
-    # 0824 코너(|κ|>0.3) 장애물 통과속도 캡 [m/s] (심 검증본). 0 = off.
-    ('obs_corner_v_live', 2.5),
 ]
 
 
@@ -742,12 +740,8 @@ class MPCNode(Node):
         try:
             self._initialize_mpc(wpnts=ref_wpnts, wall_wpnts=wall_wpnts)
         except Exception as e:
-            # 0825: CSV 폴백 실패(파일 없음 등)로 여기 오면 init_done 을 되돌려
-            # 늦게 도착하는 /global_waypoints 로 자동 복구되게 한다 (이전엔 영구 idle).
-            self._track_init_done = False
             self.get_logger().error(
-                f"MPC track init failed: {e}. Control loop idles until "
-                f"reference waypoints arrive (retry armed).")
+                f"MPC track init failed: {e}. Control loop will idle.")
             self._mpc_ready = False
 
     def _track_csv_fallback_cb(self) -> None:

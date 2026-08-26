@@ -19,6 +19,8 @@
        description="ROS params YAML for the global planner node"/>
   <arg name="reverse"            default="false"   description="Reverse raceline direction"/>
   <arg name="show_plots"         default="false"   description="Show optimization result plots"/>
+  <arg name="rebound"         default="true"    description="After the line is optimized, re-measure d_left/d_right against the untouched wall image. The optimizer measures them on [map].png, which is also the image people edit to force the line where they want it, so a corridor narrowed in GIMP is published as the real one. Truth image is [map]_origin.png when present, else [map].pgm. See scripts/rebound_widths.py."/>
+  <arg name="rebound_timeout" default="900.0"   description="Seconds to wait for the optimizer to finish writing global_waypoints.json before giving up on the re-measure"/>
   <arg name="slice_gui"          default="false"    description="Open the matplotlib sector-slicing GUI. false = headless: write ONE sector over the whole track and exit. The GUI blocks forever with no display, so use false over SSH."/>
 
   <!-- sim -> SIM config folder, real hardware -> CAR config folder. The folder
@@ -61,4 +63,15 @@
     <param name="save_dir" value="$(var maps_dir)/$(var map)"/>
     <param name="use_gui" value="$(var slice_gui)"/>
   </node>
+
+  <!-- ===== track bounds: re-measure on the true wall, after the line is written ===== -->
+  <!-- The planner node above does not exit once it has written global_waypoints.json, it
+       keeps publishing, so there is no process exit to trigger on. The script waits for both
+       written files to appear with a fresh mtime and then hold still, and only then rewrites
+       the widths; x/y are never touched, so the optimized line is exactly as produced.
+       It refuses to write unless it can first reproduce the stored widths on the image that
+       generated them, so a drift between it and the planner stops it instead of corrupting
+       the map. optional keeps a map with no truth image from failing the launch. -->
+  <executable cmd="$(find-pkg-prefix stack_master)/lib/stack_master/rebound_widths.py $(var maps_dir)/$(var map) --apply --optional --wait $(var rebound_timeout)"
+              name="rebound_widths" output="screen" if="$(var rebound)"/>
 </launch>

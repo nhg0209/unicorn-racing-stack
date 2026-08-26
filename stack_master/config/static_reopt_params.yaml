@@ -103,8 +103,8 @@ static_reopt_node:
 
     # [m] safety_width for the obstacle-aware re-optimizer (incl. car width). Reported in the
     # startup margin line; its old consumer, the whole-track mincurv_iqp path, is gone.
-    safety_width: 0.5
-    safety_width_sp: 0.5
+    safety_width: 0.4
+    safety_width_sp: 0.4
     # also re-optimize the shortest_path line (ot_interpolator consumes it); false only if the OT
     # line is unused
     compute_sp: true
@@ -134,7 +134,7 @@ static_reopt_node:
     # the recorded apex was DRIVEN at that reserve; a larger value here shrinks the hump below the
     # proven clearance and the all-or-nothing fit rejects it. Also the reserve taken off the
     # measured grid corridor, which both solvers use.
-    wall_margin: 0.05
+    wall_margin: 0.1
     # [cells] erosion kernel of the FINAL wall gate: every published point is checked against the
     # map eroded by floor(k/2) cells before the swap is allowed. A published point is a CAR
     # CENTRE, so this must reserve at least half a car — 7 cells at 0.05 m/px = 0.15 m = width/2,
@@ -155,7 +155,7 @@ static_reopt_node:
     # status, the clearance veto). MUST be >= the reactive keep-out (width_car/2 + safety_margin
     # = 0.30) or a line judged by it sits inside the reactive planner's keep-out and gets
     # re-avoided every lap. closed_qp reports its OWN floor per box, so this is the fallback.
-    obs_margin: 0.35
+    obs_margin: 0.25
     # [m] the floor the drift trigger and the publish veto judge an unknown box by. Its other
     # role -- the hump coverage ladder's lowest rung -- went with the hump; these two did not. Two constraints, higher wins: at least the REACTIVE keep-out (0.30) so a relaxed hump
     # still clears by what the reactive planner would itself have driven, AND at least 5 cm above

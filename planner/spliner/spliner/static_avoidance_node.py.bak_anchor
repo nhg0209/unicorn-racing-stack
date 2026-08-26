@@ -304,10 +304,6 @@ class ObstacleSpliner(Node):
         self.a_long_max = 4.0        # [m/s^2] longitudinal DECEL for the backward pass (brake into the apex)
         self.a_long_accel = 3.0      # [m/s^2] longitudinal ACCEL for the forward pass (gentle exit ramp-up;
                                      # lower = more gradual "fast-out" acceleration off the apex)
-        # Scale on the avoidance velocity profile's per-point cap, applied BEFORE the accel/decel
-        # passes so the published profile stays inside a_long_max / a_long_accel at any value.
-        # NOT replaced from veh_dyn_info: this is a tuning knob on top of whatever ggv says.
-        self.speed_scale_static = 1.0
         self._veh_dyn = None         # (ay, ax, ax_machines, b_ax_machines) tables, or None
         self.safety_margin = 0.16    # [m] extra clearance around the obstacle box (beyond half car).
         # LATERAL half of the keep-out. Split from safety_margin so the two axes obs_margin
@@ -488,15 +484,6 @@ class ObstacleSpliner(Node):
         self.commit_reanchor_len_m = 2.0   # [m] arc length the entry correction is faded out over
         self.commit_reanchor_max_m = 1.0   # [m] beyond this it is not an entry fix -> full re-plan
         self.preramp_len_m = 3.0     # [m] decay the car's current d to the raceline within this
-        # ANCHOR OFFSET. See _anchor_offset for why this is not zero and why it is not constant.
-        self.anchor_offset_enable = True
-        self.anchor_base_m = 0.42          # [m] empirical floor (discretisation + low-speed residual)
-        self.anchor_psi_equiv_rad = 0.115  # [rad] heading the join typically has to develop
-        self.anchor_t_lag_s = 0.10         # [s] pipeline lag between the solve and the consumer
-        self.anchor_kappa_steer = 1.76     # [1/m] tan(delta_max)/wheelbase = tan(0.53)/0.333
-        self.anchor_min_m = 0.5            # [m] below this the join was feasible in only 94%
-        self.anchor_max_m = 2.5            # [m]
-        self.sector_scale_curv_cap = True  # apply the sector scale to the curvature cap too
                                      #     much of the path BEFORE the hump's entry ramp
         self.commit_obs_ds = 0.75    # [m] drop the commit if the triggering box's s drifts this far
         self.commit_obs_dd = 0.40    # [m] ... or its d drifts this far (re-plan the apex around it)
@@ -521,7 +508,6 @@ class ObstacleSpliner(Node):
             'kernel_size', 'body_kernel_size',
             'lookahead_min', 'lookahead_k', 'n_d_samples', 'sample_gaps', 'kappa_max',
             'kappa_add_max', 'kappa_abs_max', 'a_lat_max', 'a_long_max', 'a_long_accel',
-            'speed_scale_static',
             'safety_margin', 'safety_margin_d', 'avoid_log_throttle_s',
             'static_near_zero_mps', 'static_promote_sec',
             'static_demote_mps', 'static_demote_sec',
@@ -537,8 +523,6 @@ class ObstacleSpliner(Node):
             'commit_enable', 'commit_dev_max', 'commit_obs_ds', 'commit_obs_dd',
             'commit_drop_on_new_obstacle', 'commit_replan_gap_m',
             'commit_reanchor_len_m', 'commit_reanchor_max_m', 'preramp_len_m',
-            'anchor_offset_enable', 'anchor_base_m', 'anchor_psi_equiv_rad', 'anchor_t_lag_s',
-            'anchor_kappa_steer', 'anchor_min_m', 'anchor_max_m', 'sector_scale_curv_cap',
             'static_plan_method', 'corridor_qp_w_dev', 'corridor_qp_pin_apex',
             'corridor_qp_max_vars', 'corridor_qp_ramp_ladder', 'static_plan_log',
         ]))
@@ -674,8 +658,6 @@ class ObstacleSpliner(Node):
         self.declare_parameter('a_lat_max', 6.0, dbl(1.0, 20.0, "lateral-accel cap [m/s^2]"))
         self.declare_parameter('a_long_max', 4.0, dbl(0.5, 20.0, "longitudinal decel for backward speed pass [m/s^2]"))
         self.declare_parameter('a_long_accel', 3.0, dbl(0.5, 20.0, "longitudinal accel for forward pass (gentle exit) [m/s^2]"))
-        self.declare_parameter('speed_scale_static', 1.0,
-                               dbl(0.1, 2.0, "scale on the avoidance velocity profile (applied before the accel/decel passes)"))
         self.declare_parameter('safety_margin', 0.16, dbl(0.0, 1.0, "clearance around obstacle box [m]"))
         self.declare_parameter('safety_margin_d', 0.16, dbl(0.0, 1.0, "LATERAL clearance around the obstacle box [m]"))
         self.declare_parameter('avoid_log_throttle_s', 2.0,
@@ -772,16 +754,6 @@ class ObstacleSpliner(Node):
         self.declare_parameter('commit_reanchor_len_m', 2.0, dbl(0.5, 10.0, "arc length the entry re-anchor is faded out over [m]"))
         self.declare_parameter('commit_reanchor_max_m', 1.0, dbl(0.1, 3.0, "deviation beyond which a full re-plan is taken instead [m]"))
         self.declare_parameter('preramp_len_m', 3.0, dbl(0.0, 15.0, "decay the car's current d to the raceline within this much of the path before the hump [m]"))
-        self.declare_parameter('anchor_offset_enable', True,
-                               ParameterDescriptor(description="anchor the path ahead of the car; False reproduces the car-anchored behaviour exactly"))
-        self.declare_parameter('anchor_base_m', 0.42, dbl(0.0, 5.0, "anchor offset floor [m]"))
-        self.declare_parameter('anchor_psi_equiv_rad', 0.115, dbl(0.0, 1.0, "heading the join must develop [rad]"))
-        self.declare_parameter('anchor_t_lag_s', 0.10, dbl(0.0, 1.0, "solve-to-consumer lag [s]"))
-        self.declare_parameter('anchor_kappa_steer', 1.76, dbl(0.1, 10.0, "steering-limited curvature tan(delta_max)/wheelbase [1/m]"))
-        self.declare_parameter('anchor_min_m', 0.5, dbl(0.0, 5.0, "anchor offset lower clamp [m]"))
-        self.declare_parameter('anchor_max_m', 2.5, dbl(0.0, 10.0, "anchor offset upper clamp [m]"))
-        self.declare_parameter('sector_scale_curv_cap', True,
-                               ParameterDescriptor(description="scale the curvature cap by the sector speed scale; False restores the full-ggv cap"))
         self.declare_parameter('commit_obs_ds', 0.75, dbl(0.05, 5.0, "drop the commit if the triggering obstacle s drifts this far [m]"))
         self.declare_parameter('commit_obs_dd', 0.40, dbl(0.05, 2.0, "drop the commit if the triggering obstacle d drifts this far [m]"))
         # --- which shape carries the sampled terminal offset (see the branch in do_spline) ---
@@ -842,8 +814,6 @@ class ObstacleSpliner(Node):
                 self.a_long_max = float(p.value)
             elif n == 'a_long_accel':
                 self.a_long_accel = float(p.value)
-            elif n == 'speed_scale_static':
-                self.speed_scale_static = float(p.value)
             elif n == 'safety_margin':
                 self.safety_margin = float(p.value)
             elif n == 'safety_margin_d':
@@ -956,22 +926,6 @@ class ObstacleSpliner(Node):
                 self.commit_reanchor_max_m = float(p.value)
             elif n == 'preramp_len_m':
                 self.preramp_len_m = float(p.value)
-            elif n == 'anchor_offset_enable':
-                self.anchor_offset_enable = bool(p.value)
-            elif n == 'anchor_base_m':
-                self.anchor_base_m = float(p.value)
-            elif n == 'anchor_psi_equiv_rad':
-                self.anchor_psi_equiv_rad = float(p.value)
-            elif n == 'anchor_t_lag_s':
-                self.anchor_t_lag_s = float(p.value)
-            elif n == 'anchor_kappa_steer':
-                self.anchor_kappa_steer = float(p.value)
-            elif n == 'anchor_min_m':
-                self.anchor_min_m = float(p.value)
-            elif n == 'anchor_max_m':
-                self.anchor_max_m = float(p.value)
-            elif n == 'sector_scale_curv_cap':
-                self.sector_scale_curv_cap = bool(p.value)
             elif n == 'commit_obs_ds':
                 self.commit_obs_ds = float(p.value)
             elif n == 'commit_obs_dd':
@@ -1336,37 +1290,7 @@ class ObstacleSpliner(Node):
             return float(np.sign(da)) * self.apex_bulge
         return math.copysign(self.apex_bulge, da - d_c)
 
-    def _anchor_offset(self, v: float) -> float:
-        """Distance AHEAD of the car at which to anchor the published path [m].
-
-        Anchoring the grid ON the car asks the car to ALREADY hold the heading the path opens
-        with: the path's initial slope d'(s0) is a heading offset atan(d') against the raceline,
-        and developing it over L needs curvature psi/L, which is unbounded at L = 0. Measured
-        over the 766 fresh solves in rosbag2_2026_08_24-16_34_45, the join needed a curvature
-        the car could not produce in 100% of them at L = 0, and in 0% of them at L = 1.0 m.
-
-        Two terms, two different laws. The heading room is psi / kappa_available, and the
-        curvature available is the SMALLER of the steering lock and what grip allows at this
-        speed -- so it is flat below the crossover (v = sqrt(a_lat/kappa_steer), 1.9 m/s on the
-        current ggv) and grows as v^2 above it. a_lat is read from ggv through _load_veh_dyn
-        rather than written here, because the crossover moves whenever the lateral budget does;
-        a literal would silently keep the old crossover after a re-grip.
-        The second term is pipeline lag, which is simply v * t_lag. Measured on the same bag:
-        the published path started 0.240 m behind the car at 2.45 m/s, i.e. t_lag p50 0.078 s.
-
-        Returns 0.0 when disabled, which reproduces the car-anchored behaviour exactly.
-        """
-        if not self.anchor_offset_enable:
-            return 0.0
-        a_lat = max(float(self.a_lat_max), 1e-3)
-        k_steer = max(float(self.anchor_kappa_steer), 1e-3)
-        k_avail = min(k_steer, a_lat / max(float(v), 0.5) ** 2)
-        head = float(self.anchor_psi_equiv_rad) / k_avail
-        return float(np.clip(self.anchor_base_m + head + self.anchor_t_lag_s * float(v),
-                             self.anchor_min_m, self.anchor_max_m))
-
-    def _anchor_car_idx(self, s_idx: int, gb_wpnts, wpnt_dist: float, search_m: float = 3.0,
-                        ref_xy=None) -> int:
+    def _anchor_car_idx(self, s_idx: int, gb_wpnts, wpnt_dist: float, search_m: float = 3.0) -> int:
         """Re-anchor the s-derived grid start to the station NEAREST THE CAR.
 
         Same idiom, and the same reason, as the state machine's anchor_gb_index. cur_s comes from
@@ -1381,15 +1305,11 @@ class ObstacleSpliner(Node):
         """
         if self.cur_x is None or self.cur_y is None or not gb_wpnts:
             return s_idx
-        # ref_xy lets the caller snap to a point the car has NOT reached yet. Snapping to the car
-        # would undo any forward offset the caller applied to s_idx -- the search would simply
-        # walk back to the nearest station to the car, which is the thing being moved away from.
-        rx, ry = (self.cur_x, self.cur_y) if ref_xy is None else (float(ref_xy[0]), float(ref_xy[1]))
         n = self.gb_max_idx
         k = max(1, int(search_m / max(wpnt_dist, 1e-3)))
         idx = (s_idx + np.arange(-k, k + 1)) % n
-        dx = np.fromiter((gb_wpnts[j].x_m - rx for j in idx), float, len(idx))
-        dy = np.fromiter((gb_wpnts[j].y_m - ry for j in idx), float, len(idx))
+        dx = np.fromiter((gb_wpnts[j].x_m - self.cur_x for j in idx), float, len(idx))
+        dy = np.fromiter((gb_wpnts[j].y_m - self.cur_y for j in idx), float, len(idx))
         return int(idx[int(np.argmin(dx * dx + dy * dy))])
 
     def _squeeze_schedule(self):
@@ -1789,17 +1709,9 @@ class ObstacleSpliner(Node):
         span = min(s_exit_end + self.tail_m, self.gb_max_s * 0.9)
 
         # --- s-grid for the path ---
-        anchor_off = self._anchor_offset(abs(float(self.cur_vs or 0.0)))
-        i_anchor = int(((self.cur_s + anchor_off) % self.gb_max_s) / wpnt_dist) % self.gb_max_idx
-        car_idx = self._anchor_car_idx(i_anchor, gb_wpnts, wpnt_dist,
-                                       ref_xy=(gb_wpnts[i_anchor].x_m, gb_wpnts[i_anchor].y_m))
+        car_idx = self._anchor_car_idx(int(self.cur_s / wpnt_dist) % self.gb_max_idx,
+                                       gb_wpnts, wpnt_dist)
         grid_start_s = gb_wpnts[car_idx].s_m
-        # Lateral state the car is PREDICTED to hold on arrival at the anchor, on its present
-        # heading. Seeding the pre-ramp with cur_d instead would assert the car travels
-        # anchor_off metres without moving sideways -- false for any cur_dp != 0, and that false
-        # assertion is exactly the step this offset exists to remove. cur_dp is already bounded
-        # (tan of a +-0.5 rad clip), so the extrapolation cannot run away.
-        d_anchor = float(self.cur_d + cur_dp * anchor_off)
         n = max(int(span / wpnt_dist), 5)
         idxs = (car_idx + np.arange(n)) % self.gb_max_idx
         s_abs = grid_start_s + np.arange(n) * wpnt_dist
@@ -1810,20 +1722,6 @@ class ObstacleSpliner(Node):
         d_left_arr = np.array([gb_wpnts[j].d_left for j in idxs])
         d_right_arr = np.array([gb_wpnts[j].d_right for j in idxs])   # magnitude of right half-width
         v_gb_arr = np.array([gb_wpnts[j].vx_mps for j in idxs])
-        # PER-STATION sector scale, recovered from the two waypoint streams rather than held as a
-        # parameter of our own: sector_tuner is the single source of truth for speed scaling, and
-        # a second copy here would drift the moment a sector is retuned or a map is swapped.
-        # do_spline is called with gb_scaled_wpnts, so v_gb_arr above is ALREADY scaled; dividing
-        # by the raw line recovers exactly what the tuner applied, sector boundaries and all.
-        # Falls back to 1.0 whenever the two streams disagree in length, which they do for up to
-        # sector_tuner's 0.5 s republish period after a static_reopt line swap.
-        sector_scale_arr = np.ones(n)
-        if self.sector_scale_curv_cap and self.gb_wpnts is not None:
-            raw_wpnts = self.gb_wpnts.wpnts
-            if len(raw_wpnts) == len(gb_wpnts):
-                v_raw = np.array([raw_wpnts[j].vx_mps for j in idxs])
-                ok_v = v_raw > 1e-3
-                sector_scale_arr[ok_v] = np.clip(v_gb_arr[ok_v] / v_raw[ok_v], 0.05, 1.0)
         kappa_ref = np.array([gb_wpnts[j].kappa_radpm for j in idxs])  # raceline curvature (corner-fair check)
 
         # --- terminal-offset samples: the DRIVABLE GAPS beside the obstacle ---
@@ -2093,13 +1991,13 @@ class ObstacleSpliner(Node):
                 return 1.0 - t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
 
             if s_entry0 > 0.0:
-                d_start = float(d_anchor * _decay(s_entry0))
-                if abs(d_anchor) > 1e-9:
+                d_start = float(self.cur_d * _decay(s_entry0))
+                if abs(self.cur_d) > 1e-9:
                     m_pre = s_local <= s_entry0
-                    dv[m_pre] = d_anchor * _decay(s_local[m_pre])
+                    dv[m_pre] = self.cur_d * _decay(s_local[m_pre])
             else:
-                d_start = d_anchor
-                dv[:] = d_anchor
+                d_start = self.cur_d
+                dv[:] = self.cur_d
             if span_ok and m_span.any():
                 # One knot per obstacle centre -> a single smooth quintic hump (raceline -> apex ->
                 # raceline). d'=0 at each apex makes it the peak. apex_bulge pushes the peak FURTHER
@@ -2459,21 +2357,8 @@ class ObstacleSpliner(Node):
         #   3) forward accel pass  -> leave the apex and accelerate out GRADUALLY (bounded a_long_accel)
         a_lat_max, a_long_max, a_long_accel = self._a_limits()
         v_gb_s = _savgol_safe(v_gb_arr, SMOOTH_VEL_WINDOW)
-        # The curvature cap spends the FULL ggv lateral budget, while the raceline on either
-        # side of the manoeuvre is being driven at the sector's scale -- so the hump asked for
-        # a_lat_max where the line asked for a_lat_max * scale^2. Measured on this map at
-        # global_limit 0.8: 6.50 against 4.16, a 56% step in lateral demand landing exactly where
-        # the geometry is tightest. Speed scales as k and lateral as k^2, so multiplying the cap
-        # by k puts the manoeuvre on the same envelope as the line it leaves and rejoins.
-        # v_gb_s already carries the scale (it is the scaled line); this is the other term.
-        v_curv = np.sqrt(a_lat_max / np.maximum(np.abs(kappa_), 1e-3)) * sector_scale_arr
-        # speed_scale_static multiplies the PER-POINT CAP, not the finished profile: the two
-        # passes below then re-derive the accel/decel envelope at the scaled speeds, so the
-        # published profile respects a_long_max / a_long_accel at any scale ("the cap goes IN,
-        # not on afterwards"). Above 1.0 the lateral budget is knowingly exceeded.
-        v_scale = max(0.1, float(self.speed_scale_static))
-        v_arr = np.clip(_savgol_safe(np.minimum(v_gb_s, v_curv) * v_scale, SMOOTH_VEL_WINDOW),
-                        0.0, v_gb_s * v_scale)
+        v_curv = np.sqrt(a_lat_max / np.maximum(np.abs(kappa_), 1e-3))
+        v_arr = np.clip(_savgol_safe(np.minimum(v_gb_s, v_curv), SMOOTH_VEL_WINDOW), 0.0, v_gb_s)
         # FRICTION CIRCLE. The two passes used to spend the FULL longitudinal limit at every
         # point while the curvature cap independently spent the full lateral one, so at the
         # shoulders of an apex the profile demanded sqrt(7.0^2 + 7.0^2) = 9.90 m/s^2 of a tyre
@@ -2657,21 +2542,7 @@ class ObstacleSpliner(Node):
         # has advanced along it. Keeping s_local >= car_prog - 0.30 drops only the passed prefix.
         s0 = c['s_mod'][0]
         s_local = (c['s_mod'] - s0) % L
-        # SIGNED progress, and it has to be. (cur_s - s0) % L maps "the car is 0.2 m BEFORE the
-        # path start" -- the NORMAL case, since a fresh plan begins just ahead of the car -- to
-        # ~L (a whole lap), which reads as "past the end" and released the commit on the cycle
-        # after it was stored. Measured on bag 0825_pr2/rosbag2_2026_08_25-20_07_42 replayed
-        # through this node: 43 releases in 18 s, i.e. every commit died 40-50 ms after being
-        # made, in forward driving as much as while the reverse recovery backed up. With no
-        # commit surviving, every cycle re-planned from scratch from a closer pose, so a single
-        # rejected cycle (body/obs_box/curv) deleted the avoidance outright and the SM dropped
-        # the OVERTAKE. gym closed-loop A/B (same map, obstacle at the bag's own coordinates,
-        # overlaid on the LiDAR so detection stays realistic), 4 runs each:
-        #   this line as it was : 3/4 passed (1 permanent standstill), reverse recovery fired in
-        #                         4/4, SQUEEZE 7-63 times
-        #   signed              : 4/4 passed, reverse 0/4, SQUEEZE 0
-        # Clearing time was unchanged (~2.5-2.6 s) -- the fix buys robustness, not pace.
-        car_prog = (self.cur_s - s0 + L / 2.0) % L - L / 2.0
+        car_prog = (self.cur_s - s0) % L
         ahead = s_local >= (car_prog - 0.30)
         if int(ahead.sum()) < 3:
             self.get_logger().info(

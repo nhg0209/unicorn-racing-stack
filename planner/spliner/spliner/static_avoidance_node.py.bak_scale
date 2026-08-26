@@ -496,7 +496,6 @@ class ObstacleSpliner(Node):
         self.anchor_kappa_steer = 1.76     # [1/m] tan(delta_max)/wheelbase = tan(0.53)/0.333
         self.anchor_min_m = 0.5            # [m] below this the join was feasible in only 94%
         self.anchor_max_m = 2.5            # [m]
-        self.sector_scale_curv_cap = True  # apply the sector scale to the curvature cap too
                                      #     much of the path BEFORE the hump's entry ramp
         self.commit_obs_ds = 0.75    # [m] drop the commit if the triggering box's s drifts this far
         self.commit_obs_dd = 0.40    # [m] ... or its d drifts this far (re-plan the apex around it)
@@ -538,7 +537,7 @@ class ObstacleSpliner(Node):
             'commit_drop_on_new_obstacle', 'commit_replan_gap_m',
             'commit_reanchor_len_m', 'commit_reanchor_max_m', 'preramp_len_m',
             'anchor_offset_enable', 'anchor_base_m', 'anchor_psi_equiv_rad', 'anchor_t_lag_s',
-            'anchor_kappa_steer', 'anchor_min_m', 'anchor_max_m', 'sector_scale_curv_cap',
+            'anchor_kappa_steer', 'anchor_min_m', 'anchor_max_m',
             'static_plan_method', 'corridor_qp_w_dev', 'corridor_qp_pin_apex',
             'corridor_qp_max_vars', 'corridor_qp_ramp_ladder', 'static_plan_log',
         ]))
@@ -780,8 +779,6 @@ class ObstacleSpliner(Node):
         self.declare_parameter('anchor_kappa_steer', 1.76, dbl(0.1, 10.0, "steering-limited curvature tan(delta_max)/wheelbase [1/m]"))
         self.declare_parameter('anchor_min_m', 0.5, dbl(0.0, 5.0, "anchor offset lower clamp [m]"))
         self.declare_parameter('anchor_max_m', 2.5, dbl(0.0, 10.0, "anchor offset upper clamp [m]"))
-        self.declare_parameter('sector_scale_curv_cap', True,
-                               ParameterDescriptor(description="scale the curvature cap by the sector speed scale; False restores the full-ggv cap"))
         self.declare_parameter('commit_obs_ds', 0.75, dbl(0.05, 5.0, "drop the commit if the triggering obstacle s drifts this far [m]"))
         self.declare_parameter('commit_obs_dd', 0.40, dbl(0.05, 2.0, "drop the commit if the triggering obstacle d drifts this far [m]"))
         # --- which shape carries the sampled terminal offset (see the branch in do_spline) ---
@@ -970,8 +967,6 @@ class ObstacleSpliner(Node):
                 self.anchor_min_m = float(p.value)
             elif n == 'anchor_max_m':
                 self.anchor_max_m = float(p.value)
-            elif n == 'sector_scale_curv_cap':
-                self.sector_scale_curv_cap = bool(p.value)
             elif n == 'commit_obs_ds':
                 self.commit_obs_ds = float(p.value)
             elif n == 'commit_obs_dd':
@@ -1810,20 +1805,6 @@ class ObstacleSpliner(Node):
         d_left_arr = np.array([gb_wpnts[j].d_left for j in idxs])
         d_right_arr = np.array([gb_wpnts[j].d_right for j in idxs])   # magnitude of right half-width
         v_gb_arr = np.array([gb_wpnts[j].vx_mps for j in idxs])
-        # PER-STATION sector scale, recovered from the two waypoint streams rather than held as a
-        # parameter of our own: sector_tuner is the single source of truth for speed scaling, and
-        # a second copy here would drift the moment a sector is retuned or a map is swapped.
-        # do_spline is called with gb_scaled_wpnts, so v_gb_arr above is ALREADY scaled; dividing
-        # by the raw line recovers exactly what the tuner applied, sector boundaries and all.
-        # Falls back to 1.0 whenever the two streams disagree in length, which they do for up to
-        # sector_tuner's 0.5 s republish period after a static_reopt line swap.
-        sector_scale_arr = np.ones(n)
-        if self.sector_scale_curv_cap and self.gb_wpnts is not None:
-            raw_wpnts = self.gb_wpnts.wpnts
-            if len(raw_wpnts) == len(gb_wpnts):
-                v_raw = np.array([raw_wpnts[j].vx_mps for j in idxs])
-                ok_v = v_raw > 1e-3
-                sector_scale_arr[ok_v] = np.clip(v_gb_arr[ok_v] / v_raw[ok_v], 0.05, 1.0)
         kappa_ref = np.array([gb_wpnts[j].kappa_radpm for j in idxs])  # raceline curvature (corner-fair check)
 
         # --- terminal-offset samples: the DRIVABLE GAPS beside the obstacle ---
@@ -2459,14 +2440,7 @@ class ObstacleSpliner(Node):
         #   3) forward accel pass  -> leave the apex and accelerate out GRADUALLY (bounded a_long_accel)
         a_lat_max, a_long_max, a_long_accel = self._a_limits()
         v_gb_s = _savgol_safe(v_gb_arr, SMOOTH_VEL_WINDOW)
-        # The curvature cap spends the FULL ggv lateral budget, while the raceline on either
-        # side of the manoeuvre is being driven at the sector's scale -- so the hump asked for
-        # a_lat_max where the line asked for a_lat_max * scale^2. Measured on this map at
-        # global_limit 0.8: 6.50 against 4.16, a 56% step in lateral demand landing exactly where
-        # the geometry is tightest. Speed scales as k and lateral as k^2, so multiplying the cap
-        # by k puts the manoeuvre on the same envelope as the line it leaves and rejoins.
-        # v_gb_s already carries the scale (it is the scaled line); this is the other term.
-        v_curv = np.sqrt(a_lat_max / np.maximum(np.abs(kappa_), 1e-3)) * sector_scale_arr
+        v_curv = np.sqrt(a_lat_max / np.maximum(np.abs(kappa_), 1e-3))
         # speed_scale_static multiplies the PER-POINT CAP, not the finished profile: the two
         # passes below then re-derive the accel/decel envelope at the scaled speeds, so the
         # published profile respects a_long_max / a_long_accel at any scale ("the cap goes IN,
@@ -2657,21 +2631,7 @@ class ObstacleSpliner(Node):
         # has advanced along it. Keeping s_local >= car_prog - 0.30 drops only the passed prefix.
         s0 = c['s_mod'][0]
         s_local = (c['s_mod'] - s0) % L
-        # SIGNED progress, and it has to be. (cur_s - s0) % L maps "the car is 0.2 m BEFORE the
-        # path start" -- the NORMAL case, since a fresh plan begins just ahead of the car -- to
-        # ~L (a whole lap), which reads as "past the end" and released the commit on the cycle
-        # after it was stored. Measured on bag 0825_pr2/rosbag2_2026_08_25-20_07_42 replayed
-        # through this node: 43 releases in 18 s, i.e. every commit died 40-50 ms after being
-        # made, in forward driving as much as while the reverse recovery backed up. With no
-        # commit surviving, every cycle re-planned from scratch from a closer pose, so a single
-        # rejected cycle (body/obs_box/curv) deleted the avoidance outright and the SM dropped
-        # the OVERTAKE. gym closed-loop A/B (same map, obstacle at the bag's own coordinates,
-        # overlaid on the LiDAR so detection stays realistic), 4 runs each:
-        #   this line as it was : 3/4 passed (1 permanent standstill), reverse recovery fired in
-        #                         4/4, SQUEEZE 7-63 times
-        #   signed              : 4/4 passed, reverse 0/4, SQUEEZE 0
-        # Clearing time was unchanged (~2.5-2.6 s) -- the fix buys robustness, not pace.
-        car_prog = (self.cur_s - s0 + L / 2.0) % L - L / 2.0
+        car_prog = (self.cur_s - s0) % L
         ahead = s_local >= (car_prog - 0.30)
         if int(ahead.sum()) < 3:
             self.get_logger().info(

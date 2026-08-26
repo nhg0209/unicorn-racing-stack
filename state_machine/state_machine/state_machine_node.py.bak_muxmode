@@ -342,8 +342,6 @@ class StateMachine(Node):
         self._reverse_active = False
         self._reverse_target = 0.0
         self._reverse_stuck_since = None
-        # manual driving must not accrue the stuck timer (missing topic == autonomous)
-        self._mux_autonomous = True
         self._reverse_cooldown_until = 0.0
         self._reverse_attempts = 0
 
@@ -514,7 +512,6 @@ class StateMachine(Node):
         # Reverse recovery: request a short back-up to controller_manager (m; 0 = cancel)
         self.reverse_cmd_pub = self.create_publisher(Float32, "/state_machine/reverse_cmd", 1)
         self.create_subscription(Bool, "/controller/reverse_done", self.reverse_done_cb, 10)
-        self.create_subscription(Bool, "/mux/autonomous", self.mux_autonomous_cb, 10)
         # ROS1 published this from dynamic_statemachine_server when the save_start_traj
         # rqt button was pressed; re-homed here as a momentary param (see loop()).
         self.save_start_traj_pub = self.create_publisher(Bool, "/save_start_traj", 1)
@@ -718,16 +715,6 @@ class StateMachine(Node):
             self._reverse_stuck_since = None
             self._reverse_cooldown_until = self.now_sec() + self.reverse_cooldown
 
-    def mux_autonomous_cb(self, msg: Bool):
-        # Entering manual driving clears any accrued stuck time and cancels an
-        # in-flight reverse, so switching back to auto never starts from a
-        # timer the human filled while parked.
-        if not msg.data and self._mux_autonomous:
-            self._reverse_stuck_since = None
-            self._reverse_active = False
-            self._reverse_target = 0.0
-        self._mux_autonomous = bool(msg.data)
-
     def _rear_clearance(self) -> float:
         # Max safe back-up distance: capped at reverse_max_dist, reduced by the nearest
         # obstacle behind the car within a narrow lateral corridor (keeps rear_margin).
@@ -766,13 +753,6 @@ class StateMachine(Node):
         if self.cur_state not in trigger_states:
             self._reverse_stuck_since = None
             self._reverse_attempts = 0
-            self.reverse_cmd_pub.publish(Float32(data=0.0))
-            return
-
-        # Manual driving: the car is stationary because a human parked it, not
-        # because it is blocked -- do not accrue the stuck timer.
-        if not self._mux_autonomous:
-            self._reverse_stuck_since = None
             self.reverse_cmd_pub.publish(Float32(data=0.0))
             return
 

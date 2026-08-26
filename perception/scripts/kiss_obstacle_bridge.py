@@ -13,12 +13,21 @@ scale.x/scale.y is the real bbox extent. The rest of the stack
 (tracking -> state_machine) expects f110_msgs/ObstacleArray on
 /detect/raw_obstacles with the Frenet fields filled.
 
-This bridge reads each CUBE marker, converts its center (x, y map) to Frenet
-(s, d), and — crucially — projects the axis-aligned bbox onto the track
-tangent/normal (using psi_rad from the global path) so d_left/d_right and
-s_start/s_end reflect the REAL obstacle width. The static-avoidance planner
-sizes its keep-out box from d_left/d_right, so an accurate width is what lets
-it find a feasible overtake corridor (a fixed oversized box blocks it).
+This bridge reads each CUBE marker and converts its center (x, y map) to
+Frenet (s, d). The footprint it publishes depends on `obstacle_diameter`:
+
+  > 0 (default 0.25): every detection becomes a CIRCLE of that diameter around
+      the cluster centre. The obstacles this car races against are physically
+      identical cones, so their true size is known a priori and is a better
+      estimate than a per-frame DBSCAN bbox, which grows and shrinks with
+      viewing angle, range and the z-band crop.
+  = 0: fall back to the measured bbox, projected onto the track tangent/normal
+      (using psi_rad from the global path) so d_left/d_right and s_start/s_end
+      reflect the per-frame extent.
+
+Either way the box is symmetric or not, the static-avoidance planner sizes its
+keep-out from d_left/d_right, so the published width is what decides whether a
+feasible overtake corridor exists.
 
 Mirrors:
   - perception/src/detect.cpp:637-661  (ObstacleArray field population)
@@ -43,6 +52,10 @@ class KissObstacleBridge(Node):
             'marker_topic', '/kiss_loc/detections').value
         # Minimum box half-extent [m] (kiss already floors scale at 0.1; guard anyway).
         self.min_half = self.declare_parameter('min_half_extent', 0.05).value
+        # Fixed obstacle footprint [m]: the track obstacles are all the same
+        # physical size, so publish a circle of this diameter around the cluster
+        # centre instead of the per-frame DBSCAN bbox. 0 disables (use the bbox).
+        self.fixed_diam = float(self.declare_parameter('obstacle_diameter', 0.25).value)
 
         self.converter = None
         self.track_length = None
@@ -58,9 +71,11 @@ class KissObstacleBridge(Node):
         self.obstacle_pub = self.create_publisher(
             ObstacleArray, '/detect/raw_obstacles', 5)
 
+        shape = (f"fixed circle d={self.fixed_diam:.2f} m"
+                 if self.fixed_diam > 0.0 else "measured bbox")
         self.get_logger().info(
-            f"[kiss_obstacle_bridge] {marker_topic} (CUBE) -> /detect/raw_obstacles; "
-            "waiting for global path...")
+            f"[kiss_obstacle_bridge] {marker_topic} (CUBE) -> /detect/raw_obstacles "
+            f"[{shape}]; waiting for global path...")
 
     def path_cb(self, data: WpntArray):
         """Build the FrenetConverter + heading lookup from the scaled path. The global
@@ -116,17 +131,23 @@ class KissObstacleBridge(Node):
                 s = float(s_arr[i]) % tl
                 d = float(d_arr[i])
 
-                # Axis-aligned bbox half-extents in the marker frame (map, since
-                # kiss uses identity orientation — general yaw handled anyway).
-                hx = max(0.5 * m.scale.x, self.min_half)
-                hy = max(0.5 * m.scale.y, self.min_half)
-                # Box orientation relative to the track tangent at the obstacle.
-                psi = float(self.wpnt_psi[int(np.argmin(np.abs(self.wpnt_s - s)))])
-                alpha = psi - self._yaw(m.pose.orientation)
-                ca, sa = abs(math.cos(alpha)), abs(math.sin(alpha))
-                # Support half-widths: along tangent (s) and along normal (d).
-                half_s = hx * ca + hy * sa
-                half_d = hx * sa + hy * ca
+                if self.fixed_diam > 0.0:
+                    # Known obstacle size: a circle is rotation-invariant, so the
+                    # tangent/normal projection below is unnecessary — both
+                    # half-widths are the radius.
+                    half_s = half_d = 0.5 * self.fixed_diam
+                else:
+                    # Axis-aligned bbox half-extents in the marker frame (map, since
+                    # kiss uses identity orientation — general yaw handled anyway).
+                    hx = max(0.5 * m.scale.x, self.min_half)
+                    hy = max(0.5 * m.scale.y, self.min_half)
+                    # Box orientation relative to the track tangent at the obstacle.
+                    psi = float(self.wpnt_psi[int(np.argmin(np.abs(self.wpnt_s - s)))])
+                    alpha = psi - self._yaw(m.pose.orientation)
+                    ca, sa = abs(math.cos(alpha)), abs(math.sin(alpha))
+                    # Support half-widths: along tangent (s) and along normal (d).
+                    half_s = hx * ca + hy * sa
+                    half_d = hx * sa + hy * ca
 
                 obs = Obstacle()
                 obs.id = i
@@ -139,6 +160,9 @@ class KissObstacleBridge(Node):
                 obs.s_end = (s + half_s) % tl
                 obs.d_left = d + half_d
                 obs.d_right = d - half_d
+                # Downstream tracking rebuilds the bounds as a SQUARE from `size`
+                # (multi_tracking.publishObstacles), so keeping size == the circle's
+                # diameter makes that rebuild reproduce this footprint exactly.
                 obs.size = 2.0 * max(half_s, half_d)
                 # RAW-stage placeholders, matching detect.cpp: static/dynamic classification is
                 # owned by tracking's position-std voting downstream (a single frame has no

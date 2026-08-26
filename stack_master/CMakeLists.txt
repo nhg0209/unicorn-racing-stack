@@ -68,6 +68,7 @@ install(PROGRAMS
   scripts/vesc_calibration_node.py
   scripts/opponent_bridge_node.py
   scripts/vehdyn_test_node.py
+  scripts/rebound_widths.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

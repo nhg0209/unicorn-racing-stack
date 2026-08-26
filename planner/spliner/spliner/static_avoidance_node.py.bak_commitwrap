@@ -2657,21 +2657,7 @@ class ObstacleSpliner(Node):
         # has advanced along it. Keeping s_local >= car_prog - 0.30 drops only the passed prefix.
         s0 = c['s_mod'][0]
         s_local = (c['s_mod'] - s0) % L
-        # SIGNED progress, and it has to be. (cur_s - s0) % L maps "the car is 0.2 m BEFORE the
-        # path start" -- the NORMAL case, since a fresh plan begins just ahead of the car -- to
-        # ~L (a whole lap), which reads as "past the end" and released the commit on the cycle
-        # after it was stored. Measured on bag 0825_pr2/rosbag2_2026_08_25-20_07_42 replayed
-        # through this node: 43 releases in 18 s, i.e. every commit died 40-50 ms after being
-        # made, in forward driving as much as while the reverse recovery backed up. With no
-        # commit surviving, every cycle re-planned from scratch from a closer pose, so a single
-        # rejected cycle (body/obs_box/curv) deleted the avoidance outright and the SM dropped
-        # the OVERTAKE. gym closed-loop A/B (same map, obstacle at the bag's own coordinates,
-        # overlaid on the LiDAR so detection stays realistic), 4 runs each:
-        #   this line as it was : 3/4 passed (1 permanent standstill), reverse recovery fired in
-        #                         4/4, SQUEEZE 7-63 times
-        #   signed              : 4/4 passed, reverse 0/4, SQUEEZE 0
-        # Clearing time was unchanged (~2.5-2.6 s) -- the fix buys robustness, not pace.
-        car_prog = (self.cur_s - s0 + L / 2.0) % L - L / 2.0
+        car_prog = (self.cur_s - s0) % L
         ahead = s_local >= (car_prog - 0.30)
         if int(ahead.sum()) < 3:
             self.get_logger().info(

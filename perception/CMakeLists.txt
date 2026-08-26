@@ -84,4 +84,12 @@ install(PROGRAMS
   RENAME kiss_obstacle_bridge
 )
 
+# Qualification tracker: every detection forwarded as a STATIC obstacle
+# (no static/dynamic classification; quali has no opponent car).
+install(PROGRAMS
+  scripts/tracking_quali.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME tracking_quali
+)
+
 ament_package()

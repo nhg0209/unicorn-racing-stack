@@ -333,9 +333,6 @@ class MPC:
         # 되돌린다: 장애물중심→벽 r ≥ r_obs(0.15) + [차반폭0.15+여유0.05]
         # + [차반폭0.15+벽여유0.05] = 0.55.  50cm 틈이면 r=0.65 라 통과.
         self.narrow_room_live   = 0.55   # [m] 이 이상이면 서행 통과 허용
-        # 0824 코너(|κ|>0.3) 장애물 통과속도 캡 [m/s] (심 검증: apex 장애물
-        # 240s STUCK 17→0 기여). 0 = off. 직선 장애물 무영향.
-        self.obs_corner_v_live  = 2.5
         self.narrow_pass_v_live = 1.5    # [m/s] 통과 중 속도 상한 (0=제한없음)
         self.narrow_pass_hold   = 1.5    # [s]  판정 후 속도상한 유지 시간
         self._narrow_pass_until = 0.0
@@ -1878,9 +1875,6 @@ class MPC:
                 # 0723e κ보너스 ½ 재축소 (0.75κ→0.4κ, cap 0.45→0.25): 코너는 공간이
                 # 제일 없는 곳인데 보너스가 keepout을 최대 +0.45 부풀려 좁은 코너
                 # 통과 자체를 막음 (bag 13_21: s7.0 keepout 1.19 / s22.4 1.35 → 벽충돌).
-                # 0824 게이트/보너스 분리 (심 검증본 이식): 보너스는 게이트만
-                # 부풀린다 — 목표 keepout 은 _full_keep 이 따로 계산.
-                _w_phys = w_car_safe
                 w_car_safe = w_car_safe + min(0.25, 0.4 * _ko)
                 # 0722h: 30s 막힌쪽 제외를 여기(room 검사와 함께)서 — 이전엔 commit
                 # 블록이 room 검사 없이 반대쪽 강제 → 재시도가 좁은쪽 돌진(더 깊숙히).
@@ -1895,28 +1889,6 @@ class MPC:
                 # 요구 room 가산 (병합 장애물의 실질 반폭 확장)
                 ok_up = (r_up - float(extra_up) >= w_car_safe) and (+1 not in _stuck)
                 ok_dn = (r_dn - float(extra_dn) >= w_car_safe) and (-1 not in _stuck)
-                # 0824 폴백1: 코너 보너스 때문에 양측 불가면 물리하한으로 재판정
-                # (심 계측: 50cm 통로가 코너에서 BLOCK 되던 원인).
-                if not ok_up and not ok_dn:
-                    _pu = (r_up - float(extra_up) >= _w_phys) and (+1 not in _stuck)
-                    _pd = (r_dn - float(extra_dn) >= _w_phys) and (-1 not in _stuck)
-                    if _pu or _pd:
-                        self._log.info_throttle(
-                            1.0, "[MPC] 게이트 물리하한 폴백 %.2f->%.2f "
-                            "(room u/d=%.2f/%.2f)", w_car_safe, _w_phys, r_up, r_dn)
-                        ok_up, ok_dn, w_car_safe = _pu, _pd, _w_phys
-                # 0824 폴백2: _recent_stuck 이 양쪽을 정책 제외해 공간이 있어도
-                # BLOCK 사이클에 빠지는 것 차단 (심 계측: room 1.6/1.75 인데
-                # side=0 반복). stuck-recover 직후 저속 재출발이라 재시도 안전.
-                if not ok_up and not ok_dn and _stuck:
-                    _ru2 = r_up - float(extra_up); _rd2 = r_dn - float(extra_dn)
-                    _pu2 = _ru2 >= _w_phys
-                    _pd2 = _rd2 >= _w_phys
-                    if _pu2 or _pd2:
-                        self._log.info_throttle(
-                            1.0, "[MPC] stuck-제외 무시 재시도 (room u/d=%.2f/%.2f)",
-                            _ru2, _rd2)
-                        ok_up, ok_dn, w_car_safe = _pu2, _pd2, _w_phys
                 # ── 2026-08-13 달성가능 keepout 기반 side 선택 (hall bag2 실측) ──
                 # raw room 비교는 두 문제를 낳는다: ①센터 장애물(e_c≈0)에선 검출
                 # 노이즈 ±5cm 가 side 를 결정(랩마다 반전), ②좁은 쪽이 낙점되면
@@ -2416,33 +2388,6 @@ class MPC:
                 _MERGE_CAP = 0.60                     # [m] 최대 확장 (트랙폭 보호)
                 _e_ext = (min(_e_ext, ce_c + _MERGE_CAP) if cside > 0
                           else max(_e_ext, ce_c - _MERGE_CAP))
-                # 0824 코리도 클램프 (심 이식): 확장 제약선의 요구 경계가
-                # 벽−R_car 밴드를 넘으면 해가 없어 벽으로 밀린다 (엇갈린 2개
-                # 병합 실측 boundary 0.13m). 코리도 도달가능치로 제한.
-                try:
-                    _Lm2 = float(self.path_length)
-                    _sk0m = cs_obs % _Lm2
-                    _dxm = float(self.center_lut_dx(_sk0m))
-                    _dym = float(self.center_lut_dy(_sk0m))
-                    _nm = math.hypot(_dxm, _dym) + 1e-9
-                    _smt, _cmt = _dym / _nm, _dxm / _nm
-                    _cxm = float(self.center_lut_x(_sk0m))
-                    _cym = float(self.center_lut_y(_sk0m))
-                    _wlm = (_smt * (float(self.left_lut_x(_sk0m)) - _cxm)
-                            - _cmt * (float(self.left_lut_y(_sk0m)) - _cym))
-                    _wrm = (_smt * (float(self.right_lut_x(_sk0m)) - _cxm)
-                            - _cmt * (float(self.right_lut_y(_sk0m)) - _cym))
-                    _him = max(_wlm, _wrm); _lom = min(_wlm, _wrm)
-                    _rcm = float(self.R_car_live)
-                    _keepm = float(self.R_safe_live) + _rcm
-                    if cside > 0:
-                        _capm = (_him - _rcm - 0.12) - _keepm
-                        _e_ext = min(_e_ext, max(ce_c, _capm))
-                    else:
-                        _capm = (_lom + _rcm + 0.12) + _keepm
-                        _e_ext = max(_e_ext, min(ce_c, _capm))
-                except Exception:
-                    pass
                 if abs(_e_ext - ce_c) > 1e-3:
                     self._log.warn_throttle(
                         1.0, "[MPC] 커밋 중 병합 확장 e_eff %+.2f→%+.2f (side %+d)",
@@ -2478,16 +2423,7 @@ class MPC:
                         (self.RELEASE_FADE_END - delta_s)
                         / (self.RELEASE_FADE_END - 1.5))
             elif not obs_still_present:
-                _age = (_mono - self._commit_seen_t
-                        if getattr(self, '_commit_seen_t', None) is not None
-                        else -1.0)
-                _near = ' '.join(
-                    f"({op[0]-cox:+.2f},{op[1]-coy:+.2f})"
-                    for op in (obstacles or [])[:4])
-                self._log.info(
-                    "[MPC] committed obs removed — release "
-                    "(miss %.2fs, n_det=%d, near: %s)",
-                    _age, len(obstacles or []), _near or '없음')
+                self._log.info("[MPC] committed obs removed — release")
                 self._committed_obs = None
             elif car_to_obs > 12.0:
                 # Drifted way past; safety release.
@@ -2774,23 +2710,6 @@ class MPC:
                     _rsc = float(self._refv_scale_fn(sk))
                 except Exception:
                     _rsc = 1.0
-            # ── 0824 코너 장애물 접근 거버너 (심 검증본 이식) ──────────────
-            # 커밋 장애물이 코너(|κ|>0.3)에 있으면 전후 6 m 의 ref_v 를
-            # obs_corner_v_live 로 캡 — 그립 정직(슬랙 300/200) 하에서 코너
-            # 회피 횡이동은 속도를 미리 눌러야 마찰원 안에서 성립한다.
-            _vcg = float(getattr(self, 'obs_corner_v_live', 0.0) or 0.0)
-            if _vcg > 0.0 and self._committed_obs is not None:
-                try:
-                    _csg = float(self._committed_obs[2]) % L
-                    _dsg2 = abs(((sk - _csg + 0.5 * L) % L) - 0.5 * L)
-                    if _dsg2 < 6.0:
-                        _ikg = int(_csg / self.kappa_ds) % len(self.kappa_grid)
-                        if abs(float(self.kappa_grid[_ikg])) > 0.3:
-                            _rv0g = float(self.ref_v(sk))
-                            if _rv0g > _vcg:
-                                _rsc = min(_rsc, _vcg / _rv0g)
-                except Exception:
-                    pass
             if self._alat_scale_fn is not None:
                 try:
                     _asc = float(self._alat_scale_fn(sk))

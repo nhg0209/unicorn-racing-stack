@@ -216,21 +216,6 @@ class Controller:
         self._speed_cmd_prev = None           # last PUBLISHED command, for the slew limit
         self._trailing_handoff = None         # ramp state while merging out of TRAILING
         self._trailing_entry = None           # ...and while merging INTO it (see calc_speed_command)
-        # RELEASE CAP. The handoff ramp bounds the RATE the command leaves TRAILING at; it says
-        # nothing about where it is HEADING, which is the full path speed. Against an opponent
-        # that is the wrong destination for the moment right after the release -- the gap PID was
-        # holding station for a reason and the opponent is still in front. Cap the command at a
-        # fraction of the path speed for a fixed window afterwards.
-        # Keyed off the PATH speed and not the opponent's vs on purpose: vs is a tracker estimate
-        # and carries its error, while the profile is a known quantity.
-        # Counted in CYCLES, like the AEB latch: this loop is fixed-rate and has no clock.
-        self._was_trailing = False
-        self._release_cycles = 0
-        self.trailing_release_enable = True
-        self.trailing_release_scale = 0.85    # [-] fraction of the path speed during the window
-        self.trailing_release_hold_s = 1.0    # [s] window length
-        self.trailing_release_dynamic_only = True
-        self._was_trailing_dynamic = False
         # TYRE LIMIT on the steering command -- see _clip_to_tyre_limit. ggv_table is the
         # [v_mps, ay_max] table from config/<SIM|CAR>/veh_dyn_info/ggv.csv, delivered by the
         # manager (load_ggv_ay); without it the clip is inert and says so once. The three
@@ -842,16 +827,6 @@ class Controller:
                 else:
                     speed_command = self._trailing_entry
             self._trailing_handoff = speed_command      # where the handoff below must start from
-            self._was_trailing = True
-            # opponent[3] is is_static, straight off the SM's trailing target. The cap was built
-            # for LOSING a moving opponent; a static box is a different event -- the SM hands
-            # TRAILING to OVERTAKE the moment the avoidance spline is feasible, and capping there
-            # slows an avoidance that was never at risk of rear-ending anything. Observed on the
-            # car: nearly every static avoidance was being driven at the cap.
-            # A fresh track reads is_static False until the tracker classifies it (min_nb_meas),
-            # so an unclassified box arms the cap for its first cycles. That is the safe
-            # direction and it clears within one measurement at the shipped min_nb_meas of 1.
-            self._was_trailing_dynamic = not bool(self.opponent[3])
         else:
             # HANDOFF out of TRAILING. The gap PID has been holding the car down at the opponent's
             # pace while the path speed ahead is already much higher, so assigning global_speed
@@ -861,11 +836,6 @@ class Controller:
             # and the REFERENCE was continuous there (vx[10] 4.94 -> 4.94), so the step was created
             # here, not by the planner. Ramp out at the same longitudinal limit the trajectory is
             # planned with instead; the car still accelerates to pass, it just does it feasibly.
-            if self._was_trailing:
-                arm = self._was_trailing_dynamic or not self.trailing_release_dynamic_only
-                self._release_cycles = (int(round(self.trailing_release_hold_s
-                                                  * max(self.loop_rate, 1.0))) if arm else 0)
-                self._was_trailing = False
             if self._trailing_handoff is not None:
                 step = self.max_accel_mps2 / max(self.loop_rate, 1.0)
                 self._trailing_handoff = min(global_speed, self._trailing_handoff + step)
@@ -876,14 +846,6 @@ class Controller:
                     speed_command = self._trailing_handoff
             else:
                 speed_command = global_speed
-            # min(), not an assignment: while the ramp is still under the cap the ramp governs and
-            # this does nothing, so the two never fight over the same cycle. The counter runs down
-            # whether or not the cap is enabled, so toggling it live cannot strand an open window.
-            if self._release_cycles > 0:
-                self._release_cycles -= 1
-                if self.trailing_release_enable:
-                    speed_command = min(speed_command,
-                                        self.trailing_release_scale * global_speed)
             self.trailing_speed = global_speed
             self.i_gap = 0
             self._trailing_entry = None                 # re-armed for the next entry

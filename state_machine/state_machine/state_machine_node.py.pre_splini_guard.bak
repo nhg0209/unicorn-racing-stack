@@ -342,8 +342,6 @@ class StateMachine(Node):
         self._reverse_active = False
         self._reverse_target = 0.0
         self._reverse_stuck_since = None
-        # manual driving must not accrue the stuck timer (missing topic == autonomous)
-        self._mux_autonomous = True
         self._reverse_cooldown_until = 0.0
         self._reverse_attempts = 0
 
@@ -514,7 +512,6 @@ class StateMachine(Node):
         # Reverse recovery: request a short back-up to controller_manager (m; 0 = cancel)
         self.reverse_cmd_pub = self.create_publisher(Float32, "/state_machine/reverse_cmd", 1)
         self.create_subscription(Bool, "/controller/reverse_done", self.reverse_done_cb, 10)
-        self.create_subscription(Bool, "/mux/autonomous", self.mux_autonomous_cb, 10)
         # ROS1 published this from dynamic_statemachine_server when the save_start_traj
         # rqt button was pressed; re-homed here as a momentary param (see loop()).
         self.save_start_traj_pub = self.create_publisher(Bool, "/save_start_traj", 1)
@@ -718,16 +715,6 @@ class StateMachine(Node):
             self._reverse_stuck_since = None
             self._reverse_cooldown_until = self.now_sec() + self.reverse_cooldown
 
-    def mux_autonomous_cb(self, msg: Bool):
-        # Entering manual driving clears any accrued stuck time and cancels an
-        # in-flight reverse, so switching back to auto never starts from a
-        # timer the human filled while parked.
-        if not msg.data and self._mux_autonomous:
-            self._reverse_stuck_since = None
-            self._reverse_active = False
-            self._reverse_target = 0.0
-        self._mux_autonomous = bool(msg.data)
-
     def _rear_clearance(self) -> float:
         # Max safe back-up distance: capped at reverse_max_dist, reduced by the nearest
         # obstacle behind the car within a narrow lateral corridor (keeps rear_margin).
@@ -766,13 +753,6 @@ class StateMachine(Node):
         if self.cur_state not in trigger_states:
             self._reverse_stuck_since = None
             self._reverse_attempts = 0
-            self.reverse_cmd_pub.publish(Float32(data=0.0))
-            return
-
-        # Manual driving: the car is stationary because a human parked it, not
-        # because it is blocked -- do not accrue the stuck timer.
-        if not self._mux_autonomous:
-            self._reverse_stuck_since = None
             self.reverse_cmd_pub.publish(Float32(data=0.0))
             return
 
@@ -2075,9 +2055,9 @@ class StateMachine(Node):
         far too little to strand the window behind the car.
         """
         arr = wpnts.array
-        if arr is None or len(arr) == 0:   # uninitialised cache -> no anchor to find
-            return 0
         n = len(arr)
+        if n == 0:
+            return 0
         L = self.track_length if self.track_length else self.max_s
         cand = np.arange(n)
         if L:
@@ -2151,26 +2131,6 @@ class StateMachine(Node):
             wpnts = self.cur_static_avoidance_wpnts
         else:
             wpnts = self.cur_avoidance_wpnts
-
-        # OVERTAKE as a SOURCE is reachable WITHOUT a commit: _hold_static_avoidance_reference
-        # returns (TRAILING, OVERTAKE) while the car is still out on a cached static path. If no
-        # static commit ever ran this session (e.g. the dynamic-priority gate blocked them all),
-        # static_overtaking_mode is still False and the selector above picks the DYNAMIC cache --
-        # which on a lane-change-suppressed car was never initialised (array is None). That exact
-        # combination crashed the node mid-run (TypeError in _splini_anchor_index, bag
-        # 2026-08-24-18_58_26 @ t=160.7). Serve whichever avoidance cache actually holds a path;
-        # if neither does, fall back to the global window instead of dying.
-        if not wpnts.is_init:
-            other = (self.cur_static_avoidance_wpnts if wpnts is self.cur_avoidance_wpnts
-                     else self.cur_avoidance_wpnts)
-            if other.is_init:
-                wpnts = other
-            else:
-                self.get_logger().warn(
-                    f"[{self.name}] OVERTAKE source requested but no avoidance cache is "
-                    f"initialised (static_overtaking_mode={self.static_overtaking_mode}); "
-                    f"serving the global window instead", throttle_duration_sec=1.0)
-                return self.states[StateType.GB_TRACK](self)
 
         min_idx = self._splini_anchor_index(wpnts)
         avoidance_wpnts = wpnts.list[min_idx:min_idx + self.n_loc_wpnts]

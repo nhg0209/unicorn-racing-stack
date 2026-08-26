@@ -70,7 +70,7 @@ static_avoidance_planner:
     # tracker's own position error.
     # Equal to safety_margin here on purpose -- the split shipped as a pure refactor, verified
     # bit-identical over 1656 planning cases. Move it, not safety_margin, to narrow the avoidance.
-    safety_margin_d: 0.1
+    safety_margin_d: 0.15
     wall_margin: 0.15        # [m]  how close to the wall a candidate may reach (corridor room).
                             #   NOT a feasibility knob either, despite what the safety_margin note above
                             #   implies about tight sections: measured over the same grid, feasible
@@ -413,12 +413,6 @@ static_avoidance_planner:
     anchor_kappa_steer: 1.76     # [1/m] tan(0.53)/0.333
     anchor_min_m: 0.5            # [m]   0.5 cleared 94% of joins, 1.0 cleared 100%
     anchor_max_m: 2.5            # [m]
-    # The avoidance profile is min(scaled raceline speed, curvature cap). The first term already
-    # carries speed_scaling.yaml's global_limit; the second spent the full ggv lateral budget, so
-    # the manoeuvre cornered harder than the line it was rejoining. Scale is read per station out
-    # of /global_waypoints vs /global_waypoints_scaled -- sector_tuner stays the single source.
-    # false restores the previous full-ggv cap.
-    sector_scale_curv_cap: true
     preramp_len_m: 3.0
     commit_obs_ds: 0.75     # [m] drop the commit if the triggering box's s drifts this far (re-plan apex)
     commit_obs_dd: 0.40     # [m] ... or its d drifts this far

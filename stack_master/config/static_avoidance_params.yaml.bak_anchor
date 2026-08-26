@@ -70,7 +70,7 @@ static_avoidance_planner:
     # tracker's own position error.
     # Equal to safety_margin here on purpose -- the split shipped as a pure refactor, verified
     # bit-identical over 1656 planning cases. Move it, not safety_margin, to narrow the avoidance.
-    safety_margin_d: 0.1
+    safety_margin_d: 0.15
     wall_margin: 0.15        # [m]  how close to the wall a candidate may reach (corridor room).
                             #   NOT a feasibility knob either, despite what the safety_margin note above
                             #   implies about tight sections: measured over the same grid, feasible
@@ -106,7 +106,7 @@ static_avoidance_planner:
                                   #     map whose own error (localization + grid discretization)
                                   #     is of the same order as the reserve itself, so 5 cm of it
                                   #     is not a margin, it is a rounding.
-    squeeze_max_speed_mps: 6.0    # [m/s] above this, "no feasible candidate" still means TRAILING.
+    squeeze_max_speed_mps: 3.0    # [m/s] above this, "no feasible candidate" still means TRAILING.
                                   #       Trading clearance for motion is only defensible where a
                                   #       mis-clearance is survivable.
     relax_hold_s: 2.0             # [s] how long a /planner/avoidance/relax request (the SM's static
@@ -268,17 +268,6 @@ static_avoidance_planner:
     # Because the node re-reads them at startup, `ros2 param set a_lat_max ...` no longer
     # changes anything on a car whose config IS readable. That is deliberate and costs nothing
     # here: the re-grip workflow restarts the stack anyway.
-    # Scale on the avoidance velocity profile. Multiplies the per-point cap min(v_gb, v_curv)
-    # BEFORE the accel/decel passes, so the published profile stays inside a_long_max /
-    # a_long_accel at any value (the passes re-derive the envelope at the scaled speeds).
-    # <1.0 = drive the avoidance slower than ggv allows (tuning reserve for sim2real gap);
-    # >1.0 knowingly exceeds the lateral ggv budget. UNLIKE the three limits below this is
-    # NOT replaced from veh_dyn_info at startup -- it survives a re-grip and is live:
-    #   ros2 param set /static_avoidance_planner speed_scale_static 0.8
-    # Scope: this planner's published paths only (both sample and corridor_qp, and the
-    # committed-path re-slices, which store the scaled profile). The raceline, the SM's
-    # trailing/squeeze caps and static_reopt are untouched.
-    speed_scale_static: 1.0
     a_lat_max: 6.0          # [m/s^2] lateral-accel cap used for v = min(v_gb, sqrt(a_lat_max/kappa))
     a_long_max: 4.0         # [m/s^2] longitudinal DECEL; backward pass brakes EARLY into the apex (slow-in)
     a_long_accel: 3.0       # [m/s^2] longitudinal ACCEL; forward pass ramps speed up GRADUALLY out of the
@@ -398,27 +387,6 @@ static_avoidance_planner:
     # to 10.5 m of path carrying the instantaneous tracking error as a DC offset, and the hump then
     # started from that offset instead of from the raceline. Decay it to the raceline within this
     # distance (quintic, C2 at both ends) and hold zero until the hump opens. 0 = no pre-ramp.
-    # --- anchor offset: start the path AHEAD of the car -------------------------------------
-    # Anchored ON the car, the path opens with a slope the car would have to be holding
-    # already; the curvature that join needs is psi/L, unbounded at L = 0. Over the 766 fresh
-    # solves in rosbag2_2026_08_24-16_34_45 the join was infeasible in 100% of them at L = 0
-    # and feasible in 100% at L = 1.0 m. The offset is speed-dependent because the curvature
-    # available to develop that heading is min(steering lock, a_lat/v^2): flat below the
-    # crossover, v^2 above it. See _anchor_offset -- a_lat is read from ggv, not from here.
-    # false reproduces the previous car-anchored behaviour exactly, for A/B on one run.
-    anchor_offset_enable: true
-    anchor_base_m: 0.42          # [m]   empirical floor
-    anchor_psi_equiv_rad: 0.115  # [rad] heading the join typically develops (fit: b 0.0177 x ay 6.5)
-    anchor_t_lag_s: 0.10         # [s]   measured p50 0.078 (start 0.240 m behind at 2.45 m/s)
-    anchor_kappa_steer: 1.76     # [1/m] tan(0.53)/0.333
-    anchor_min_m: 0.5            # [m]   0.5 cleared 94% of joins, 1.0 cleared 100%
-    anchor_max_m: 2.5            # [m]
-    # The avoidance profile is min(scaled raceline speed, curvature cap). The first term already
-    # carries speed_scaling.yaml's global_limit; the second spent the full ggv lateral budget, so
-    # the manoeuvre cornered harder than the line it was rejoining. Scale is read per station out
-    # of /global_waypoints vs /global_waypoints_scaled -- sector_tuner stays the single source.
-    # false restores the previous full-ggv cap.
-    sector_scale_curv_cap: true
     preramp_len_m: 3.0
     commit_obs_ds: 0.75     # [m] drop the commit if the triggering box's s drifts this far (re-plan apex)
     commit_obs_dd: 0.40     # [m] ... or its d drifts this far

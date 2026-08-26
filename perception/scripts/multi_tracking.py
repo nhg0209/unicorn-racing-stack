@@ -198,6 +198,10 @@ class ObstacleSD:
     min_std = None
     max_std = None
     static_net_floor = 0.12   # 2026-08-21 B: 순변위 정적-거부 문턱[m]
+    # 2026-08-26: PUBLISHED/ASSOCIATION position window [samples]. 1 = the latest
+    # measurement (default). >1 = median of the last N measurements. NEVER a mean:
+    # see update_pos.
+    pos_window = 1
 
     def __init__(self, id, s_meas, d_meas, lap, size, isVisible):
         """
@@ -208,6 +212,10 @@ class ObstacleSD:
         self.measurments_s = [s_meas]
         self.measurments_d = [d_meas]
         self.mean = [s_meas, d_meas]  # [mean_s. mean_d]
+        # Position handed to the rest of the stack (publish + association). Kept
+        # SEPARATE from self.mean, which stays the classification reference for
+        # std_s(). See update_pos for why the mean must not be published.
+        self.pos = [s_meas, d_meas]
         self.static_count = 0
         self.total_count = 0
         self.nb_meas = 0
@@ -246,6 +254,45 @@ class ObstacleSD:
             mean_angle = math.atan2(sin_mean_angle, cos_mean_angle)
             mean_s = mean_angle*track_length/2/math.pi
             self.mean[0] = mean_s if mean_s >= 0 else mean_s+track_length
+
+    def update_pos(self, track_length):
+        """Position published downstream = the LATEST measurement (pos_window 1).
+
+        It must never be a mean of the measurement history. `self.mean` is a
+        CUMULATIVE lifetime average (update_mean weights by nb_meas), so for a
+        track that moved -- a real mover, or a chain of spurious detections
+        associated across frames -- it converges to the MIDPOINT OF THE PATH:
+        a coordinate where nothing ever was.
+
+        MEASURED (bag 0825_pr2/rosbag2_2026_08_25-20_07_42, t=263-267 s): a train
+        of z-band noise clusters ~4 m ahead built track id213, which swept
+        s=4.5->10.5 m. When its KF speed decayed below vs_reset the `avg_vs`
+        rule below force-flipped it to static, and the published position became
+        the lifetime mean s=7.06, d=-0.18 -- ON the raceline, 1.2 m in front of
+        the car, with the nearest real detection 1.05 m away. Worse, that same
+        mean is the association anchor for a static track, so the box could no
+        longer match the real obstacle (1.07 m > max_dist 0.8) and simply sat
+        there until ttl expired. The car braked to 0.29 m/s and drove an
+        avoidance around a phantom.
+
+        The latest measurement cannot invent a position: a mis-association makes
+        it jump to some OTHER real object for one frame and it recovers on the
+        next, instead of poisoning the estimate permanently. Jitter is not a
+        reason to average here -- measured per-frame spread of an isolated static
+        obstacle in that bag is p50 1.5 cm / p90 4.9 cm laterally. Set pos_window
+        > 1 to median-filter the ~1% outliers (p99 14 cm); the median still only
+        ever returns a coordinate that was actually observed.
+        """
+        n = max(1, int(ObstacleSD.pos_window or 1))
+        if n <= 1 or len(self.measurments_s) < n:
+            self.pos = [self.measurments_s[-1] % track_length, self.measurments_d[-1]]
+            return
+        ss = self.measurments_s[-n:]
+        dd = sorted(self.measurments_d[-n:])
+        # s is cyclic: take the median of the offsets from the latest sample
+        base = ss[-1]
+        offs = sorted(normalize_s(x - base, track_length) for x in ss)
+        self.pos = [(base + offs[len(offs) // 2]) % track_length, dd[len(dd) // 2]]
 
     def std_s(self, track_length):
         sum = 0
@@ -421,6 +468,7 @@ class StaticDynamic(Node):
         ObstacleSD.min_std = self.min_std
         ObstacleSD.max_std = self.max_std
         ObstacleSD.static_net_floor = self._get_param("static_net_floor_m")   # 2026-08-21 B
+        ObstacleSD.pos_window = self._get_param("static_pos_window", 1)       # 2026-08-26: 1 = latest measurement
         self.vs_reset = self.vs_reset
 
         # save-back path (ROS1 dynamic_tracker_server wrote both detect + tracking
@@ -484,6 +532,7 @@ class StaticDynamic(Node):
         ObstacleSD.min_nb_meas = self.min_nb_meas
         ObstacleSD.min_std = self.min_std
         ObstacleSD.max_std = self.max_std
+        ObstacleSD.pos_window = self._get_param("static_pos_window", 1)
 
         obstacle_params = [ObstacleSD.ttl, ObstacleSD.min_nb_meas, ObstacleSD.min_std, ObstacleSD.max_std]
         print(f'[Tracking] Dynamic reconf triggered new tracking params: Tracking TTL: {Opponent_state.ttl}, Ratio to glob path: {Opponent_state.ratio_to_glob_path}\n'
@@ -665,6 +714,8 @@ class StaticDynamic(Node):
                                                               self.track_length),
                                                   d_new - t.mean[1]))
                     t.mean = [s_new, d_new]
+                if getattr(t, "pos", None) is not None:
+                    t.pos = list(to_new(t.pos[0], t.pos[1]))
                 ds = getattr(t, "dynamic_state", None)
                 if ds is not None and getattr(ds, "isInitialised", False):
                     kf = ds.dynamic_kf
@@ -735,7 +786,7 @@ class StaticDynamic(Node):
             obstacle_position = [obstacle.dynamic_state.dynamic_kf.x[0] % self.track_length, obstacle.dynamic_state.dynamic_kf.x[2]]
             max_dist *= self.aggro_multiplier
         else:
-            obstacle_position = [obstacle.mean[0], obstacle.mean[1]]
+            obstacle_position = [obstacle.pos[0], obstacle.pos[1]]
         potential_obs, dists = self.get_closest_pos(max_dist, obstacle_position, meas_obstacles_copy)
         if (len(dists) > 0):
             min_idx = np.argmin(dists)
@@ -743,7 +794,7 @@ class StaticDynamic(Node):
 
         # maybe kalman was wrong, the obstacles can't just be gone
         elif(obstacle.staticFlag == False):
-            obstacle_position = [obstacle.mean[0], obstacle.mean[1]]
+            obstacle_position = [obstacle.pos[0], obstacle.pos[1]]
             potential_obs, dists = self.get_closest_pos(max_dist, obstacle_position, meas_obstacles_copy)
             if (len(dists) > 0):
                 min_idx = np.argmin(dists)
@@ -776,6 +827,7 @@ class StaticDynamic(Node):
             tracked_obstacle.measurments_s = tracked_obstacle.measurments_s[-20:]
             tracked_obstacle.measurments_d = tracked_obstacle.measurments_d[-20:]
         tracked_obstacle.update_mean(self.track_length)
+        tracked_obstacle.update_pos(self.track_length)
         tracked_obstacle.nb_meas += 1
         tracked_obstacle.isInFront = True
         tracked_obstacle.isVisible = True
@@ -852,7 +904,7 @@ class StaticDynamic(Node):
             for t in self.tracked_obstacles:
                 pos = ([t.dynamic_state.dynamic_kf.x[0] % self.track_length,
                         t.dynamic_state.dynamic_kf.x[2]]
-                       if t.staticFlag is False else [t.mean[0], t.mean[1]])
+                       if t.staticFlag is False else [t.pos[0], t.pos[1]])
                 # the SAME gate verify_position would have used: aggro_multi is a MULTIPLIER
                 gate = self.max_dist * (self.aggro_multiplier if t.staticFlag is False else 1.0)
                 dd = math.hypot(normalize_s(pos[0] - meas_obstacle.s_center, self.track_length),
@@ -1056,7 +1108,7 @@ class StaticDynamic(Node):
                     # --- if obstacle is near enough check if we can see it ---
                     elif(distance_obstacle_car < self.dist_deletion and tracked_obstacle.staticFlag):
                         try:
-                            resp = self.converter.get_cartesian(tracked_obstacle.mean[0], tracked_obstacle.mean[1])
+                            resp = self.converter.get_cartesian(tracked_obstacle.pos[0], tracked_obstacle.pos[1])
                         except Exception:
                             continue
                         vec_car_to_obs = resp - car_position_copy
@@ -1137,7 +1189,7 @@ class StaticDynamic(Node):
                 marker.color.g = 1.
                 marker.color.r = 0.
                 marker.color.b = 0.
-                x, y = self.converter.get_cartesian(tracked_obstacle.mean[0], tracked_obstacle.mean[1])
+                x, y = self.converter.get_cartesian(tracked_obstacle.pos[0], tracked_obstacle.pos[1])
                 marker.pose.position.x = x
                 marker.pose.position.y = y
                 marker.pose.orientation.w = 1.
@@ -1191,8 +1243,8 @@ class StaticDynamic(Node):
                 obs_msg.s_center = obs.measurments_s[-1] % self.track_length
                 obs_msg.d_center = obs.measurments_d[-1]
             elif obs.staticFlag:
-                obs_msg.s_center = obs.mean[0]
-                obs_msg.d_center = obs.mean[1]
+                obs_msg.s_center = obs.pos[0]
+                obs_msg.d_center = obs.pos[1]
             else:
                 if obs.dynamic_state.isInitialised:
                     if obs.dynamic_state.dynamic_kf.P[0][0] < self.var_pub:

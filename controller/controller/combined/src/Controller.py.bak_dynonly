@@ -229,8 +229,6 @@ class Controller:
         self.trailing_release_enable = True
         self.trailing_release_scale = 0.85    # [-] fraction of the path speed during the window
         self.trailing_release_hold_s = 1.0    # [s] window length
-        self.trailing_release_dynamic_only = True
-        self._was_trailing_dynamic = False
         # TYRE LIMIT on the steering command -- see _clip_to_tyre_limit. ggv_table is the
         # [v_mps, ay_max] table from config/<SIM|CAR>/veh_dyn_info/ggv.csv, delivered by the
         # manager (load_ggv_ay); without it the clip is inert and says so once. The three
@@ -843,15 +841,6 @@ class Controller:
                     speed_command = self._trailing_entry
             self._trailing_handoff = speed_command      # where the handoff below must start from
             self._was_trailing = True
-            # opponent[3] is is_static, straight off the SM's trailing target. The cap was built
-            # for LOSING a moving opponent; a static box is a different event -- the SM hands
-            # TRAILING to OVERTAKE the moment the avoidance spline is feasible, and capping there
-            # slows an avoidance that was never at risk of rear-ending anything. Observed on the
-            # car: nearly every static avoidance was being driven at the cap.
-            # A fresh track reads is_static False until the tracker classifies it (min_nb_meas),
-            # so an unclassified box arms the cap for its first cycles. That is the safe
-            # direction and it clears within one measurement at the shipped min_nb_meas of 1.
-            self._was_trailing_dynamic = not bool(self.opponent[3])
         else:
             # HANDOFF out of TRAILING. The gap PID has been holding the car down at the opponent's
             # pace while the path speed ahead is already much higher, so assigning global_speed
@@ -862,9 +851,8 @@ class Controller:
             # here, not by the planner. Ramp out at the same longitudinal limit the trajectory is
             # planned with instead; the car still accelerates to pass, it just does it feasibly.
             if self._was_trailing:
-                arm = self._was_trailing_dynamic or not self.trailing_release_dynamic_only
-                self._release_cycles = (int(round(self.trailing_release_hold_s
-                                                  * max(self.loop_rate, 1.0))) if arm else 0)
+                self._release_cycles = int(round(self.trailing_release_hold_s
+                                                 * max(self.loop_rate, 1.0)))
                 self._was_trailing = False
             if self._trailing_handoff is not None:
                 step = self.max_accel_mps2 / max(self.loop_rate, 1.0)

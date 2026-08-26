@@ -1,6 +1,6 @@
 controller_manager:
   ros__parameters:
-    t_clip_min: 0.6
+    t_clip_min: 0.8
     t_clip_max: 8.0
     # cap on the sqrt(2)*lat_err lookahead LOWER-bound inflation. Post-swap the car can sit
     # ~1 m off the new global line (deadlock-breaker commit); uncapped, the anti-swerve bound
@@ -22,25 +22,6 @@ controller_manager:
     trailing_i_gain: 0.0
     trailing_d_gain: 1.0
     blind_trailing_speed: 1.5
-    # --- release cap: speed ceiling for a window after TRAILING ends ---------------------------
-    # The handoff ramp in calc_speed_command limits how FAST the command may leave TRAILING
-    # (max_accel_mps2); it does not limit WHERE it goes, which is the full path speed. Measured
-    # on rosbag2_2026_08_24-16_34_45: 99 TRAILING exits, and the ramp still delivers the whole
-    # path speed ~0.8 s later. Against an opponent still in front that is a closing speed.
-    # Applied as min(command, scale * path speed), so the ramp governs until it reaches the cap.
-    # NOTE this also scales exits to OVERTAKE (29 of the 99 on that bag), i.e. overtake
-    # acceleration is damped too. Deliberate for now -- a separate skip would be an unverified
-    # branch. Raise the scale or disable if a pass ends up too slow.
-    # enable false, or scale 1.0, reproduces the previous behaviour exactly.
-    trailing_release_enable: true
-    trailing_release_scale: 0.4   # [-] of path speed during the window
-    trailing_release_hold_s: 1.0   # [s] window length (x loop_rate 50 = 50 cycles)
-    # Only cap after trailing a DYNAMIC target. Against a static box the SM leaves TRAILING for
-    # OVERTAKE as soon as the avoidance spline is feasible -- a planned pass, not a lost target --
-    # and capping it slowed nearly every static avoidance on the car. false restores the cap on
-    # both, which is what shipped first.
-    trailing_release_dynamic_only: true
-
     curvature_factor: 0.06
     speed_factor_for_lat_err: 1.0
     speed_factor_for_curvature: 1.0
@@ -50,14 +31,14 @@ controller_manager:
     heading_error_thres: 10.0
     steer_gain_for_speed: 1.0
     future_constant: 0.05
-    AEB_thres: 999.0
+    AEB_thres: 0.8
     # Used whenever the LOCAL WINDOW is an offset line (max|d_m| > AEB_offline_d_thres), not when
     # the state happens to be named OVERTAKE: an offset line is legitimately far from the car, and
     # the tight garbage-path threshold clamps to 2 m/s against it. Keying on the state name missed
     # the cases where the SM hands the same avoidance geometry to the controller under TRAILING
     # (holding the avoidance reference through a drop, and on the trailing approach) -- there the
     # 0.5 m bar fired and released repeatedly, i.e. a sawtooth in the speed command.
-    AEB_thres_overtake: 999.0
+    AEB_thres_overtake: 0.9
     AEB_offline_d_thres: 0.1
     # The bar is LATCHED. Without hysteresis every wobble of the measured distance around it is a
     # fresh engage and release, i.e. a 2 m/s clamp toggling at the loop rate -- measured on the

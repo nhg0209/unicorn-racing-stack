@@ -107,19 +107,12 @@
     <!-- save_params writes back to the SAME yaml it loaded; the install copy is a
          colcon symlink-install symlink to the source tree, so tuned values persist. -->
     <param name="save_yaml_path" value="$(var maps_dir)/$(var map)/speed_scaling.yaml"/>
-    <!-- Declared here, not in the map yaml: the node auto-declares from OVERRIDES only, and
-         save_yaml() is what writes save_params into a map file, so a map that has never
-         been saved has no such parameter, rqt never shows the box, and it can never be
-         saved. Five old maps carry it and every newer one does not; sector_slicer does not
-         emit it either. Declaring it here covers all of them, now and in future. -->
-    <param name="save_params" value="false" type="bool"/>
   </node>
 
   <!-- Overtaking lines: ot_sectors.yaml -> /global_waypoints/overtaking -->
   <node pkg="overtaking_sector_tuner" exec="ot_interpolator" name="ot_sector_tuner" output="screen">
     <param from="$(var maps_dir)/$(var map)/ot_sectors.yaml"/>
     <param name="save_yaml_path" value="$(var maps_dir)/$(var map)/ot_sectors.yaml"/>
-    <param name="save_params" value="false" type="bool"/>   <!-- same reason as above -->
   </node>
 
   <!-- ===== Frenet conversion service (ROS1: middle_level) =====

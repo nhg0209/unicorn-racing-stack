@@ -87,9 +87,6 @@ class SimpleMuxNode(Node):
             self.create_subscription(Odometry,  odom_topic, self._odom_cb, 10)
 
         self.drive_pub = self.create_publisher(AckermannDriveStamped, out_topic, 10)
-        # current routing source for consumers that must behave differently under
-        # manual driving (state_machine reverse-recovery stuck timer)
-        self.mode_pub = self.create_publisher(Bool, '/mux/autonomous', 10)
         self.create_timer(1.0 / p('rate_hz'), self._loop)
 
     def _scan_cb(self, msg): self.scan = msg
@@ -125,7 +122,6 @@ class SimpleMuxNode(Node):
             out = self.estop.should_stop(self.scan, self.odom, out)
 
         self.drive_pub.publish(out)
-        self.mode_pub.publish(Bool(data=self.current_host == 'autodrive'))
 
     def _ego_control_cb(self, msg):
         self.use_keyboard = bool(msg.data)

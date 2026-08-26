@@ -24,6 +24,7 @@ setup(
     entry_points={
         'console_scripts': [
             'lap_analyser = lap_analyser.lap_analyser:main',
+            'quali_lap_manager = lap_analyser.quali_lap_manager:main',
         ],
     },
 )
